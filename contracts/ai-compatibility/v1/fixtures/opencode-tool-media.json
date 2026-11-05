@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "opencode-tool-media",
+  "pipeline": "normalize",
+  "client": "opencode",
+  "provider": "openai_responses_limited",
+  "protocol": "openai-responses",
+  "input": {
+    "model": "model-a",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "tool_choice": "auto",
+    "tools": [
+      {"type": "function", "name": "read", "parameters": {"type": "object"}},
+      {"type": "namespace", "name": "mcp__cua", "tools": []},
+      {"type": "web_search"}
+    ],
+    "input": [
+      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "读取截图"}]},
+      {"type": "function_call", "call_id": "call-1", "name": "execute", "arguments": "{}"},
+      {"type": "function_call_output", "call_id": "call-1", "output": [
+        {"type": "input_text", "text": "screenshot"},
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,AAAA"},
+        {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,AAAA"}
+      ]}
+    ]
+  },
+  "expect": {
+    "lengths": {"/tools": 1},
+    "paths": {"/tools/0/type": "function", "/input/1/type": "message", "/input/2/type": "message"},
+    "absent_paths": ["/temperature", "/top_p"],
+    "forbidden_substrings": ["input_image", "input_file", "data:image", "data:application/pdf"],
+    "changes_include": ["tool_result_image", "tool_result_file", "function_call_history", "sampling_temperature", "sampling_top_p"]
+  }
+}

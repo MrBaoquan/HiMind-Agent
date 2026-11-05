@@ -201,6 +201,51 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | HiMind AI 会话报「页面认证失败：HTTP 502 Bad Gateway」 | `diagnostics check` 的 `himind_ai_rail_links`、`loopback_proxy_bypass`、`himind_ai_session`，以及 `agent-events.jsonl` 里的「HiMind AI 会话启动失败」 | 三种成因各自可判：`himind_ai_rail_links.broken` 非空 = 工作区会话目录联接不受信（0.3.72 起自动重建）；`loopback_proxy_bypass` 为 warning = 系统代理接管了发往 127.0.0.1 的请求（把 127.0.0.1、localhost 加进绕过列表或设 NO_PROXY；0.3.74 起 Agent 自己的环回请求不再走代理）；诊断里出现 `dsh: warning: 1 entry did not activate` 加 `ERR_INVALID_ARG_TYPE ... paths[0]` = profile 里的 Office 行缺 Runtime 路径（0.3.74 起该行自解析并会就地升级） |
 | 会话能开，但 Office/文档能力不可用，DSH 报 `1 entry did not activate` | 会话诊断里的原始错误、各工作区 `profiles\himind\cordis.patch.yml` 是否含 `id: skill-office` | 0.3.74 起该行自解析 Runtime 路径，会话准备时就地升级旧行；更早版本升级 Agent |
 | 扩展源显示「未找到受信的签名公钥：<key-id>」 | `diagnostics check` 的 `extension_source_health` 与 `extension_source_trust` | 把 `<key-id>.pem` 放进 `trusted-keys`（`manage-trusted-signing-key.ps1 -Action import`）；自建来源也可把验证策略改为 `optional`；0.3.72+ 官方扩展公钥已内嵌 |
+| MCP 客户端显示「HiMind agent couldn't start」/ 日志里反复出现 `HiMind MCP bridge failed: 系统找不到指定的文件 (os error 2)` | `%LOCALAPPDATA%\HiMindAgent\runtime\mcp-service\<scope>\service.json` 里的 `pid` 是否还存活；`versions\<active-version>` 下 `himind-agent.exe` 与 `himind-agent-mcp.exe` 的 `LastWriteTime` 是否一致 | 0.3.91 及更早：运行 `pwsh scripts/fix-mcp-startup.ps1` 清掉指向死进程的发现记录，再重连客户端；0.3.92+ 由桥接自己校验进程存活（含 pid 复用），无需手工清理。两者时间差很远 = 只换了主程序没换桥接，重装或重跑 `scripts/deploy-local.ps1` |
+
+### 9. MCP 客户端一直连不上：「HiMind agent couldn't start」与 `os error 2`
+
+MCP 采用「stdio 桥接 + 本机单例服务 + 命名管道」结构（见 ADR 0001）。桥接启动时
+先读发现记录 `runtime\mcp-service\<profile>-<identity>-<state>\service.json`，
+按里面的 `endpoint` 与 `token` 连上服务；服务只在启动时写一次这条记录，
+`Drop` 时删除。
+
+- **成因**：服务被强杀或崩溃时 `Drop` 不会执行，记录留下但 `pid` 已经死了。
+  0.3.91 及更早的桥接只读文件、不校验存活，于是每次启动都去连一个不存在的管道，
+  立刻以 `系统找不到指定的文件 (os error 2)` 退出。客户端日志
+  `%LOCALAPPDATA%\Claude-3p\logs\mcp-server-himind-agent.log` 里会同时出现
+  `Couldn't start for Cowork and Code sessions. Error: Connection closed`。
+- **判据**：把记录里的 `pid` 与进程表对照。`Get-Process -Id <pid>` 报不存在就是命中。
+  注意 `127.0.0.1:18083` 可能被别的程序（例如 Docker Desktop 的代理）占用并返回
+  HiMind Dashboard 页面，它和本条无关；Agent 的本地服务在 18181。
+- **修复**：`pwsh -NoProfile -File scripts/fix-mcp-startup.ps1`。脚本只删除指向死进程
+  的记录，不动活着的 scope，也不杀进程（`-Restart` 会顺带重启主程序，
+  `-KillBridges` 会先结束桥接/启动器）。然后回到客户端断开并重连一次。
+- **不要在服务侧做「探测端点是否可连」的判断。** 命名管道每个实例只能被连一次：
+  零权限的 `CreateFileW` 也会被服务的 accept 循环当成客户端收下，服务读到半截连接
+  就报 `MCP bridge closed before hello`；实测连续 46 次探测就能让服务以
+  `管道正在被关闭。 (os error 232)` 退出，同时留下死记录，把可自愈的故障变成永久的。
+  已有客户端占着连接时，同端点的 open 还会返回 `ERROR_PIPE_BUSY`（231），
+  把「忙」当成「不可达」会让多客户端场景误删活记录。存活判据只看进程
+  （存活 + 创建时刻与 `started_at_unix` 相符），可连性交给 `mcp_pipe::connect` 的重试。
+  详见 ADR 0022。
+- **记录被外部删掉时**：服务还活着但客户端看不见它，新桥接会去 spawn 新服务，
+  而新服务撞上单例锁直接退出（`HiMind Agent service exited during startup: exit code: 1`）。
+  0.3.92+ 服务侧有守护线程按 500ms 补写记录，这种情况会在一个间隔内自愈。
+- **只升级 Agent 而没升级桥接的「半修复」**：桥接是独立的
+  `himind-agent-mcp.exe`，它的存活校验必须和 `himind-agent.exe` 同版本一起更换。
+  只换主程序、桥接还是旧版时症状与本条完全相同（实测：服务侧已能在 0.9s 内补写记录，
+  旧桥接仍在 1.2s 内以 `os error 2` 退出）。排查时先对比两者版本：
+
+  ```powershell
+  $root = "$env:LOCALAPPDATA\HiMindAgent"
+  $v = (Get-Content "$root\active-version" -Raw).Trim()
+  Get-ChildItem "$root\versions\$v" -Filter "himind-agent*.exe" |
+      Select-Object Name, Length, LastWriteTime
+  ```
+
+  两个 `LastWriteTime` 相差很远就是命中，重新安装或重跑部署脚本（`scripts/deploy-local.ps1`
+  现已同时构建并部署 `himind-agent.exe`、`himind-agent-mcp.exe`、`himind-agent-launcher.exe`）。
 
 ## 发布门禁
 

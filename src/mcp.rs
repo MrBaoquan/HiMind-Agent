@@ -431,19 +431,26 @@ fn spawn_registry_watcher_with_interval(
     poll_interval: Duration,
 ) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
-    let mut last_generation = mcp_registry_generation(&gateway).ok();
-    thread::spawn(move || loop {
-        thread::sleep(poll_interval);
-        let Ok(generation) = mcp_registry_generation(&gateway) else {
-            continue;
-        };
-        if last_generation.as_deref() == Some(generation.as_str()) {
-            continue;
+    thread::spawn(move || {
+        // The initial registry probe can be slow while the Dashboard catalog or
+        // local stores are warming up. It must never run on the service startup
+        // thread: serve_with_gateway creates the named-pipe instance immediately
+        // after this function returns, and a synchronous probe leaves MCP
+        // bridges staring at a dead endpoint until their connect window expires.
+        let mut last_generation = mcp_registry_generation(&gateway).ok();
+        loop {
+            thread::sleep(poll_interval);
+            let Ok(generation) = mcp_registry_generation(&gateway) else {
+                continue;
+            };
+            if last_generation.as_deref() == Some(generation.as_str()) {
+                continue;
+            }
+            if tx.send(generation.clone()).is_err() {
+                break;
+            }
+            last_generation = Some(generation);
         }
-        if tx.send(generation.clone()).is_err() {
-            break;
-        }
-        last_generation = Some(generation);
     });
     rx
 }

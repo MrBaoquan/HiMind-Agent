@@ -8,9 +8,17 @@ const page = readFileSync(join(root, 'src/pages/ExtensionDevelopmentPage.tsx'), 
 const main = readFileSync(join(root, 'src/main.tsx'), 'utf8');
 const css = readFileSync(join(root, 'styles.css'), 'utf8');
 
-for (const label of ['候选：', '运行时：', '可见性：', '发布：']) {
-  assert.ok(page.includes(label), `activation facts must expose ${label}`);
+// 状态事实条现在是「字段名 + 值」的纯文本（<em> 承载字段名），不再是四枚药丸。
+// 保留的断言是语义：可见性/发布必须始终出现，候选只在未确认时补一句，
+// 且这行不能退回药丸（不许有 999px 圆角与底色）。
+for (const label of ['可见性', '发布']) {
+  assert.ok(page.includes(`<em>${label}</em>`), `activation facts must expose ${label}`);
 }
+assert.match(page, /confirmed \? null : <span data-state="waiting"><em>候选<\/em>未确认<\/span>/,
+  'activation facts must only mention 候选 when it is unconfirmed');
+assert.doesNotMatch(page, /运行时：\{active/, 'activation facts must not repeat the runtime state already shown in the summary');
+assert.match(css, /\.development-build-summary > \.development-activation-facts > span \{[^}]*color: var\(--text\);[^}]*line-height: 1\.5;/, 'fact entries must be plain text, not pills');
+assert.doesNotMatch(css, /\.development-activation-facts > span \{[^}]*border-radius: 999px/, 'fact entries must not fall back to pill styling');
 assert.ok(page.includes('title={`${project.name} · ${listMeta(project)}`}'), 'truncated project rows must expose the full name on hover');
 assert.match(page, /replace\(\/\^\\\/\\\/\\\?\\\/UNC\\\//, 'Windows verbatim UNC paths must normalize');
 assert.match(page, /replace\(\/\^\\\/\\\/\\\?\\\//, 'Windows verbatim drive paths must normalize');
@@ -20,7 +28,7 @@ assert.ok(!page.includes('恢复上一开发版'), 'development detail must not 
 assert.ok(!page.includes('onRefreshActivationSurfaces'), 'rollback-only refresh wiring must be removed with the action');
 assert.match(main, /singleFlight\('development',[\s\S]*?\{ force \}\)/, 'development refresh must honor force');
 assert.match(main, /refreshDevelopment\(true\)/, 'build completion must use a forced development refresh');
-assert.match(css, /\.development-build-summary > \.development-activation-facts > span \{[^}]*width: auto;[^}]*height: auto;[^}]*min-width: 0;[^}]*max-width: 100%;[^}]*flex: 0 1 auto;[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;/, 'fact chips must shrink and ellipsize instead of overflowing the detail pane');
+assert.match(css, /\.development-build-summary > \.development-activation-facts > span \{[^}]*width: auto;[^}]*height: auto;[^}]*min-width: 0;[^}]*max-width: 100%;[^}]*flex: 0 1 auto;[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;/, 'fact entries must shrink and ellipsize instead of overflowing the detail pane');
 assert.match(css, /\.development-detail-header \{[^}]*display: flex;/, 'development detail header must remain a flex layout');
 assert.match(css, /@container agent-main \(max-width: 880px\) \{[\s\S]*?\.development-rail-head \{ display: none; \}/, 'compact workspace rail must not consume vertical reading space');
 assert.match(css, /@container agent-main \(max-width: 880px\) \{[\s\S]*?\.instruction-panel-head \{ min-height: 36px; \}/, 'compact project rules must retain a usable detail viewport');

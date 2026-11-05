@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Activity, ArrowUpRight, Check, CircleAlert, Download, LogIn, MessageCircle, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
+import { Activity, AppWindow, ArrowUpRight, Check, CircleAlert, Download, LogIn, MessageCircle, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
 import type { RefObject } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
@@ -48,6 +48,7 @@ export function BuiltinAiPage({
   const [sessionUrl, setSessionUrl] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [browserOpening, setBrowserOpening] = useState(false);
+  const [windowOpening, setWindowOpening] = useState(false);
   const [frameLoaded, setFrameLoaded] = useState(false);
   // 会话重开时即使 URL 一个字没变，也要换一个 iframe 元素：同一个元素重新指向
   // 同一个地址，浏览器不会再发 load，加载遮罩就会一直挂在那儿（会话其实已经开了）。
@@ -269,6 +270,22 @@ export function BuiltinAiPage({
     }
   }, [browserOpening, canStartSession, connecting, runtimeReady, sessionUrl, workspaceTarget]);
 
+  const openInWindow = useCallback(async () => {
+    if (windowOpening || connecting || !runtimeReady || !canStartSession) return;
+    setWindowOpening(true);
+    setConnectionError('');
+    setConnectionDetail('');
+    try {
+      await agentApi.openBuiltinAiWindow(builtinAiSessionTarget(workspaceTarget));
+    } catch (error) {
+      const presented = presentConnectionError(error);
+      setConnectionError(presented.message);
+      setConnectionDetail(presented.detail);
+    } finally {
+      setWindowOpening(false);
+    }
+  }, [canStartSession, connecting, runtimeReady, windowOpening, workspaceTarget]);
+
   useEffect(() => {
     if (!workspaceRequestRevision || connecting || handledWorkspaceRequest.current === workspaceRequestRevision) return;
     handledWorkspaceRequest.current = workspaceRequestRevision;
@@ -316,8 +333,11 @@ export function BuiltinAiPage({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void listen<{ reason?: string; service_id?: string }>('himind:ai-service-changed', () => {
+    void listen<{ reason?: string; service_id?: string; restart_required?: boolean }>('himind:ai-service-changed', (event) => {
       if (cancelled) return;
+      // Local service switches are applied through the stable Agent router and
+      // the stable `himind-active` model seat. Keep both DSH and the iframe live.
+      if (event.payload?.restart_required === false) return;
       frameRetry.current = 0;
       setFrameStalled(false);
       setFrameLoaded(false);
@@ -387,6 +407,14 @@ export function BuiltinAiPage({
           <span className="builtin-ai-mark"><MessageCircle size={17} /></span>
           {/* 扩展工作区不是一个"项目"，它只是一个开发目录，文案必须跟着目标类型走。 */}
           <div><h2>HiMind AI</h2><span>{workspaceTarget ? `${workspaceTarget.kind === 'extension-workspace' ? '当前工作区' : '当前项目'}：${workspaceTarget.name}` : 'AI 对话'}</span></div>
+        </div>
+        <div className="builtin-ai-toolbar-actions">
+          <button type="button" className="btn" disabled={browserOpening || connecting || !runtimeReady || !canStartSession} onClick={() => void openInBrowser()}>
+            {browserOpening ? <BusyIndicator size={14} /> : <ArrowUpRight size={14} />}网页打开
+          </button>
+          <button type="button" className="btn" disabled={windowOpening || connecting || !runtimeReady || !canStartSession} onClick={() => void openInWindow()}>
+            {windowOpening ? <BusyIndicator size={14} /> : <AppWindow size={14} />}独立窗口
+          </button>
         </div>
       </header>
 

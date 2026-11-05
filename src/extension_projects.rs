@@ -116,10 +116,26 @@ pub(crate) struct ExtensionProject {
     /// 没有草稿的项目只能从这里读到依赖。
     #[serde(default)]
     pub plugin_dependencies: Vec<String>,
+    /// 构建顺序所需的全部同仓扩展依赖（插件与技能）。工作流只有把技能
+    /// 也排到前面，首次一键构建才不会读到旧的已安装版本。
+    #[serde(default)]
+    pub extension_dependencies: Vec<String>,
+    /// 带最低版本与必需性信息的构建依赖，供自动构建计划解析。
+    #[serde(default)]
+    pub build_dependencies: Vec<ExtensionBuildDependency>,
     pub updated_at: String,
     /// 所属扩展分发单元键，由扩展源实时派生，不落盘。
     #[serde(default)]
     pub source_unit_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExtensionBuildDependency {
+    pub kind: crate::extension_contracts::ExtensionAssetKind,
+    pub id: String,
+    #[serde(default)]
+    pub min_version: String,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1927,6 +1943,8 @@ impl From<ProjectRecord> for ExtensionProject {
             source_unit_key: value.source_unit_key,
             // 清单依赖需要读盘，由 project_view 补齐。
             plugin_dependencies: Vec::new(),
+            extension_dependencies: Vec::new(),
+            build_dependencies: Vec::new(),
         }
     }
 }
@@ -1994,27 +2012,68 @@ fn read_declared_distribution_targets(record: &ProjectRecord) -> Vec<Distributio
         .unwrap_or_default()
 }
 
-/// 读取清单声明的同仓插件依赖，供「一键构建」在首次构建之前排序。
+/// 从依赖项读取稳定 ID；兼容字符串和清单对象两种写法。
+fn declared_dependency_id(item: &Value) -> Option<&str> {
+    item.as_str()
+        .or_else(|| item.get("plugin_id").and_then(Value::as_str))
+        .or_else(|| item.get("skill_id").and_then(Value::as_str))
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn push_declared_dependency(
+    dependencies: &mut Vec<ExtensionBuildDependency>,
+    kind: crate::extension_contracts::ExtensionAssetKind,
+    item: &Value,
+    default_required: bool,
+) {
+    let Some(id) = declared_dependency_id(item) else {
+        return;
+    };
+    let min_version = item
+        .get("min_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let required = item
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(default_required);
+    if let Some(existing) = dependencies
+        .iter_mut()
+        .find(|dependency| dependency.kind == kind && dependency.id == id)
+    {
+        existing.required |= required;
+        if existing.min_version.is_empty() && !min_version.is_empty() {
+            existing.min_version = min_version;
+        }
+        return;
+    }
+    dependencies.push(ExtensionBuildDependency {
+        kind,
+        id: id.to_string(),
+        min_version,
+        required,
+    });
+}
+
+/// 读取清单声明的全部构建依赖。
 ///
-/// 插件/技能写 `plugin_dependencies: [{plugin_id}]`，工作流写
-/// `dependencies.plugins: [id]`；两种形态都要认，否则工作区的依赖方
-/// 会先于被依赖的插件执行。
-fn read_declared_plugin_dependencies(record: &ProjectRecord) -> Vec<String> {
+/// 插件/技能写 `plugin_dependencies`，工作流写 `dependencies.plugins` 和
+/// `dependencies.skills`。工作流依赖缺省为必需；插件对技能的引用缺省为可选，
+/// 与实际 Manifest 语义保持一致。
+fn read_declared_build_dependencies(record: &ProjectRecord) -> Vec<ExtensionBuildDependency> {
+    use crate::extension_contracts::ExtensionAssetKind;
+
     let Some(value) = read_manifest_value(record) else {
         return Vec::new();
     };
     let mut dependencies = Vec::new();
     if let Some(items) = value.get("plugin_dependencies").and_then(Value::as_array) {
         for item in items {
-            let id = item
-                .get("plugin_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim();
-            if !id.is_empty() {
-                dependencies.push(id.to_string());
-            }
+            push_declared_dependency(&mut dependencies, ExtensionAssetKind::Plugin, item, false);
         }
     }
     if let Some(items) = value
@@ -2023,13 +2082,36 @@ fn read_declared_plugin_dependencies(record: &ProjectRecord) -> Vec<String> {
         .and_then(Value::as_array)
     {
         for item in items {
-            let id = item.as_str().unwrap_or_default().trim();
-            if !id.is_empty() && !dependencies.iter().any(|existing| existing == id) {
-                dependencies.push(id.to_string());
-            }
+            push_declared_dependency(&mut dependencies, ExtensionAssetKind::Plugin, item, true);
+        }
+    }
+    if let Some(items) = value
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get("skills"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            push_declared_dependency(&mut dependencies, ExtensionAssetKind::Skill, item, true);
         }
     }
     dependencies
+}
+
+fn read_declared_plugin_dependencies(record: &ProjectRecord) -> Vec<String> {
+    read_declared_build_dependencies(record)
+        .into_iter()
+        .filter(|dependency| {
+            dependency.kind == crate::extension_contracts::ExtensionAssetKind::Plugin
+        })
+        .map(|dependency| dependency.id)
+        .collect()
+}
+
+fn read_declared_extension_dependencies(record: &ProjectRecord) -> Vec<String> {
+    read_declared_build_dependencies(record)
+        .into_iter()
+        .map(|dependency| dependency.id)
+        .collect()
 }
 
 /// 把记录投影成对外的项目视图，并补齐分发单元与目标字段。
@@ -2059,7 +2141,9 @@ fn project_view_with(
     view.distribution_targets_declared = declared.clone();
     view.distribution_targets_source = source.to_string();
     view.icon = read_project_icon(record);
+    view.build_dependencies = read_declared_build_dependencies(record);
     view.plugin_dependencies = read_declared_plugin_dependencies(record);
+    view.extension_dependencies = read_declared_extension_dependencies(record);
     view
 }
 
@@ -2126,6 +2210,62 @@ fn derive_unit_key(record: &ProjectRecord) -> String {
 mod tests {
     use super::*;
     use crate::app::extension_source::LocalSourceWorkspace;
+
+    #[test]
+    fn project_view_exposes_workflow_plugin_and_skill_dependencies() {
+        let root = env::temp_dir().join(format!(
+            "himind-extension-dependencies-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("workflow.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "com.himind.workflow.dependency-order-test",
+                "name": "依赖排序测试",
+                "description": "读取插件与技能依赖",
+                "version": "1.0.0",
+                "dependencies": {
+                    "plugins": [
+                        {"id": "com.himind.plugin.dependency-order-test", "required": true},
+                        "com.himind.plugin.legacy-string-test"
+                    ],
+                    "skills": [
+                        {"id": "com.himind.skill.dependency-order-test", "required": true}
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let record = record(
+            ExtensionProjectKind::Workflow,
+            "com.himind.workflow.dependency-order-test".to_string(),
+            "依赖排序测试".to_string(),
+            String::new(),
+            "1.0.0".to_string(),
+            &root,
+            "test",
+        );
+        let view = project_view(&record);
+        assert_eq!(
+            view.plugin_dependencies,
+            vec![
+                "com.himind.plugin.dependency-order-test",
+                "com.himind.plugin.legacy-string-test"
+            ]
+        );
+        assert_eq!(
+            view.extension_dependencies,
+            vec![
+                "com.himind.plugin.dependency-order-test",
+                "com.himind.plugin.legacy-string-test",
+                "com.himind.skill.dependency-order-test"
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     #[ignore = "requires HIMIND_EXT_E2E_ROOT pointing at himind-ext-projects"]

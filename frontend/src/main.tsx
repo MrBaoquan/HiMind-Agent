@@ -23,6 +23,7 @@ const ExpertStudioPanel = lazyNamed(() => import('./components/ExpertStudioPanel
 const InstructionProjectionPanel = lazyNamed(() => import('./components/InstructionProjectionPanel'), 'InstructionProjectionPanel');
 const ManagedCapabilitiesPanel = lazyNamed(() => import('./pages/ManagedCapabilitiesPage'), 'ManagedCapabilitiesPanel');
 const ExtensionDevelopmentPage = lazyNamed(() => import('./pages/ExtensionDevelopmentPage'), 'ExtensionDevelopmentPage');
+import type { ExtensionBuildStage } from './pages/ExtensionDevelopmentPage';
 const ExtensionsPage = lazyNamed(() => import('./pages/ExtensionsPage'), 'ExtensionsPage');
 import type { MarketLoadError } from './pages/ExtensionsPage';
 const InboxPage = lazyNamed(() => import('./pages/InboxPage'), 'InboxPage');
@@ -396,7 +397,7 @@ function AgentApp() {
       setProjectionSyncStatus(await agentApi.projectionSyncStatus());
     });
   }
-  /// 重投只把失败记录放回队列，真正上报由投影循环在 30 秒内接手，所以这里刷新到的是「已重新排队」的状态。
+  /// 只把失败记录重新排队；实际上报由投影循环在 30 秒内接手。
   async function requeueProjectionDeadLetters() {
     if (projectionRequeueBusy) return;
     setProjectionRequeueBusy(true);
@@ -1599,17 +1600,11 @@ function AgentApp() {
       await agentApi.confirmInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
       await agentApi.activateInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
     }
-    // 构建完就直接装到本机：开发者的循环是「改代码 → 构建 → 立刻在会话里用」。
-    // 装失败要显式报出来，否则界面显示构建成功、扩展却还是旧版本。
+    // 插件和技能的 activate 动作已经把当前构建放进开发直挂槽位；再装进正式
+    // 安装库只会制造同版本内容冲突。开发者的当前构建就是当前有效版本。
     let installId = '';
     let installVersion = '';
-    if (candidate.kind === 'plugin' || candidate.kind === 'skill') {
-      installId = candidate.draft.manifest.id;
-      installVersion = candidate.draft.manifest.version;
-    } else if (candidate.kind === 'workflow') {
-      installId = candidate.draft.package_id;
-      installVersion = candidate.draft.version;
-    } else if (candidate.kind === 'expert') {
+    if (candidate.kind === 'expert') {
       installId = candidate.draft.definition.id;
       installVersion = candidate.draft.definition.version;
     }
@@ -1632,6 +1627,56 @@ function AgentApp() {
         refreshBuiltinAiToolContext(),
       ]);
     }
+  }
+
+  /// 临时网络、下载、锁竞争错误自动重试一次；结构性错误不原样重试。
+  async function buildOneProjectAutomatically(
+    projectId: string,
+    onProgress?: (stage: ExtensionBuildStage) => void,
+    deferCapabilityRefresh = false,
+  ) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await buildOneProject(projectId, onProgress, deferCapabilityRefresh);
+        return;
+      } catch (error) {
+        const message = formatError(error, '');
+        const retryable = /(dial tcp|connection attempt failed|timed out|timeout|TLS handshake|connection reset|proxy\.golang\.org|502 Bad Gateway|503|504|下载失败|请稍后重试|network|file lock|另一个进程)/i.test(message);
+        if (attempt >= 1 || !retryable) throw error;
+        await new Promise(resolve => window.setTimeout(resolve, 700));
+      }
+    }
+  }
+
+  /// 单项目构建同样先解析依赖图：当前工作流依赖的 Plugin/Skill 不存在或版本旧时，
+  /// 自动构建并激活它们，再构建目标。不能要求用户先逐个点击依赖项目。
+  async function buildProjectWithDependencies(
+    projectId: string,
+    onProgress?: (stage: 'building' | 'activating' | 'refreshing') => void,
+  ) {
+    onProgress?.('building');
+    const plan = await agentApi.planExtensionBuild([projectId]);
+    if (plan.blockers.length) {
+      throw new Error(`依赖无法自动解析：${plan.blockers.map(blocker => blocker.message).join('；')}`);
+    }
+    if (!plan.order.length) throw new Error('没有可构建的扩展项目');
+    for (let index = 0; index < plan.order.length; index += 1) {
+      const node = plan.nodes.find(item => item.project_id === plan.order[index]);
+      try {
+        await buildOneProjectAutomatically(plan.order[index], undefined, true);
+      } catch (error) {
+        const prefix = node ? `${node.name}：` : '';
+        throw new Error(`自动构建依赖链失败，${prefix}${formatError(error, '构建失败')}`);
+      }
+    }
+    onProgress?.('refreshing');
+    await Promise.all([
+      refreshDevelopment(true),
+      refreshPlugins(),
+      refreshSkills(),
+      refreshWorkflowCenter(false, true),
+      refreshBuiltinAiToolContext(),
+    ]);
   }
 
   const availablePlugins = useMemo(() => {
@@ -2148,9 +2193,29 @@ function AgentApp() {
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
       onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型来源已保存'); } catch (error) { notify('error', formatError(error, '保存模型来源失败')); throw error; } }}
-      onSetActiveAIService={(id) => run(async () => { await agentApi.setActiveAIService(id); await refreshAIServices(); }, id ? 'HiMind AI 对话已改用所选服务' : 'HiMind AI 对话已恢复默认服务', '切换 HiMind AI 对话服务失败')}
-      onSetImageAIService={(id, capability) => run(async () => { await agentApi.setImageAIService(id, capability); await refreshAIServices(); }, id ? '媒体能力已改用所选服务' : '媒体能力已恢复自动选择', '设置媒体能力服务失败')}
+      onSetCapabilityRoutes={async (capability, entries) => {
+        try {
+          await agentApi.setCapabilityRoutes(capability, entries);
+          await refreshAIServices();
+          const primary = entries[0];
+          notify('success', primary ? '能力路由已更新' : '能力路由已恢复自动选择');
+        } catch (error) {
+          notify('error', formatError(error, '保存能力路由失败'));
+          throw error;
+        }
+      }}
       onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型来源已删除', '删除模型来源失败')}
+      onCloneAIService={async (id) => {
+        try {
+          const cloned = await agentApi.cloneAIService(id);
+          await refreshAIServices();
+          notify('success', `已克隆为「${cloned.display_name}」`);
+          return cloned;
+        } catch (error) {
+          notify('error', formatError(error, '克隆模型来源失败'));
+          throw error;
+        }
+      }}
       onFetchModels={(input) => agentApi.fetchAIServiceModels(input).then((result) => result.models)}
       onFetchSavedModels={(id, baseUrl) => agentApi.fetchSavedAIServiceModels(id, baseUrl).then((result) => result.models)}
       onFetchBalance={(id) => agentApi.fetchSavedAIServiceBalance(id)}
@@ -2616,7 +2681,7 @@ function AgentApp() {
       }}
       onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '已添加到扩展开发', '打开扩展项目失败')}
       onAssociateProject={(project: ExtensionRemoteProject) => runDevelopmentOperation(`associate:${project.product_key}`, async () => { await agentApi.associateExtensionProject(project); await refreshDevelopment(); }, '本地项目已关联', '关联本地项目失败')}
-      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, () => buildOneProject(projectId, onProgress), '构建完成，已执行本地开发版激活', '构建或开发版激活失败')}
+      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, () => buildProjectWithDependencies(projectId, onProgress), '构建完成，已执行本地开发版激活', '构建或开发版激活失败')}
       // 工作区级「一键构建」：页面按依赖排好序后交过来，这里逐个执行。
       // 单个失败不打断后面的；被依赖的项没成功就跳过依赖者（跳过不是失败）。
       // 失败与跳过都以值的形式交回页面，由页面在同一条提示里说明是谁、为什么。
@@ -2638,7 +2703,7 @@ function AgentApp() {
               continue;
             }
             try {
-              await buildOneProject(project.id, undefined, true);
+              await buildOneProjectAutomatically(project.id, undefined, true);
               succeeded.add(project.extensionId);
             } catch (error) {
               failures.push({ name: project.name, message: formatError(error, '构建失败') });

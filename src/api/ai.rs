@@ -1,6 +1,7 @@
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::Duration;
@@ -35,6 +36,11 @@ pub(crate) struct AIUserCredential {
     pub updated_at: String,
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub rotated_at: String,
+    /// Per-model capability facts returned by Dashboard/AI Control. Older
+    /// servers omit this field; the agent then falls back to live discovery and
+    /// versioned known-model facts.
+    #[serde(default)]
+    pub model_metadata: BTreeMap<String, AIModelMetadata>,
 }
 
 fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -64,8 +70,31 @@ fn default_protocol() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_ai_service_templates_with_token, AIUserAccess};
+    use super::{fetch_ai_service_templates_with_token, known_model_metadata, AIUserAccess};
     use std::io::{Read, Write};
+
+    #[test]
+    fn agent_plan_model_metadata_matches_provider_catalog() {
+        let cases = [
+            ("doubao-seed-evolving", true),
+            ("glm-5.3", false),
+            ("glm-5.3-flash", true),
+            ("kimi-k2.8-preview", true),
+            ("kimi-k3", true),
+            ("kimi-k3.1-pro", true),
+            ("deepseek-v4.1-flash", true),
+            ("deepseek-v4.1-flash-economy", true),
+            ("deepseek-v4-flash", false),
+            ("deepseek-v4-pro", false),
+        ];
+        for (model, supports_image) in cases {
+            let metadata = known_model_metadata(model);
+            assert_eq!(metadata.context_window, Some(1_000_000), "{model} context");
+            assert_eq!(metadata.max_output_tokens, Some(64_000), "{model} output");
+            assert_eq!(metadata.supports_image(), supports_image, "{model} image");
+            assert!(!metadata.reasoning_efforts.is_empty(), "{model} reasoning");
+        }
+    }
 
     #[test]
     fn catalog_request_carries_delegated_headers_and_parses_templates() {
@@ -78,7 +107,7 @@ mod tests {
             let mut buffer = [0u8; 4096];
             let read = stream.read(&mut buffer).unwrap_or(0);
             *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"按量付费","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","api_mode":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
+            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"按量付费","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","api_mode":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true,"reasoning_efforts":["low","medium","high"],"default_reasoning_effort":"medium"}]}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -110,6 +139,35 @@ mod tests {
             "claude-sonnet-4-20250514"
         );
         assert!(templates[0].models[0].recommended);
+        assert_eq!(
+            templates[0].models[0].reasoning_efforts,
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(templates[0].models[0].default_reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn model_metadata_revision_tracks_reasoning_contract() {
+        use crate::api::ai::{model_metadata_revision, AIModelMetadata};
+        use std::collections::BTreeMap;
+
+        let mut first = BTreeMap::new();
+        first.insert(
+            "model-a".to_string(),
+            AIModelMetadata {
+                reasoning_efforts: vec!["low".to_string(), "high".to_string()],
+                default_reasoning_effort: "high".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut second = first.clone();
+        second.get_mut("model-a").unwrap().reasoning_efforts =
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+        second.get_mut("model-a").unwrap().default_reasoning_effort = "medium".to_string();
+
+        let first_revision = model_metadata_revision(&first);
+        assert_eq!(first_revision, model_metadata_revision(&first));
+        assert_ne!(first_revision, model_metadata_revision(&second));
     }
 
     #[test]
@@ -137,6 +195,12 @@ mod tests {
                 "base_url": "https://gateway.example/v1",
                 "model": "model-1",
                 "models": ["model-1"],
+                "model_metadata": {
+                    "model-1": {
+                        "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                        "default_reasoning_effort": "medium"
+                    }
+                },
                 "protocol": null,
                 "created_at": "2026-01-01T00:00:00Z",
                 "updated_at": "2026-01-01T00:00:00Z",
@@ -148,6 +212,14 @@ mod tests {
         assert_eq!(credential.active_personal_connection_id, "");
         assert_eq!(credential.rotated_at, "");
         assert_eq!(credential.protocol, "openai-responses");
+        assert_eq!(
+            credential.model_metadata["model-1"].reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            credential.model_metadata["model-1"].default_reasoning_effort,
+            "medium"
+        );
     }
 }
 
@@ -204,6 +276,10 @@ pub(crate) struct AiProviderTemplateModel {
     pub upstream_model: String,
     #[serde(default)]
     pub recommended: bool,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub default_reasoning_effort: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,11 +302,14 @@ where
 /// 它来自供应商的 `/v1/models` 或内置的已知模型兜底，不能由注册器按供应商
 /// 写死。`context_window` 与 `input_modalities` 都会直接影响客户端的上下文
 /// 预算和附件入口；缺失时保持为空，由各客户端自己的缺省策略处理。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct AIModelMetadata {
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: String,
 }
 
 impl AIModelMetadata {
@@ -239,6 +318,159 @@ impl AIModelMetadata {
             .iter()
             .any(|value| value.eq_ignore_ascii_case("image"))
     }
+
+    pub(crate) fn supports_reasoning(&self) -> bool {
+        !self.reasoning_efforts.is_empty()
+    }
+}
+
+fn reasoning_effort_rank(value: &str) -> usize {
+    match value {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        "ultra" => 7,
+        _ => 100,
+    }
+}
+
+pub(crate) fn normalize_reasoning_efforts(values: &[String]) -> Vec<String> {
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() || result.iter().any(|existing: &String| existing == &value) {
+            continue;
+        }
+        result.push(value);
+    }
+    result.sort_by_key(|value| reasoning_effort_rank(value));
+    result
+}
+
+pub(crate) fn choose_default_reasoning_effort(efforts: &[String], requested: &str) -> String {
+    let requested = requested.trim().to_ascii_lowercase();
+    if !requested.is_empty() && efforts.iter().any(|value| value == &requested) {
+        return requested;
+    }
+    for preferred in [
+        "medium", "high", "low", "minimal", "none", "xhigh", "max", "ultra",
+    ] {
+        if efforts.iter().any(|value| value == preferred) {
+            return preferred.to_string();
+        }
+    }
+    efforts.first().cloned().unwrap_or_default()
+}
+
+pub(crate) fn normalize_model_reasoning_metadata(mut metadata: AIModelMetadata) -> AIModelMetadata {
+    metadata.reasoning_efforts = normalize_reasoning_efforts(&metadata.reasoning_efforts);
+    metadata.default_reasoning_effort = choose_default_reasoning_effort(
+        &metadata.reasoning_efforts,
+        &metadata.default_reasoning_effort,
+    );
+    metadata
+}
+
+fn normalized_model_key(model: &str) -> String {
+    let mut value = model.trim().to_ascii_lowercase();
+    if let Some(stripped) = value.strip_prefix("models/") {
+        value = stripped.to_string();
+    }
+    value.rsplit('/').next().unwrap_or(&value).to_string()
+}
+
+fn known_model_reasoning(model: &str) -> Option<(&'static [&'static str], &'static str)> {
+    let full = model.trim().to_ascii_lowercase();
+    let suffix = normalized_model_key(model);
+    match suffix.as_str() {
+        "gpt-6-astra" | "gpt-6.1-sol" => {
+            Some((&["low", "medium", "high", "xhigh", "max"], "medium"))
+        }
+        "gpt-6-sol" | "gpt-6.1-terra" => {
+            Some((&["none", "low", "medium", "high", "xhigh", "max"], "medium"))
+        }
+        "gpt-6-luna" => Some((&["none", "low", "medium", "high", "xhigh", "max"], "medium")),
+        "gpt-5.6-sol" | "gpt-5.6-terra" => Some((
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+            "medium",
+        )),
+        "gpt-5.6-luna" => Some((&["low", "medium", "high", "xhigh", "max"], "medium")),
+        "gpt-5.5" => Some((&["low", "medium", "high", "xhigh"], "medium")),
+        "deepseek-flash" => Some((&["none", "low", "high", "max"], "high")),
+        // 火山方舟 Agent Plan 目录中的模型能力。这里按规范化模型 ID 精确匹配，
+        // 避免把某个套餐的上下文/输出上限误套到其它供应商的同名模型。
+        "doubao-seed-evolving" => Some((&["minimal", "low", "medium", "high"], "high")),
+        "glm-5.3" => Some((&["high", "max", "low"], "high")),
+        "glm-5.3-flash" => Some((&["max", "high", "low"], "max")),
+        "kimi-k2.8-preview" | "kimi-k3" | "kimi-k3.1-pro" => Some((&["max", "high", "low"], "max")),
+        "deepseek-v4.1-flash-economy" => Some((&["high", "max", "low", "none"], "high")),
+        "deepseek-v4-flash" | "deepseek-v4-pro" => Some((&["high", "max", "none"], "high")),
+        value if value.starts_with("deepseek-v4.1-flash") => {
+            if full.contains("opencode-go/") || full.contains("opencode/") {
+                Some((&["none", "low", "high", "max"], "high"))
+            } else {
+                Some((&["none", "low", "high", "max"], "high"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Versioned fallback for model families whose capabilities are stable and
+/// already represented in the GCMP/Codex catalogs. Live provider metadata and
+/// Dashboard metadata always win; this only fills missing fields.
+pub(crate) fn merge_known_model_metadata(model: &str, metadata: &mut AIModelMetadata) {
+    let key = model.to_ascii_lowercase();
+    let suffix = normalized_model_key(model);
+    let (context_window, max_output_tokens, image) = match suffix.as_str() {
+        "doubao-seed-evolving" => (Some(1_000_000), Some(64_000), true),
+        "glm-5.3" => (Some(1_000_000), Some(64_000), false),
+        "glm-5.3-flash" => (Some(1_000_000), Some(64_000), true),
+        "kimi-k2.8-preview" | "kimi-k3" | "kimi-k3.1-pro" => (Some(1_000_000), Some(64_000), true),
+        "deepseek-v4.1-flash" | "deepseek-v4.1-flash-economy" => {
+            (Some(1_000_000), Some(64_000), true)
+        }
+        "deepseek-v4-flash" | "deepseek-v4-pro" => (Some(1_000_000), Some(64_000), false),
+        _ if key.contains("deepseek-v4.1-flash") => (Some(1_000_000), Some(64_000), true),
+        _ if key.contains("deepseek-v4-flash") || key.contains("deepseek-v4-pro") => {
+            (Some(1_000_000), Some(64_000), false)
+        }
+        _ if key.contains("qwen3.8-max") => (Some(1_000_000), None, true),
+        _ if key.contains("kimi-k3") => (Some(1_000_000), None, true),
+        _ if key.contains("glm-5.3") => (Some(1_000_000), None, false),
+        _ if key.contains("minimax-m3") => (None, None, true),
+        _ => (None, None, false),
+    };
+    if metadata.context_window.is_none() {
+        metadata.context_window = context_window;
+    }
+    if metadata.max_output_tokens.is_none() {
+        metadata.max_output_tokens = max_output_tokens;
+    }
+    if metadata.input_modalities.is_empty() {
+        metadata.input_modalities = if image {
+            vec!["text".to_string(), "image".to_string()]
+        } else {
+            vec!["text".to_string()]
+        };
+    }
+    if metadata.reasoning_efforts.is_empty() {
+        if let Some((efforts, default_effort)) = known_model_reasoning(model) {
+            metadata.reasoning_efforts = efforts.iter().map(|value| (*value).to_string()).collect();
+            metadata.default_reasoning_effort = default_effort.to_string();
+        }
+    }
+    *metadata = normalize_model_reasoning_metadata(metadata.clone());
+}
+
+pub(crate) fn known_model_metadata(model: &str) -> AIModelMetadata {
+    let mut metadata = AIModelMetadata::default();
+    merge_known_model_metadata(model, &mut metadata);
+    metadata
 }
 
 #[derive(Clone)]
@@ -355,14 +587,15 @@ pub(crate) fn fetch_client_credential(
     if revealed.api_key.trim().is_empty() {
         return Err("Dashboard 返回的 AI 凭证为空".into());
     }
+    let model_metadata = credential.model_metadata.clone();
     Ok(AIClientCredential {
         access: credential,
         api_key: revealed.api_key,
-        model_metadata: BTreeMap::new(),
+        model_metadata,
     })
 }
 
-/// ADR 0118：读取当前 managed 接入的来源修订号（`updated_at|rotated_at`），
+/// ADR 0118：读取当前 managed 接入的来源修订号（`updated_at|rotated_at|model_metadata_digest`），
 /// 与工作台「我的接入」用于判断同步态的 `activeServiceRevision` 同源。
 ///
 /// 只读、不领取密钥；未授权、用户不一致、未生成凭据或请求失败都返回空串，
@@ -387,9 +620,19 @@ pub(crate) fn fetch_managed_service_revision(
     }
     let access = response.json::<AIUserAccess>()?;
     Ok(match access.credential {
-        Some(credential) => format!("{}|{}", credential.updated_at, credential.rotated_at),
+        Some(credential) => format!(
+            "{}|{}|{}",
+            credential.updated_at,
+            credential.rotated_at,
+            model_metadata_revision(&credential.model_metadata)
+        ),
         None => String::new(),
     })
+}
+
+fn model_metadata_revision(metadata: &BTreeMap<String, AIModelMetadata>) -> String {
+    let digest = Sha256::digest(serde_json::to_vec(metadata).unwrap_or_default());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Dashboard 分发的个人 AI 服务摘要（只读，不领取 API Key）。

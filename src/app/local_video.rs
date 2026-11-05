@@ -1019,6 +1019,7 @@ mod tests {
                 crate::store::ai_services::MediaModelBinding {
                     adapter: ADAPTER_ARK_VIDEO.to_string(),
                     model: "doubao-seedance-test".to_string(),
+                    models: Vec::new(),
                     execution_mode: None,
                 },
             );
@@ -1102,6 +1103,7 @@ mod tests {
                 crate::store::ai_services::MediaModelBinding {
                     adapter: ADAPTER_WAN_VIDEO.to_string(),
                     model: "wan2.6-i2v-flash".to_string(),
+                    models: Vec::new(),
                     execution_mode: None,
                 },
             );

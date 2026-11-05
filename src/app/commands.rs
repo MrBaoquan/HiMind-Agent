@@ -1704,6 +1704,18 @@ pub(crate) async fn open_builtin_ai_web(
 }
 
 #[tauri::command]
+pub(crate) async fn open_builtin_ai_window(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    project_id: Option<String>,
+    workspace_root: Option<String>,
+) -> Result<String, String> {
+    let session_url = start_builtin_ai_session(state, project_id, workspace_root).await?;
+    crate::app::ui::open_builtin_ai_session_window(&app, &session_url)?;
+    Ok(session_url)
+}
+
+#[tauri::command]
 pub(crate) async fn sync_builtin_ai_models(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::builtin_ai_model_sync::BuiltinAiModelSyncResult, String> {
@@ -2869,9 +2881,26 @@ pub(crate) fn list_gateway_profiles(
 
 #[tauri::command]
 pub(crate) fn save_gateway_profile(
+    app: AppHandle,
+    state: State<'_, AgentState>,
     input: crate::store::gateway_profiles::GatewayProfileInput,
 ) -> Result<crate::store::gateway_profiles::GatewayProfile, String> {
-    crate::store::gateway_profiles::save(input).map_err(|error| error.to_string())
+    crate::app::ai_provider_import::validate_profile_update_for_bound_clients(
+        &state.options,
+        &input,
+    )
+    .map_err(|error| error.to_string())?;
+    let profile = crate::store::gateway_profiles::save(input).map_err(|error| error.to_string())?;
+    let affected = crate::app::ai_provider_import::refresh_all_binding_sync_states(&state.options);
+    let _ = app.emit(
+        "himind:ai-client-sync-changed",
+        json!({
+            "reason": "gateway_profile_changed",
+            "profile_id": profile.id.clone(),
+            "clients": affected,
+        }),
+    );
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -3089,14 +3118,101 @@ pub(crate) async fn test_ai_capability(
     .map_err(|error| error.to_string())?
 }
 
+/// 覆盖写入某能力的完整路由表：下标 0 是主选，其余按序是备用。
+/// 每项是 `{service_id, model}`，`model` 为空表示跟随服务默认绑定。
 #[tauri::command]
-pub(crate) fn set_ai_capability_fallbacks(
+pub(crate) fn set_capability_routes(
+    app: AppHandle,
+    state: State<'_, AgentState>,
     capability: String,
-    service_ids: Vec<String>,
+    routes: Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    crate::store::ai_services::set_capability_fallbacks(&capability, service_ids)
+    let entries = routes
+        .into_iter()
+        .map(|route| {
+            let service_id = route
+                .get("service_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model = route
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            crate::store::ai_services::CapabilityRouteEntry::new(service_id, model)
+        })
+        .collect::<Vec<_>>();
+    // 对话主选是 DSH 的入口：写之前先记住旧值，只有真变了才需要同步。
+    let previous_chat = current_chat_selection();
+    crate::store::ai_services::set_capability_routes(&capability, entries)
         .map_err(|error| error.to_string())?;
-    crate::store::ai_services::media_provider_catalog().map_err(|error| error.to_string())
+    if capability.trim() == crate::store::ai_services::CAP_CHAT {
+        sync_chat_route(&app, &state, previous_chat);
+    }
+    Ok(json!({
+        "capability_routes": crate::store::ai_services::public_snapshot()
+            .map_err(|error| error.to_string())?["capability_routes"].clone(),
+        "routes": crate::store::ai_services::media_provider_catalog()
+            .map_err(|error| error.to_string())?["routes"].clone(),
+    }))
+}
+
+/// 当前对话主选解析出的（服务, 模型）；没有主选或模型不可用时为 `None`。
+/// 解析失败也当作 `None`：这里只用来判断「有没有变化」，真正的错误由同步路径报告。
+fn current_chat_selection() -> Option<(String, String)> {
+    let service = crate::store::ai_services::active_service().ok().flatten()?;
+    let entry = crate::store::ai_services::capability_routes(crate::store::ai_services::CAP_CHAT)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let (model, _) = crate::store::ai_services::route_entry_model(
+        &service,
+        crate::store::ai_services::CAP_CHAT,
+        &entry,
+    );
+    Some((service.id, model?))
+}
+
+/// 对话路由变了以后，把新模型目录推给已经启动的 DSH 会话。
+///
+/// 与旧 `set_active_ai_service` 的语义一致，但比较单位是「服务 + 模型」：
+/// 只要 DSH 该用的别名变了，就要重新激活默认模型（`activate_…` 内部同时刷新
+/// 目录并选中新模型）；清空主选则停掉本机路由，让 DSH 回到原生配置。
+fn sync_chat_route(
+    app: &AppHandle,
+    state: &State<'_, AgentState>,
+    previous: Option<(String, String)>,
+) {
+    let current = current_chat_selection();
+    if current == previous {
+        return;
+    }
+    match current.as_ref() {
+        None => {
+            crate::app::ui::stop_builtin_ai_process();
+            state
+                .approval_manager
+                .add_log("info", "已取消 HiMind AI 本机默认服务，恢复 DSH 原生设置");
+        }
+        Some(_) => {
+            if let Err(error) = crate::app::ui::activate_builtin_ai_local_service() {
+                state.approval_manager.add_log("warn", &error);
+            }
+            state
+                .approval_manager
+                .add_log("info", "已将本机模型服务设为 HiMind AI 对话默认服务");
+        }
+    }
+    let _ = app.emit(
+        "himind:ai-service-changed",
+        json!({
+            "reason": "active_service_changed",
+            "service_id": current.as_ref().map(|(id, _)| id.clone()).unwrap_or_default(),
+            "model": current.as_ref().map(|(_, model)| model.clone()).unwrap_or_default(),
+            "restart_required": current.is_none(),
+        }),
+    );
 }
 
 #[tauri::command]
@@ -3260,6 +3376,11 @@ pub(crate) fn save_ai_service(
     speech_adapter: Option<String>,
     transcribe_model: Option<String>,
     transcribe_adapter: Option<String>,
+    // 视觉理解专用模型。留空表示不写该槽位，运行时跟随服务对话模型（ADR 0023 第七条）。
+    vision_model: Option<String>,
+    // 媒体能力的额外可选模型：能力 → 模型列表（不含默认模型）。
+    // 与对话的 `models` 同义，供能力路由按模型选择。
+    media_models: Option<std::collections::BTreeMap<String, Vec<String>>>,
     balance_profile_id: Option<String>,
     balance_access_token: Option<String>,
     balance_user_id: Option<String>,
@@ -3278,12 +3399,28 @@ pub(crate) fn save_ai_service(
     let speech_adapter = speech_adapter.unwrap_or_default();
     let transcribe_model = transcribe_model.unwrap_or_default();
     let transcribe_adapter = transcribe_adapter.unwrap_or_default();
+    let vision_model = vision_model.unwrap_or_default();
+    // 媒体能力的额外可选模型（不含默认模型）。空列表等价于「只有默认模型一个」。
+    let media_models = media_models.unwrap_or_default();
+    let extra_models = |capability: &str| {
+        media_models
+            .get(capability)
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| model.trim().to_string())
+                    .filter(|model| !model.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
     if !speech_model.trim().is_empty() {
         media.insert(
             crate::store::ai_services::CAP_AUDIO_SPEECH.to_string(),
             crate::store::ai_services::MediaModelBinding {
                 adapter: speech_adapter.trim().to_string(),
                 model: speech_model.trim().to_string(),
+                models: extra_models(crate::store::ai_services::CAP_AUDIO_SPEECH),
                 execution_mode: None,
             },
         );
@@ -3294,6 +3431,7 @@ pub(crate) fn save_ai_service(
             crate::store::ai_services::MediaModelBinding {
                 adapter: transcribe_adapter.trim().to_string(),
                 model: transcribe_model.trim().to_string(),
+                models: extra_models(crate::store::ai_services::CAP_AUDIO_TRANSCRIBE),
                 execution_mode: None,
             },
         );
@@ -3304,6 +3442,7 @@ pub(crate) fn save_ai_service(
             crate::store::ai_services::MediaModelBinding {
                 adapter: video_adapter.trim().to_string(),
                 model: video_model.trim().to_string(),
+                models: extra_models(crate::store::ai_services::CAP_VIDEO_GENERATE),
                 execution_mode: None,
             },
         );
@@ -3314,6 +3453,35 @@ pub(crate) fn save_ai_service(
             crate::store::ai_services::MediaModelBinding {
                 adapter: image_edit_adapter.trim().to_string(),
                 model: image_edit_model.trim().to_string(),
+                models: extra_models(crate::store::ai_services::CAP_IMAGE_EDIT),
+                execution_mode: None,
+            },
+        );
+    }
+    // 生图走 `image_model` 这个旧投影字段，额外模型必须在这里一并带上：
+    // `upsert_internal` 会用 `image_model` 覆盖整个 `image.generate` 槽位。
+    let image_extra = extra_models(crate::store::ai_services::CAP_IMAGE_GENERATE);
+    if !image_extra.is_empty() && !image_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_IMAGE_GENERATE.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                adapter: image_adapter.trim().to_string(),
+                model: image_model.trim().to_string(),
+                models: image_extra,
+                execution_mode: None,
+            },
+        );
+    }
+    // 视觉理解：只有显式填了模型才写槽位。空串表示「没有绑定」，
+    // 运行时按 ADR 0023 第七条回落到服务的对话模型。
+    if !vision_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_VISION.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                // 视觉理解走服务自身协议，没有媒体适配器。
+                adapter: String::new(),
+                model: vision_model.trim().to_string(),
+                models: extra_models(crate::store::ai_services::CAP_VISION),
                 execution_mode: None,
             },
         );
@@ -3340,17 +3508,34 @@ pub(crate) fn save_ai_service(
         None => crate::store::ai_services::upsert(input),
     }
     .map_err(|e| e.to_string())?;
-    if crate::store::ai_services::active_id()
-        .map_err(|e| e.to_string())?
-        .as_deref()
-        == Some(service.id.as_str())
-    {
-        crate::app::ui::stop_builtin_ai_process();
+    let affected_clients =
+        crate::app::ai_provider_import::refresh_all_binding_sync_states(&state.options);
+    let _ = app.emit(
+        "himind:ai-client-sync-changed",
+        json!({
+            "reason": "ai_service_changed",
+            "service_id": service.id.clone(),
+            "clients": affected_clients,
+        }),
+    );
+    let active_service_id = crate::store::ai_services::active_id().map_err(|e| e.to_string())?;
+    if active_service_id.is_some() {
+        let sync_result = if active_service_id.as_deref() == Some(service.id.as_str()) {
+            crate::app::ui::activate_builtin_ai_local_service()
+        } else {
+            crate::app::ui::refresh_builtin_ai_local_catalog()
+        };
+        if let Err(error) = sync_result {
+            state.approval_manager.add_log("warn", &error);
+        }
+    }
+    if active_service_id.as_deref() == Some(service.id.as_str()) {
         let _ = app.emit(
             "himind:ai-service-changed",
             json!({
                 "reason": "active_service_edited",
                 "service_id": service.id.clone(),
+                "restart_required": false,
             }),
         );
     }
@@ -3362,11 +3547,40 @@ pub(crate) fn save_ai_service(
 }
 
 #[tauri::command]
+pub(crate) fn clone_ai_service(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let service = crate::store::ai_services::duplicate(&id).map_err(|e| e.to_string())?;
+    let affected_clients =
+        crate::app::ai_provider_import::refresh_all_binding_sync_states(&state.options);
+    let _ = app.emit(
+        "himind:ai-client-sync-changed",
+        json!({
+            "reason": "ai_service_cloned",
+            "service_id": service.id.clone(),
+            "source_service_id": id.trim(),
+            "clients": affected_clients,
+        }),
+    );
+    state.approval_manager.add_log(
+        "info",
+        &format!("已克隆自定义 AI 服务: {}", service.display_name),
+    );
+    Ok(service.public_json())
+}
+
+#[tauri::command]
 pub(crate) fn remove_ai_service(
     app: AppHandle,
     state: State<'_, AgentState>,
     id: String,
 ) -> Result<bool, String> {
+    let was_active = crate::store::ai_services::active_id()
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        == Some(id.trim());
     let profiles = crate::store::gateway_profiles::profiles_referencing_service(&id)
         .map_err(|error| error.to_string())?;
     if !profiles.is_empty() {
@@ -3379,95 +3593,26 @@ pub(crate) fn remove_ai_service(
         .map_err(|error| error.to_string())?;
     let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;
     if removed {
-        crate::app::ui::stop_builtin_ai_process();
-        let _ = app.emit(
-            "himind:ai-service-changed",
-            json!({
-                "reason": "active_service_removed",
-                "service_id": id.clone(),
-            }),
-        );
+        if was_active {
+            crate::app::ui::stop_builtin_ai_process();
+            let _ = app.emit(
+                "himind:ai-service-changed",
+                json!({
+                    "reason": "active_service_removed",
+                    "service_id": id.clone(),
+                    "restart_required": true,
+                }),
+            );
+        } else {
+            if let Err(error) = crate::app::ui::refresh_builtin_ai_local_catalog() {
+                state.approval_manager.add_log("warn", &error);
+            }
+        }
         state
             .approval_manager
             .add_log("info", &format!("已删除自定义 AI 服务: {id}"));
     }
     Ok(removed)
-}
-
-#[tauri::command]
-pub(crate) fn set_active_ai_service(
-    app: AppHandle,
-    state: State<'_, AgentState>,
-    id: String,
-) -> Result<serde_json::Value, String> {
-    let selected = crate::store::ai_services::set_active(&id).map_err(|e| e.to_string())?;
-    crate::app::ui::stop_builtin_ai_process();
-    let service_id = selected
-        .as_ref()
-        .map(|service| service.id.clone())
-        .unwrap_or_default();
-    if let Some(service) = selected.as_ref() {
-        state.approval_manager.add_log(
-            "info",
-            &format!(
-                "已将本机模型服务设为 HiMind AI 默认服务: {}",
-                service.display_name
-            ),
-        );
-    } else {
-        state
-            .approval_manager
-            .add_log("info", "已取消 HiMind AI 本机默认服务，恢复 DSH 原生设置");
-    }
-    // The main window keeps the AI iframe mounted across navigation. Stopping DSH
-    // leaves that iframe pointed at a dead proxy URL, and its own rail can only
-    // say "reconnecting" forever. Tell every window to drop the stale session and
-    // start a fresh one with the newly selected service.
-    let _ = app.emit(
-        "himind:ai-service-changed",
-        json!({
-            "reason": "active_service_changed",
-            "service_id": service_id.clone(),
-        }),
-    );
-    Ok(json!({
-        "active_service_id": service_id,
-    }))
-}
-
-/// 指定生图（`media.image.generate`）默认使用的本机服务；不影响对话使用的服务。
-#[tauri::command]
-pub(crate) fn set_image_ai_service(
-    state: State<'_, AgentState>,
-    id: String,
-    capability: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let capability = capability
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(crate::store::ai_services::CAP_IMAGE_GENERATE)
-        .to_string();
-    let selected = crate::store::ai_services::set_media_service(&capability, &id)
-        .map_err(|e| e.to_string())?;
-    if let Some(service) = selected.as_ref() {
-        state.approval_manager.add_log(
-            "info",
-            &format!(
-                "已将本机模型服务设为 {capability} 的默认服务: {}",
-                service.display_name
-            ),
-        );
-    } else {
-        state.approval_manager.add_log(
-            "info",
-            &format!("已清除 {capability} 的默认服务，恢复自动选择"),
-        );
-    }
-    Ok(json!({
-        "capability": capability,
-        "service_id": selected.map(|service| service.id).unwrap_or_default(),
-    }))
 }
 
 #[tauri::command]
@@ -3491,10 +3636,10 @@ pub(crate) fn fetch_saved_ai_service_models(
     id: String,
     base_url: String,
 ) -> Result<serde_json::Value, String> {
-    let (service, api_key) =
-        crate::store::ai_services::load_secret(&id).map_err(|e| e.to_string())?;
-    let models = crate::store::ai_services::fetch_models(&base_url, &api_key, service.protocol)
-        .map_err(|e| e.to_string())?;
+    // 保留 baseUrl 参数以兼容既有前端调用；已保存服务始终以磁盘里的 Base URL 为准，
+    // 避免编辑中的临时地址把连接检查指向错误端点。
+    let _ = base_url;
+    let models = crate::store::ai_services::list_models(&id).map_err(|e| e.to_string())?;
     Ok(json!({ "models": models }))
 }
 
@@ -3549,6 +3694,52 @@ pub(crate) fn remove_ai_client(
         .approval_manager
         .add_log("info", "已取消 AI 客户端注册");
     Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn plan_ai_client_sync(
+    state: State<'_, AgentState>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    crate::app::ai_provider_import::sync_plan(&state.options, &target)
+        .and_then(|plan| serde_json::to_value(plan).map_err(|error| error.into()))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn sync_ai_client(
+    state: State<'_, AgentState>,
+    target: String,
+    expected_revision: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let user_id = crate::app::identity::identity_status(&options).user_id;
+        let result = crate::app::ai_provider_import::sync_binding(
+            &options,
+            &user_id,
+            &target,
+            expected_revision.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(result).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn sync_ai_clients(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let user_id = crate::app::identity::identity_status(&options).user_id;
+        serde_json::to_value(crate::app::ai_provider_import::sync_all(&options, &user_id))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn skill_capability_facts(
@@ -4420,6 +4611,13 @@ pub(crate) fn build_extension_project(
     crate::extension_projects::build(&project_id).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub(crate) fn plan_extension_build(
+    project_ids: Vec<String>,
+) -> Result<crate::extension_build::ExtensionBuildPlan, String> {
+    crate::extension_build::plan(&project_ids).map_err(|error| error.to_string())
+}
+
 /// 构建后一键装到本机：把刚构建出的候选包按类型安装（插件额外确保启用）。
 ///
 /// 开发者的循环是「改代码 → 构建 → 立刻在会话里用」。构建只产出候选包，
@@ -4463,9 +4661,15 @@ pub(crate) fn install_extension_candidate(
         ExtensionProjectKind::Workflow => {
             let draft = crate::workflow::read_authoring_draft(&id, &version)
                 .map_err(|error| error.to_string())?;
-            crate::app::workflow_manager::install_local_archive(&draft.candidate_path, false)
-                .map_err(|error| error.to_string())?;
-            Ok("已安装".to_string())
+            // 工作流候选属于本地开发内容，必须进独立开发槽位。把它当正式包
+            // 安装会在同版本内容变化时撞上不可变保护，和开发循环的语义冲突。
+            crate::app::workflow_manager::install_development_archive(
+                &draft.candidate_path,
+                &draft.source_root,
+                draft.lock.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok("已更新本地开发版".to_string())
         }
         ExtensionProjectKind::Expert => {
             let draft = crate::expert::read_authoring_draft(&id, &version)

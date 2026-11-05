@@ -14,6 +14,11 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+/// Several AI clients may launch MCP bridges immediately after a service
+/// restart. A one-second window was too short under Windows pipe startup and
+/// produced a false `os error 2` even though the service became ready moments
+/// later. Keep retrying long enough for the service's next pipe instance.
+const CONNECT_RETRY_SECONDS: u64 = 10;
 
 pub(crate) struct PipeStream {
     file: File,
@@ -74,7 +79,9 @@ pub(crate) fn accept(endpoint: &str) -> io::Result<PipeStream> {
 
 pub(crate) fn connect(endpoint: &str) -> io::Result<PipeStream> {
     let mut last_error = None;
-    for _ in 0..40 {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(CONNECT_RETRY_SECONDS);
+    while std::time::Instant::now() < deadline {
         match connect_once(endpoint) {
             Ok(stream) => return Ok(stream),
             Err(error)
@@ -141,6 +148,26 @@ mod tests {
             r"\\.\pipe\himind-agent-test-{label}-{}-{nonce}",
             std::process::id()
         )
+    }
+
+    #[test]
+    fn connect_waits_for_service_startup_beyond_one_second() {
+        let endpoint = test_endpoint("slow-start");
+        let server_endpoint = endpoint.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(1250));
+            let mut stream = accept(&server_endpoint).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let frame: ServiceFrame = read_frame(&mut reader).unwrap().unwrap();
+            assert_eq!(frame, ServiceFrame::Ping { request_id: 7 });
+            write_frame(&mut stream, &ServiceEvent::Pong { request_id: 7 }).unwrap();
+        });
+        let mut client = connect(&endpoint).unwrap();
+        write_frame(&mut client, &ServiceFrame::Ping { request_id: 7 }).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let event: ServiceEvent = read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(event, ServiceEvent::Pong { request_id: 7 });
+        server.join().unwrap();
     }
 
     #[test]

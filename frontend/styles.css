@@ -2320,6 +2320,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .action-menu { display: flex; min-width: 0; }
 .action-menu .btn-icon.is-open, .action-menu .btn[aria-expanded="true"] { border-color: var(--border-strong); background: #f1f3f5; }
 .action-menu-panel { position: fixed; z-index: 1200; }
+/* 菜单项文本必须能在面板宽度内收住：模型名这类长标识一旦溢出，面板会被横向撑开，
+   右侧图标也被挤出可见区。完整值仍走 title。 */
+.action-menu-panel button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.action-menu-panel .app-menu-section-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 能力路由的备用菜单要放下「服务 · 模型」全名，208px 的面板宽度不够：
+   最长的模型名单独就有 172px，再加图标与内边距就顶到边了。 */
+.action-menu-panel.ai-route-menu { width: 280px; }
 .runtime-install-progress { width: 100%; height: 5px; margin-top: 12px; overflow: hidden; border-radius: 3px; background: #dbe3ed; }
 .runtime-install-progress span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width .2s ease; }
 .runtime-update-notice { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; margin-top: 12px; padding: 9px 10px; border-left: 3px solid var(--primary); color: var(--text-secondary); background: var(--primary-soft); font-size: 11px; line-height: 1.5; }
@@ -2626,6 +2633,9 @@ tr:last-child td { border-bottom: 0; }
 .ai-service-form-error { display: flex; align-items: flex-start; gap: 7px; margin: 12px 15px 0; padding: 9px 10px; border: 1px solid #fecaca; border-radius: 6px; color: #b91c1c; background: #fef2f2; font-size: 11px; line-height: 1.5; }
 .ai-service-form-error svg { flex: 0 0 auto; margin-top: 1px; }
 .ai-service-form-error span { min-width: 0; overflow-wrap: anywhere; }
+.ai-service-form-notice { display: flex; align-items: flex-start; gap: 7px; margin: 12px 15px 0; padding: 9px 10px; border: 1px solid #bfdbfe; border-radius: 6px; color: #1d4ed8; background: #eff6ff; font-size: 11px; line-height: 1.5; }
+.ai-service-form-notice svg { flex: 0 0 auto; margin-top: 1px; }
+.ai-service-form-notice span { min-width: 0; overflow-wrap: anywhere; }
 .ai-service-group-label { margin-bottom: 9px; color: var(--text-muted); font-size: 12px; font-weight: 600; }
 .ai-service-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 14px; }
 .ai-service-field { margin-bottom: 0; }
@@ -2644,6 +2654,26 @@ tr:last-child td { border-bottom: 0; }
 .mcp-test-result { min-height: 38px; display: flex; align-items: center; gap: 9px; margin-bottom: 12px; padding: 8px 11px; border: 1px solid #a7f3d0; border-radius: 7px; color: #065f46; background: #ecfdf5; font-size: 12px; }
 .mcp-test-result strong { margin-left: auto; }
 .mcp-test-result code { color: #047857; font-family: Consolas, monospace; }
+.ai-client-sync-banner {
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--warning, #d97706) 28%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warning, #d97706) 7%, var(--panel, #fff));
+}
+.ai-client-sync-banner > div { min-width: 0; display: grid; gap: 2px; }
+.ai-client-sync-banner strong { font-size: 12px; }
+.ai-client-sync-banner span { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+.ai-client-sync-banner .btn { flex: 0 0 auto; min-height: 30px; padding: 0 11px; gap: 5px; }
+@media (max-width: 720px) {
+  .ai-client-sync-banner { align-items: stretch; flex-direction: column; }
+  .ai-client-sync-banner .btn { align-self: flex-start; }
+}
+
 .ai-client-section { margin-top: 16px; }
 .ai-section-heading { min-height: 42px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .ai-section-heading h3 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0; }
@@ -2695,11 +2725,7 @@ tr:last-child td { border-bottom: 0; }
 .ai-client-copy strong, .ai-client-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-client-copy strong { font-size: 12px; font-weight: 600; }
 .ai-client-copy span { color: var(--text-muted); font-size: 12px; }
-.ai-service-imported-clients { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 3px; color: var(--text-subtle); font-size: 11px; }
-.ai-service-imported-clients.standalone { margin-top: 0; }
-.ai-service-client-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border: 1px solid var(--primary-border); border-radius: 5px; color: var(--primary-hover); background: var(--primary-soft); }
-.ai-service-client-chip button { display: inline-grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
-.ai-service-client-chip button:disabled { opacity: .55; cursor: wait; }
+/* 「谁在用」现在并进 .ai-service-fact-line，行内的工具名不再单独成排小方块。 */
 .ai-client-copy .ai-service-balance { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
 .ai-client-copy .ai-service-balance-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; color: var(--text-muted); font-size: 11px; }
 .ai-client-copy .ai-service-balance-copy > span { overflow: visible; color: var(--text); font-weight: 600; text-overflow: clip; white-space: normal; }
@@ -2711,11 +2737,6 @@ tr:last-child td { border-bottom: 0; }
 .ai-client-copy .ai-service-balance-refresh:disabled { opacity: .65; cursor: wait; }
 .ai-service-balance-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .ai-service-balance-suggestion .btn { min-height: 26px; padding: 3px 9px; font-size: 11px; white-space: nowrap; }
-/* 行内「谁在用」：`.ai-client-copy span` 默认是单行省略，这里要改回可换行，
-   否则第二个工具名会被裁掉。选择器带 .ai-client-copy 前缀才压得住那条规则。 */
-.ai-client-copy .ai-service-imported-clients { overflow: visible; white-space: normal; text-overflow: clip; }
-.ai-service-client-chip { max-width: 132px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-service-client-chip.more { border-style: dashed; border-color: var(--border); color: var(--text-muted); background: var(--surface-muted); }
 .ai-client-registration-actions { min-width: 166px; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 7px; }
 .ai-client-registration-actions > span { color: var(--text-subtle); font-size: 11px; white-space: nowrap; }
 .ai-client-registration-actions > .btn { min-height: 30px; padding: 5px 9px; font-size: 12px; }
@@ -3144,7 +3165,7 @@ tr:last-child td { border-bottom: 0; }
 .development-list-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--surface); font-size: 12px; }
 .development-list-heading span { min-width: 20px; padding: 1px 6px; border-radius: 8px; color: var(--text-muted); background: var(--surface-muted); font-size: 11px; text-align: center; }
 .development-list-body { min-height: 0; overflow-y: auto; padding: 5px; }
-.development-project-item { width: 100%; min-width: 0; min-height: 70px; display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 8px; border: 1px solid transparent; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.development-project-item { width: 100%; min-width: 0; min-height: 52px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 6px 8px; border: 1px solid transparent; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
 .development-project-item:hover { background: rgba(255, 255, 255, .75); }
 .development-project-item.selected { border-color: var(--border-strong); background: var(--surface); box-shadow: 0 1px 2px rgba(17, 24, 39, .05); }
 .development-project-item .extension-kind-mark { width: 32px; height: 32px; border-radius: 7px; }
@@ -3153,6 +3174,18 @@ tr:last-child td { border-bottom: 0; }
 .development-project-copy strong { font-size: 12px; font-weight: 600; }
 .development-project-copy small { color: var(--text-muted); font-size: 11px; }
 .development-project-item .skill-state-label { align-self: start; margin-top: 2px; white-space: nowrap; }
+/* 列表行状态改用「圆点 + 11px 文字」：药丸的底色会把每行的正常态都抬成色块，
+   五行走廊变一条绿墙。例外态（未构建 / 目录不可用 / 构建中）才出现，且不抢标题。 */
+.development-row-state { align-self: start; display: inline-flex; align-items: center; gap: 5px; margin-top: 3px; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+.development-row-state .status-dot { width: 6px; height: 6px; }
+.development-row-state[data-state="success"] { color: var(--success-strong); }
+.development-row-state[data-state="success"] .status-dot { background: var(--success-live); }
+.development-row-state[data-state="warn"] { color: var(--warning-strong); }
+.development-row-state[data-state="warn"] .status-dot { background: var(--warning); }
+.development-row-state[data-state="danger"] { color: var(--danger); }
+.development-row-state[data-state="danger"] .status-dot { background: var(--danger); }
+.development-row-state[data-state="progress"] { color: var(--primary); }
+.development-row-state[data-state="progress"] .status-dot { background: var(--primary); animation: live-breathe 1.6s ease-in-out infinite; }
 .development-project-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; container: detail-pane / inline-size; }
 .development-detail-header { min-height: 72px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; padding: 13px 16px 10px; }
 .development-detail-title { min-width: 0; flex: 1 1 220px; display: flex; align-items: center; gap: 10px; }
@@ -3214,10 +3247,13 @@ tr:last-child td { border-bottom: 0; }
 .development-build-summary > div > div { min-width: 0; display: grid; gap: 2px; }
 .development-build-summary strong { font-size: 12px; }
 .development-build-summary small { color: var(--text-muted); font-size: 11px; }
-.development-build-summary > .development-activation-facts { order: 3; flex: 1 0 100%; min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; }
-.development-build-summary > .development-activation-facts > span { width: auto; height: auto; min-width: 0; max-width: 100%; flex: 0 1 auto; display: inline-flex; align-items: center; padding: 3px 7px; overflow: hidden; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: var(--surface); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
-.development-build-summary > .development-activation-facts > span[data-state="ok"] { color: #047857; border-color: #a7f3d0; background: #ecfdf5; }
-.development-build-summary > .development-activation-facts > span[data-state="warn"] { color: #b45309; border-color: #fde68a; background: #fffbeb; }
+/* 激活状态条：字段名弱化、值用正文色，纯文本一行；只有例外（可见性失败/审核中）才上色。
+   四枚 999px 药丸会把「未发布」「未验证」也画成需要被扫到的告警，实际只是在陈述事实。 */
+.development-build-summary > .development-activation-facts { order: 3; flex: 1 0 100%; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; margin-top: 2px; }
+.development-build-summary > .development-activation-facts > span { width: auto; height: auto; min-width: 0; max-width: 100%; flex: 0 1 auto; display: inline-flex; align-items: baseline; gap: 5px; overflow: hidden; color: var(--text); font-size: 11px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.development-build-summary > .development-activation-facts > span > em { flex: 0 0 auto; color: var(--text-subtle); font-style: normal; }
+.development-build-summary > .development-activation-facts > span[data-state="warn"] { color: var(--warning-strong); }
+.development-build-summary > .development-activation-facts > span[data-state="waiting"] > em { color: var(--text-subtle); }
 .development-build-progress { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 12px; border-bottom: 1px solid var(--primary-border); background: #f8fbff; }
 .development-build-progress-copy { min-width: 0; display: flex; align-items: center; gap: 9px; color: var(--primary); }
 .development-build-progress-copy > div { min-width: 0; display: grid; gap: 2px; }
@@ -5141,16 +5177,32 @@ tr:last-child td { border-bottom: 0; }
 .ai-service-search:focus-within { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
 .ai-service-search input { min-width: 0; flex: 1 1 auto; border: 0; outline: 0; background: transparent; box-shadow: none; }
 .ai-service-filter { min-height: 34px; min-width: 126px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
-.ai-service-capability-chips, .ai-service-state-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 5px; }
-.ai-service-capability-chips span,
-.ai-service-state-chips .ai-service-state { min-height: 20px; display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 999px; font-size: 10px; line-height: 1.3; white-space: nowrap; }
-.ai-service-capability-chips span { border: 1px solid #dbe4f0; background: #f5f8fc; color: #35506f; }
-.ai-service-state { border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-muted); }
-.ai-service-state.success { border-color: var(--success-border); background: var(--success-soft); color: var(--success-strong); }
-.ai-service-state.warn { border-color: #fde68a; background: #fffbeb; color: #92400e; }
-.ai-service-state.route { border-color: #bfdbfe; background: #eff6ff; color: #1d4ed8; }
-.ai-service-state.neutral { color: var(--text-muted); }
-.ai-service-connection-check { display: block; margin-top: 5px; font-size: 10px; }
+/* 服务行的「事实行」：健康点 + 能力 / 默认路由 / 分发，全部是纯文本。
+   药丸只留给「需要被扫到的例外」，行里一旦出现两排圆角底色，标题就压不住它们了。 */
+.ai-service-fact-line { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin-top: 1px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.ai-service-fact-line > span { min-width: 0; font-size: 11px; }
+.ai-service-fact-line > span + span::before { margin-right: 8px; color: var(--border-strong); content: "·"; }
+.ai-service-health { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); }
+.ai-service-health .status-dot { width: 6px; height: 6px; }
+.ai-service-health.is-success { color: var(--success-strong); }
+.ai-service-health.is-warn { color: var(--warning-strong); }
+.ai-service-health.is-neutral { color: var(--text-muted); }
+/* 行尾动作改用图标按钮：四个动作各自带 title 与无障碍名，命中区 28×28，
+   一行文字按钮会把服务名挤到只剩一半宽度。 */
+.ai-service-row { grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 11px; }
+.ai-service-row .ai-client-registration-actions { min-width: 0; flex-wrap: nowrap; }
+.ai-service-row-actions { min-width: 0; gap: 4px; flex-wrap: nowrap; }
+/* 选择器带 .ai-client-registration-actions 前缀：`.ai-client-registration-actions > .btn`
+   与 `.btn.btn-icon` 的权重都高于单个类，只写 `.ai-service-icon-btn` 会被撑回 36×30。 */
+.ai-service-row .ai-client-registration-actions > .ai-service-icon-btn { width: 28px; min-width: 28px; min-height: 28px; padding: 0; color: var(--text-muted); }
+.ai-service-row .ai-client-registration-actions > .ai-service-icon-btn:hover:not(:disabled) { color: var(--text); }
+.ai-service-row .ai-client-registration-actions > .ai-service-icon-btn:disabled { opacity: .38; }
+/* 窄窗下其他行的文字按钮会整组换行并加分隔线；服务行只剩四个图标（约 124px），
+   换行反而多出一行空带，所以继续留在第三列。 */
+@media (max-width: 820px) {
+  .ai-service-row .ai-client-registration-actions { grid-column: 3; grid-row: 1; padding-top: 0; border-top: 0; }
+}
+.ai-service-connection-check { display: block; margin-top: 5px; font-size: 11px; }
 .ai-service-connection-check.ok { color: var(--success-strong); }
 .ai-service-connection-check.error { color: #b45309; }
 
@@ -5175,52 +5227,104 @@ tr:last-child td { border-bottom: 0; }
 .ai-capability-card .ai-service-form-grid { margin: 0; }
 .ai-capability-card .ai-service-fetch-models { margin-top: 8px; }
 
-.ai-routes-view { display: grid; gap: 14px; }
+/* 容器改挂路由面板自身：`agent-main` 量的是设置窗口内容列（默认 764px），
+   而表格被 `.ai-page` 的 max-width 卡在 880px 以内，两者宽度从不相干。
+   窗口放大到 1400px 时内容列 1168px 早已越过四列下限，表格却只有 880px，
+   于是误判成四列并把 chip 挤到截断。 */
+.ai-routes-view { display: grid; gap: 14px; container: ai-routes / inline-size; }
 .ai-routes-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .ai-routes-header > div { min-width: 0; }
-.ai-routes-header h3 { margin: 2px 0 4px; font-size: 15px; }
-.ai-routes-header p { margin: 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+/* 页签已经标了「能力路由」，页头只留一个标题；说明句在 title 里，不再占一整行正文。 */
+.ai-routes-header h3 { margin: 0; font-size: 14px; line-height: 1.4; }
 .ai-route-table { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
-.ai-route-row { display: grid; grid-template-columns: minmax(135px, .95fr) minmax(155px, .8fr) minmax(160px, .9fr) minmax(165px, 1fr) minmax(150px, auto); gap: 10px; align-items: center; padding: 11px 14px; border-top: 1px solid var(--border); }
+.ai-route-row { display: grid; grid-template-columns: minmax(104px, .82fr) minmax(152px, 1.05fr) minmax(152px, 1.3fr) minmax(131px, 1.4fr); gap: 10px; align-items: center; padding: 11px 14px; border-top: 1px solid var(--border); }
 .ai-route-row:first-child { border-top: 0; }
 .ai-route-row-head { min-height: 34px; padding-block: 7px; background: var(--surface-muted); color: var(--text-muted); font-size: 10px; font-weight: 600; }
 .ai-route-capability { min-width: 0; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 2px 7px; align-items: center; }
 .ai-route-capability svg { grid-row: 1 / span 2; color: var(--text-muted); }
 .ai-route-capability strong { font-size: 12px; }
-.ai-route-capability small { color: var(--text-muted); font-size: 10px; line-height: 1.4; }
-.ai-route-resolution { min-width: 0; display: grid; gap: 2px; }
-.ai-route-resolution strong, .ai-route-resolution span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-route-resolution strong { font-size: 11px; font-weight: 600; }
-.ai-route-resolution span { color: var(--text-muted); font-size: 10px; }
-.ai-route-missing { display: inline-flex; align-items: center; gap: 5px; color: #b45309 !important; }
+/* 说明最多两行：整句 275px 宽，四列下能力列只有 104-147px，单行必被切。
+   两行能放完整句，完整文本仍在 title 里。 */
+.ai-route-capability small {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; color: var(--text-muted); font-size: 10px; line-height: 1.4;
+}
 .ai-route-status { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .ai-route-status .btn { min-height: 26px; }
+/* 行内状态与 AI 服务行、扩展列表同一套表达：圆点 + 11px 文字。
+   一列状态全是同色药丸时，五个「正常」会互相竞争注意力，什么也没强调到。 */
+.ai-route-state { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+.ai-route-state .status-dot { width: 6px; height: 6px; }
+.ai-route-state.is-success { color: var(--success-strong); }
+.ai-route-state.is-success .status-dot { background: var(--success-live); }
+.ai-route-state.is-warn { color: var(--warning-strong); }
+.ai-route-state.is-warn .status-dot { background: var(--warning); }
+.ai-route-state.is-neutral { color: var(--text-muted); }
+.ai-route-state.is-neutral .status-dot { background: var(--text-subtle); }
+/* 备用列没有备用时用破折号占位：一个永远「无其它候选」的下拉会让人以为还要配置，
+   而它已经是最终状态。 */
+.ai-route-axis { color: var(--text-subtle); font-size: 11px; line-height: 1.4; }
+/* 自检是低频动作，图标足够；选择器带 .ai-route-status 前缀才能压过
+   `.btn.btn-icon` 的 min-width 与 `.ai-route-status .btn` 的 26px 行高。 */
+.ai-route-status > .ai-route-icon-btn { width: 28px; min-width: 28px; min-height: 28px; padding: 0; color: var(--text-muted); }
+.ai-route-status > .ai-route-icon-btn:hover:not(:disabled) { color: var(--text); }
+.ai-route-status > .ai-route-icon-btn:disabled { opacity: .38; }
 .ai-route-fallbacks { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
-.ai-route-fallback-chip { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; padding: 3px 5px; border-radius: 5px; color: var(--text-muted); background: var(--surface-muted); font-size: 10px; }
-.ai-route-fallback-chip span, .ai-route-fallback-chip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-route-fallback-chip button { display: grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
-.ai-route-fallback-add { display: inline-flex; align-items: center; gap: 3px; color: var(--text-muted); font-size: 10px; }
-.ai-route-fallback-add select { max-width: 110px; min-height: 24px; padding: 1px 4px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); font-size: 10px; }
-.ai-route-resolution small { color: var(--text-subtle); font-size: 10px; }
-.ai-route-test { grid-column: 1 / -1; color: var(--warning-strong); font-size: 10px; }
+/* 备用项是只读状态，不是控件：增删都在状态列的操作菜单里，chip 不再带删除按钮。
+   两行排布（序号 + 服务名 / 模型名）：一行塞下「服务 · 模型」时最长的模型名
+   （doubao-seedream-5-0-pro-260628，204px）必然截断，两行各自省略后至少服务名读得全。 */
+.ai-route-fallback-chip { display: grid; justify-items: start; min-width: 0; max-width: 100%; padding: 3px 6px; border-radius: 5px; color: var(--text-muted); background: var(--surface-muted); line-height: 1.3; }
+.ai-route-fallback-chip b, .ai-route-fallback-chip em { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-route-fallback-chip b { font-size: 10px; font-weight: 500; }
+.ai-route-fallback-chip em { font-size: 9.5px; font-style: normal; opacity: .75; }
+/* 图标按钮靠右成一列：状态文字长短不一，不靠右的话按钮位置会逐行漂移。 */
+.ai-route-status > .action-menu { margin-left: auto; }
+.ai-route-status > .ai-service-tool-btn { min-width: 0; padding-inline: 8px; }
+/* 行内操作菜单与自检按钮同高：两者并排时基线对齐才不显歪。 */
+.ai-route-status .action-menu > .btn { width: 28px; min-width: 28px; min-height: 28px; padding: 0; color: var(--text-muted); }
+.ai-route-status .action-menu > .btn:hover:not(:disabled),
+.ai-route-status .action-menu > .btn.is-open { color: var(--text); border-color: var(--border-strong); background: #f1f3f5; }
+.ai-route-status .action-menu > .btn:disabled { opacity: .38; }
+/* 自检结果跟在状态列末尾，跨整行换行显示；这一列是 flex，不写 grid-column。 */
+.ai-route-test { color: var(--warning-strong); font-size: 10px; }
 .ai-route-test.ok { color: var(--success-strong); }
 
-@media (max-width: 960px) {
+/* 路由表按自身宽度收窄：左栏 184px 加 .main-content 左右 30px 后，默认窗口下
+   路由表只有 693px；最小窗口或系统缩放后还会更窄，而旧断点写的是内容列宽度，
+   永远不会在需要的时候触发。
+   四列的完整需求是 104+152+152+131 的列底限、3 个 10px 列间距、左右各 14px 行内边距
+   与表格 1px 边框，合计 599px。低于 599px 时 grid 仍按列底限排布，但行内边距会被
+   末列吃掉：实测 586/592/598px 时状态列右缘距表格边框只剩 2/8/14px（应为 15px），
+   图标按钮贴住边框。`.ai-route-table` 有 `overflow: hidden`，所以这条越界量不出
+   scrollWidth，只能量末列实际右缘——旧断点 585px 正是这么漏掉的。
+   回落形态取「能力 + 状态一行 / 主选一行 / 备用一行」：实测 890px，
+   比旧的「能力整行 + 两列对开」1066px 矮 176px。 */
+@container ai-routes (max-width: 598px) {
   .ai-route-row-head { display: none; }
-  .ai-route-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .ai-route-capability { grid-column: 1 / -1; }
-  .ai-route-status { grid-column: 1 / -1; }
-  .ai-route-status { justify-content: flex-start; }
+  .ai-route-row { grid-template-columns: minmax(0, 1fr) max-content; gap: 8px 12px; }
+  .ai-route-capability { grid-column: 1; grid-row: 1; }
+  .ai-route-status { grid-column: 2; grid-row: 1; justify-content: flex-end; }
+  .ai-route-primary { grid-column: 1 / -1; grid-row: 2; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .ai-route-fallbacks { grid-column: 1 / -1; grid-row: 3; }
 }
-@media (max-width: 680px) {
+@container ai-routes (max-width: 460px) {
+  .ai-routes-header { flex-direction: column; }
+  .ai-route-row { grid-template-columns: minmax(0, 1fr); }
+  .ai-route-status { grid-column: 1; grid-row: auto; justify-content: flex-start; }
+  .ai-route-primary, .ai-route-fallbacks { grid-column: 1; grid-row: auto; }
+}
+/* 服务列表的工具条与能力选择器不在路由面板里，仍然按内容列（agent-main）收窄。 */
+@container agent-main (max-width: 620px) {
   .ai-service-toolbar { flex-direction: column; align-items: stretch; }
   .ai-service-filter { width: 100%; }
   .ai-capability-picker { grid-template-columns: 1fr; }
-  .ai-routes-header { flex-direction: column; }
-  .ai-route-row { grid-template-columns: 1fr; gap: 8px; }
 }
 .ai-route-row > div { min-width: 0; }
 .ai-route-row .ai-service-route-select { width: 100%; max-width: none; min-width: 0; }
+/* 默认服务与模型上下堆叠而不是并排：服务名（如「火山方舟（生图）」）和模型名
+   （如 doubao-seedream-5-0-pro-260628）都远超半个列宽，并排只会两边都截断。
+   真正省高度的是「只有一个模型时不渲染第二个下拉」，不是把它们挤到一行。 */
+.ai-route-primary { display: grid; gap: 4px; }
 
 /* Account and credential center */
 .credential-center-body { display: grid; gap: 12px; padding: 12px 14px 14px; }

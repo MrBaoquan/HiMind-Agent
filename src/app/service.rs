@@ -1244,6 +1244,75 @@ fn handle_local_http(
                 ),
             }
         }
+        ("POST", "/ai-provider-sync/plan") => {
+            let payload: crate::app::ai_provider_import::AIProviderSyncRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": format!("invalid AI client sync plan payload: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(
+                &context,
+                "ai.client.sync.plan",
+                json!({ "target": payload.target }),
+            ) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
+        ("POST", "/ai-provider-sync") => {
+            let payload: crate::app::ai_provider_import::AIProviderSyncRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": format!("invalid AI client sync payload: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(
+                &context,
+                "ai.client.sync",
+                json!({
+                    "target": payload.target,
+                    "expected_revision": payload.expected_revision,
+                }),
+            ) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
+        ("POST", "/ai-provider-sync/all") => {
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(&context, "ai.client.sync-all", json!({})) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
         ("POST", "/ai-provider-import/cancel") => {
             let payload: AIProviderImportRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
@@ -1963,6 +2032,9 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
         ("GET", "/ai-provider-import/status") => Some("local.ai.provider_import_status"),
         ("POST", "/ai-provider-import/plan") => Some("local.ai.provider_import_plan"),
         ("POST", "/ai-provider-import/cancel") => Some("local.ai.provider_import_cancel"),
+        ("POST", "/ai-provider-sync/plan") => Some("local.ai.provider_sync_plan"),
+        ("POST", "/ai-provider-sync") => Some("local.ai.provider_sync"),
+        ("POST", "/ai-provider-sync/all") => Some("local.ai.provider_sync_all"),
         ("GET", "/login-status") => Some("local.inner_admin.login_status"),
         ("GET", "/engineering-projects") => Some("local.inner_admin.projects"),
         ("POST", "/engineering-exhibits") => Some("local.inner_admin.exhibits"),
@@ -2062,6 +2134,18 @@ mod local_operation_tests {
         assert_eq!(
             local_operation("POST", "/ai-provider-import/cancel"),
             Some("local.ai.provider_import_cancel")
+        );
+        assert_eq!(
+            local_operation("POST", "/ai-provider-sync/plan"),
+            Some("local.ai.provider_sync_plan")
+        );
+        assert_eq!(
+            local_operation("POST", "/ai-provider-sync"),
+            Some("local.ai.provider_sync")
+        );
+        assert_eq!(
+            local_operation("POST", "/ai-provider-sync/all"),
+            Some("local.ai.provider_sync_all")
         );
     }
 

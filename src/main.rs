@@ -38,6 +38,7 @@ mod engineering_project;
 mod expert;
 mod expert_authoring;
 mod extension_authoring;
+mod extension_build;
 mod extension_category;
 mod extension_contracts;
 mod extension_projects;
@@ -1093,7 +1094,31 @@ fn run_ai_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Err
             );
             Ok(())
         }
-        _ => Err("usage: himind-agent ai ask <workspace> <prompt>".into()),
+        [action, target, service] if action == "import" => {
+            let user_id = crate::app::identity::identity_status(options).user_id;
+            let result = crate::app::ai_provider_import::import(
+                options,
+                &user_id,
+                &crate::app::ai_provider_import::AIProviderImportRequest {
+                    target: target.clone(),
+                    service: service.clone(),
+                    replace: true,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        [action, target, service] if action == "bind" => {
+            let user_id = crate::app::identity::identity_status(options).user_id;
+            let result = crate::app::ai_provider_import::enable_gateway_binding(
+                options, &user_id, target, service,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        _ => Err(
+            "usage: himind-agent ai ask <workspace> <prompt> | ai import <target> <service> | ai bind <target> <service>".into(),
+        ),
     }
 }
 

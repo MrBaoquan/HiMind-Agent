@@ -3824,6 +3824,42 @@ mod tests {
     }
 
     #[test]
+    fn explicit_lower_development_version_overrides_installed_version() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-plugin-explicit-lower-test-{}",
+            next_request_id()
+        ));
+        let installed_dir = root.join("plugins/demo.explicit-lower");
+        let development_dir = root.join("draft/demo.explicit-lower");
+        let write_package = |dir: &std::path::Path, version: &str| {
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin/demo.exe"), "test executable").unwrap();
+            fs::write(
+                dir.join("plugin.json"),
+                format!(
+                    r#"{{"id":"demo.explicit-lower","name":"Demo","version":"{version}","runtime":"process-jsonrpc-stdio","entry":"bin/demo.exe"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_package(&installed_dir, "1.0.0");
+        write_package(&development_dir, "0.9.0");
+        let mut items = vec![read_plugin_item(installed_dir, false)];
+        merge_development_items_with_mode(
+            &mut items,
+            vec![(read_plugin_item(development_dir, true), true)],
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].development);
+        assert_eq!(items[0].version, "0.9.0");
+        assert_eq!(
+            items[0].overrides_installed_version.as_deref(),
+            Some("1.0.0")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn explicit_development_activation_overrides_same_installed_version() {
         let root = std::env::temp_dir().join(format!(
             "agent-plugin-explicit-activation-test-{}",

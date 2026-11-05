@@ -39,7 +39,7 @@ type ProjectModel = {
   submissions: SubmissionRef[];
 };
 
-type ExtensionBuildStage = 'building' | 'activating' | 'refreshing';
+export type ExtensionBuildStage = 'building' | 'activating' | 'refreshing';
 
 /// 左栏的一行：一个本机开发目录。`declared` 是登记表里的扩展数，只在项目列表
 /// 整体读不到时兜底，免得一个明明有内容的目录显示成 0 个扩展。
@@ -55,7 +55,13 @@ type WorkspaceItem = {
 };
 
 /// 「一键构建」的运行进度：建到第几个、正在建哪个扩展。
-type WorkspaceBuildProgress = { done: number; total: number; name: string };
+type WorkspaceBuildProgress = {
+  done: number;
+  total: number;
+  name: string;
+  targetCount?: number;
+  dependencyCount?: number;
+};
 
 /// 「一键构建」里失败的那条扩展及其原因，由父层跑完整批后一次性交回。
 type WorkspaceBuildFailure = { name: string; message: string };
@@ -157,6 +163,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   const [removeProject, setRemoveProject] = useState<ExtensionProject | null>(null);
   const [runningSessions, setRunningSessions] = useState<Set<string>>(() => new Set());
   const [actionError, setActionError] = useState('');
+  const [actionWarning, setActionWarning] = useState('');
   /// 「一键构建」的运行状态：非空表示正在按顺序构建当前工作区里的扩展。
   const [workspaceBuild, setWorkspaceBuild] = useState<WorkspaceBuildProgress | null>(null);
   /// 构建执行源：装了扩展开发工具走插件执行器，没装就走内核实现。
@@ -288,8 +295,8 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     try { await props.onAddWorkspace(); }
     catch (reason) { setActionError(failureText(reason, '添加工作区失败')); }
   };
-  /// 一键构建：按依赖顺序把当前工作区里能构建的扩展交给父层跑完整条流水线。
-  /// 失败项一次说明；「重试失败项」只重跑上一批失败的那些。
+  /// 一键构建：后端先把当前工作区的目标扩展连同插件/技能依赖解析成拓扑计划，
+  /// 再按计划自动构建并激活。依赖不在本工作区但已登记本地源时也会自动加入。
   const buildWorkspace = async (retryIds?: string[]) => {
     if (!activeItem || workspaceBuild) return;
     const pool = retryIds?.length
@@ -297,47 +304,65 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
       : buildableProjects;
     if (!pool.length) return;
     setActionError('');
+    setActionWarning('');
     setFailedBatch([]);
-    const ordered = orderByDependencies(pool);
-    setWorkspaceBuild({ done: 1, total: ordered.length, name: ordered[0].name });
     try {
-      const outcome = await props.onBuildWorkspace(
-        ordered.map(project => ({
-          id: project.local!.id,
-          name: project.name,
-          extensionId: project.extensionId,
-          dependencies: declaredPluginDependencies(project),
-        })),
-        progress => setWorkspaceBuild(progress),
-      );
+      const plan = await agentApi.planExtensionBuild(pool.map(project => project.local!.id));
+      const items: WorkspaceBuildItem[] = plan.nodes.map(node => ({
+        id: node.project_id,
+        name: node.name,
+        extensionId: node.extension_id,
+        dependencies: node.dependencies,
+      }));
+      if (!items.length) {
+        const reasons = plan.blockers.map(blocker => `${blocker.message}（${blocker.remediation}）`).join('；');
+        setActionError(`自动解析依赖后没有可构建项${reasons ? `：${reasons}` : ''}`);
+        return;
+      }
+      const dependencyCount = Math.max(0, items.length - pool.length);
+      setWorkspaceBuild({
+        done: 1,
+        total: items.length,
+        name: items[0].name,
+        targetCount: pool.length,
+        dependencyCount,
+      });
+      const outcome = await props.onBuildWorkspace(items, progress => {
+        setWorkspaceBuild(current => current ? { ...current, ...progress } : progress);
+      });
       const { succeeded, failures, skipped } = outcome;
       const retryable = failures.filter(item => retryableFailure(item.message));
-      const parts: string[] = [];
+      const failureParts: string[] = [];
       if (failures.length) {
-        // 同一条原因往往砸中一整批（工具链未就绪、依赖未装）：逐条罗列会把提示刷成
-        // 三千字，按原因归类 + 点名前三项才看得清。
         const grouped = new Map<string, string[]>();
         for (const item of failures) {
           const reason = item.message.trim() || '构建失败';
           grouped.set(reason, [...(grouped.get(reason) || []), item.name]);
         }
-        parts.push(`失败 ${failures.length} 项：${[...grouped.entries()]
+        failureParts.push(`失败 ${failures.length} 项：${[...grouped.entries()]
           .map(([reason, names]) => `${reason}（${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}）`)
           .join('；')}`);
       }
       if (skipped.length) {
-        parts.push(`跳过 ${skipped.length} 项：${skipped.map(item => `${item.name}（${item.reason}）`).join('；')}`);
+        failureParts.push(`跳过 ${skipped.length} 项：${skipped.map(item => `${item.name}（${item.reason}）`).join('；')}`);
+      }
+      if (plan.blockers.length) {
+        failureParts.push(`依赖阻断 ${plan.blockers.length} 项：${plan.blockers.map(blocker => blocker.message).join('；')}`);
+      }
+      if (failures.length || skipped.length || plan.blockers.length) {
+        setActionError(`一键构建：${succeeded}/${items.length} 成功；${failureParts.join('；')}`);
+      }
+      const warningParts: string[] = [];
+      if (items.length > pool.length) warningParts.push(`自动补建依赖 ${items.length - pool.length} 个`);
+      if (plan.reused.length) warningParts.push(`复用已生效依赖 ${plan.reused.length} 个`);
+      if (plan.warnings.length) warningParts.push(...plan.warnings);
+      if (!failures.length && !skipped.length && !plan.blockers.length && warningParts.length) {
+        setActionWarning(`一键构建已完成：${warningParts.join('；')}`);
       }
       if (retryable.length) {
-        parts.push(`其中 ${retryable.length} 项是网络/超时类，环境恢复后可点「重试失败项」`);
+        setActionWarning(`${retryable.length} 项是网络/超时类错误，可直接重试失败项`);
       }
-      if (failures.length || skipped.length) {
-        setActionError(`一键构建：${succeeded}/${ordered.length} 成功；${parts.join('；')}`);
-      }
-      setFailedBatch(failures.map(item => {
-        const project = ordered.find(candidate => candidate.name === item.name);
-        return project ? { id: project.local!.id, name: item.name } : null;
-      }).filter((item): item is { id: string; name: string } => Boolean(item)));
+      setFailedBatch(failures.length ? pool.map(project => ({ id: project.local!.id, name: project.name })) : []);
     } catch (reason) {
       setActionError(failureText(reason, '一键构建失败'));
     } finally {
@@ -379,6 +404,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     {actionError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>操作未完成</strong><span>{actionError}</span></div>
       {failedBatch.length ? <button className="btn" disabled={busy} onClick={() => void buildWorkspace(failedBatch.map(item => item.id))}>重试失败项（{failedBatch.length}）</button> : null}
       <button className="btn" onClick={() => setActionError('')}>关闭</button></div> : null}
+    {actionWarning ? <div className="development-notice"><CircleAlert size={16} /><div><strong>构建完成，有提示</strong><span>{actionWarning}</span></div><button className="btn" onClick={() => setActionWarning('')}>关闭</button></div> : null}
     {/* 构建、校验与打包已收回内核：没装扩展开发工具也能干活，但插件类扩展要 Go。 */}
 
     {readiness && !readiness.kernel.go.installed ? <div className="development-notice"><CircleAlert size={16} /><div><strong>Go 工具链未就绪</strong><span>插件类扩展需要 go 在 PATH 中；技能、工作流、专家、项目规则不受影响。</span></div></div> : null}
@@ -403,7 +429,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           <div className="development-workspace-copy">
             <strong>{props.loading ? '正在读取…' : activeItem?.label || '还没有工作区'}</strong>
             <small className={headProblem ? 'is-problem' : undefined} title={headPath || undefined}>{headMeta}</small>
-            {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在一键构建 ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
+            {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在一键构建 ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.dependencyCount ? `（本工作区 ${workspaceBuild.targetCount} + 自动依赖 ${workspaceBuild.dependencyCount}）` : ''}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
           </div>
           {activeItem ? <div className="development-workspace-actions">
             {/* 这一层是「整个仓库」，下面详情里是「单个扩展」。两个都叫「用 AI 开发」时
@@ -519,10 +545,12 @@ function ProjectListItem({ project, activation, dashboardEnabled, busyAction, se
   const building = Boolean(project.local && busyAction === `build:${project.local.id}`);
   // 已构建是开发页的默认健康态；列表只为构建中、未构建和发布例外保留状态位。
   const showState = building || state.label !== '已构建';
+  // 状态不再用药丸：一列行都长着绿色圆角底色，等于每行都在喊同一句「正常」。
+  // 圆点 + 11px 灰字只在例外时出现，正常行不给任何标记。
   return <button className={`development-project-item ${selected ? 'selected' : ''}`} title={`${project.name} · ${listMeta(project)}`} onClick={() => onSelect(project.key)}>
-    <ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={40} label={extensionKindLabels[project.kind]} />
+    <ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={32} label={extensionKindLabels[project.kind]} />
     <span className="development-project-copy"><strong>{project.name}</strong><small title={`${extensionKindLabels[project.kind]} · ${projectSourceLabel(project)}${project.local ? ` · v${project.local.version}` : ''}`}>{listMeta(project)}</small></span>
-    {showState ? <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span> : null}
+    {showState ? <span className="development-row-state" data-state={building ? 'progress' : state.tone}><span className="status-dot" aria-hidden="true" />{building ? '构建中' : state.label}</span> : null}
   </button>;
 }
 
@@ -567,10 +595,17 @@ function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorize
       <header className="development-detail-header">
       <div className="development-detail-title"><ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={46} /><div><div><h3>{project.name}</h3></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
       <div className="development-detail-actions">
-        {/* 这三个动作是这个页面上最常用的操作，图标 + 文字一起给，避免「点之前不知道是什么」。 */}
+        {/* 一屏只留一个文字主按钮：「用 AI 开发」是这个页面最常见的下一步。
+            打开目录、构建都是低频动作，收进 ⋯，免得三个文字按钮把标题挤窄；
+            构建在批量工具条里也有入口，这里不重复强调。 */}
         {project.local?.workspace_available ? <button className="btn btn-primary" title="在这个项目目录里开一条 AI 会话" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} />用 AI 开发</button> : <button className="btn btn-primary" title="选择协作项目的本地目录" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} />关联本地项目</button>}
-        {project.local?.workspace_available ? <button className="btn" title="在文件管理器里打开项目目录" onClick={() => onOpenFolder(project.local!.workspace_path)}><FolderOpen size={15} />打开目录</button> : null}
-        {project.local?.workspace_available ? <button className="btn" title={buildStage ? '正在构建项目' : '构建并生成测试制品'} disabled={busy} onClick={() => void buildProject()}>{buildStage ? <BusyIndicator size={15} /> : <Hammer size={15} />}构建</button> : null}
+        <ActionMenu variant="icon" icon={buildStage ? <BusyIndicator size={16} /> : <MoreHorizontal size={16} />} title={`${project.name} · 更多操作`} disabled={busy} panelWidth={196}>
+          {close => <>
+            {project.local?.workspace_available ? <ActionMenuItem icon={<FolderOpen size={15} />} label="打开目录" onClick={() => { close(); onOpenFolder(project.local!.workspace_path); }} /> : null}
+            {project.local?.workspace_available ? <ActionMenuItem icon={<Hammer size={15} />} label={buildStage ? '正在构建' : '构建并生成测试制品'} disabled={busy} onClick={() => { close(); void buildProject(); }} /> : null}
+            {project.local?.workspace_available ? null : <ActionMenuItem icon={<FolderOpen size={15} />} label="关联本地目录" onClick={() => { close(); void (project.remote ? onAssociateProject(project.remote) : onOpenProject()); }} />}
+          </>}
+        </ActionMenu>
       </div>
     </header>
     <div className="extension-detail-tabs development-detail-tabs" role="tablist">
@@ -694,19 +729,19 @@ function BuildSummary({ project, activation, dashboardEnabled, draft, active, bu
     : '候选已确认 · 开发版未激活';
   if (draft.kind === 'instruction') {
     const published = Boolean(draft.value.published_at);
-    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '已发布到本机规则库' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} published={published} />{published ? <small>可在「AI 对话 → 项目规则」里选择并同步到客户端。</small> : <button className="btn btn-primary" disabled={busy} onClick={() => void onPublishInstruction(id, version)}><Send size={15} />发布到规则库</button>}</div>;
+    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '已发布到本机规则库' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} activation={activation} published={published} />{published ? <small>可在「AI 对话 → 项目规则」里选择并同步到客户端。</small> : <button className="btn btn-primary" disabled={busy} onClick={() => void onPublishInstruction(id, version)}><Send size={15} />发布到规则库</button>}</div>;
   }
   if (!dashboardEnabled) {
-    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} /><small>{developmentActive ? `作用范围：${activation?.target.profile || '--'} · ${activation?.target.scope === 'workspace' ? '当前工作区' : activation?.target.deployment_id || '已有安装目标'}` : '候选已生成，但未找到与当前候选 SHA 匹配的本机开发激活记录。'}</small></div>;
+    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} activation={activation} /><small>{developmentActive ? `作用范围：${activation?.target.profile || '--'} · ${activation?.target.scope === 'workspace' ? '当前工作区' : activation?.target.deployment_id || '已有安装目标'}` : '候选已生成，但未找到与当前候选 SHA 匹配的本机开发激活记录。'}</small></div>;
   }
   const published = active?.value.version === version && active.value.release_status === 'published';
   const submitted = buildMatchesSubmission(draft, active) || (project.kind === 'workflow' && Boolean(draft.value.submitted_at));
   const canSubmit = projectCanSubmit(project);
   const sourceReady = projectSourceReady(project);
-  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '组织发布版' : submitted ? '工作台审核中' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} published={published} submitted={submitted} />{published ? <small>该制品已发布并可供安装，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">已提交，等待审核</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{project.kind === 'workflow' ? (draft.kind === 'workflow' && draft.value.lock ? '开发版已激活；需要发布时可提交审核' : '工作流还未完成检查') : sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中'}</small>}</div>;
+  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '组织发布版' : submitted ? '工作台审核中' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} activation={activation} published={published} submitted={submitted} />{published ? <small>该制品已发布并可供安装，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">已提交，等待审核</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{project.kind === 'workflow' ? (draft.kind === 'workflow' && draft.value.lock ? '开发版已激活；需要发布时可提交审核' : '工作流还未完成检查') : sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中'}</small>}</div>;
 }
 
-function ActivationFactStrip({ confirmed, active, activation, published = false, submitted = false }: { confirmed: boolean; active: boolean; activation?: ExtensionActivationReceipt; published?: boolean; submitted?: boolean }) {
+function ActivationFactStrip({ confirmed, activation, published = false, submitted = false }: { confirmed: boolean; activation?: ExtensionActivationReceipt; published?: boolean; submitted?: boolean }) {
   const visibleSurfaces = (activation?.surfaces || [])
     .filter(surface => surface.state === 'visible')
     .map(surface => surface.id === 'mcp' ? 'MCP' : surface.id.startsWith('client:') ? surface.id.slice(7) : '')
@@ -716,11 +751,14 @@ function ActivationFactStrip({ confirmed, active, activation, published = false,
   const visibility = [hasMcp ? 'MCP' : '', clients.length ? `${clients.length} 个客户端` : ''].filter(Boolean).join(' · ');
   const visibilityTitle = [hasMcp ? 'MCP' : '', ...clients].filter(Boolean).join('、');
   const release = published ? '已发布' : submitted ? '审核中' : '未发布';
+  const partial = activation?.status === 'partial';
+  // 候选/运行时与上方摘要说的是同一件事（摘要已写「开发版已激活 · v0.4.2」），
+  // 这里只留还没闭环的事实：可见性、发布；候选只在未确认时补一句。
+  // 字段名用弱化色、值用正文色，只有例外才上色，不再是四枚同色药丸。
   return <div className="development-activation-facts" aria-label="扩展状态事实">
-    <span data-state={confirmed ? 'ok' : 'waiting'}>候选：{confirmed ? '已确认' : '未确认'}</span>
-    <span data-state={active ? 'ok' : 'waiting'}>运行时：{active ? '已激活' : '未激活'}</span>
-    <span title={visibilityTitle || undefined} data-state={visibility ? 'ok' : activation?.status === 'partial' ? 'warn' : 'waiting'}>可见性：{visibility || (activation?.status === 'partial' ? '部分失败' : '未验证')}</span>
-    <span data-state={published ? 'ok' : submitted ? 'warn' : 'neutral'}>发布：{release}</span>
+    <span data-state={visibility ? 'ok' : partial ? 'warn' : 'waiting'} title={visibilityTitle || undefined}><em>可见性</em>{visibility || (partial ? '部分失败' : '未验证')}</span>
+    <span data-state={published ? 'ok' : submitted ? 'warn' : 'neutral'}><em>发布</em>{release}</span>
+    {confirmed ? null : <span data-state="waiting"><em>候选</em>未确认</span>}
   </div>;
 }
 
@@ -1024,40 +1062,6 @@ function submissionStatus(submission: SubmissionRef): { label: string; tone: 'su
   if (submission.value.status === 'changes_requested') return { label: '需要修改', tone: 'warn' };
   if (submission.value.status === 'rejected') return { label: '未通过', tone: 'danger' };
   return { label: '待审核', tone: 'warn' };
-}
-
-/// 这个项目声明依赖的同仓库插件（技能/插件/工作流都写在 manifest.plugin_dependencies）。
-function declaredPluginDependencies(project: ProjectModel): string[] {
-  const draft = project.drafts.find(item => draftVersion(item) === project.local?.version) || project.drafts[0];
-  if (draft && draft.kind !== 'expert' && draft.kind !== 'instruction') {
-    const declared = (draft.value.manifest.plugin_dependencies || []).map(item => item.plugin_id).filter(Boolean);
-    if (declared.length) return declared;
-  }
-  // 还没建过的项目没有草稿，依赖只能从清单投影里取；否则一键构建会把
-  // 依赖方排在插件前面，首批必然报「缺少必需插件」。
-  return project.local?.plugin_dependencies || [];
-}
-
-/// 构建顺序：被依赖的插件先建。
-///
-/// 仓库里技能/工作流声明了对本仓库插件的依赖（媒体下载助手 → 媒体下载工具，
-/// 开发技能 → 扩展开发工具）。按列表顺序跑会先建依赖者，于是第一批「依赖未启用」
-/// 的失败里有一半是本可以避免的。循环依赖保持原顺序，不让它们永远排不上。
-function orderByDependencies(projects: ProjectModel[]): ProjectModel[] {
-  const pending = new Map(projects.map(project => [project.extensionId, project]));
-  const ordered: ProjectModel[] = [];
-  let progressed = true;
-  while (pending.size && progressed) {
-    progressed = false;
-    for (const [id, project] of [...pending]) {
-      const waitFor = declaredPluginDependencies(project).filter(dep => dep !== id && pending.has(dep));
-      if (waitFor.length) continue;
-      pending.delete(id);
-      ordered.push(project);
-      progressed = true;
-    }
-  }
-  return [...ordered, ...pending.values()];
 }
 
 /// 网络/超时类失败与「清单写错、编译不过」不同：环境恢复后重试就有意义。

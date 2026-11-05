@@ -1,5 +1,6 @@
 pub(crate) mod ai_capability_bus;
 pub(crate) mod ai_clients;
+pub(crate) mod ai_compatibility;
 pub(crate) mod ai_provider_import;
 pub(crate) mod ai_service_balance;
 pub(crate) mod ai_service_templates;
@@ -9,6 +10,7 @@ pub(crate) mod backup;
 pub(crate) mod builtin_ai_gateway;
 pub(crate) mod builtin_ai_model_sync;
 pub(crate) mod builtin_ai_proxy;
+pub(crate) mod builtin_ai_router;
 pub(crate) mod builtin_ai_sync;
 pub(crate) mod chat_responses;
 pub(crate) mod client_matrix;

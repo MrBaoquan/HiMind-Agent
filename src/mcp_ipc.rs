@@ -10,8 +10,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const IPC_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const DISCOVERY_SCHEMA_VERSION: u32 = 1;
@@ -121,6 +123,7 @@ pub(crate) struct ServiceDiscovery {
 pub(crate) struct ServiceInstance {
     discovery: ServiceDiscovery,
     discovery_path: PathBuf,
+    keeper_stop: Arc<AtomicBool>,
     _lock: File,
 }
 
@@ -132,10 +135,36 @@ impl ServiceInstance {
     pub(crate) fn discovery_path(&self) -> &Path {
         &self.discovery_path
     }
+
+    /// 起一个守护线程，持续保证发现记录在磁盘上。
+    ///
+    /// 记录只在启动时写一次，而它是可以被外部删除的：桥接侧把「进程已死」当成
+    /// 唯一判据后不会再误删活记录，但旧版本、清理脚本、手工操作都还能删掉它。
+    /// 记录一旦消失，服务虽然活着，任何新桥接都看不见它，只能去 spawn 一个
+    /// 新服务，而新服务会因为单例锁直接退出（`exit code: 1`），故障就一直留着。
+    ///
+    /// 不能在 accept 循环里补写：`accept` 会阻塞到下一个客户端连进来，而那正是
+    /// 「记录已丢、没有客户端能连」的死结。用独立线程按固定间隔检查才是自愈。
+    ///
+    /// `Drop` 会先置停止标志再删记录，避免线程在服务退出后把记录重新写出来。
+    pub(crate) fn spawn_discovery_keeper(&self) {
+        let path = self.discovery_path.clone();
+        let content = serde_json::to_vec_pretty(&self.discovery).unwrap_or_default();
+        let stop = Arc::clone(&self.keeper_stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if !path.is_file() {
+                    let _ = atomic_write(&path, &content);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
 }
 
 impl Drop for ServiceInstance {
     fn drop(&mut self) {
+        self.keeper_stop.store(true, Ordering::Relaxed);
         let _ = fs::remove_file(&self.discovery_path);
     }
 }
@@ -182,13 +211,14 @@ pub(crate) fn start_service(
         endpoint: scope.endpoint(runtime_dir),
         token: random_token(),
         agent_version: agent_version.to_string(),
-        started_at_unix: unix_now(),
+        started_at_unix: process_started_at_unix(std::process::id()).unwrap_or_else(unix_now),
     };
     let discovery_path = scope.discovery_path(runtime_dir);
     atomic_write(&discovery_path, &serde_json::to_vec_pretty(&discovery)?)?;
     Ok(ServiceStartOutcome::Started(ServiceInstance {
         discovery,
         discovery_path,
+        keeper_stop: Arc::new(AtomicBool::new(false)),
         _lock: lock,
     }))
 }
@@ -197,6 +227,149 @@ pub(crate) fn read_discovery(runtime_dir: &Path) -> Option<ServiceDiscovery> {
     let content = fs::read(runtime_dir.join("service.json")).ok()?;
     serde_json::from_slice(&content).ok()
 }
+
+/// 发现记录对应的服务是否真的还在。
+///
+/// `service.json` 是崩溃或被杀后的残留：ServiceInstance 的 Drop 在强制终止时不会执行，
+/// 而 MCP 服务又是桥接的子进程，桥接一退出服务就跟着死，文件却留在磁盘上。
+/// 只读文件不校验存活会让桥接永久卡在一个指向死进程的记录上，症状是
+/// “系统找不到指定的文件 (os error 2)”，与配置错误无法区分。
+///
+/// 判据只看进程本身（存活 + 启动时刻与记录相符），**不碰管道**：
+/// - 命名管道的每个实例只能被连一次，探测性连接会被服务的 accept 循环当成客户端收下，
+///   服务读到半截连接就报 `MCP bridge closed before hello`，密集探测能把服务打掉
+///   （实测 46 次零权限 open/close 即让 `--mcp-service` 以 os error 232 退出，
+///   同时 Drop 删掉 service.json，于是故障从「可自愈」变成「永久不可用」）；
+/// - 已有客户端占着连接时，同端点的 open 会返回 `ERROR_PIPE_BUSY`，
+///   把「忙」当成「不可达」会让多客户端场景把活记录判成残留（实测 300 次探测里 292 次为 BUSY）。
+///
+/// 启动时刻用来防 pid 复用：进程号会被回收，只有「同一个 pid + 同一个启动时刻」
+/// 才说明记录指向的就是当初那个服务。
+fn discovery_is_live(discovery: &ServiceDiscovery) -> bool {
+    process_matches_discovery(discovery.pid, discovery.started_at_unix)
+}
+
+/// 只在服务真实存活时返回发现记录；残留记录会被清掉并返回 `None`。
+pub(crate) fn read_live_discovery(runtime_dir: &Path) -> Option<ServiceDiscovery> {
+    let discovery = read_discovery(runtime_dir)?;
+    if discovery_is_live(&discovery) {
+        return Some(discovery);
+    }
+    discard_stale_discovery(runtime_dir);
+    None
+}
+
+/// 丢弃指向已死服务的发现记录，避免下一轮继续读到它。
+fn discard_stale_discovery(runtime_dir: &Path) {
+    let path = runtime_dir.join("service.json");
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0_u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+/// 进程存活且启动时刻与发现记录一致。
+#[cfg(windows)]
+pub(crate) fn process_started_at_unix(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        let filetime = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
+        filetime
+            .checked_div(10_000_000)
+            .and_then(|seconds| seconds.checked_sub(WINDOWS_TO_UNIX_SECONDS))
+    }
+}
+
+#[cfg(windows)]
+fn process_matches_discovery(pid: u32, started_at_unix: u64) -> bool {
+    let Some(expected_started_at) = nonzero_unix(started_at_unix) else {
+        return false;
+    };
+    let Some(actual_started_at) = process_started_at_unix(pid) else {
+        return false;
+    };
+    actual_started_at.abs_diff(expected_started_at) <= 1
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_started_at_unix(pid: u32) -> Option<u64> {
+    process_is_alive(pid).then_some(unix_now())
+}
+
+#[cfg(not(windows))]
+fn process_matches_discovery(pid: u32, started_at_unix: u64) -> bool {
+    nonzero_unix(started_at_unix).is_some() && process_is_alive(pid)
+}
+
+fn nonzero_unix(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+// 这里刻意没有「探测端点是否可连」的辅助函数：命名管道的每个实例只能被连一次，
+// 探测性 open 会被服务当成真实客户端收下并报 `MCP bridge closed before hello`；
+// 已有客户端占着连接时它还会返回 `ERROR_PIPE_BUSY`。真正的可用性判定交给
+// `mcp_pipe::connect` 的重试，它区分 BUSY 与 NOT_FOUND。
 
 pub(crate) fn ensure_service_running(
     profile: &str,
@@ -209,7 +382,12 @@ pub(crate) fn ensure_service_running(
     let scope = ServiceScope::for_current_user(profile, state_path)?;
     let runtime_dir = scope.runtime_dir(agent_home);
     if let Some(discovery) = read_discovery(&runtime_dir) {
-        return Ok(discovery);
+        if discovery_is_live(&discovery) {
+            return Ok(discovery);
+        }
+        // 残留记录：服务进程已死或管道不通。清掉它，让下面的逻辑重新拉起服务，
+        // 而不是把一个死端点交给调用方。
+        discard_stale_discovery(&runtime_dir);
     }
     if !service_executable.is_file() {
         return Err(format!(
@@ -243,14 +421,35 @@ pub(crate) fn ensure_service_running(
     let mut child = command.spawn()?;
     for _ in 0..200 {
         if let Some(discovery) = read_discovery(&runtime_dir) {
-            return Ok(discovery);
+            if discovery_is_live(&discovery) {
+                return Ok(discovery);
+            }
         }
         if let Some(status) = child.try_wait()? {
+            // Several OpenCode workspaces can launch the bridge at the same time.
+            // Only one child wins the service lock; the others exit quickly. Do not
+            // fail those bridges before the winner has published discovery.
+            if let Some(discovery) = wait_for_live_discovery(&runtime_dir, Duration::from_secs(2)) {
+                return Ok(discovery);
+            }
             return Err(format!("HiMind Agent service exited during startup: {status}").into());
         }
         thread::sleep(Duration::from_millis(50));
     }
     Err("timed out waiting for HiMind Agent service startup".into())
+}
+
+fn wait_for_live_discovery(runtime_dir: &Path, timeout: Duration) -> Option<ServiceDiscovery> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(discovery) = read_live_discovery(runtime_dir) {
+            return Some(discovery);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 pub(crate) fn read_discovery_with_retry(runtime_dir: &Path) -> Option<ServiceDiscovery> {
@@ -479,4 +678,138 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_runtime_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("himind-ipc-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn discovery_for(pid: u32, endpoint: &str) -> ServiceDiscovery {
+        ServiceDiscovery {
+            schema_version: DISCOVERY_SCHEMA_VERSION,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            pid,
+            profile: "production".to_string(),
+            identity_hash: "identity".to_string(),
+            state_hash: "state".to_string(),
+            endpoint: endpoint.to_string(),
+            token: "token".to_string(),
+            agent_version: "test".to_string(),
+            started_at_unix: process_started_at_unix(std::process::id()).unwrap_or_else(unix_now),
+        }
+    }
+
+    /// 死进程留下的发现记录必须被识别为 stale 并清掉，否则桥接会永久指向死端点。
+    #[test]
+    fn stale_discovery_with_dead_pid_is_discarded() {
+        let dir = temp_runtime_dir("stale-pid");
+        let dead_pid = u32::MAX - 1;
+        let record = discovery_for(dead_pid, "\\\\.\\pipe\\himind-agent-definitely-absent");
+        fs::write(
+            dir.join("service.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_live_discovery(&dir).is_none());
+        assert!(
+            !dir.join("service.json").exists(),
+            "stale discovery record must be removed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 记录指向一个活着、但不是当初那个进程的 pid（pid 复用）同样不算可用。
+    #[test]
+    fn discovery_pointing_at_a_reused_pid_is_discarded() {
+        let dir = temp_runtime_dir("pid-reuse");
+        let mut record = discovery_for(std::process::id(), "\\\\.\\pipe\\himind-agent-live-pid");
+        // 当前进程绝不是 started_at_unix=1 那一刻启动的。
+        record.started_at_unix = 1;
+        fs::write(
+            dir.join("service.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_live_discovery(&dir).is_none());
+        assert!(!dir.join("service.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归：指向「本进程、本时刻」的活记录必须原样保留。
+    ///
+    /// 早期修复用「零权限打开端点」判断存活，会在管道忙时把活服务判成残留，
+    /// 也会把探测连接当客户端塞给服务（服务读到半截连接就退出）。这条测试锁住
+    /// 「活记录不删、不碰管道」这个行为。
+    #[test]
+    fn competing_bridge_waits_for_winner_discovery() {
+        let dir = temp_runtime_dir("competing-start");
+        let publisher_dir = dir.clone();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let record = discovery_for(
+                std::process::id(),
+                "\\\\.\\pipe\\himind-agent-competing-winner",
+            );
+            fs::write(
+                publisher_dir.join("service.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        });
+        let live = wait_for_live_discovery(&dir, std::time::Duration::from_secs(2))
+            .expect("competitor should observe the winning discovery");
+        assert_eq!(live.pid, std::process::id());
+        publisher.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn live_discovery_for_this_process_is_kept() {
+        let dir = temp_runtime_dir("live");
+        let record = discovery_for(
+            std::process::id(),
+            "\\\\.\\pipe\\himind-agent-probe-must-not-connect",
+        );
+        let path = dir.join("service.json");
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let live = read_live_discovery(&dir).expect("live record must be returned");
+        assert_eq!(live.pid, std::process::id());
+        assert!(path.exists(), "live discovery record must not be deleted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_discovery_returns_none_without_error() {
+        let dir = temp_runtime_dir("absent");
+        assert!(read_live_discovery(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_process_is_alive_and_zero_pid_is_not() {
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(0));
+    }
+
+    #[test]
+    fn current_process_matches_a_fresh_record_and_not_an_old_one() {
+        let started_at = process_started_at_unix(std::process::id()).expect("process start time");
+        assert!(process_matches_discovery(std::process::id(), started_at));
+        assert!(!process_matches_discovery(std::process::id(), 1));
+        assert!(!process_matches_discovery(0, unix_now()));
+        assert!(!process_matches_discovery(std::process::id(), 0));
+    }
 }

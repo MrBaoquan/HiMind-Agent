@@ -762,6 +762,123 @@ impl BuiltinAiProxyControl {
         base_url: &str,
         models: &[String],
     ) -> Result<(), String> {
+        let model_entries = models
+            .iter()
+            .map(|model| model_profile_entry(model))
+            .filter(|model| {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+            })
+            .collect::<Vec<_>>();
+        self.sync_provider_catalog(
+            "himind-proxy",
+            "HiMind AI",
+            "DEEPSEEK_API_KEY",
+            "openai-completions",
+            default_model,
+            base_url,
+            model_entries,
+            false,
+        )
+    }
+
+    pub(crate) fn sync_local_service_catalog(
+        &self,
+        default_model: &str,
+        base_url: &str,
+        routes: &[crate::app::builtin_ai_router::ModelRoute],
+        activate_default: bool,
+    ) -> Result<(), String> {
+        let model_entries = routes
+            .iter()
+            .map(|route| {
+                json!({
+                    "id": route.alias,
+                    "name": route.display_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.sync_provider_catalog(
+            crate::app::builtin_ai_router::PROVIDER_ID,
+            "HiMind AI",
+            crate::app::builtin_ai_router::API_KEY_ENV,
+            "openai-completions",
+            default_model,
+            base_url,
+            model_entries,
+            activate_default,
+        )
+    }
+
+    /// Point the newest Session in one Workspace at the new local model.
+    ///
+    /// DSH keeps model selection per Session even when the default provider
+    /// catalog changes. Updating it here makes the next prompt use the selected
+    /// service without rebuilding the Host process.
+    pub(crate) fn select_latest_session_model(
+        &self,
+        workspace: &Path,
+        model: &str,
+    ) -> Result<(), String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Ok(());
+        }
+        let listed = self.call_runtime_api("session/list", json!({ "_request": {} }))?;
+        let value = runtime_result_value(&listed, "读取 DSH 会话列表")?;
+        let directory = crate::extension_workspace::display_path(workspace);
+        let mut newest: Option<(u64, String)> = None;
+        for item in value
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let matches_directory = item
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|cwd| cwd.eq_ignore_ascii_case(&directory));
+            if !matches_directory || item.get("blank").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            let updated_at = item.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+            if newest.as_ref().is_none_or(|(best, _)| updated_at > *best) {
+                newest = Some((updated_at, session_id.to_string()));
+            }
+        }
+        let Some((_, session_id)) = newest else {
+            return Ok(());
+        };
+        let response = self.call_runtime_api(
+            "session/selectModel",
+            json!({
+                "request": {
+                    "sessionId": session_id,
+                    "provider": crate::app::builtin_ai_router::PROVIDER_ID,
+                    "model": model,
+                },
+            }),
+        )?;
+        runtime_result_value(&response, "切换 DSH 会话模型")?;
+        Ok(())
+    }
+
+    fn sync_provider_catalog(
+        &self,
+        provider_id: &str,
+        display_name: &str,
+        api_key_env: &str,
+        api: &str,
+        default_model: &str,
+        base_url: &str,
+        models: Vec<Value>,
+        force_default: bool,
+    ) -> Result<(), String> {
         let default_model = default_model.trim();
         let base_url = base_url.trim();
         if default_model.is_empty() || base_url.is_empty() || models.is_empty() {
@@ -786,15 +903,11 @@ impl BuiltinAiProxyControl {
             .ok_or_else(|| "DSH 设置目录不可用".to_string())?;
 
         let provider_profile = json!({
-            "displayName": "HiMind AI",
-            "apiKeyEnv": "DEEPSEEK_API_KEY",
-            "api": "openai-completions",
+            "displayName": display_name,
+            "apiKeyEnv": api_key_env,
+            "api": api,
             "baseURL": base_url,
-            "models": models
-                .iter()
-                .map(|model| model_profile_entry(model))
-                .filter(|model| model.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()))
-                .collect::<Vec<_>>(),
+            "models": models,
         });
         let llm_revision = namespace_revision(namespaces, "llm-pi-ai");
         self.mutate_settings(
@@ -802,38 +915,26 @@ impl BuiltinAiProxyControl {
             "llm-pi-ai",
             vec![json!({
                 "op": "set",
-                "path": ["providers", "himind-proxy"],
+                "path": ["providers", provider_id],
                 "value": provider_profile,
             })],
             llm_revision,
         )?;
 
-        // A user-selected provider remains untouched. The built-in DeepSeek
-        // default is migrated to the managed route, while an existing HiMind
-        // model remains user-owned. Only an empty HiMind model is initialized
-        // from the current service default.
-        let default_namespace = namespaces
-            .iter()
-            .find(|item| item.get("ns").and_then(Value::as_str) == Some("agent-default-model"));
-        let current_provider = default_namespace
-            .and_then(|item| item.get("user"))
-            .and_then(|value| value.get("provider"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let current_model = default_namespace
-            .and_then(|item| item.get("user"))
-            .and_then(|value| value.get("model"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if should_initialize_managed_model(current_provider, current_model) {
-            let revision = default_namespace
+        // Catalog refreshes are deliberately non-destructive: adding or editing
+        // any service must not steal the model the user selected in DSH. Only an
+        // explicit activation (launch/default-service switch) moves the default.
+        if force_default {
+            let revision = namespaces
+                .iter()
+                .find(|item| item.get("ns").and_then(Value::as_str) == Some("agent-default-model"))
                 .and_then(|item| item.get("revision"))
                 .and_then(Value::as_i64);
             self.mutate_settings(
                 &client,
                 "agent-default-model",
                 vec![
-                    json!({ "op": "set", "path": ["provider"], "value": "himind-proxy" }),
+                    json!({ "op": "set", "path": ["provider"], "value": provider_id }),
                     json!({ "op": "set", "path": ["model"], "value": default_model }),
                 ],
                 revision,
@@ -1019,12 +1120,6 @@ fn namespace_revision(namespaces: &[Value], namespace: &str) -> Option<i64> {
         .find(|item| item.get("ns").and_then(Value::as_str) == Some(namespace))
         .and_then(|item| item.get("revision"))
         .and_then(Value::as_i64)
-}
-
-fn should_initialize_managed_model(provider: &str, model: &str) -> bool {
-    provider.trim().is_empty()
-        || provider == "deepseek-official"
-        || (provider == "himind-proxy" && model.trim().is_empty())
 }
 
 pub(crate) fn unix_millis() -> u128 {
@@ -2515,24 +2610,6 @@ mod tests {
         let error = runtime_result_value(&response, "注册 DSH 工作区").unwrap_err();
         assert!(error.contains("workspace-invalid-path"));
         assert!(error.contains("path is invalid"));
-    }
-
-    #[test]
-    fn existing_himind_model_is_not_replaced_by_service_default() {
-        assert!(!should_initialize_managed_model(
-            "himind-proxy",
-            "deepseek-v4-flash"
-        ));
-        assert!(should_initialize_managed_model("himind-proxy", ""));
-        assert!(should_initialize_managed_model("", ""));
-        assert!(should_initialize_managed_model(
-            "deepseek-official",
-            "deepseek-chat"
-        ));
-        assert!(!should_initialize_managed_model(
-            "personal-deepseek",
-            "deepseek-chat"
-        ));
     }
 
     #[test]

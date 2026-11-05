@@ -1,6 +1,5 @@
 use crate::mcp_ipc::{
-    read_discovery, read_frame, write_frame, ServiceEvent, ServiceFrame, ServiceScope,
-    IPC_PROTOCOL_VERSION,
+    read_frame, write_frame, ServiceEvent, ServiceFrame, ServiceScope, IPC_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -42,7 +41,12 @@ pub(crate) fn run_bridge_io<R: BufRead, W: Write>(
     if discovery.profile != scope.profile() || discovery.state_hash != scope.state_hash() {
         return Err("MCP bridge discovered a service from a different scope".into());
     }
-    let mut pipe = crate::mcp_pipe::connect(&discovery.endpoint)?;
+    let mut pipe = crate::mcp_pipe::connect(&discovery.endpoint).map_err(|error| {
+        format!(
+            "MCP service pipe is unavailable at {}: {error}",
+            discovery.endpoint
+        )
+    })?;
     let mut pipe_reader = BufReader::new(pipe.try_clone()?);
     write_frame(
         &mut pipe,
@@ -146,7 +150,7 @@ fn wait_for_discovery(
     runtime_dir: &Path,
 ) -> Result<crate::mcp_ipc::ServiceDiscovery, Box<dyn Error>> {
     for _ in 0..80 {
-        if let Some(discovery) = read_discovery(runtime_dir) {
+        if let Some(discovery) = crate::mcp_ipc::read_live_discovery(runtime_dir) {
             return Ok(discovery);
         }
         thread::sleep(Duration::from_millis(25));

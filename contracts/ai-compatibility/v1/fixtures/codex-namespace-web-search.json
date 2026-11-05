@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "codex-namespace-web-search",
+  "pipeline": "normalize",
+  "client": "codex",
+  "provider": "openai_responses_limited",
+  "protocol": "openai-responses",
+  "input": {
+    "model": "model-a",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "tool_choice": "auto",
+    "tools": [
+      {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+      {"type": "namespace", "name": "mcp__cua", "tools": []},
+      {"type": "web_search"}
+    ],
+    "input": [
+      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
+      {"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"},
+      {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+    ]
+  },
+  "expect": {
+    "lengths": {"/tools": 1},
+    "paths": {"/tools/0/type": "function", "/input/1/type": "message", "/input/2/type": "message", "/tool_choice": "auto"},
+    "absent_paths": ["/temperature", "/top_p"],
+    "forbidden_substrings": ["namespace", "web_search", "function_call"],
+    "changes_include": ["namespace_tools", "function_call_history", "sampling_temperature", "sampling_top_p"]
+  }
+}

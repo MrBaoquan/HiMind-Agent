@@ -25,6 +25,10 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0017](0017-agent-credential-center.md) | Agent credentials have one catalog and a brokered runtime boundary | accepted | 2026-10-25 |
 | [0018](0018-agent-bundled-pinned-runtime.md) | Runtime binaries are pinned and bundled with the Agent | accepted | 2026-10-26 |
 | [0019](0019-extension-brand-icons.md) | Extension brand icons are package assets with local overrides | accepted | 2026-10-26 |
+| [0020](0020-local-ai-gateway-aggregation.md) | 本机 AI 网关聚合 Profile 与模型路由 | accepted | 2026-10-27 |
+| [0021](0021-user-data-location.md) | User data can move to another local disk, the program stays put | accepted | 2026-10-31 |
+| [0022](0022-mcp-discovery-liveness-is-process-scoped.md) | MCP discovery liveness is decided by the process, never by probing the pipe | accepted | 2026-11-04 |
+| [0023](0023-capability-route-selects-service-and-model.md) | 能力路由的选择单位是「服务 + 模型」 | accepted | 2026-11-05 |
 
 ## How these relate
 
@@ -58,6 +62,18 @@ control-plane capabilities a provider lifecycle instead of a global Agent mode.
 dependency on the MCP catalog series: it leaves 0007's market discovery and the
 metaguide's extension-description contract alone, and constrains the Agent's own
 labels, hints and empty states instead.
+
+0022 is the companion of 0001 on the process side. 0001 says there is exactly one
+Agent bridge per client; 0022 says how a bridge decides that the service behind
+that bridge still exists, and why the answer must come from the process rather
+than from the endpoint.
+
+0023 carries 0016's contract down to the model field. 0016 already declared
+`model` a first-class part of the request and the plan, but the implementation
+stopped at service granularity; 0023 removes that gap and accepts a hard
+migration of the persisted selection to do it. It deliberately does not touch
+0020's `GatewayModelRoute`: that record owns the model aliases exposed to
+external clients, while 0023 owns the model HiMind's own capabilities use.
 
 ## Adding a record
 

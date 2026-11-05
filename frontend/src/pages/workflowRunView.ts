@@ -213,7 +213,7 @@ function graphNodesForRun(snapshot: WorkflowRunSnapshot): WorkflowGraphNode[] {
   return snapshot.run.steps.map(fallbackGraphNode);
 }
 
-/** 运行步骤优先按精确节点路径匹配，其次按声明的 step_id 顺序消费；匹配不上的运行步骤保留为额外节点。 */
+/** 运行步骤先按节点路径、再按 step_id 匹配；未匹配的保留为额外节点。 */
 function runtimeStepsByNode(snapshot: WorkflowRunSnapshot, nodes: WorkflowGraphNode[]) {
   const exact = new Map<string, RuntimeStep>();
   const byStepId = new Map<string, RuntimeStep[]>();

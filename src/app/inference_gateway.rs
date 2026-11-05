@@ -669,9 +669,24 @@ fn claude_desktop_display_name(exposed: &str) -> String {
     format!("HiMind · {exposed}")
 }
 
+const ONE_MILLION_SUFFIX: &str = "[1m]";
+
+/// Claude 在 1M 模型上会请求 `<model>[1m]`；这个后缀只是客户端的窗口选择，
+/// 不能拿去做绑定匹配，否则会误报 UnknownModel。
+fn trim_context_suffix(model: &str) -> &str {
+    let trimmed = model.trim();
+    if trimmed.len() >= ONE_MILLION_SUFFIX.len()
+        && trimmed[trimmed.len() - ONE_MILLION_SUFFIX.len()..]
+            .eq_ignore_ascii_case(ONE_MILLION_SUFFIX)
+    {
+        return trimmed[..trimmed.len() - ONE_MILLION_SUFFIX.len()].trim();
+    }
+    trimmed
+}
+
 /// 请求用的模型名是不是某个绑定的 Claude Desktop 别名。
 fn is_claude_desktop_alias(binding: &GatewayBinding, model: &str) -> bool {
-    claude_desktop_model_alias(binding_exposed_model(binding)) == model
+    claude_desktop_model_alias(binding_exposed_model(binding)) == trim_context_suffix(model)
 }
 
 /// 别名命中时把绑定对外暴露的名字换成别名：下游所有 `model` 回写都从
@@ -758,7 +773,7 @@ fn binding_exposed_model(binding: &GatewayBinding) -> &str {
 
 /// 绑定的模型目录来自服务定义；旧绑定用模型列表判定，新绑定使用 exposed_model。
 fn binding_has_model(binding: &GatewayBinding, model: &str) -> bool {
-    binding_exposed_model(binding) == model
+    binding_exposed_model(binding) == trim_context_suffix(model)
         || binding
             .models
             .iter()
@@ -778,6 +793,43 @@ fn join_upstream(base_url: &str, path: &str) -> String {
         return format!("{base}/v1{path}");
     }
     format!("{base}{path}")
+}
+
+/// 将 Responses 工具结果里的图片/文件附件降级成文本说明。
+///
+/// OpenAI Responses 允许 `function_call_output.output` 是富内容数组，但部分兼容
+/// 上游（例如向量潮汐）只接受字符串或纯文本数组。OpenCode 的浏览器截图工具会
+/// 把 JPEG data URI 放进工具结果，后续请求就会被上游以泛化的 400 拒绝。
+/// 用户主动附带在消息里的图片不受影响，只处理工具结果内部的文件内容。
+fn response_tool_output_media_fallback(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let input = value.get_mut("input")?.as_array_mut()?;
+    let mut changed = false;
+    for item in input.iter_mut() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            continue;
+        }
+        let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in output.iter_mut() {
+            let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(kind, "input_image" | "input_file") {
+                continue;
+            }
+            let label = if kind == "input_image" {
+                "图片"
+            } else {
+                "文件"
+            };
+            *part = json!({
+                "type": "input_text",
+                "text": format!("[工具结果中的{label}已由 HiMind 本机网关省略]")
+            });
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
 /// 将 Responses 输入里的工具调用轨迹降级成普通消息。
@@ -835,6 +887,33 @@ fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     *input = downgraded;
+    serde_json::to_vec(&value).ok()
+}
+
+/// 移除 Responses 上游不支持的扩展工具定义。
+///
+/// Codex 的 `namespace`（MCP 工具分组）和 `web_search` 不是标准 function
+/// tool；Vector Tide 等只接受 Responses 子集的上游会因此直接返回 400。
+/// 保留 function 工具仍可完成本地命令、文件操作等核心工作；如果全部工具
+/// 都被移除，也必须同步删掉 `tool_choice`，否则仍有上游判为非法。
+fn response_unsupported_tools_fallback(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let tools = value.get_mut("tools")?.as_array_mut()?;
+    let original_len = tools.len();
+    tools.retain(|tool| {
+        !matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("namespace" | "web_search")
+        )
+    });
+    if tools.len() == original_len {
+        return None;
+    }
+    if tools.is_empty() {
+        let object = value.as_object_mut()?;
+        object.remove("tools");
+        object.remove("tool_choice");
+    }
     serde_json::to_vec(&value).ok()
 }
 
@@ -1193,6 +1272,7 @@ fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String 
             } else {
                 binding.profile_id.clone()
             };
+            let metadata = crate::api::ai::known_model_metadata(&binding.upstream_model);
             if claude_desktop {
                 // id 必须中性（见 claude_desktop_model_alias 的说明），可读名字走
                 // display_name：Claude 的过滤器只看 id。
@@ -1200,9 +1280,10 @@ fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String 
                     claude_desktop_model_alias(exposed),
                     owner,
                     Some(claude_desktop_display_name(exposed)),
+                    metadata,
                 )
             } else {
-                (exposed.to_string(), owner, None)
+                (exposed.to_string(), owner, None, metadata)
             }
         })
         .collect::<Vec<_>>();
@@ -1210,7 +1291,7 @@ fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String 
     rows.dedup_by(|left, right| left.0 == right.0);
     let data = rows
         .into_iter()
-        .map(|(id, owned_by, display_name)| {
+        .map(|(id, owned_by, display_name, metadata)| {
             let mut item = json!({
                 "id": id,
                 "object": "model",
@@ -1219,6 +1300,28 @@ fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String 
             if let Some(display_name) = display_name {
                 item["display_name"] = json!(display_name);
                 item["description"] = json!("HiMind 聚合模型");
+            }
+            if let Some(context_window) = metadata.context_window {
+                item["context_window"] = json!(context_window);
+                // Claude Desktop / Claude Code 读取 max_input_tokens；达到 1M 时
+                // 再下 supports_1m，客户端才会生成 `<model>[1m]` 变体。
+                item["max_input_tokens"] = json!(context_window);
+                if context_window >= 1_000_000 {
+                    item["supports_1m"] = json!(true);
+                }
+            }
+            if let Some(max_output_tokens) = metadata.max_output_tokens {
+                item["max_output_tokens"] = json!(max_output_tokens);
+            }
+            if !metadata.input_modalities.is_empty() {
+                item["input_modalities"] = json!(metadata.input_modalities);
+                if metadata.supports_image() {
+                    item["supports_image_detail_original"] = json!(true);
+                }
+            }
+            if !metadata.reasoning_efforts.is_empty() {
+                item["reasoning_efforts"] = json!(metadata.reasoning_efforts);
+                item["default_reasoning_effort"] = json!(metadata.default_reasoning_effort);
             }
             item
         })
@@ -1296,6 +1399,38 @@ fn rewrite_sse_model_line(line: &str, exposed_model: &str) -> String {
     value["model"] = json!(exposed_model);
     format!("data: {value}")
 }
+const TRANSIENT_UPSTREAM_MAX_ATTEMPTS: usize = 2;
+
+/// 上游在开始流式输出前返回的瞬时 5xx 可以安全透明重试：此时客户端还没有收到
+/// 任何字节，模型请求也没有执行工具。只重试一次，避免把真实故障放大成重试风暴。
+fn send_upstream_with_transient_retry<F>(
+    binding: &GatewayBinding,
+    payload: &[u8],
+    send: &mut F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut(&[u8]) -> reqwest::Result<reqwest::blocking::Response>,
+{
+    for attempt in 1..=TRANSIENT_UPSTREAM_MAX_ATTEMPTS {
+        let response = send(payload)?;
+        let status = response.status().as_u16();
+        let transient = matches!(status, 500 | 502 | 503 | 504);
+        if transient && attempt < TRANSIENT_UPSTREAM_MAX_ATTEMPTS {
+            crate::approval::manager::append_event_log(
+                "info",
+                &format!(
+                    "本机网关上游瞬时失败，透明重试：client={} service={} status={status} attempt={attempt}",
+                    binding.client, binding.service
+                ),
+            );
+            let _ = response.bytes();
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        return Ok(response);
+    }
+    unreachable!("transient retry loop always returns")
+}
 fn forward(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
@@ -1368,10 +1503,24 @@ fn forward(
     if kind == "openai-chat" && binding.protocol == "openai-responses" {
         return forward_chat_responses_translated(stream, binding, body, started);
     }
-    let outgoing_body = match normalized_responses {
-        Some(request) => serde_json::to_vec(&request)
-            .map_err(|error| media_normalize_error(stream, &error.to_string()))?,
-        None if kind == "openai-chat" => inject_stream_usage_flag(body),
+    let compatibility_request = match normalized_responses {
+        Some(request) => Some(request),
+        None if kind == "openai-chat" => {
+            serde_json::from_slice::<Value>(&inject_stream_usage_flag(body)).ok()
+        }
+        None => serde_json::from_slice::<Value>(body).ok(),
+    };
+    let outgoing_body = match compatibility_request {
+        Some(request) => {
+            let normalized = normalize_compatibility_request(
+                stream,
+                binding,
+                binding.protocol.as_str(),
+                request,
+            )?;
+            serde_json::to_vec(&normalized)
+                .map_err(|error| media_normalize_error(stream, &error.to_string()))?
+        }
         None => body.to_vec(),
     };
     if kind != "models" {
@@ -1381,7 +1530,7 @@ fn forward(
     let client = upstream_client(&upstream_url).map_err(|_| GatewayError::Answered)?;
     let method =
         reqwest::Method::from_bytes(head.method.as_bytes()).unwrap_or(reqwest::Method::POST);
-    let send_upstream = |payload: Vec<u8>| {
+    let mut send_upstream = |payload: &[u8]| {
         let mut request = client
             .request(method.clone(), &upstream_url)
             .header("accept-encoding", "identity");
@@ -1407,35 +1556,72 @@ fn forward(
             body,
         );
         if kind != "models" {
-            request = request.body(payload);
+            request = request.body(payload.to_vec());
         }
         request.send()
     };
-    let mut response = match send_upstream(outgoing_body.clone()) {
-        // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
-        Ok(response) => response,
-        Err(error) => {
-            return Err(write_upstream_failure(stream, &error.to_string()));
-        }
-    };
-    // `function_call` / `function_call_output` 历史。OpenCode 在同一会话切换到
-    // 这类上游时会携带上一模型的工具轨迹，表现为一个与参数名无关的 400。
-    // 首轮仅在 400/422 且确实存在工具历史时降级为普通消息并重试一次。
+    let mut response =
+        match send_upstream_with_transient_retry(binding, &outgoing_body, &mut send_upstream) {
+            // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
+            Ok(response) => response,
+            Err(error) => {
+                return Err(write_upstream_failure(stream, &error.to_string()));
+            }
+        };
+    // Responses 兼容上游支持的子集并不一致。Codex 会同时携带
+    // `function_call` 历史和 `namespace` / `web_search` 工具；Vector Tide 等
+    // 上游对两类输入都会返回同一个泛化的 400。首轮仅在 400/422 时把已知
+    // 不兼容的部分一起收敛，再重试一次，避免第一次回退后仍撞在另一类字段上。
     if kind == "openai-responses"
         && binding.protocol == "openai-responses"
         && matches!(response.status().as_u16(), 400 | 422)
     {
-        if let Some(fallback_body) = response_tool_history_fallback(&outgoing_body) {
+        let mut fallback_body = outgoing_body.clone();
+        // 先做最小兼容：仅移除工具结果中的图片/文件，保留 function_call 结构。
+        if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
+            fallback_body = media_body;
             crate::approval::manager::append_event_log(
                 "info",
-                "本机网关兼容回退：上游不接受 Responses 工具调用历史，已将历史调用降级为普通消息后重试",
+                "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
             );
-            response = match send_upstream(fallback_body) {
+            response = match send_upstream_with_transient_retry(
+                binding,
+                &fallback_body,
+                &mut send_upstream,
+            ) {
                 Ok(response) => response,
                 Err(error) => {
                     return Err(write_upstream_failure(stream, &error.to_string()));
                 }
             };
+        }
+        // 仍失败时再降级整个工具历史，并移除上游不支持的扩展工具。
+        if matches!(response.status().as_u16(), 400 | 422) {
+            let mut fallback_changes = Vec::new();
+            if let Some(history_body) = response_tool_history_fallback(&fallback_body) {
+                fallback_body = history_body;
+                fallback_changes.push("已将历史工具调用降级为普通消息");
+            }
+            if let Some(tools_body) = response_unsupported_tools_fallback(&fallback_body) {
+                fallback_body = tools_body;
+                fallback_changes.push("已移除上游不支持的 namespace/web_search 工具");
+            }
+            if !fallback_changes.is_empty() {
+                crate::approval::manager::append_event_log(
+                    "info",
+                    &format!("本机网关兼容回退：{}后重试", fallback_changes.join("；")),
+                );
+                response = match send_upstream_with_transient_retry(
+                    binding,
+                    &fallback_body,
+                    &mut send_upstream,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return Err(write_upstream_failure(stream, &error.to_string()));
+                    }
+                };
+            }
         }
     }
     let status = response.status();
@@ -1450,14 +1636,14 @@ fn forward(
     // 上游失败时先完整收下错误体：既便于本机诊断，也避免把空 502
     // 当成正常的流式响应交给客户端，导致真正原因被吞掉。
     if !status.is_success() {
+        let upstream_headers = response.headers().clone();
         let mut raw = Vec::new();
         let _ = response.read_to_end(&mut raw);
-        let excerpt = String::from_utf8_lossy(&raw[..raw.len().min(1200)]).replace('\n', " ");
         let header_names = head.headers.keys().cloned().collect::<Vec<_>>().join(",");
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
-                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={} body={excerpt}",
+                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={}",
                 status.as_u16(),
                 head.path,
                 raw.len(),
@@ -1465,6 +1651,31 @@ fn forward(
                 request_summary,
             ),
         );
+        if matches!(status.as_u16(), 400 | 422) {
+            let request =
+                serde_json::from_slice::<Value>(&outgoing_body).unwrap_or_else(|_| json!({}));
+            write_upstream_compatibility_diagnostic(
+                stream,
+                status,
+                binding,
+                kind,
+                &request,
+                &raw,
+                &upstream_headers,
+            )?;
+            if kind != "models" {
+                record_usage(
+                    binding,
+                    &display_model,
+                    streaming,
+                    status.as_u16(),
+                    Usage::default(),
+                    true,
+                    started.elapsed().as_millis() as u64,
+                );
+            }
+            return Ok(());
+        }
         write_buffered_head(
             stream,
             status.as_u16(),
@@ -1582,6 +1793,7 @@ fn forward_translated(
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
+    let kind = binding.entry_protocol.as_str();
     let request: Value = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(_) => {
@@ -1598,6 +1810,7 @@ fn forward_translated(
             Ok(openai_body) => openai_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
+    let openai_body = normalize_compatibility_request(stream, binding, "openai-chat", openai_body)?;
     let openai_payload = openai_body.to_string();
     enforce_outbound_body_limit(stream, openai_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
@@ -1616,7 +1829,32 @@ fn forward_translated(
     let status = response.status();
     if !status.is_success() {
         // 上游错误原样翻成 Anthropic 的错误体，客户端才能显示真实原因。
-        let detail = response.text().unwrap_or_default();
+        let upstream_headers = response.headers().clone();
+        let mut raw_error = Vec::new();
+        let _ = response.read_to_end(&mut raw_error);
+        let detail = String::from_utf8_lossy(&raw_error).to_string();
+        if matches!(status.as_u16(), 400 | 422) {
+            let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+            write_upstream_compatibility_diagnostic(
+                stream,
+                status,
+                binding,
+                kind,
+                &request,
+                &raw_error,
+                &upstream_headers,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         let payload = json!({
             "type": "error",
             "error": { "type": "api_error", "message": detail },
@@ -1729,6 +1967,7 @@ fn forward_anthropic_responses_translated(
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
+    let kind = binding.entry_protocol.as_str();
     let request: Value = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(_) => return Err(translate_error(stream, "Anthropic 请求体不是合法 JSON")),
@@ -1745,6 +1984,8 @@ fn forward_anthropic_responses_translated(
         Ok(body) => body,
         Err(error) => return Err(translate_error(stream, &error)),
     };
+    let responses_body =
+        normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
     let payload = responses_body.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
@@ -1762,7 +2003,32 @@ fn forward_anthropic_responses_translated(
     };
     let status = response.status();
     if !status.is_success() {
-        let detail = response.text().unwrap_or_default();
+        let upstream_headers = response.headers().clone();
+        let mut raw_error = Vec::new();
+        let _ = response.read_to_end(&mut raw_error);
+        let detail = String::from_utf8_lossy(&raw_error).to_string();
+        if matches!(status.as_u16(), 400 | 422) {
+            let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+            write_upstream_compatibility_diagnostic(
+                stream,
+                status,
+                binding,
+                kind,
+                &request,
+                &raw_error,
+                &upstream_headers,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         let payload = json!({
             "type": "error",
             "error": { "type": "api_error", "message": detail },
@@ -1898,6 +2164,7 @@ fn forward_responses_translated(
     client_session: Option<&str>,
     started: Instant,
 ) -> Result<(), GatewayError> {
+    let kind = binding.entry_protocol.as_str();
     let streaming = request
         .get("stream")
         .and_then(Value::as_bool)
@@ -1908,6 +2175,7 @@ fn forward_responses_translated(
             Ok(chat_body) => chat_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
+    let chat_body = normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
     let chat_payload = chat_body.to_string();
     enforce_outbound_body_limit(stream, chat_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
@@ -1925,7 +2193,32 @@ fn forward_responses_translated(
     };
     let status = response.status();
     if !status.is_success() {
-        let detail = response.text().unwrap_or_default();
+        let upstream_headers = response.headers().clone();
+        let mut raw_error = Vec::new();
+        let _ = response.read_to_end(&mut raw_error);
+        let detail = String::from_utf8_lossy(&raw_error).to_string();
+        if matches!(status.as_u16(), 400 | 422) {
+            let request = request.clone();
+            write_upstream_compatibility_diagnostic(
+                stream,
+                status,
+                binding,
+                kind,
+                &request,
+                &raw_error,
+                &upstream_headers,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         // 翻译路径的失败要留痕：只看上游报错无法判断是哪条消息结构不合法。
         crate::approval::manager::append_event_log(
             "warn",
@@ -2043,6 +2336,7 @@ fn forward_chat_responses_translated(
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
+    let kind = binding.entry_protocol.as_str();
     let request: Value = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(_) => return Err(translate_error(stream, "Chat 请求体不是合法 JSON")),
@@ -2057,6 +2351,8 @@ fn forward_chat_responses_translated(
             Ok(body) => body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
+    let responses_body =
+        normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
     let payload = responses_body.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
@@ -2074,7 +2370,32 @@ fn forward_chat_responses_translated(
     };
     let status = response.status();
     if !status.is_success() {
-        let detail = response.text().unwrap_or_default();
+        let upstream_headers = response.headers().clone();
+        let mut raw_error = Vec::new();
+        let _ = response.read_to_end(&mut raw_error);
+        let detail = String::from_utf8_lossy(&raw_error).to_string();
+        if matches!(status.as_u16(), 400 | 422) {
+            let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+            write_upstream_compatibility_diagnostic(
+                stream,
+                status,
+                binding,
+                kind,
+                &request,
+                &raw_error,
+                &upstream_headers,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
         let head = format!(
             "{}content-length: {}\r\n\r\n",
@@ -2180,6 +2501,361 @@ fn translate_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
     GatewayError::Answered
 }
 
+fn compatibility_normalize_error(
+    stream: &mut TcpStream,
+    binding: &GatewayBinding,
+    protocol: &str,
+    error: &crate::app::ai_compatibility::CompatibilityNormalizationError,
+) -> GatewayError {
+    crate::approval::manager::append_event_log(
+        "warn",
+        &format!(
+            "本机网关兼容矩阵拒绝发送：client={} provider={} protocol={} feature={}",
+            binding.client,
+            binding.service,
+            protocol,
+            error.feature.as_str()
+        ),
+    );
+    let provider_protocol = crate::store::ai_services::AIServiceProtocol::parse(protocol)
+        .unwrap_or(crate::store::ai_services::AIServiceProtocol::OpenaiChat);
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = matrix.resolve_provider(&binding.base_url, &provider_protocol);
+    let suggested_action = suggested_action_for_feature(error.feature.as_str());
+    let safe_message = format!(
+        "请求包含 Provider 无法安全降级的能力（{}）：{} {}",
+        error.feature.as_str(),
+        error.message,
+        suggested_action
+    );
+    let diagnostic = crate::app::ai_compatibility::CompatibilityDiagnosticV1 {
+        schema_version: crate::app::ai_compatibility::AI_COMPATIBILITY_SCHEMA_VERSION,
+        client: binding.client.clone(),
+        provider: provider.id.clone(),
+        client_protocol: binding.entry_protocol.clone(),
+        provider_protocol: provider_protocol.as_str().to_string(),
+        unsupported_feature: error.feature.as_str().to_string(),
+        upstream_status: 400,
+        request_id: None,
+        attempted_normalizations: vec![crate::app::ai_compatibility::NormalizationAction::Reject],
+        suggested_action: suggested_action.to_string(),
+        safe_message: safe_message.clone(),
+    };
+    let payload = if binding.entry_protocol == "anthropic" {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": safe_message,
+                "diagnostic": diagnostic
+            }
+        })
+    } else {
+        json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "himind_gateway_compatibility_rejected",
+                "message": safe_message,
+                "diagnostic": diagnostic
+            }
+        })
+    }
+    .to_string();
+    let _ = write_buffered_head(
+        stream,
+        400,
+        "application/json; charset=utf-8",
+        &binding.id,
+        payload.len(),
+    );
+    let _ = stream.write_all(payload.as_bytes());
+    let _ = stream.flush();
+    GatewayError::Answered
+}
+
+fn normalize_compatibility_request(
+    stream: &mut TcpStream,
+    binding: &GatewayBinding,
+    protocol: &str,
+    request: Value,
+) -> Result<Value, GatewayError> {
+    let protocol = match crate::store::ai_services::AIServiceProtocol::parse(protocol) {
+        Ok(protocol) => protocol,
+        Err(error) => return Err(translate_error(stream, &error)),
+    };
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = matrix.resolve_provider(&binding.base_url, &protocol);
+    let requested_model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model_rule = matrix.model_rule(&provider.id, &requested_model);
+    let fallback_client = crate::app::ai_compatibility::ClientCapability::default();
+    let client = matrix.client(&binding.client).unwrap_or(&fallback_client);
+    let normalized = crate::app::ai_compatibility::normalize_provider_request(
+        &protocol, request, client, provider, model_rule,
+    )
+    .map_err(|error| compatibility_normalize_error(stream, binding, protocol.as_str(), &error))?;
+    for change in &normalized.changes {
+        crate::approval::manager::append_event_log(
+            "info",
+            &format!(
+                "本机网关兼容矩阵：client={} provider={} feature={} action={:?} {}",
+                binding.client, provider.id, change.feature, change.action, change.detail
+            ),
+        );
+    }
+    Ok(normalized.request)
+}
+fn write_upstream_compatibility_diagnostic(
+    stream: &mut TcpStream,
+    status: reqwest::StatusCode,
+    binding: &GatewayBinding,
+    client_protocol: &str,
+    request: &Value,
+    upstream_body: &[u8],
+    upstream_headers: &reqwest::header::HeaderMap,
+) -> Result<(), GatewayError> {
+    let upstream_text = String::from_utf8_lossy(upstream_body);
+    let request_id = upstream_request_id(upstream_headers, upstream_text.as_ref());
+    let provider_protocol = crate::store::ai_services::AIServiceProtocol::parse(&binding.protocol)
+        .unwrap_or(crate::store::ai_services::AIServiceProtocol::OpenaiChat);
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = matrix.resolve_provider(&binding.base_url, &provider_protocol);
+    let unsupported_feature = infer_unsupported_feature(request, &upstream_text);
+    let suggested_action = suggested_action_for_feature(&unsupported_feature);
+    let safe_message = format!(
+        "{} 的请求与 Provider {} 不兼容（{}）。{}",
+        binding.client, provider.id, unsupported_feature, suggested_action
+    );
+    let diagnostic = crate::app::ai_compatibility::CompatibilityDiagnosticV1 {
+        schema_version: crate::app::ai_compatibility::AI_COMPATIBILITY_SCHEMA_VERSION,
+        client: binding.client.clone(),
+        provider: provider.id.clone(),
+        client_protocol: client_protocol.to_string(),
+        provider_protocol: provider_protocol.as_str().to_string(),
+        unsupported_feature: unsupported_feature.clone(),
+        upstream_status: status.as_u16(),
+        request_id: request_id.clone(),
+        attempted_normalizations: Vec::new(),
+        suggested_action: suggested_action.to_string(),
+        safe_message: safe_message.clone(),
+    };
+    crate::approval::manager::append_event_log(
+        "warn",
+        &format!(
+            "本机网关兼容诊断：client={} provider={} feature={} status={} request_id={}",
+            binding.client,
+            provider.id,
+            unsupported_feature,
+            status.as_u16(),
+            request_id.as_deref().unwrap_or("none")
+        ),
+    );
+    let payload = if client_protocol == "anthropic" {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": safe_message,
+                "diagnostic": diagnostic
+            }
+        })
+    } else {
+        json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "himind_gateway_compatibility_rejected",
+                "message": safe_message,
+                "diagnostic": diagnostic
+            }
+        })
+    }
+    .to_string();
+    write_buffered_head(
+        stream,
+        status.as_u16(),
+        "application/json; charset=utf-8",
+        &binding.id,
+        payload.len(),
+    )
+    .map_err(|_| GatewayError::Answered)?;
+    let _ = stream.write_all(payload.as_bytes());
+    let _ = stream.flush();
+    Ok(())
+}
+
+fn infer_unsupported_feature(request: &Value, upstream_text: &str) -> String {
+    // Anthropic often reports a bare "invalid request" for unsupported
+    // tool-result media. Inspect the actual request before falling back to the
+    // generic request_format label.
+    if contains_tool_result_media(request, "image") {
+        return "tool_result_image".to_string();
+    }
+    if contains_tool_result_media(request, "document") {
+        return "tool_result_file".to_string();
+    }
+    let detail = upstream_text.to_ascii_lowercase();
+    let request_text = request.to_string().to_ascii_lowercase();
+    for (needles, feature) in [
+        (&["tool_choice"][..], "tool_choice"),
+        (&["temperature"][..], "sampling_temperature"),
+        (&["top_p", "top-p"][..], "sampling_top_p"),
+        (
+            &["max_output_tokens", "max_tokens"][..],
+            "max_output_tokens",
+        ),
+        (&["namespace"][..], "namespace_tools"),
+        (&["web_search", "web search"][..], "web_search_tool"),
+        (
+            &["function_call", "tool history", "tool_history"][..],
+            "function_call_history",
+        ),
+    ] {
+        if needles.iter().any(|needle| detail.contains(needle)) {
+            return feature.to_string();
+        }
+    }
+    if detail.contains("image") || detail.contains("vision") {
+        if request_text.contains("function_call_output") {
+            return "tool_result_image".to_string();
+        }
+        return "user_input_image".to_string();
+    }
+    if detail.contains("file") || detail.contains("pdf") || detail.contains("document") {
+        return "tool_result_file".to_string();
+    }
+    if detail.contains("model") {
+        return "model".to_string();
+    }
+    if detail.contains("tool") {
+        return "tool_protocol".to_string();
+    }
+    "request_format".to_string()
+}
+
+fn contains_tool_result_media(value: &Value, media_type: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(content) = object.get("content").and_then(Value::as_array) {
+                    if content
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some(media_type))
+                    {
+                        return true;
+                    }
+                }
+            }
+            object
+                .values()
+                .any(|child| contains_tool_result_media(child, media_type))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|child| contains_tool_result_media(child, media_type)),
+        _ => false,
+    }
+}
+
+fn suggested_action_for_feature(feature: &str) -> &'static str {
+    match feature {
+        "tool_result_image" | "tool_result_file" => {
+            "请使用本机网关并把工具结果媒体降级为文本占位，或换用支持富媒体工具结果的 Provider。"
+        }
+        "user_input_image" => "该 Provider 不支持用户图片；请换用视觉模型或移除图片后重试。",
+        "tool_choice" => "请关闭强制工具选择或改用支持 tool_choice 的 Provider。",
+        "sampling_temperature" | "sampling_top_p" => {
+            "请移除 temperature/top_p 后重试，或在兼容矩阵中显式覆盖该 Provider 能力。"
+        }
+        "max_output_tokens" => "请降低 max_output_tokens/max_tokens 并确认模型输出上限。",
+        "namespace_tools" | "web_search_tool" | "function_call_history" => {
+            "请走本机网关并把扩展工具或工具历史降级后重试。"
+        }
+        "model" => "请从 /v1/models 中选择已登记的模型，不要在 Provider 间直接套用模型名。",
+        "tool_protocol" => "请检查 tools/tool_choice/工具结果格式，或切换到兼容 Provider。",
+        _ => {
+            "请逐项移除 tools、tool_choice、temperature、top_p 和图片后重试；仍失败时反馈参考编号。"
+        }
+    }
+}
+
+fn upstream_request_id(headers: &reqwest::header::HeaderMap, body: &str) -> Option<String> {
+    for name in [
+        "x-request-id",
+        "request-id",
+        "x-requestid",
+        "x-amzn-requestid",
+        "x-volc-request-id",
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(sanitize_request_id)
+        {
+            return Some(value);
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(found) = find_json_request_id(&value) {
+            return Some(found);
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    let marker = "request id:";
+    if let Some(position) = lower.find(marker) {
+        let tail = &body[position + marker.len()..];
+        if let Some(token) = tail.split_whitespace().next().and_then(sanitize_request_id) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn find_json_request_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "request_id",
+                "requestId",
+                "requestID",
+                "request-id",
+                "trace_id",
+            ] {
+                if let Some(found) = object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_request_id)
+                {
+                    return Some(found);
+                }
+            }
+            object.values().find_map(find_json_request_id)
+        }
+        Value::Array(items) => items.iter().find_map(find_json_request_id),
+        _ => None,
+    }
+}
+
+fn sanitize_request_id(raw: &str) -> Option<String> {
+    let token = raw
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | ',' | '}' | ']' | ':' | ';' | '.')
+        })
+        .trim();
+    if !(8..=160).contains(&token.len()) {
+        return None;
+    }
+    if token.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+    }) {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
 fn media_normalize_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
     let _ = write_json_error(
         stream,
@@ -2505,6 +3181,7 @@ mod tests {
         first.id = "codex:profile:alias-a".to_string();
         first.profile_id = "profile".to_string();
         first.exposed_model = "service-a/model-a".to_string();
+        first.upstream_model = "gpt-6.1-sol".to_string();
         first.models = vec![first.exposed_model.clone()];
         first.upstream_model = "model-a".to_string();
         first.is_default = true;
@@ -2538,10 +3215,12 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn aggregated_models_payload_uses_exposed_aliases() {
         let mut first = binding("codex", "openai-chat", "tok-1");
         first.profile_id = "profile".to_string();
         first.exposed_model = "service-a/model-a".to_string();
+        first.upstream_model = "gpt-6.1-sol".to_string();
         first.models = vec![first.exposed_model.clone()];
         let mut second = binding("codex", "openai-chat", "tok-1");
         second.profile_id = "profile".to_string();
@@ -2556,6 +3235,17 @@ mod tests {
             .filter_map(|item| item["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["service-a/model-a", "service-b/model-b"]);
+        let first_item = &payload["data"].as_array().unwrap()[0];
+        assert_eq!(
+            first_item["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(first_item["default_reasoning_effort"], "medium");
     }
 
     /// Claude Desktop 表面：`/v1/models` 必须给 Anthropic 形态的名字，否则
@@ -2563,11 +3253,13 @@ mod tests {
     #[test]
     fn claude_desktop_models_payload_uses_anthropic_aliases() {
         let mut first = binding("claude-desktop", "anthropic", "tok-1");
-        first.exposed_model = "service-a/model-a".to_string();
+        first.exposed_model = "service-a/deepseek-v4.1-flash".to_string();
         first.models = vec![first.exposed_model.clone()];
+        first.upstream_model = "deepseek-v4.1-flash".to_string();
         let mut second = binding("claude-desktop", "anthropic", "tok-1");
-        second.exposed_model = "service-b/model-b".to_string();
+        second.exposed_model = "service-b/kimi-k3".to_string();
         second.models = vec![second.exposed_model.clone()];
+        second.upstream_model = "kimi-k3".to_string();
         let refs = vec![&first, &second];
 
         let payload: Value = serde_json::from_str(&models_payload(&refs, true)).unwrap();
@@ -2579,8 +3271,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                claude_desktop_model_alias("service-a/model-a").as_str(),
-                claude_desktop_model_alias("service-b/model-b").as_str(),
+                claude_desktop_model_alias("service-a/deepseek-v4.1-flash").as_str(),
+                claude_desktop_model_alias("service-b/kimi-k3").as_str(),
             ]
         );
         for item in items {
@@ -2601,6 +3293,10 @@ mod tests {
                     .is_some_and(|name| name.contains("service-a") || name.contains("service-b")),
                 "可读名字要留在 display_name 里"
             );
+            assert_eq!(item["max_input_tokens"], 1_000_000);
+            assert_eq!(item["supports_1m"], true);
+            assert_eq!(item["max_output_tokens"], 64_000);
+            assert_eq!(item["supports_image_detail_original"], true);
         }
     }
 
@@ -2710,6 +3406,11 @@ mod tests {
         assert_eq!(selected.upstream_model, "model-a");
         assert_eq!(selected.exposed_model, alias);
         assert_eq!(selected.models, vec![alias.clone()]);
+
+        let one_million = format!(r#"{{"model":"{alias}[1m]","max_tokens":1}}"#);
+        let selected = authorize(&bindings, &headers, one_million.as_bytes(), "anthropic").unwrap();
+        assert_eq!(selected.upstream_model, "model-a");
+        assert_eq!(selected.exposed_model, format!("{alias}[1m]"));
 
         let unknown = format!(r#"{{"model":"claude-himind-not-a-route-00000000"}}"#);
         assert_eq!(
@@ -2832,6 +3533,80 @@ mod tests {
                 reasoning: 0
             }
         );
+    }
+
+    #[test]
+    fn strips_unsupported_responses_tools_but_keeps_functions() {
+        let original = json!({
+            "model": "model-a",
+            "input": "hi",
+            "tool_choice": "auto",
+            "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "mcp__cua_repl", "tools": []},
+                {"type": "web_search"}
+            ]
+        });
+        let fallback =
+            response_unsupported_tools_fallback(original.to_string().as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&fallback).unwrap();
+        assert_eq!(value["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["name"], "read");
+        assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn unsupported_tools_fallback_drops_tool_choice_when_no_tool_remains() {
+        let original = json!({
+            "model": "model-a",
+            "input": "hi",
+            "tool_choice": "auto",
+            "tools": [
+                {"type": "namespace", "name": "mcp__cua_repl", "tools": []},
+                {"type": "web_search"}
+            ]
+        });
+        let fallback =
+            response_unsupported_tools_fallback(original.to_string().as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&fallback).unwrap();
+        assert!(value.get("tools").is_none(), "fallback={value}");
+        assert!(value.get("tool_choice").is_none(), "fallback={value}");
+    }
+
+    #[test]
+    fn response_tool_output_media_fallback_strips_tool_images_only() {
+        let original = json!({
+            "model": "test-model",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,USER_IMAGE"}
+                ]},
+                {"type": "function_call", "call_id": "call-1", "name": "execute", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": [
+                    {"type": "input_text", "text": "browser screenshot"},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,TOOL_IMAGE"},
+                    {"type": "input_file", "file_data": "data:application/pdf;base64,TOOL_FILE"}
+                ]}
+            ]
+        });
+        let body = serde_json::to_vec(&original).unwrap();
+        let fallback = response_tool_output_media_fallback(&body).expect("media fallback");
+        let value: Value = serde_json::from_slice(&fallback).unwrap();
+        let output = value["input"][2]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[1]["type"], "input_text");
+        assert!(output[1]["text"].as_str().unwrap().contains("已由 HiMind"));
+        assert_eq!(output[2]["type"], "input_text");
+        assert!(!fallback
+            .windows(b"TOOL_IMAGE".len())
+            .any(|part| part == b"TOOL_IMAGE"));
+        assert!(!fallback
+            .windows(b"TOOL_FILE".len())
+            .any(|part| part == b"TOOL_FILE"));
+        assert!(fallback
+            .windows(b"USER_IMAGE".len())
+            .any(|part| part == b"USER_IMAGE"));
     }
 
     #[test]
@@ -3024,52 +3799,35 @@ mod tests {
         );
     }
     #[test]
-    fn responses_gateway_retries_when_upstream_rejects_native_tool_history() {
+    fn responses_gateway_pre_normalizes_limited_tool_history() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_address = upstream.local_addr().unwrap();
         let upstream_thread = thread::spawn(move || {
-            let (mut first, _) = upstream.accept().unwrap();
-            let (_, first_body) = match read_request(&mut first).unwrap() {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (_, body) = match read_request(&mut stream).unwrap() {
                 RequestRead::Request(head, body) => (head, body),
-                _ => panic!("expected first request"),
+                _ => panic!("expected normalized request"),
             };
-            let first_value: Value = serde_json::from_slice(&first_body).unwrap();
-            assert!(first_value["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item["type"] == "function_call"));
-            let rejected = br#"{"error":{"message":"tool history unsupported","type":"invalid_request_error"}}"#;
-            let rejected_head = format!(
-                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                rejected.len()
-            );
-            first.write_all(rejected_head.as_bytes()).unwrap();
-            first.write_all(rejected).unwrap();
-            first.flush().unwrap();
-
-            let (mut second, _) = upstream.accept().unwrap();
-            let (_, second_body) = match read_request(&mut second).unwrap() {
-                RequestRead::Request(head, body) => (head, body),
-                _ => panic!("expected fallback request"),
-            };
-            let second_value: Value = serde_json::from_slice(&second_body).unwrap();
-            assert!(second_value["input"]
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert!(value["input"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .all(|item| item["type"] == "message"));
+            assert!(!body.windows(11).any(|window| window == b"input_image"));
+            assert!(value.get("temperature").is_none());
+            assert!(value.get("top_p").is_none());
             let accepted = br#"{"id":"resp-test","usage":{"input_tokens":3,"output_tokens":1}}"#;
             let accepted_head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 accepted.len()
             );
-            second.write_all(accepted_head.as_bytes()).unwrap();
-            second.write_all(accepted).unwrap();
-            second.flush().unwrap();
+            stream.write_all(accepted_head.as_bytes()).unwrap();
+            stream.write_all(accepted).unwrap();
+            stream.flush().unwrap();
         });
 
-        let token = "responses-fallback-token".to_string();
+        let token = "responses-pre-normalize-token".to_string();
         let resolver_token = token.clone();
         let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
             vec![GatewayBinding {
@@ -3093,10 +3851,15 @@ mod tests {
         let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
         let request_body = json!({
             "model": "service/model-a",
+            "temperature": 0.2,
+            "top_p": 0.9,
             "input": [
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
                 {"type": "function_call", "call_id": "call-1", "name": "read", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+                {"type": "function_call_output", "call_id": "call-1", "output": [
+                    {"type": "input_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,AAAA"}
+                ]}
             ],
             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
         })
@@ -3118,7 +3881,6 @@ mod tests {
             "response={response}"
         );
     }
-
     #[test]
     fn responses_request_through_gateway_offloads_large_images_before_upstream() {
         use base64::Engine as _;
@@ -3462,5 +4224,167 @@ mod tests {
             response.contains(r#""model":"service/model-a""#),
             "response={response}"
         );
+    }
+    #[test]
+    fn anthropic_tool_result_image_gets_specific_diagnostic_feature() {
+        let request = serde_json::json!({
+            "model": "model-a",
+            "messages": [
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}}]
+                }]}
+            ]
+        });
+        assert_eq!(
+            infer_unsupported_feature(&request, "invalid request"),
+            "tool_result_image"
+        );
+    }
+
+    #[test]
+    fn generic_upstream_400_returns_safe_structured_diagnostic() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let rejected = br#"{"error":{"message":"tool_choice unsupported; Authorization: Bearer sk-secret-value; request id: req_vt_test_123","type":"invalid_request_error"}}"#;
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nx-request-id: req_vt_header_456\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                rejected.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(rejected).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "diagnostic-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "opencode:diagnostic".to_string(),
+                client: "opencode".to_string(),
+                service: "custom:diagnostic".to_string(),
+                profile_id: String::new(),
+                entry_protocol: "openai-responses".to_string(),
+                exposed_model: "model-a".to_string(),
+                models: vec!["model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-secret".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "model-a",
+            "tool_choice": "auto",
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains(r#""code":"himind_gateway_compatibility_rejected""#));
+        assert!(response.contains(r#""client":"opencode""#));
+        assert!(response.contains(r#""provider":"openai_responses_limited""#));
+        assert!(response.contains(r#""unsupported_feature":"tool_choice""#));
+        assert!(response.contains(r#""request_id":"req_vt_header_456""#));
+        assert!(response.contains(r#""suggested_action""#));
+        assert!(!response.contains("sk-secret-value"));
+        assert!(!response.contains("upstream-secret"));
+        assert!(!response.contains("Bearer sk-"));
+    }
+    #[test]
+    fn responses_gateway_retries_transient_upstream_500_once() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            for attempt in 1..=2 {
+                let (mut stream, _) = upstream.accept().unwrap();
+                let _ = read_request(&mut stream).unwrap();
+                let (status, body) = if attempt == 1 {
+                    (
+                        "500 Internal Server Error",
+                        br#"{"error":{"type":"service_unavailable_error","message":"temporary upstream failure"}}"#.as_slice(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        br#"{"id":"resp-retry-test","object":"response","output":[],"usage":{"input_tokens":2,"output_tokens":1}}"#.as_slice(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let token = "retry-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "opencode:retry".to_string(),
+                client: "opencode".to_string(),
+                service: "custom:vector-tide".to_string(),
+                profile_id: String::new(),
+                entry_protocol: "openai-responses".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "service/model-a",
+            "stream": false,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("resp-retry-test"), "{response}");
     }
 }

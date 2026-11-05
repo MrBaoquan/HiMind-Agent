@@ -41,12 +41,20 @@ impl BuiltinAiModelSync {
         options: &Options,
         proxy: &BuiltinAiProxyControl,
     ) -> Result<BuiltinAiModelSyncResult, String> {
-        require_dashboard_model_sync(options)?;
         let previous = self
             .snapshot
             .lock()
             .map_err(|_| "HiMind AI 模型同步状态不可用".to_string())?
             .clone();
+        if previous.user_id == "local" {
+            return Ok(BuiltinAiModelSyncResult {
+                status: "unchanged".to_string(),
+                model_count: previous.models.len(),
+                restarted: false,
+                session_url: String::new(),
+            });
+        }
+        require_dashboard_model_sync(options)?;
         let credential = fetch_client_credential(options, &previous.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
         let next = snapshot(&previous.user_id, &credential);

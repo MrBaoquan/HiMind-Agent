@@ -13,6 +13,11 @@ use crate::agent_core_contracts::{
 pub(crate) const LOCAL_RUN_DB_FILE: &str = "local-runs.sqlite3";
 const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Workflow steps may block in a long model call without touching SQLite for
+/// several minutes. Keep a generous lease TTL; the renewal thread refreshes it
+/// every 30 seconds, and the stale sweep also verifies that the owning process
+/// is gone before declaring the run abandoned.
+pub(crate) const RUN_LEASE_TTL_SECONDS: u64 = 900;
 const BEST_EFFORT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 // Schema creation is idempotent, but SQLite still takes a write lock for DDL
 // and migration inserts. Serialize initialization inside one Agent process so
@@ -439,23 +444,25 @@ impl LocalRunLedger {
         force: bool,
         limit: usize,
     ) -> Result<Vec<LocalRun>, Box<dyn Error>> {
-        let run_ids = if force {
+        let lease_rows = if force {
             let connection = self.connection()?;
             let mut statement = connection.prepare(
-                "SELECT run_id
+                "SELECT local_runs.run_id, local_run_leases.owner
                  FROM local_runs
-                 WHERE status = 'running'
-                 ORDER BY updated_at ASC
+                 LEFT JOIN local_run_leases
+                   ON local_run_leases.run_id = local_runs.run_id
+                 WHERE local_runs.status = 'running'
+                 ORDER BY local_runs.updated_at ASC
                  LIMIT ?1",
             )?;
-            let run_ids = statement
-                .query_map(params![limit.clamp(1, 100) as i64], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?;
-            run_ids
+            let rows = statement.query_map(params![limit.clamp(1, 100) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
         } else {
             let connection = self.connection()?;
             let mut statement = connection.prepare(
-                "SELECT local_runs.run_id
+                "SELECT local_runs.run_id, local_run_leases.owner
                  FROM local_runs
                  JOIN local_run_leases
                    ON local_run_leases.run_id = local_runs.run_id
@@ -464,15 +471,17 @@ impl LocalRunLedger {
                  ORDER BY local_run_leases.expires_at ASC
                  LIMIT ?1",
             )?;
-            let run_ids = statement
+            let rows = statement
                 .query_map(params![limit.clamp(1, 100) as i64, unix_now_i64()], |row| {
-                    row.get(0)
-                })?
-                .collect::<Result<Vec<String>, _>>()?;
-            run_ids
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut recovered = Vec::new();
-        for run_id in run_ids {
+        for (run_id, owner) in lease_rows {
+            if !force && owner.as_deref().is_some_and(lease_owner_process_alive) {
+                continue;
+            }
             let Some(mut run) = self.get_run(&run_id)? else {
                 continue;
             };
@@ -529,10 +538,10 @@ impl LocalRunLedger {
         limit: usize,
     ) -> Result<Vec<LocalRun>, Box<dyn Error>> {
         let now = unix_now_i64();
-        let run_ids = {
+        let lease_rows = {
             let connection = self.connection()?;
             let mut statement = connection.prepare(
-                "SELECT local_runs.run_id
+                "SELECT local_runs.run_id, local_run_leases.owner
                  FROM local_runs
                  LEFT JOIN local_run_leases
                    ON local_run_leases.run_id = local_runs.run_id
@@ -550,21 +559,25 @@ impl LocalRunLedger {
                  ORDER BY local_runs.updated_at ASC
                  LIMIT ?1",
             )?;
-            let run_ids = statement
-                .query_map(
-                    params![
-                        limit.clamp(1, 500) as i64,
-                        now,
-                        now.saturating_sub(grace_seconds.max(0)),
-                        now.saturating_sub(grace_seconds.max(0).saturating_mul(15)),
-                    ],
-                    |row| row.get(0),
-                )?
-                .collect::<Result<Vec<String>, _>>()?;
-            run_ids
+            let rows = statement.query_map(
+                params![
+                    limit.clamp(1, 500) as i64,
+                    now,
+                    now.saturating_sub(grace_seconds.max(0)),
+                    now.saturating_sub(grace_seconds.max(0).saturating_mul(15)),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut abandoned = Vec::new();
-        for run_id in run_ids {
+        for (run_id, owner) in lease_rows {
+            // A slow SQLite writer can delay lease renewal past the TTL even
+            // though the workflow process is alive. Process identity is the
+            // stronger signal; never abandon a run owned by this live process.
+            if owner.as_deref().is_some_and(lease_owner_process_alive) {
+                continue;
+            }
             let Some(mut run) = self.get_run(&run_id)? else {
                 continue;
             };
@@ -1299,6 +1312,14 @@ fn unix_now_i64() -> i64 {
         .unwrap_or_default()
 }
 
+fn lease_owner_process_alive(owner: &str) -> bool {
+    owner
+        .strip_prefix("workflow-pid-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .is_some_and(crate::mcp_ipc::process_is_alive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1775,6 +1796,42 @@ mod tests {
         assert!(ledger.list_events("run-1").unwrap().iter().any(|event| {
             event.payload.get("recovered").and_then(Value::as_bool) == Some(true)
         }));
+    }
+
+    #[test]
+    fn live_lease_owner_is_not_abandoned_after_expiry() {
+        let ledger = ledger();
+        ledger.record_interaction(&interaction()).unwrap();
+        ledger.save_run(&run(LocalRunStatus::Running)).unwrap();
+        let owner = format!("workflow-pid-{}-run-1", std::process::id());
+        assert!(ledger.acquire_run_lease("run-1", &owner, 300).unwrap());
+        let connection = ledger.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE local_run_leases SET expires_at = 0 WHERE run_id = 'run-1'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(ledger.recover_running_runs(false, 10).unwrap().is_empty());
+        assert!(ledger
+            .abandon_stale_runs("stale", 0, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ledger.get_run("run-1").unwrap().unwrap().status,
+            LocalRunStatus::Running
+        );
+        let connection = ledger.connection().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_run_leases WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

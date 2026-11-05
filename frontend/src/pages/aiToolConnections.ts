@@ -14,8 +14,8 @@ import type {
   ManagedAIServiceSummary,
   McpTargetDescriptor,
 } from '../services/agentApi';
-import { acpPresets } from './acpProfileView';
-import { clientLabel } from '../utils/clientLabels';
+import { acpPresets } from './acpProfileView.ts';
+import { clientLabel } from '../utils/clientLabels.ts';
 
 export type ToolCapabilities = { mcp: boolean; model: boolean; exec: boolean };
 
@@ -66,12 +66,14 @@ export function toolState(item: ToolConnection): ToolState {
   return mcpSettled && modelSettled && execSettled ? 'ready' : 'idle';
 }
 
-// 排序：内置置顶 → 待处理 → 已就绪 → 未接入。把已接好的排在未接入前面，
-// 接一个工具它就往上走一格，列表底部留给那串可选的未接入工具。
-const STATE_RANK: Record<ToolState, number> = { attention: 1, ready: 2, idle: 3 };
+// 排序与状态解耦：内置置顶，其余按展示名（同名再按稳定 key）排。
+// 状态只用于标签和筛选，不再决定位置——否则接好一个工具、探测一次、同步一次配置，
+// 整张表就会重新洗牌，用户回来找不到刚才那一行。
+// 工具身份 key 在改名后也不变，所以改名之外的操作不会让行跳动。
 
-function rank(item: ToolConnection): number {
-  return item.builtin ? 0 : STATE_RANK[item.state];
+function compareTools(left: ToolConnection, right: ToolConnection): number {
+  if (left.builtin !== right.builtin) return left.builtin ? -1 : 1;
+  return left.name.localeCompare(right.name, 'zh-Hans-CN') || left.key.localeCompare(right.key);
 }
 
 export function buildToolConnections(input: {
@@ -115,11 +117,7 @@ export function buildToolConnections(input: {
     return item;
   });
 
-  return items.sort((a, b) => {
-    const byRank = rank(a) - rank(b);
-    if (byRank) return byRank;
-    return a.name.localeCompare(b.name, 'zh-Hans-CN');
-  });
+  return items.sort(compareTools);
 }
 
 /** 模型来源的展示名：把簿记里的 `managed` / `custom:<id>` / 空值翻成人话。 */

@@ -291,13 +291,23 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
 
         let candidate_sha256 = sha256_file(&source)?;
         let previous = read(&manifest.id, &manifest.version).ok();
-        crate::app::extension_activation::ensure_workspace_identity(
-            previous
-                .as_ref()
-                .and_then(|draft| draft.workspace_path.as_deref()),
-            source.parent().unwrap_or(source.as_path()),
-            crate::app::extension_activation::ActivationKind::Skill,
-        )?;
+        let can_rebind = previous.as_ref().is_some_and(|draft| {
+            crate::app::extension_activation::can_rebind_authoring_workspace(
+                &draft.source,
+                draft.submitted_at.is_some(),
+                draft.dashboard_draft_id.is_some(),
+                draft.workspace_path.as_deref(),
+            )
+        });
+        if !can_rebind {
+            crate::app::extension_activation::ensure_workspace_identity(
+                previous
+                    .as_ref()
+                    .and_then(|draft| draft.workspace_path.as_deref()),
+                source.parent().unwrap_or(source.as_path()),
+                crate::app::extension_activation::ActivationKind::Skill,
+            )?;
+        }
         let unchanged = previous
             .as_ref()
             .is_some_and(|draft| draft.candidate_sha256 == candidate_sha256);

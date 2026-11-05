@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::store::ai_services::{self, AIServiceProtocol, CustomAIService, CAP_CHAT, CAP_VISION};
+use crate::store::ai_services::{self, AIServiceProtocol, CustomAIService, CAP_VISION};
 
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_EDGE: u32 = 1024;
@@ -43,9 +43,15 @@ pub(crate) fn describe(input: &Value) -> Result<Value, Box<dyn Error>> {
     } else {
         return Err("service 必须是 custom:<id>，留空由 Agent 按能力绑定选择".into());
     };
+    // 模型解析顺序必须与路由计划一致（ADR 0023 第七条）：
+    // 显式传入 → `vision.describe` 的媒体绑定 → 服务对话模型。
+    // 计划里 `capability_models(CAP_VISION)` 用的也是这个顺序，三处同源。
     let model = string_field(input, "model")
-        .or_else(|| ai_services::binding_for(&service, CAP_VISION).map(|(_, model)| model))
-        .or_else(|| ai_services::binding_for(&service, CAP_CHAT).map(|(_, model)| model))
+        .or_else(|| {
+            ai_services::capability_models(&service, CAP_VISION)
+                .into_iter()
+                .next()
+        })
         .unwrap_or_else(|| service.model.clone());
     if model.trim().is_empty() {
         return Err("当前 AI 服务没有可用模型".into());

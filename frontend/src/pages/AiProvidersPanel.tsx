@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronLeft, ChevronRight, CircleDashed, CircleX, ExternalLink, Pencil, PlugZap, RefreshCw, Search, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronLeft, ChevronRight, CircleDashed, CircleX, Copy, ExternalLink, Info, Pencil, PlugZap, RefreshCw, Search, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
 import { Pill } from '../components/Common';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -15,6 +15,7 @@ import {
   capabilityAdapter,
   capabilityModel,
   inferPresetCapabilities,
+  primaryRouteServiceId,
   serviceCapabilities,
   serviceSupportsCapability,
   suggestedServiceId,
@@ -32,6 +33,18 @@ const protocolLabels: Record<AIServiceProtocol, string> = {
   'openai-chat': 'Chat',
   anthropic: 'Anthropic',
 };
+
+/** 火山方舟 Agent Plan 只有 Messages 推理入口，没有 `/models` 发现接口。 */
+function isVolcengineAgentPlan(baseUrl: string): boolean {
+  try {
+    const parsed = new URL(baseUrl.trim());
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
+    return host.endsWith('.volces.com') && path === '/api/plan';
+  } catch {
+    return false;
+  }
+}
 
 const mediaCapabilityLabels: Record<string, string> = {
   'image.generate': '生图',
@@ -104,12 +117,17 @@ type AiProvidersPanelProps = {
     speech_adapter: string;
     transcribe_model: string;
     transcribe_adapter: string;
+    /** 视觉理解专用模型；留空表示跟随对话模型（ADR 0023 第七条）。 */
+    vision_model: string;
+    /** 媒体能力的额外可选模型：能力 → 模型列表（不含默认模型）。 */
+    media_models: Record<string, string[]>;
     balance_profile_id: string;
     balance_access_token: string;
     balance_user_id: string;
     api_key: string;
   }) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
+  onCloneAIService: (id: string) => Promise<CustomAIService>;
   onOpenAccount: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
@@ -128,14 +146,21 @@ const emptyDraft = {
   models: '',
   image_model: '',
   image_adapter: '',
+  image_models: '',
   image_edit_model: '',
   image_edit_adapter: '',
+  image_edit_models: '',
   video_model: '',
   video_adapter: '',
+  video_models: '',
   speech_model: '',
   speech_adapter: '',
+  speech_models: '',
   transcribe_model: '',
   transcribe_adapter: '',
+  transcribe_models: '',
+  vision_model: '',
+  vision_models: '',
   balance_profile_id: '',
   balance_access_token: '',
   balance_user_id: '',
@@ -154,6 +179,7 @@ export function AiProvidersPanel({
   onRefresh,
   onSaveAIService,
   onRemoveAIService,
+  onCloneAIService,
   onOpenAccount,
   onFetchModels,
   onFetchSavedModels,
@@ -167,11 +193,13 @@ export function AiProvidersPanel({
   const [saving, setSaving] = useState(false);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [formError, setFormError] = useState('');
+  const [formNotice, setFormNotice] = useState('');
   const [balanceSnapshots, setBalanceSnapshots] = useState<Record<string, AIServiceBalanceSnapshot>>(aiServices?.custom?.balances ?? {});
   const [providerCatalog, setProviderCatalog] = useState<MediaProviderCatalogResult | null>(null);
   const [balanceRefreshingId, setBalanceRefreshingId] = useState<string | null>(null);
   const [balanceErrors, setBalanceErrors] = useState<Record<string, string>>({});
   const [connectionChecks, setConnectionChecks] = useState<Record<string, ConnectionCheck>>({});
+  const [cloningServiceId, setCloningServiceId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [capabilityFilter, setCapabilityFilter] = useState<'all' | AIServiceCapability>('all');
   const [selectedPreset, setSelectedPreset] = useState<string>('');
@@ -180,9 +208,9 @@ export function AiProvidersPanel({
   const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   const customServices = aiServices?.custom?.services ?? [];
-  const activeServiceId = aiServices?.custom?.active_service_id ?? '';
-  const mediaDefaults = aiServices?.custom?.media_services ?? {};
-  const imageServiceId = aiServices?.custom?.image_service_id ?? '';
+  // 每个能力的默认服务即该能力路由表的第一项（ADR 0023）。
+  const routeTable = aiServices?.custom?.capability_routes ?? {};
+  const activeServiceId = primaryRouteServiceId(routeTable, 'chat');
   const managed = aiServices?.managed ?? { available: false };
   const clientStatuses = aiServices?.clients?.targets ?? [];
   const serviceCount = customServices.length;
@@ -244,8 +272,9 @@ export function AiProvidersPanel({
     const labels: string[] = [];
     if (activeServiceId === service.id) labels.push('对话默认');
     for (const capability of MEDIA_CAPABILITIES) {
-      const selected = mediaDefaults[capability] || (capability === 'image.generate' ? imageServiceId : '');
-      if (selected === service.id) labels.push(`${AI_SERVICE_CAPABILITY_LABELS[capability]}默认`);
+      if (primaryRouteServiceId(routeTable, capability) === service.id) {
+        labels.push(`${AI_SERVICE_CAPABILITY_LABELS[capability]}默认`);
+      }
     }
     return labels;
   }
@@ -289,6 +318,7 @@ export function AiProvidersPanel({
     setEnabledCapabilities(enabled);
     setFormStep(0);
     setFormError('');
+    setFormNotice('');
     setDraft({
       id: preset.id,
       display_name: preset.name,
@@ -298,14 +328,21 @@ export function AiProvidersPanel({
       models: preset.models.join(', '),
       image_model: imageModel,
       image_adapter: imageModel ? 'openai-images' : '',
+      image_models: '',
       image_edit_model: editModel,
       image_edit_adapter: editModel ? 'openai-images-edit' : '',
+      image_edit_models: '',
       video_model: videoModel,
       video_adapter: isWanVideo ? 'wan-video' : '',
+      video_models: '',
       speech_model: speechModel,
       speech_adapter: speechModel ? 'openai-speech' : '',
+      speech_models: '',
       transcribe_model: transcribeModel,
       transcribe_adapter: transcribeModel ? 'openai-audio' : '',
+      transcribe_models: '',
+      vision_model: '',
+      vision_models: '',
       balance_profile_id: balanceProfileForPreset(preset.base_url),
       balance_access_token: '',
       balance_user_id: '',
@@ -333,11 +370,48 @@ export function AiProvidersPanel({
       case 'video.generate': return draft.video_model.trim();
       case 'audio.speech': return draft.speech_model.trim();
       case 'audio.transcribe': return draft.transcribe_model.trim();
+      case 'vision.describe': return draft.vision_model.trim();
     }
+  }
+
+  function draftModelsFor(capability: AIServiceCapability): string {
+    switch (capability) {
+      case 'chat': return draft.models;
+      case 'image.generate': return draft.image_models;
+      case 'image.edit': return draft.image_edit_models;
+      case 'video.generate': return draft.video_models;
+      case 'audio.speech': return draft.speech_models;
+      case 'audio.transcribe': return draft.transcribe_models;
+      case 'vision.describe': return draft.vision_models;
+    }
+  }
+
+  /** 把表单里的逗号/换行分隔列表拆成去重后的模型名，并剔除默认模型本身。 */
+  function parseExtraModels(raw: string, defaultModel: string): string[] {
+    const seen = new Set<string>();
+    const models: string[] = [];
+    for (const item of raw.split(/[\n,]/)) {
+      const model = item.trim();
+      if (!model || model === defaultModel.trim() || seen.has(model)) continue;
+      seen.add(model);
+      models.push(model);
+    }
+    return models;
+  }
+
+  function mediaModelsPayload(enabled: Set<AIServiceCapability>) {
+    const payload: Record<string, string[]> = {};
+    for (const capability of MEDIA_CAPABILITIES) {
+      if (!enabled.has(capability) || !draftModelFor(capability)) continue;
+      const extra = parseExtraModels(draftModelsFor(capability), draftModelFor(capability));
+      if (extra.length) payload[capability] = extra;
+    }
+    return payload;
   }
 
   function toggleCapability(capability: AIServiceCapability) {
     setFormError('');
+    setFormNotice('');
     setEnabledCapabilities(current => {
       if (current.includes(capability)) return current.filter(item => item !== capability);
       return [...current, capability];
@@ -361,8 +435,14 @@ export function AiProvidersPanel({
 
   function capabilityStepError() {
     if (!enabledCapabilities.length) return '请至少启用一项能力。';
-    const missing = enabledCapabilities.find(capability => !draftModelFor(capability));
-    if (missing) return `请为「${AI_SERVICE_CAPABILITY_LABELS[missing]}」填写模型。`;
+    for (const capability of enabledCapabilities) {
+      if (draftModelFor(capability)) continue;
+      // 视觉理解没有显式绑定时跟随服务的对话模型（ADR 0023 第七条），
+      // 后端 capability_models / vision_describe / binding_shape 都按这个顺序解析。
+      // 所以它只在「连对话模型都没有」时才真的缺模型，不能当成必填媒体能力。
+      if (capability === 'vision.describe' && draft.model.trim()) continue;
+      return `请为「${AI_SERVICE_CAPABILITY_LABELS[capability]}」填写模型。`;
+    }
     return '';
   }
 
@@ -413,6 +493,8 @@ export function AiProvidersPanel({
         speech_adapter: enabled.has('audio.speech') ? (draft.speech_adapter || 'openai-speech') : '',
         transcribe_model: enabled.has('audio.transcribe') ? draft.transcribe_model.trim() : '',
         transcribe_adapter: enabled.has('audio.transcribe') ? (draft.transcribe_adapter || 'openai-audio') : '',
+        vision_model: enabled.has('vision.describe') ? draft.vision_model.trim() : '',
+        media_models: mediaModelsPayload(enabled),
         balance_profile_id: draft.balance_profile_id,
         balance_access_token: draft.balance_access_token.trim(),
         balance_user_id: draft.balance_user_id.trim(),
@@ -452,6 +534,13 @@ export function AiProvidersPanel({
   async function fetchModels() {
     if (!draft.base_url.trim() || (!draft.api_key.trim() && !editing)) return;
     setFormError('');
+    setFormNotice('');
+    if (isVolcengineAgentPlan(draft.base_url)) {
+      setFormNotice(draft.models.trim()
+        ? 'Agent Plan 无 /models 接口，已保留现有模型。保存后点“检查连接”验证 Key。'
+        : 'Agent Plan 不提供 /models 模型列表接口，请手动填写模型。保存后可用“检查连接”验证 Key。');
+      return;
+    }
     setFetchingModels(true);
     try {
       const models = draft.api_key.trim()
@@ -473,9 +562,54 @@ export function AiProvidersPanel({
     setConnectionChecks(current => ({ ...current, [service.id]: { state: 'busy', message: '检查中…' } }));
     try {
       const models = await onFetchSavedModels(service.id, service.base_url);
-      setConnectionChecks(current => ({ ...current, [service.id]: { state: 'ok', message: `模型接口可用 · ${models.length} 个模型` } }));
+      setConnectionChecks(current => ({
+        ...current,
+        [service.id]: {
+          state: 'ok',
+          message: isVolcengineAgentPlan(service.base_url)
+            ? `推理接口可用 · 已验证 ${capabilityModel(service, 'chat') || '默认模型'} · ${models.length} 个目录模型`
+            : `模型接口可用 · ${models.length} 个模型`,
+        },
+      }));
     } catch (error) {
-      setConnectionChecks(current => ({ ...current, [service.id]: { state: 'error', message: formatAIServiceError(error, '模型接口不可用') } }));
+      setConnectionChecks(current => ({
+        ...current,
+        [service.id]: {
+          state: 'error',
+          message: formatAIServiceError(
+            error,
+            isVolcengineAgentPlan(service.base_url) ? '推理接口不可用' : '模型接口不可用',
+          ),
+        },
+      }));
+    }
+  }
+
+  async function cloneService(service: CustomAIService) {
+    if (cloningServiceId) return;
+    setCloningServiceId(service.id);
+    setConnectionChecks(current => ({
+      ...current,
+      [service.id]: { state: 'busy', message: '正在复制服务和加密凭据…' },
+    }));
+    try {
+      const cloned = await onCloneAIService(service.id);
+      setConnectionChecks(current => ({
+        ...current,
+        [service.id]: { state: 'ok', message: `已克隆为 ${cloned.display_name}` },
+      }));
+      openEditService(cloned);
+      setFormNotice('已复制连接信息、模型、能力与加密凭据。可修改名称或参数后保存为新服务。');
+    } catch (error) {
+      setConnectionChecks(current => ({
+        ...current,
+        [service.id]: {
+          state: 'error',
+          message: formatAIServiceError(error, '克隆 AI 服务失败'),
+        },
+      }));
+    } finally {
+      setCloningServiceId(null);
     }
   }
 
@@ -488,6 +622,7 @@ export function AiProvidersPanel({
     setEnabledCapabilities(['chat']);
     setFormStep(0);
     setFormError('');
+    setFormNotice('');
     setFormOpen(true);
   }
 
@@ -505,14 +640,21 @@ export function AiProvidersPanel({
       models: service.models.join(', '),
       image_model: service.image_model ?? '',
       image_adapter: service.image_adapter ?? '',
+      image_models: (service.media?.['image.generate']?.models ?? []).join(', '),
       image_edit_model: service.media?.['image.edit']?.model ?? '',
       image_edit_adapter: service.media?.['image.edit']?.adapter ?? '',
+      image_edit_models: (service.media?.['image.edit']?.models ?? []).join(', '),
       video_model: service.media?.['video.generate']?.model ?? '',
       video_adapter: service.media?.['video.generate']?.adapter ?? '',
+      video_models: (service.media?.['video.generate']?.models ?? []).join(', '),
       speech_model: service.media?.['audio.speech']?.model ?? '',
       speech_adapter: service.media?.['audio.speech']?.adapter ?? '',
+      speech_models: (service.media?.['audio.speech']?.models ?? []).join(', '),
       transcribe_model: service.media?.['audio.transcribe']?.model ?? '',
       transcribe_adapter: service.media?.['audio.transcribe']?.adapter ?? '',
+      transcribe_models: (service.media?.['audio.transcribe']?.models ?? []).join(', '),
+      vision_model: service.media?.['vision.describe']?.model ?? '',
+      vision_models: (service.media?.['vision.describe']?.models ?? []).join(', '),
       balance_profile_id: service.balance_profile_id ?? '',
       balance_access_token: '',
       balance_user_id: service.balance_user_id ?? '',
@@ -530,6 +672,7 @@ export function AiProvidersPanel({
     setFormOpen(false);
     setEditingServiceId(null);
     setFormStep(0);
+    setFormNotice('');
   }
   return (
     <div className="ai-providers-view">
@@ -586,8 +729,10 @@ export function AiProvidersPanel({
               balanceLoading={balanceRefreshingId === service.id}
               balanceBusy={balanceRefreshingId !== null}
               balanceError={balanceErrors[service.id] ?? ''}
+              cloneBusy={cloningServiceId === service.id}
               onCheckConnection={() => void checkServiceConnection(service)}
               onRefreshBalance={() => void refreshBalance(service.id)}
+              onClone={() => void cloneService(service)}
               onEdit={() => openEditService(service)}
               onRemove={() => void onRemoveAIService(service.id)}
             />
@@ -609,6 +754,7 @@ export function AiProvidersPanel({
             </div>
             <div className="modal-body ai-service-modal-body">
               {formError ? <div className="ai-service-form-error" role="alert"><CircleX size={15} /><span>{formError}</span></div> : null}
+              {formNotice ? <div className="ai-service-form-notice" role="status"><Info size={15} /><span>{formNotice}</span></div> : null}
               <div className="ai-service-steps" aria-label="配置步骤">
                 {['连接', '能力与模型', '高级与用量'].map((label, index) => (
                   <span key={label} className={`ai-service-step${formStep === index ? ' active' : ''}${formStep > index ? ' complete' : ''}`}>
@@ -673,9 +819,10 @@ export function AiProvidersPanel({
                     <label className="field-label ai-service-field"><span>对话默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-4.1 / deepseek-chat" /></label>
                     <label className="field-label ai-service-field"><span>可用模型</span><input value={draft.models} onChange={(event) => setDraft((current) => ({ ...current, models: event.target.value }))} placeholder="多个模型用逗号分隔" /></label>
                   </div>
-                  <button className="btn ai-service-fetch-models" title={!draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
-                    {fetchingModels ? <BusyIndicator size={14} /> : <RefreshCw size={14} />}{fetchingModels ? '获取中' : '从服务获取模型'}
+                  <button className="btn ai-service-fetch-models" title={isVolcengineAgentPlan(draft.base_url) ? 'Agent Plan 不提供 /models；模型由目录提供' : !draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
+                    {fetchingModels ? <BusyIndicator size={14} /> : isVolcengineAgentPlan(draft.base_url) ? <Info size={14} /> : <RefreshCw size={14} />}{fetchingModels ? '获取中' : isVolcengineAgentPlan(draft.base_url) ? '使用目录模型' : '从服务获取模型'}
                   </button>
+                  {isVolcengineAgentPlan(draft.base_url) ? <small className="ai-service-hint">Agent Plan 不提供模型列表；模型来自目录。保存后的“检查连接”会发送 1 Token 的 Messages 探测。</small> : null}
                 </div> : null}
 
                 {enabledCapabilities.includes('image.generate') ? <div className="ai-capability-card">
@@ -683,6 +830,7 @@ export function AiProvidersPanel({
                   <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>生图模型</span><input value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
                     <label className="field-label ai-service-field"><span>生图适配器</span><select value={draft.image_adapter || 'openai-images'} onChange={(event) => setDraft((current) => ({ ...current, image_adapter: event.target.value }))}><option value="openai-images">OpenAI Images</option><option value="ark-images">火山方舟</option></select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它生图模型</span><input value={draft.image_models} onChange={(event) => setDraft((current) => ({ ...current, image_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
                 </div> : null}
 
@@ -691,6 +839,7 @@ export function AiProvidersPanel({
                   <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>改图模型</span><input value={draft.image_edit_model} onChange={(event) => setDraft((current) => ({ ...current, image_edit_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seededit" /></label>
                     <label className="field-label ai-service-field"><span>改图适配器</span><select value={draft.image_edit_adapter || 'openai-images-edit'} onChange={(event) => setDraft((current) => ({ ...current, image_edit_adapter: event.target.value }))}><option value="openai-images-edit">OpenAI Images Edits</option><option value="ark-images">火山方舟</option></select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它改图模型</span><input value={draft.image_edit_models} onChange={(event) => setDraft((current) => ({ ...current, image_edit_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
                 </div> : null}
 
@@ -699,6 +848,7 @@ export function AiProvidersPanel({
                   <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>生视频模型</span><input value={draft.video_model} onChange={(event) => setDraft((current) => ({ ...current, video_model: event.target.value }))} placeholder="如 doubao-seedance-2-5-…" /></label>
                     <label className="field-label ai-service-field"><span>视频适配器</span><select value={draft.video_adapter || 'ark-video'} onChange={(event) => setDraft((current) => ({ ...current, video_adapter: event.target.value }))}><option value="ark-video">火山方舟 Seedance</option><option value="wan-video">阿里云百炼万相</option></select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它视频模型</span><input value={draft.video_models} onChange={(event) => setDraft((current) => ({ ...current, video_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
                   <small className="ai-service-hint">视频是异步任务，提交后通过媒体任务查询结果。</small>
                 </div> : null}
@@ -708,6 +858,7 @@ export function AiProvidersPanel({
                   <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>语音合成模型</span><input value={draft.speech_model} onChange={(event) => setDraft((current) => ({ ...current, speech_model: event.target.value }))} placeholder="如 tts-1 / s2.1-pro-free" /></label>
                     <label className="field-label ai-service-field"><span>语音合成适配器</span><select value={draft.speech_adapter || 'openai-speech'} onChange={(event) => setDraft((current) => ({ ...current, speech_adapter: event.target.value }))}><option value="openai-speech">OpenAI 兼容</option><option value="fish-audio-tts">Fish Audio</option></select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音合成模型</span><input value={draft.speech_models} onChange={(event) => setDraft((current) => ({ ...current, speech_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
                 </div> : null}
 
@@ -716,7 +867,16 @@ export function AiProvidersPanel({
                   <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>语音转写模型</span><input value={draft.transcribe_model} onChange={(event) => setDraft((current) => ({ ...current, transcribe_model: event.target.value }))} placeholder="如 whisper-1 / transcribe-1-pro" /></label>
                     <label className="field-label ai-service-field"><span>语音转写适配器</span><select value={draft.transcribe_adapter || 'openai-audio'} onChange={(event) => setDraft((current) => ({ ...current, transcribe_adapter: event.target.value }))}><option value="openai-audio">OpenAI 兼容</option><option value="fish-audio-asr">Fish Audio</option></select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音转写模型</span><input value={draft.transcribe_models} onChange={(event) => setDraft((current) => ({ ...current, transcribe_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
+                </div> : null}
+                {enabledCapabilities.includes('vision.describe') ? <div className="ai-capability-card">
+                  <div className="ai-capability-card-head"><strong>视觉理解</strong><span>看图打标、OCR 与画面理解</span></div>
+                  <div className="ai-service-form-grid">
+                    <label className="field-label ai-service-field"><span>视觉理解模型（可留空）</span><input value={draft.vision_model} onChange={(event) => setDraft((current) => ({ ...current, vision_model: event.target.value }))} placeholder={draft.model.trim() ? `留空则跟随对话模型：${draft.model.trim()}` : '留空则跟随对话模型'} /></label>
+                    <label className="field-label ai-service-field"><span>其它视觉理解模型</span><input value={draft.vision_models} onChange={(event) => setDraft((current) => ({ ...current, vision_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
+                  </div>
+                  <small className="ai-service-hint">与对话同一协议，不需要适配器；留空则跟随对话模型。</small>
                 </div> : null}
               </> : null}
 
@@ -761,18 +921,6 @@ export function AiProvidersPanel({
     </div>
   );
 }
-function SourceUsageChips({ clients }: { clients: AIProviderImportStatus[] }) {
-  if (!clients.length) return null;
-  const names = clients.map((client) => clientLabel(client.target));
-  const shown = names.slice(0, 4);
-  return (
-    <span className="ai-service-imported-clients" title={`已分发：${names.join('、')}`}>
-      {shown.map((name) => <span className="ai-service-client-chip" key={name}>{name}</span>)}
-      {names.length > shown.length ? <span className="ai-service-client-chip more">+{names.length - shown.length}</span> : null}
-    </span>
-  );
-}
-
 function formatBalanceAmount(value: number, currency: string) {
   const amount = Number.isFinite(value) ? value.toFixed(2) : '—';
   if (currency === 'CNY') return `¥${amount}`;
@@ -797,7 +945,7 @@ function balanceComponentLabel(key: string) {
   };
   return labels[key] ?? key;
 }
-function CustomSourceRow({ service, active, capabilities, routeBadges, health, connectionCheck, clientStatuses, balanceSnapshot, balanceLoading, balanceBusy, balanceError, onCheckConnection, onRefreshBalance, onEdit, onRemove }: {
+function CustomSourceRow({ service, active, capabilities, routeBadges, health, connectionCheck, clientStatuses, balanceSnapshot, balanceLoading, balanceBusy, balanceError, cloneBusy, onCheckConnection, onRefreshBalance, onClone, onEdit, onRemove }: {
   service: CustomAIService;
   active: boolean;
   capabilities: AIServiceCapability[];
@@ -809,8 +957,10 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
   balanceLoading: boolean;
   balanceBusy: boolean;
   balanceError: string;
+  cloneBusy: boolean;
   onCheckConnection: () => void;
   onRefreshBalance: () => void;
+  onClone: () => void;
   onEdit: () => void;
   onRemove: () => void;
 }) {
@@ -818,20 +968,26 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
   const canDelete = clientStatuses.length === 0;
   const hasChat = capabilities.includes('chat');
   const summary = `${service.base_url} · ${protocolLabels[service.protocol] ?? service.protocol} · ${hasChat ? `对话模型 ${service.model}` : '媒体服务'}`;
-  const distribution = clientStatuses.length ? `已分发 ${clientStatuses.length} 个工具` : '未分发到工具';
+  // 一行元信息替代原先两排药丸：能力、默认路由、分发都只是「读一眼」的事实，
+  // 药丸的底色会把它们抬成和标题同级的信息，行里就只剩下色块。
+  const capabilityText = capabilities.map(capability => AI_SERVICE_CAPABILITY_LABELS[capability]).join(' / ');
+  // 分发目标直接写名字，比「已分发 N 个工具」再单起一行列工具名少一行；
+  // 名字最多三个，剩下的用 +N，完整清单在 title 里。
+  const clientNames = clientStatuses.map(client => clientLabel(client.target));
+  const distribution = clientNames.length
+    ? `已分发 ${clientNames.slice(0, 3).join('、')}${clientNames.length > 3 ? ` +${clientNames.length - 3}` : ''}`
+    : '未分发';
+  const facts = [capabilityText, ...routeBadges, distribution].filter(Boolean);
   return (
     <article className={`ai-client-row ai-service-row${active ? ' active' : ''}`}>
       <div className="ai-client-icon target"><PlugZap size={18} /></div>
       <div className="ai-client-copy">
         <strong>{service.display_name}</strong>
         <span title={summary}>{summary}</span>
-        <div className="ai-service-capability-chips" aria-label={`${service.display_name} 支持的能力`}>
-          {capabilities.map(capability => <span key={capability}>{AI_SERVICE_CAPABILITY_LABELS[capability]}</span>)}
-        </div>
-        <div className="ai-service-state-chips">
-          <span className={`ai-service-state ${health.kind}`}>{health.text}</span>
-          {routeBadges.map(label => <span key={label} className="ai-service-state route">{label}</span>)}
-          <span className="ai-service-state neutral">{distribution}</span>
+        <div className="ai-service-fact-line" title={clientNames.length ? `已分发：${clientNames.join('、')}` : undefined}>
+          <span className={`ai-service-health is-${health.kind}`}><span className="status-dot" aria-hidden="true" />{health.text}</span>
+          {facts.map(fact => <span key={fact}>{fact}</span>)}
+          {canDelete ? null : <span className="ai-service-delete-note">有工具在用，不可删除</span>}
         </div>
         {connectionCheck ? <small className={`ai-service-connection-check ${connectionCheck.state}`} aria-live="polite">{connectionCheck.message}</small> : null}
         {!service.balance_profile_id && service.suggested_balance_profile_id ? <small className="ai-service-balance-suggestion-label">检测建议：{balanceProfileOptions.find((option) => option.value === service.suggested_balance_profile_id)?.label ?? '手动配置'}</small> : null}
@@ -856,15 +1012,14 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
             </button>
           </div>
         ) : null}
-        <SourceUsageChips clients={clientStatuses} />
       </div>
-      <div className="ai-client-registration-actions">
-        {canDelete ? null : <span className="ai-service-delete-note">有工具在用</span>}
-        <button type="button" className="btn ai-service-tool-btn" disabled={connectionCheck?.state === 'busy' || !hasChat} title={hasChat ? '检查对话模型列表接口' : '媒体服务需通过能力路由实际调用验证'} onClick={onCheckConnection}>
-          {connectionCheck?.state === 'busy' ? <BusyIndicator size={12} /> : <RefreshCw size={12} />}检查
+      <div className="ai-client-registration-actions ai-service-row-actions" role="group" aria-label={`${service.display_name} 操作`}>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={connectionCheck?.state === 'busy' || !hasChat} title={hasChat ? '检查对话模型列表接口' : '媒体服务需通过能力路由实际调用验证'} aria-label={`检查 ${service.display_name}`} onClick={onCheckConnection}>
+          {connectionCheck?.state === 'busy' ? <BusyIndicator size={12} /> : <RefreshCw size={14} />}
         </button>
-        <button type="button" className="btn ai-service-tool-btn" onClick={onEdit}><Pencil size={14} />编辑</button>
-        <button type="button" className="btn ai-service-tool-btn" disabled={!canDelete} title={canDelete ? undefined : '有 AI 工具正在使用该服务，请先取消分发'} onClick={() => { void confirm({ title: `删除 AI 服务「${service.display_name}」？`, description: '删除后需要重新填写连接信息和密钥才能再使用。', confirmText: '删除' }).then((accepted) => { if (accepted) onRemove(); }); }}><Trash2 size={14} />删除</button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={cloneBusy} title="复制连接、模型、能力和加密凭据，创建独立服务" aria-label={`克隆 ${service.display_name}`} onClick={onClone}>{cloneBusy ? <BusyIndicator size={12} /> : <Copy size={14} />}</button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" title="编辑连接、模型与能力" aria-label={`编辑 ${service.display_name}`} onClick={onEdit}><Pencil size={14} /></button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={!canDelete} title={canDelete ? '删除这个服务' : '有 AI 工具正在使用该服务，请先取消分发'} aria-label={`删除 ${service.display_name}`} onClick={() => { void confirm({ title: `删除 AI 服务「${service.display_name}」？`, description: '删除后需要重新填写连接信息和密钥才能再使用。', confirmText: '删除' }).then((accepted) => { if (accepted) onRemove(); }); }}><Trash2 size={14} /></button>
       </div>
     </article>
   );
@@ -885,11 +1040,10 @@ function ManagedSourceRow({ managed, active, clientStatuses, onOpenAccount, onRe
         <div className="ai-client-copy">
           <strong>工作台模型服务</strong>
           <span>{managed.model} · {models} · {managed.base_url}</span>
-          <SourceUsageChips clients={boundClients} />
-        </div>
-        <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已分发 ${boundClients.length} 个` : '未分发'}</Pill>
-        <div className="ai-client-registration-actions">
-          <span className="ai-target-managed"><ShieldCheck size={13} /> 工作台</span>
+          <div className="ai-service-fact-line">
+            <span className="ai-service-health is-neutral"><span className="status-dot" aria-hidden="true" />工作台</span>
+            <span>{boundClients.length ? `已分发 ${boundClients.map(client => clientLabel(client.target)).slice(0, 3).join('、')}` : '未分发'}</span>
+          </div>
         </div>
       </article>
     );

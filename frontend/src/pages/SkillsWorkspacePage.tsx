@@ -457,8 +457,7 @@ function PluginDependencyIdentity({ pluginId, plugins }: { pluginId: string; plu
 
 function SkillListItem({ item, selected, onSelect }: { item: CodexSkillStatusItem; selected: boolean; onSelect: (id: string) => void }) {
   const manifest = item.record.manifest;
-  // 安装状态与依赖可用性是两件事：插件失败时技能依然"已安装"，但列表必须能看出它现在跑不起来，
-  // 否则用户要逐条点进详情才会发现问题。标签仍表达安装状态，色条表达可用性，悬停给出真实原因。
+  // 安装状态不等于依赖可用性：技能仍已安装，但可能当前跑不起来。
   const degraded = DISTRIBUTED_SKILL_STATES.includes(item.client_state) && item.readiness.state !== 'ready';
   const railTone = degraded ? (item.readiness.state === 'blocked' ? 'danger' : 'warn') : stateTone(item.client_state);
   const reason = item.readiness.state === 'ready' ? undefined : readinessReasonText(item);

@@ -72,4 +72,46 @@ assert.match(sources, /extensionStatus\('update'\)\.label/,
 const mcpConnections = readFileSync(new URL('../src/components/McpConnectionsPanel.tsx', import.meta.url), 'utf8');
 assert.doesNotMatch(mcpConnections, /server\.enabled \? '已启用' : '已停用'/,
   'MCP 默认启用态应由开关表达，不再重复状态胶囊');
+const routes = readFileSync(new URL('../src/pages/AiServiceRoutesPanel.tsx', import.meta.url), 'utf8');
+assert.doesNotMatch(routes, /ai-overview-eyebrow/,
+  '能力路由页签已表明页面身份，页头不应再重复 eyebrow');
+assert.doesNotMatch(routes, /<p>仅同能力内降级/,
+  '路由规则属于解释性说明，应收进标题 title 而不是常驻正文');
+assert.match(routes, /className=\{`ai-route-state is-\$\{status\.kind\}`\}/,
+  '路由状态必须用圆点 + 文字，不再复用状态胶囊');
+assert.doesNotMatch(routes, /'(无其它候选|先选默认)'/,
+  '无备用服务是最终状态，应显示占位符而不是永远不可选的下拉项');
+assert.match(routes, /className="btn btn-icon ai-route-icon-btn"[\s\S]{0,220}aria-label=\{`自检/,
+  '自检是低频动作，应收成带无障碍名称的图标按钮');
+assert.doesNotMatch(routes, /ai-route-fallback-add/,
+  '备用增删应收进操作菜单，不再在每行常驻一个添加下拉');
+assert.doesNotMatch(routes, /ai-route-resolution/,
+  '解析结果不再单占一列：服务与模型下拉已经表达了解析结果，重复一列只是把内容再说一遍');
+assert.match(routes, /<ActionMenu[\s\S]{0,240}备用顺序/,
+  '备用顺序的增删必须收进行内操作菜单');
+assert.match(routes, /const showModelSelect = primaryModels\.length > 1 \|\| Boolean\(primaryEntry\?\.model\)/,
+  '服务只有一个模型时不应再渲染第二个下拉：它没有选择权，只占高度');
+assert.match(routes, /fallbackOptions\.map\(group => <div key=\{group\.service\.id\}>/,
+  '备用候选必须按服务分组；一个服务可能挂几十个模型，平铺成长菜单没法扫读（ADR 0023）');
+assert.match(routes, /panelClassName="app-menu-dropdown ai-route-menu"/,
+  '备用菜单要撑到 280px：208px 的通用皮肤放不下最长的模型名');
+// 备用 chip 两行：一行塞不下「服务 · 模型」（最长模型名 204px），截断时至少服务名还读得全。
+assert.match(routes, /<b>\{item\.index\}\. \{parts\.service\}<\/b>/,
+  '备用 chip 第一行应是「序号. 服务名」');
+assert.match(routes, /<em>\{parts\.model\}<\/em>/,
+  '备用 chip 第二行应是模型名');
+assert.doesNotMatch(routes, /className="ai-route-fallback-chip"[\s\S]{0,300}?\{item\.index\}\. \{label\}/,
+  '备用 chip 不能再把「服务 · 模型」拼成一行：最长模型名会被整体截断');
+// 没有可用服务时，备用菜单与自检按钮都无从谈起，只留「去配置」。
+assert.match(routes, /plan\?\.state === 'missing' \? <button className="btn ai-service-tool-btn"/,
+  '没有可用服务的行只该给「去配置」，不能并排两个永远禁用的图标按钮');
+const routesCss = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
+assert.doesNotMatch(routesCss, /\.ai-route-state \{[^}]*border-radius: 999px/,
+  '路由状态不能退回药丸样式');
+assert.match(routesCss, /\.ai-route-axis \{[^}]*color: var\(--text-subtle\);/, '空备用列占位符应弱化显示');
+assert.match(routesCss, /\.action-menu-panel\.ai-route-menu \{ width: 280px; \}/,
+  '备用菜单宽度必须固定下来：通用 208px 皮肤会截断最长的模型名');
+assert.match(routesCss, /\.action-menu-panel button > span \{[^}]*text-overflow: ellipsis/,
+  '菜单项文本需要溢出保护，否则长模型名会把面板横向撑开');
+
 console.log('status copy checks passed');

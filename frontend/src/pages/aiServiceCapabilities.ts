@@ -1,5 +1,5 @@
 import type { AiServicePreset } from './aiServicePresets';
-import type { CustomAIService } from '../services/agentApi';
+import type { CustomAIService, CapabilityRouteEntry } from '../services/agentApi';
 
 export type AIServiceCapability =
   | 'chat'
@@ -47,27 +47,72 @@ export const MEDIA_CAPABILITIES: Array<Exclude<AIServiceCapability, 'chat'>> = [
   'vision.describe',
 ];
 
-export function capabilityModel(service: CustomAIService, capability: AIServiceCapability): string {
+/** `service.model` 是否其实是一个媒体模型（旧数据把生图/视频模型写进了全局 model），
+ *  且没有其它真正的对话模型。这类服务不能被当作对话候选。 */
+function chatModelIsMediaOnly(service: CustomAIService): boolean {
+  const primary = service.model?.trim() ?? '';
+  if (!primary) return false;
+  const mediaModels = Object.values(service.media ?? {})
+    .map(binding => binding.model?.trim())
+    .filter(Boolean);
+  if (!mediaModels.includes(primary)) return false;
+  return !(service.models ?? []).some(model => {
+    const candidate = model.trim();
+    return candidate && candidate !== primary && !mediaModels.includes(candidate);
+  });
+}
+
+/** 某服务在某能力下的模型目录：默认模型在前，其余按声明顺序去重。
+ *  必须与后端 `capability_models` 保持一致，否则界面会给出路由实际不会用的模型。 */
+export function capabilityModels(service: CustomAIService, capability: AIServiceCapability): string[] {
+  const models: string[] = [];
+  const push = (model: string | undefined | null) => {
+    const value = model?.trim() ?? '';
+    if (value && !models.includes(value)) models.push(value);
+  };
   if (capability === 'chat') {
-    const model = service.model?.trim() ?? '';
-    if (!model) return '';
-    const mediaModels = Object.values(service.media ?? {})
-      .map(binding => binding.model?.trim())
-      .filter(Boolean);
-    const hasAnotherChatModel = (service.models ?? [])
-      .map(candidate => candidate.trim())
-      .some(candidate => candidate && candidate !== model && !mediaModels.includes(candidate));
-    // 旧数据曾把媒体模型写进全局 model；只有一个同名媒体模型时按媒体专用处理。
-    return mediaModels.includes(model) && !hasAnotherChatModel ? '' : model;
+    if (chatModelIsMediaOnly(service)) return models;
+    push(service.model);
+    for (const model of service.models ?? []) push(model);
+    return models;
   }
-  if (capability === 'image.generate') {
-    return service.media?.[capability]?.model?.trim() || service.image_model?.trim() || '';
+  const binding = service.media?.[capability];
+  if (binding) {
+    push(binding.model);
+    for (const model of binding.models ?? []) push(model);
+    return models;
   }
   if (capability === 'vision.describe') {
-    // 只有显式绑定 vision.describe 模型才开放该能力，避免把普通对话模型推导为视觉理解。
-    return service.media?.[capability]?.model?.trim() || '';
+    // 没有显式 vision 绑定时跟随对话模型（ADR 0023 第七条）。
+    if (chatModelIsMediaOnly(service)) return models;
+    push(service.model);
+    for (const model of service.models ?? []) push(model);
+    return models;
   }
-  return service.media?.[capability]?.model?.trim() ?? '';
+  if (capability === 'image.generate') push(service.image_model);
+  return models;
+}
+
+/** 该能力的默认模型，即路由项 `model` 为空时真正会用的模型。 */
+export function capabilityModel(service: CustomAIService, capability: AIServiceCapability): string {
+  return capabilityModels(service, capability)[0] ?? '';
+}
+
+/** 某能力路由表的主选服务 ID。下标 0 是主选，其余是备用（ADR 0023）。
+ *  各面板「默认」标记必须走这里，避免各自内联一套取值规则。 */
+export function primaryRouteServiceId(
+  routes: Record<string, CapabilityRouteEntry[]> | undefined,
+  capability: AIServiceCapability,
+): string {
+  return routes?.[capability]?.[0]?.service_id ?? '';
+}
+
+/** 某能力路由表主选上钉的模型；空串表示跟随该服务的默认模型。 */
+export function primaryRouteModel(
+  routes: Record<string, CapabilityRouteEntry[]> | undefined,
+  capability: AIServiceCapability,
+): string {
+  return routes?.[capability]?.[0]?.model ?? '';
 }
 
 export function capabilityAdapter(service: CustomAIService, capability: AIServiceCapability): string {
@@ -78,7 +123,8 @@ export function capabilityAdapter(service: CustomAIService, capability: AIServic
 }
 
 export function serviceSupportsCapability(service: CustomAIService, capability: AIServiceCapability): boolean {
-  return Boolean(capabilityModel(service, capability));
+  // 对话只要求有对话模型；`chat` 的候选集不因旧数据里把媒体模型塞进 `model` 而缩小。
+  return capabilityModels(service, capability).length > 0;
 }
 
 export function serviceCapabilities(service: CustomAIService): AIServiceCapability[] {

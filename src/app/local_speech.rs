@@ -764,6 +764,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_OPENAI_AUDIO.to_string(),
                 model: "whisper-test".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );
@@ -810,6 +811,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_FISH_TRANSCRIBE.to_string(),
                 model: "transcribe-1-pro".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );
@@ -871,6 +873,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_FISH_SPEECH.to_string(),
                 model: "s2.1-pro-free".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );
@@ -930,6 +933,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_FISH_SPEECH.to_string(),
                 model: "s2.1-pro-free".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );
@@ -938,6 +942,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_FISH_TRANSCRIBE.to_string(),
                 model: "transcribe-1-pro".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );
@@ -1009,6 +1014,7 @@ mod tests {
             ai_services::MediaModelBinding {
                 adapter: ADAPTER_OPENAI_SPEECH.to_string(),
                 model: "tts-test".to_string(),
+                models: Vec::new(),
                 execution_mode: Some(MediaExecutionMode::Sync),
             },
         );

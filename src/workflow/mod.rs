@@ -25,10 +25,12 @@ mod store;
 pub(crate) use authoring::{
     confirm as confirm_authoring_candidate,
     confirm_with_capabilities as confirm_authoring_candidate_with_capabilities,
-    list as list_authoring_drafts, mark_submitted as mark_workflow_candidate_submitted,
-    read as read_authoring_draft, save_from_source as save_authoring_candidate,
-    submit as submit_authoring_candidate, test as test_authoring_candidate,
-    test_with_capabilities as test_authoring_candidate_with_capabilities, WorkflowDraft,
+    ensure_release_preflight_ready, list as list_authoring_drafts,
+    mark_submitted as mark_workflow_candidate_submitted, read as read_authoring_draft,
+    save_from_source as save_authoring_candidate, submit as submit_authoring_candidate,
+    test as test_authoring_candidate,
+    test_with_capabilities as test_authoring_candidate_with_capabilities,
+    validate_release_dependency_versions, WorkflowDraft,
 };
 #[allow(unused_imports)]
 pub(crate) use candidate::{freeze_candidate, read_candidate};

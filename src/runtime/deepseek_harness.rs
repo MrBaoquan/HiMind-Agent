@@ -59,8 +59,6 @@ const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str = "media.image.generate";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
-const HIMIND_AGENT_PATCH_MARKER: &str =
-    "# Agent-owned context. This layer is regenerated for each new HiMind AI session.";
 /// Rail state is shared by pointing DSH's storage backends at two real
 /// directories. Do not recreate the old `storages`/`sessions` junctions under
 /// the Agent home: a Windows reparse point below a legacy sandbox ACL can make
@@ -84,6 +82,7 @@ const HIMIND_MANAGED_PROVIDER_ID: &str = "himind-proxy";
 const HIMIND_MANAGED_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const DSH_SETTINGS_MIGRATION_MARKER: &str = ".himind-dsh-settings-v2";
 const DSH_SETTINGS_MIGRATION_VERSION: u32 = 4;
+const DSH_PROFILE_MIGRATION_MARKER: &str = ".himind-dsh-profile-migration-v1";
 const INTERACTIVE_HOME_DIRECTORY: &str = "interactive";
 const INTERACTIVE_HOME_MIGRATION_MARKER: &str = ".himind-interactive-home-v1.json";
 const INTERACTIVE_HOME_MIGRATION_MAX_FILES: u64 = 200_000;
@@ -530,8 +529,8 @@ struct Invocation {
 pub(crate) enum ModelRouteSource {
     /// 工作台下发的按次（claim-scoped）代理凭据。
     Managed,
-    /// 用户在本机「设置 → AI 连接 → 模型服务」里选中的自定义服务。
-    LocalService,
+    /// 用户选中的本机 AI 服务，经稳定本机路由转发；切换服务不重启 DSH。
+    LocalGateway,
     /// 本机 DSH `settings.yaml` 自己选的路由，Agent 不覆写。
     Native,
 }
@@ -628,6 +627,7 @@ fn bundled_runtime_manifest() -> Option<PathBuf> {
 #[derive(serde::Deserialize)]
 struct ExpectedRuntimeManifest {
     version: String,
+    file_name: String,
     sha256: String,
 }
 
@@ -666,15 +666,40 @@ fn runtime_alignment_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+fn manifest_value_matches_expected(value: &Value, expected: &ExpectedRuntimeManifest) -> bool {
+    if value.get("version").and_then(Value::as_str) != Some(expected.version.as_str()) {
+        return false;
+    }
+    let Some(file_name) = value.get("file_name").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(sha256) = value.get("sha256").and_then(Value::as_str) else {
+        return false;
+    };
+    let exact_package =
+        file_name == expected.file_name && sha256.eq_ignore_ascii_case(&expected.sha256);
+    let derived_file_name = expected
+        .file_name
+        .strip_suffix(".zip")
+        .map(|stem| format!("{stem}-install-stored.zip"));
+    let derived_package = derived_file_name.as_deref() == Some(file_name)
+        && value
+            .get("source_package_file_name")
+            .and_then(Value::as_str)
+            == Some(expected.file_name.as_str())
+        && value
+            .get("source_package_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(&expected.sha256));
+    exact_package || derived_package
+}
+
 fn bundled_manifest_matches_expected(
     path: &Path,
     expected: &ExpectedRuntimeManifest,
 ) -> Result<bool, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(
-        value.get("version").and_then(Value::as_str) == Some(expected.version.as_str())
-            && value.get("sha256").and_then(Value::as_str) == Some(expected.sha256.as_str()),
-    )
+    Ok(manifest_value_matches_expected(&value, expected))
 }
 
 /// Check the exact installed Runtime identity without paying for the full
@@ -726,10 +751,30 @@ pub(crate) fn ensure_installed_runtime_matches(options: &Options) -> Option<Stri
         match bundled_manifest_matches_expected(path, &expected) {
             Ok(true) => {}
             Ok(false) => {
+                let actual = fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .unwrap_or(Value::Null);
+                let actual_version = actual
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                let actual_file = actual
+                    .get("file_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                let actual_sha256 = actual
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
                 let reason = format!(
-                    "内置 Runtime 清单与 Agent 固定版本不一致：期望 {} ({})，实际 {}",
+                    "内置 Runtime 清单与 Agent 固定版本不一致：期望 {} / {} / {}，实际 {} / {} / {}（{}）",
                     expected.version,
+                    expected.file_name,
                     expected.sha256,
+                    actual_version,
+                    actual_file,
+                    actual_sha256,
                     path.display()
                 );
                 crate::app::crash::record_event("warn", &reason);
@@ -1364,7 +1409,7 @@ fn prepare_independent_interactive_launch(
                 projection.0,
                 projection.1,
                 "custom",
-                ModelRouteSource::LocalService,
+                ModelRouteSource::LocalGateway,
             ),
             None => {
                 let provider_config = native_dsh_provider_config(&shared_home);
@@ -1453,22 +1498,21 @@ fn is_unenrolled_reason(reason: &str) -> bool {
 
 fn active_independent_provider_config(
 ) -> Result<Option<(NativeDshProviderConfig, String)>, Box<dyn Error>> {
-    let Some((service, api_key)) = crate::store::ai_services::active_service_with_secret()? else {
+    if crate::store::ai_services::active_service()?.is_none() {
         return Ok(None);
-    };
-    let mut models = vec![service.model.clone()];
-    models.extend(service.models.iter().cloned());
-    let mut seen = HashSet::new();
-    models.retain(|value| !value.trim().is_empty() && seen.insert(value.clone()));
+    }
+    crate::app::builtin_ai_router::ensure_started()?;
+    let model = crate::app::builtin_ai_router::active_model_alias()?;
+    let models = vec![model.clone()];
     Ok(Some((
         NativeDshProviderConfig {
             provider: INDEPENDENT_ACTIVE_PROVIDER_ID.to_string(),
-            model: service.model,
+            model,
             api_key_env: Some(INDEPENDENT_ACTIVE_API_KEY_ENV.to_string()),
-            base_url: service.base_url,
+            base_url: crate::app::builtin_ai_router::api_base_url()?,
             models,
         },
-        api_key,
+        crate::app::builtin_ai_router::token().to_string(),
     )))
 }
 
@@ -2802,63 +2846,151 @@ fn ensure_managed_capability_rows(
     Ok(())
 }
 fn migrate_managed_profile_patch(path: &Path) -> Result<(), Box<dyn Error>> {
+    let marker = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(DSH_PROFILE_MIGRATION_MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
     let source = fs::read_to_string(path)?;
-    if !source.contains(HIMIND_AGENT_PATCH_MARKER) && !source.contains("serverName: \"himind\"") {
-        return Ok(());
+    let updated = strip_agent_owned_profile_rows(&source);
+    if updated != source {
+        crate::store::atomic_file::atomic_write(path, updated.as_bytes())?;
     }
-    let Ok(document) = serde_yaml::from_str::<YamlValue>(&source) else {
-        // Do not destroy a user-authored file that is currently invalid; DSH
-        // will report its native parse error and the user can repair it.
-        return Ok(());
-    };
-    let Some(rows) = document.as_sequence() else {
-        return Ok(());
-    };
-    let filtered: Vec<YamlValue> = rows.iter().filter_map(strip_managed_patch_row).collect();
-    if filtered.as_slice() == rows.as_slice() {
-        return Ok(());
-    }
-    fs::write(path, serde_yaml::to_string(&filtered)?)?;
+    // DSH persists Settings API writes back into this same profile patch. This
+    // cleanup is only for legacy Agent-owned rows; later runs must preserve the
+    // provider catalog and any custom providers the user adds through DSH.
+    crate::store::atomic_file::atomic_write(&marker, b"1\n")?;
     Ok(())
 }
 
-fn strip_managed_patch_row(row: &YamlValue) -> Option<YamlValue> {
-    let Some(mapping) = row.as_mapping() else {
-        return Some(row.clone());
-    };
-    let id = mapping
-        .get(YamlValue::String("id".to_string()))
-        .and_then(YamlValue::as_str)
-        .unwrap_or_default();
-    if matches!(
+fn is_agent_owned_patch_row(id: &str) -> bool {
+    matches!(
         id,
         "agent-default-model" | "llm-pi-ai" | "himind-mcp" | "himind-skill-filesystem"
     ) || id == HIMIND_MCP_ROW_ID
         || id == HIMIND_SKILL_ROW_ID
         || id.starts_with("personal-mcp-")
         || id.starts_with("himind-agent-personal-mcp-")
-    {
-        return None;
+}
+
+fn patch_row_id(line: &str) -> Option<&str> {
+    let value = line.trim_start().strip_prefix("- id:")?.trim();
+    let value = value.split('#').next()?.trim();
+    let value = value.trim_matches(|character| character == '"' || character == '\'');
+    (!value.is_empty()).then_some(value)
+}
+
+fn leading_indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Locate one patch row and the row that follows it.
+///
+/// The profile patch can contain `!!js` tags, which older `serde_yaml` based
+/// migration avoided rewriting as a whole. This line-oriented removal keeps the
+/// user's valid profile formatting intact while removing only exact Agent-owned
+/// row ids (and nested copies from older insert blocks).
+fn profile_patch_row_block(source: &str, row_id: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    let mut marker_start = None;
+    let mut marker_end = None;
+    let mut marker_indent = 0usize;
+    for line in source.split_inclusive('\n') {
+        if patch_row_id(line) == Some(row_id) {
+            marker_start = Some(offset);
+            marker_end = Some(offset + line.len());
+            marker_indent = leading_indent(line);
+            break;
+        }
+        offset += line.len();
     }
-    let Some(inserted) = mapping
-        .get(YamlValue::String("insert".to_string()))
-        .and_then(YamlValue::as_sequence)
-    else {
-        return Some(row.clone());
-    };
-    let kept: Vec<YamlValue> = inserted
-        .iter()
-        .filter_map(strip_managed_patch_row)
-        .collect();
-    if kept.as_slice() == inserted.as_slice() {
-        return Some(row.clone());
+    let marker_start = marker_start?;
+    let marker_end = marker_end?;
+
+    let mut end = source.len();
+    let mut offset = marker_end;
+    for line in source[marker_end..].split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && trimmed.starts_with("- ") && leading_indent(line) <= marker_indent
+        {
+            end = line_start;
+            break;
+        }
     }
-    let mut updated = mapping.clone();
-    updated.insert(
-        YamlValue::String("insert".to_string()),
-        YamlValue::Sequence(kept),
-    );
-    Some(YamlValue::Mapping(updated))
+    Some((marker_start, end))
+}
+
+fn empty_insert_block(source: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    let mut marker_start = None;
+    let mut marker_end = None;
+    let mut marker_indent = 0usize;
+    for line in source.split_inclusive('\n') {
+        if line.trim_start().trim_end() == "- insert:" {
+            marker_start = Some(offset);
+            marker_end = Some(offset + line.len());
+            marker_indent = leading_indent(line);
+            break;
+        }
+        offset += line.len();
+    }
+    let marker_start = marker_start?;
+    let marker_end = marker_end?;
+
+    let mut end = source.len();
+    let mut offset = marker_end;
+    for line in source[marker_end..].split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && trimmed.starts_with("- ") && leading_indent(line) <= marker_indent
+        {
+            end = line_start;
+            break;
+        }
+    }
+    source[marker_end..end]
+        .lines()
+        .all(|line| line.trim().is_empty())
+        .then_some((marker_start, end))
+}
+
+fn strip_agent_owned_profile_rows(source: &str) -> String {
+    let mut updated = source.to_string();
+    loop {
+        let mut offset = 0usize;
+        let mut found = None;
+        for line in updated.split_inclusive('\n') {
+            if let Some(id) = patch_row_id(line).filter(|id| is_agent_owned_patch_row(id)) {
+                found = Some((offset, id.to_string()));
+                break;
+            }
+            offset += line.len();
+        }
+        let Some((_, row_id)) = found else {
+            break;
+        };
+        let Some((start, end)) = profile_patch_row_block(&updated, &row_id) else {
+            break;
+        };
+        updated.replace_range(start..end, "");
+    }
+    loop {
+        let Some((start, end)) = empty_insert_block(&updated) else {
+            break;
+        };
+        updated.replace_range(start..end, "");
+    }
+    if updated.trim().is_empty() {
+        return "[]\n".to_string();
+    }
+    let mut normalized = updated.trim().to_string();
+    normalized.push('\n');
+    normalized
 }
 
 fn agent_overlay_path(home: &Path) -> PathBuf {
@@ -3184,13 +3316,8 @@ fn render_himind_profile_patch_from_base(
         ModelRouteSource::Managed => {
             append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
         }
-        ModelRouteSource::LocalService => {
-            match crate::store::ai_services::active_service()? {
-                Some(service) => append_independent_service_profile(&mut patch, &service)?,
-                // 服务在本机被删掉 / 被取消选中：退回 Runtime 自己的路由，
-                // 让 DSH 用它 settings.yaml 里那份配置，而不是写一条空 provider。
-                None => append_native_route_comment(&mut patch),
-            }
+        ModelRouteSource::LocalGateway => {
+            append_local_gateway_profile(&mut patch, default_model, base_url, models)?
         }
         ModelRouteSource::Native => append_native_route_comment(&mut patch),
     }
@@ -3428,67 +3555,53 @@ fn append_native_route_comment(patch: &mut String) {
     );
 }
 
-fn append_independent_service_profile(
+/// Headless workflow sessions have no UI process to call the DSH settings API
+/// after launch. They must carry the loopback provider and the exact active
+/// model alias in the per-run overlay, otherwise DSH falls back to a native
+/// model name that the loopback gateway cannot resolve.
+fn append_local_gateway_profile(
     patch: &mut String,
-    service: &crate::store::ai_services::CustomAIService,
+    default_model: &str,
+    base_url: &str,
+    models: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    let model = service.model.trim();
-    let base_url = service.base_url.trim();
-    if model.is_empty() || base_url.is_empty() {
-        return Err("本机模型服务的模型或 Base URL 不完整".into());
+    let default_model = default_model.trim();
+    let base_url = base_url.trim();
+    if default_model.is_empty() || base_url.is_empty() {
+        return Err("本机 AI 路由配置不完整".into());
     }
-    let api = match &service.protocol {
-        crate::store::ai_services::AIServiceProtocol::OpenaiChat => "openai-completions",
-        crate::store::ai_services::AIServiceProtocol::OpenaiResponses => "openai-responses",
-        crate::store::ai_services::AIServiceProtocol::Anthropic => "anthropic-messages",
-    };
-    // Anthropic 适配器走 Anthropic SDK 约定，在 baseURL 后自行追加 `/v1/messages`；
-    // 带 `/v1` 的写法会让请求落到 `/v1/v1/messages`，因此这里统一写回 API 根地址。
-    let base_url = if service.protocol.is_anthropic() {
-        crate::store::ai_services::anthropic_api_root(base_url)
-    } else {
-        base_url.to_string()
-    };
-    let mut catalog = vec![model.to_string()];
-    catalog.extend(
-        service
-            .models
-            .iter()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    );
-    let mut seen = HashSet::new();
-    catalog.retain(|value| seen.insert(value.clone()));
-
+    let provider = INDEPENDENT_ACTIVE_PROVIDER_ID;
+    let api_key_env = INDEPENDENT_ACTIVE_API_KEY_ENV;
     patch.push_str(
-        "\n\n# Agent-owned projection of the selected local AI service. DSH settings.yaml remains user-owned.\n",
+        "\n\n# Local AI route is pinned in this per-session overlay so headless workflow runs do not depend on a post-launch settings write.\n",
     );
     patch.push_str(&format!(
         "- id: agent-default-model\n  config:\n    provider: {}\n    model: {}\n",
-        yaml_scalar(INDEPENDENT_ACTIVE_PROVIDER_ID),
-        yaml_scalar(model),
+        yaml_scalar(provider),
+        yaml_scalar(default_model),
     ));
     patch.push_str(&format!(
-        "- id: llm-pi-ai\n  config:\n    providers:\n      {}:\n        displayName: {}\n        apiKeyEnv: {}\n        api: {}\n",
-        yaml_scalar(INDEPENDENT_ACTIVE_PROVIDER_ID),
-        yaml_scalar(service.display_name.trim()),
-        yaml_scalar(INDEPENDENT_ACTIVE_API_KEY_ENV),
-        yaml_scalar(api),
+        "- id: llm-pi-ai\n  config:\n    providers:\n      {}:\n        displayName: HiMind AI (Local)\n        apiKeyEnv: {}\n        api: openai-completions\n",
+        yaml_scalar(provider),
+        yaml_scalar(api_key_env),
     ));
-    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(&base_url)));
+    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
     patch.push_str("        models:\n");
+    let mut catalog = vec![default_model.to_string()];
+    catalog.extend(
+        models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+    );
+    let mut seen = HashSet::new();
+    catalog.retain(|model| seen.insert(model.clone()));
     for model in catalog {
-        let capacity = managed_model_capacity(&model);
         let model = yaml_scalar(&model);
         patch.push_str(&format!(
             "          - id: {model}\n            name: {model}\n"
         ));
-        if let Some((context_window, max_tokens)) = capacity {
-            patch.push_str(&format!(
-                "            contextWindow: {context_window}\n            maxTokens: {max_tokens}\n"
-            ));
-        }
     }
     Ok(())
 }
@@ -4626,14 +4739,14 @@ fn first_line(value: &str) -> String {
 mod tests {
     use super::{
         active_independent_provider_config, agent_owned_route_is_viable,
-        agent_owned_route_is_viable_with, append_independent_service_profile,
-        configure_runtime_environment, degraded_notice, dsh_run_home, dsh_skill_name,
-        effective_runtime_capabilities, ensure_interactive_home, ensure_managed_capability_rows,
-        ensure_profile_patch, first_line, himind_mcp_arguments, loopback_no_proxy,
-        managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
-        native_dsh_provider_config, no_tools_overlay_text, parse_native_dsh_provider_config,
-        parse_runtime_version, recent_workspace_in, release_agent_owned_model_route,
-        remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
+        agent_owned_route_is_viable_with, configure_runtime_environment, degraded_notice,
+        dsh_run_home, dsh_skill_name, effective_runtime_capabilities, ensure_interactive_home,
+        ensure_managed_capability_rows, ensure_profile_patch, first_line, himind_mcp_arguments,
+        loopback_no_proxy, managed_model_catalog, manifest_value_matches_expected,
+        merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
+        no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
+        recent_workspace_in, release_agent_owned_model_route, remove_managed_runtime,
+        render_himind_agent_overlay, render_himind_profile_patch,
         render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
         skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
         validate_runtime_agent_compatibility, verify_staged_runtime, versioned_home,
@@ -5085,6 +5198,8 @@ mod tests {
 
     #[test]
     fn bundled_runtime_manifest_is_found_from_the_installed_layout() {
+        let _env_guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
         let root = std::env::temp_dir().join(format!(
             "himind-bundled-runtime-{}-{}",
             std::process::id(),
@@ -5095,6 +5210,7 @@ mod tests {
         ));
         // The installed layout: <root>/versions/<version>/himind-agent.exe with
         // the package at <root>/resources/runtime/.
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("isolated-agent-home"));
         let resources = root.join("resources/runtime");
         std::fs::create_dir_all(&resources).unwrap();
         let manifest = resources.join("himind-runtime-release.json");
@@ -5133,6 +5249,10 @@ mod tests {
             "a missing bundled package must report None rather than searching forever"
         );
 
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5633,6 +5753,78 @@ mod tests {
     }
 
     #[test]
+    fn profile_migration_removes_agent_model_rows_even_with_js_tags() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-model-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profiles").join(super::HIMIND_PROFILE);
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join("cordis.patch.yml");
+        std::fs::write(
+            &path,
+            r#"- id: system-prompt
+  config:
+    persona: keep-me
+- id: llm-pi-ai
+  config:
+    providers:
+      himind-local-ai:
+        displayName: HiMind AI
+        apiKeyEnv: HIMIND_LOCAL_AI_API_KEY
+        baseURL: http://localhost:44656/v1
+        models:
+          - id: old
+- id: agent-default-model
+  config:
+    provider: himind-local-ai
+    model: old
+- insert:
+    - id: himind-agent-mcp
+      config:
+        serverName: himind-agent
+    - id: user-mcp-row
+      config:
+        serverName: user-mcp
+- insert:
+    - id: personal-mcp-old
+      config:
+        serverName: old-personal
+- id: user-owned-row
+  config:
+    assetRoot: !!js "process.env.HIMIND_TEST_ROOT"
+"#,
+        )
+        .unwrap();
+
+        super::migrate_managed_profile_patch(&path).unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("id: llm-pi-ai"));
+        assert!(!migrated.contains("id: agent-default-model"));
+        assert!(!migrated.contains("id: himind-agent-mcp"));
+        assert!(!migrated.contains("id: personal-mcp-old"));
+        assert!(migrated.contains("id: system-prompt"));
+        assert!(migrated.contains("id: user-mcp-row"));
+        assert!(migrated.contains("id: user-owned-row"));
+        assert!(migrated.contains("!!js"), "user JS tags must survive");
+
+        // DSH stores later Settings API edits in this same patch. Once the
+        // legacy cleanup has run, a DSH-owned row must survive the next launch.
+        let dsh_owned = format!(
+            "{migrated}\n- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      himind-local-ai:\n        displayName: HiMind AI\n"
+        );
+        std::fs::write(&path, &dsh_owned).unwrap();
+        super::migrate_managed_profile_patch(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), dsh_owned);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn agent_mcp_namespace_conflicts_are_rejected_before_dsh_boot() {
         let root = std::env::temp_dir().join(format!(
             "himind-mcp-namespace-{}-{}",
@@ -5726,9 +5918,11 @@ mod tests {
                 projection.api_key_env.as_deref(),
                 Some("HIMIND_LOCAL_AI_API_KEY")
             );
-            assert_eq!(projection.base_url, "https://local.example/v1");
-            assert_eq!(projection.model, "local-model");
-            assert_eq!(api_key, "sk-local-secret");
+            assert!(projection.base_url.starts_with("http://localhost:"));
+            assert!(projection.base_url.ends_with("/v1"));
+            assert_eq!(projection.model, "himind:local-gateway:local-model");
+            assert_eq!(api_key, crate::app::builtin_ai_router::token());
+            assert_ne!(api_key, "sk-local-secret");
 
             let dsh_home = root.join("dsh-home");
             std::fs::create_dir_all(&dsh_home).unwrap();
@@ -5741,17 +5935,17 @@ mod tests {
             let profile = render_himind_profile_patch(
                 &dsh_home,
                 &options,
-                ModelRouteSource::LocalService,
-                "native-model",
-                "https://native.example/v1",
-                &["native-model".to_string()],
+                ModelRouteSource::LocalGateway,
+                &projection.model,
+                &projection.base_url,
+                &projection.models,
             )
             .unwrap();
             assert!(profile.contains("himind-local-ai"));
+            assert!(profile.contains("himind:local-gateway:local-model"));
             assert!(profile.contains("HIMIND_LOCAL_AI_API_KEY"));
-            assert!(profile.contains("openai-responses"));
-            assert!(profile.contains("https://local.example/v1"));
-            assert!(profile.contains("local-fast"));
+            assert!(profile.contains(&projection.base_url));
+            assert!(!profile.contains("https://local.example/v1"));
             assert!(!profile.contains("sk-local-secret"));
             assert_eq!(
                 std::fs::read_to_string(settings_path).unwrap(),
@@ -5766,12 +5960,11 @@ mod tests {
         result
     }
 
-    /// 回归护栏：模式（Connected）不再决定 provider 行，凭据来源才决定。
+    /// 回归护栏：Connected 模式下的降级会话也不能把工作台 Provider 写进 overlay。
     ///
-    /// 线上曾出现「connected + 工作台未登录」的组合：overlay 按模式写
-    /// `himind-proxy / DEEPSEEK_API_KEY`，实际注入的却是本机 AI 服务的密钥，
-    /// 于是 Runtime 报 `MISSING_CREDENTIAL`，并发会话全部空转。这里断言降级
-    /// 会话只写本机服务那条路由，绝不写工作台路由。
+    /// 本机服务必须在 overlay 里显式写 `himind-local-ai`，否则无头 Workflow
+    /// 没有机会执行启动后的 Settings API 同步。这里同时守住两点：降级会话绝不
+    /// 写工作台路由；托管路由仍保留自己的工作台配置。
     #[test]
     fn connected_mode_degraded_session_never_projects_dashboard_provider() {
         // 与前两个用例一样会重定向进程级 Agent home，共用同一把环境锁串行执行。
@@ -5816,12 +6009,14 @@ mod tests {
             let profile = render_himind_profile_patch(
                 &root,
                 &options,
-                ModelRouteSource::LocalService,
+                ModelRouteSource::LocalGateway,
                 "deepseek-chat",
-                "https://api.deepseek.com/v1",
+                "http://127.0.0.1:18151/v1",
                 &["deepseek-chat".to_string()],
             )
             .unwrap();
+            assert!(profile.contains("himind-local-ai"));
+            assert!(profile.contains("deepseek-chat"));
             assert!(profile.contains("himind-local-ai"));
             assert!(profile.contains("HIMIND_LOCAL_AI_API_KEY"));
             assert!(!profile.contains("himind-proxy"));
@@ -5893,54 +6088,6 @@ mod tests {
         launch.service_source = "native";
         let native = degraded_notice("", &launch);
         assert!(native.contains("本机 DSH 模型配置"));
-    }
-
-    #[test]
-    fn anthropic_local_service_projects_as_anthropic_messages_on_the_api_root() {
-        // 与上一个用例一样会重定向进程级 Agent home，共用同一把环境锁串行执行。
-        let _env_guard = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!(
-            "himind-independent-anthropic-service-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
-        std::env::set_var("HIMIND_AGENT_HOME", &root);
-        let result = (|| {
-            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
-                id: "local-anthropic".to_string(),
-                display_name: "Local Anthropic".to_string(),
-                // 用户按 OpenAI 习惯带上 `/v1`；Anthropic SDK 会自行追加，必须回到根地址。
-                base_url: "https://api.moonshot.cn/anthropic/v1".to_string(),
-                protocol: crate::store::ai_services::AIServiceProtocol::Anthropic,
-                model: "kimi-k3".to_string(),
-                models: vec!["kimi-k3".to_string()],
-                image_model: String::new(),
-                image_adapter: String::new(),
-                media: Default::default(),
-                api_key: "sk-anthropic-secret".to_string(),
-            })
-            .unwrap();
-            crate::store::ai_services::set_active("local-anthropic").unwrap();
-            let mut patch = String::new();
-            let (service, _) = crate::store::ai_services::load_secret("local-anthropic").unwrap();
-            append_independent_service_profile(&mut patch, &service).unwrap();
-            assert!(patch.contains("api: \"anthropic-messages\""), "{patch}");
-            assert!(
-                patch.contains("baseURL: \"https://api.moonshot.cn/anthropic\""),
-                "{patch}"
-            );
-            assert!(!patch.contains("/anthropic/v1\""), "{patch}");
-        })();
-        match previous_home {
-            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
-            None => std::env::remove_var("HIMIND_AGENT_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-        result
     }
 
     #[test]
@@ -6295,6 +6442,7 @@ mod tests {
             model: "fast".to_string(),
             models: vec!["fast".to_string(), "deep".to_string()],
             protocol: "openai-responses".to_string(),
+            model_metadata: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             managed_model_catalog(&credential).unwrap(),
@@ -6777,8 +6925,41 @@ mod tests {
     fn embedded_runtime_manifest_pins_an_exact_release() {
         let manifest = super::expected_runtime_manifest().unwrap();
         assert_eq!(manifest.version, "0.2.1-rc.2");
+        assert_eq!(
+            manifest.file_name,
+            "deepseek-harness-runtime-0.2.1-rc.2-windows-x64.zip"
+        );
         assert_eq!(manifest.sha256.len(), 64);
         assert!(manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn runtime_alignment_accepts_exact_and_derived_packages() {
+        let expected = super::expected_runtime_manifest().unwrap();
+        let exact = json!({
+            "version": expected.version.clone(),
+            "file_name": expected.file_name.clone(),
+            "sha256": expected.sha256.clone(),
+        });
+        assert!(manifest_value_matches_expected(&exact, &expected));
+
+        let derived = json!({
+            "version": expected.version.clone(),
+            "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64-install-stored.zip",
+            "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
+            "source_package_file_name": expected.file_name.clone(),
+            "source_package_sha256": expected.sha256.clone(),
+        });
+        assert!(manifest_value_matches_expected(&derived, &expected));
+
+        let wrong_source = json!({
+            "version": expected.version.clone(),
+            "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64-install-stored.zip",
+            "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
+            "source_package_file_name": expected.file_name.clone(),
+            "source_package_sha256": "0".repeat(64),
+        });
+        assert!(!manifest_value_matches_expected(&wrong_source, &expected));
     }
 
     #[test]

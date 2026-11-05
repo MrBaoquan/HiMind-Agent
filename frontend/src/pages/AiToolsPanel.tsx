@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, Check, CircleAlert, CircleCheck, CircleDashed, Code2, Copy, FolderOpen, Github, MonitorDot, PlugZap, Settings2, ShieldCheck, Unplug } from 'lucide-react';
+import { Activity, Check, CircleAlert, CircleCheck, CircleDashed, Code2, Copy, FolderOpen, Github, MonitorDot, PlugZap, RefreshCw, Settings2, ShieldCheck, Unplug } from 'lucide-react';
 import { Pill } from '../components/Common';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
 import { acpPresets, acpProfileStatus, presetCommand, presetVersion, splitCommandLine, type AcpPreset } from './acpProfileView';
 import { buildToolConnections, modelSourceLabel, type ToolConnection } from './aiToolConnections';
-import { serviceSupportsCapability } from './aiServiceCapabilities';
+import { primaryRouteServiceId, serviceSupportsCapability } from './aiServiceCapabilities';
+import { agentApi } from '../services/agentApi';
 import type {
+  AIProviderImportStatus,
+  AIProviderSyncResult,
   AcpRuntimeProfileInput,
   AcpRuntimeProfileSnapshot,
   AIServiceListResult,
@@ -50,6 +53,21 @@ type AiToolsPanelProps = {
   onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
   onRemoveAcpProfile: (providerId: string) => Promise<void>;
 };
+
+const SYNC_REASON_LABELS: Record<string, string> = {
+  binding_metadata_missing: '注册记录缺少同步版本',
+  source_changed: 'AI 服务已变化',
+  gateway_profile_changed: '聚合入口模型或协议已变化',
+  gateway_endpoint_changed: '本机网关地址已变化',
+  gateway_profile_unavailable: '聚合入口不存在或已停用',
+  gateway_models_unavailable: '当前协议没有可用模型',
+  client_config_missing: '客户端配置已丢失',
+};
+
+function syncReasonText(status?: AIProviderImportStatus) {
+  const reasons = (status?.sync_reason_codes ?? []).map((code) => SYNC_REASON_LABELS[code] ?? code);
+  return reasons.length ? reasons.join('、') : status?.last_error || '客户端配置与当前来源不一致';
+}
 
 type Filter = 'all' | 'attention' | 'idle' | 'ready';
 
@@ -95,15 +113,20 @@ export function AiToolsPanel({
   const [copied, setCopied] = useState<string | null>(null);
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [sourceDraft, setSourceDraft] = useState<Record<string, string>>({});
+  const [syncAllBusy, setSyncAllBusy] = useState(false);
+  const [syncNotice, setSyncNotice] = useState('');
 
   const clients = aiServices?.clients?.targets ?? [];
   const customServices = (aiServices?.custom?.services ?? []).filter((service) => serviceSupportsCapability(service, 'chat'));
   const managed: ManagedAIServiceSummary = aiServices?.managed ?? { available: false };
-  const activeServiceId = aiServices?.custom?.active_service_id ?? '';
+  // 对话主选就是对话路由的第一项（ADR 0023），不再读过渡期投影键。
+  const activeServiceId = primaryRouteServiceId(aiServices?.custom?.capability_routes, 'chat');
   const managedLabel = managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
   const gatewayClients = gatewayStatus?.gateway_clients ?? [];
   const gatewayClientSet = new Set(gatewayClients.map((entry) => entry.client));
   const gatewayProfileByClient = new Map(gatewayClients.map((entry) => [entry.client, entry]));
+  const clientStatusByTarget = new Map(clients.map((entry) => [entry.target, entry]));
+  const pendingClientSync = clients.filter((entry) => entry.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(entry.sync_state ?? ''));
 
   const connections = useMemo(
     () => buildToolConnections({ targets, clients, acp: acpProfiles }),
@@ -153,6 +176,37 @@ export function AiToolsPanel({
       await action();
     } finally {
       setRowBusy(null);
+    }
+  }
+
+  async function syncOneClient(target: string) {
+    setSyncNotice('');
+    try {
+      await runRow(target, async () => {
+        const plan = await agentApi.planAIClientSync(target);
+        if (plan.blocked) throw new Error(plan.detail);
+        const result: AIProviderSyncResult = await agentApi.syncAIClient(target, plan.desired_revision);
+        setSyncNotice(result.restart_required
+          ? `${target} 已更新，请重启客户端后生效`
+          : `${target} 已更新`);
+        onRefresh();
+      });
+    } catch (error) {
+      setSyncNotice(`${target} 更新失败：${String(error)}`);
+    }
+  }
+
+  async function syncAllClients() {
+    setSyncAllBusy(true);
+    setSyncNotice('');
+    try {
+      const result = await agentApi.syncAIClients();
+      setSyncNotice(result.ok
+        ? `已更新 ${result.synced.length} 个客户端`
+        : `已更新 ${result.synced.length} 个客户端，${result.failed.length} 个失败`);
+      onRefresh();
+    } finally {
+      setSyncAllBusy(false);
     }
   }
 
@@ -233,6 +287,18 @@ export function AiToolsPanel({
           ) : null}
         </div>
 
+        {pendingClientSync.length ? (
+          <div className="ai-client-sync-banner" role="status">
+            <div>
+              <strong>{pendingClientSync.length} 个已注册工具待更新</strong>
+              <span>{syncNotice || pendingClientSync.map((entry) => `${entry.target}：${syncReasonText(entry)}`).join('；')}</span>
+            </div>
+            <button type="button" className="btn btn-primary" disabled={syncAllBusy || Boolean(rowBusy)} onClick={() => void syncAllClients()}>
+              {syncAllBusy ? <BusyIndicator size={12} /> : <RefreshCw size={14} />}{syncAllBusy ? '更新中' : '更新全部'}
+            </button>
+          </div>
+        ) : syncNotice ? <div className="ai-client-sync-banner" role="status"><span>{syncNotice}</span></div> : null}
+
         <div className="ai-client-list">
           {visible.map((item) => (
             <ToolRow
@@ -247,6 +313,8 @@ export function AiToolsPanel({
               managedLabel={managedLabel}
               gatewayClientSet={gatewayClientSet}
               gatewayProfile={gatewayProfileByClient.get(item.key)}
+              clientStatus={clientStatusByTarget.get(item.key)}
+              onSyncClient={() => syncOneClient(item.key)}
               gatewayProfiles={gatewayProfiles}
               defaultSource={defaultSource}
               sourceDraft={sourceDraft[item.key] ?? defaultSource}
@@ -388,6 +456,8 @@ function ToolRow(props: {
   managedLabel: string;
   gatewayClientSet: Set<string>;
   gatewayProfile?: InferenceGatewayStatus['gateway_clients'][number];
+  clientStatus?: AIProviderImportStatus;
+  onSyncClient: () => void;
   gatewayProfiles: GatewayProfile[];
   defaultSource: string;
   sourceDraft: string;
@@ -411,7 +481,7 @@ function ToolRow(props: {
 }) {
   const {
     item, expanded, rowBusy, busyAction, customServices, managed, managedLabel, gatewayClientSet,
-    gatewayProfile, gatewayProfiles, defaultSource,
+    gatewayProfile, clientStatus, onSyncClient, gatewayProfiles, defaultSource,
     sourceDraft, acpProfiles,
     onToggle, onApplyTarget, onRemoveTarget, onCopyTarget,
     onOpenDirectory, onImportAIClient, onRemoveAIClient, onOpenModelSources, onSetBindingMode, onSourceDraft,
@@ -422,6 +492,8 @@ function ToolRow(props: {
   const modelState = item.model?.state ?? '';
   const modelImported = modelState === 'imported';
   const gatewayMode = gatewayClientSet.has(item.key);
+  const needsSync = item.model?.state === 'imported'
+    && ['needs_update', 'failed', 'conflict'].includes(clientStatus?.sync_state ?? '');
   const summary = toolSummary(item, customServices, managed, gatewayClientSet);
   const activeSource = gatewayProfile?.profile_id ? `profile:${gatewayProfile.profile_id}` : (item.model?.service ?? '');
   const rowState = item.state;
@@ -447,6 +519,17 @@ function ToolRow(props: {
     }
   }
 
+  async function switchBindingMode(nextMode: 'gateway' | 'direct') {
+    if (nextMode === 'direct' && clientStatus?.warning) {
+      const accepted = await confirm({
+        title: `改为直连 ${item.name}？`,
+        description: `${clientStatus.warning} 直连将绕过兼容规范化，可能再次触发 400。`,
+        confirmText: '仍然直连',
+      });
+      if (!accepted) return;
+    }
+    await onRunRow(item.key, () => onSetBindingMode(item.key, nextMode));
+  }
   async function distributeSource() {
     if (!sourceDraft) return;
     if (sourceDraft.startsWith('profile:')) {
@@ -511,6 +594,7 @@ function ToolRow(props: {
                     {sourceOptions.some((option) => option.value === activeSource) ? null : <option value={activeSource}>未知来源</option>}
                   </select>
                   <span className="muted">· {gatewayProfile?.profile_name ? `聚合：${gatewayProfile.profile_name}（${gatewayProfile.models.length} 个模型）` : gatewayMode ? '经本机网关' : '直连'}</span>
+                  {!gatewayMode && clientStatus?.warning ? <span className="warning-text">{clientStatus.warning}</span> : null}
                 </> : <>
                   <span className="status-dot" />
                   <span className="muted">未分发</span>
@@ -523,7 +607,8 @@ function ToolRow(props: {
                 {!hasUsableSource ? (
                   <button type="button" className="btn btn-primary ai-service-tool-btn" onClick={onOpenModelSources}><PlugZap size={14} />新增 AI 服务</button>
                 ) : modelImported ? <>
-                  <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：把真实地址与密钥写回该工具' : '切到网关：密钥留在 Agent'} onClick={() => void onRunRow(item.key, () => onSetBindingMode(item.key, gatewayMode ? 'direct' : 'gateway'))}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
+                  {needsSync ? <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy} title={syncReasonText(clientStatus)} onClick={onSyncClient}>{rowBusy ? <BusyIndicator size={11} /> : <RefreshCw size={14} />}更新配置</button> : null}
+                  <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：真实地址与密钥会写回工具' : '切到网关：密钥留在 Agent'} onClick={() => void switchBindingMode(gatewayMode ? 'direct' : 'gateway')}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '取消后该工具恢复自己的模型配置，服务仍可再分发。', confirmText: '取消分发' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}取消分发</button>
                 </> : (
                   <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy || !sourceDraft || (sourceDraft === 'managed' && !managed.available)} onClick={() => void distributeSource()}>{rowBusy ? <BusyIndicator size={11} /> : null}分发</button>

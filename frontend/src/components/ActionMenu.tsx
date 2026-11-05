@@ -134,10 +134,12 @@ export function ActionMenu({ label, icon, title, variant = 'default', disabled =
 }
 
 /** 与标题栏菜单一致的菜单行：图标 + 文字（+ 右侧状态/徽标）。 */
-export function ActionMenuItem({ icon, label, title, state, badge, danger = false, disabled = false, onClick }: {
+export function ActionMenuItem({ icon, label, title, ariaLabel, state, badge, danger = false, disabled = false, onClick }: {
   icon: ReactNode;
   label: string;
   title?: string;
+  /** 可见文字只是短名时（例如分组菜单里只剩模型名），用它补全读屏听到的完整含义。 */
+  ariaLabel?: string;
   state?: string;
   badge?: ReactNode;
   danger?: boolean;
@@ -145,7 +147,7 @@ export function ActionMenuItem({ icon, label, title, state, badge, danger = fals
   onClick: () => void;
 }) {
   return (
-    <button type="button" role="menuitem" className={danger ? 'danger' : undefined} title={title} disabled={disabled} onClick={onClick}>
+    <button type="button" role="menuitem" className={danger ? 'danger' : undefined} title={title} aria-label={ariaLabel} disabled={disabled} onClick={onClick}>
       {icon}
       <span>{label}</span>
       {state ? <small className="extension-source-menu-state">{state}</small> : null}

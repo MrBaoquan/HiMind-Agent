@@ -224,6 +224,7 @@ mod tests {
             model_alias: alias.to_string(),
             upstream_model: upstream.to_string(),
             recommended,
+            ..Default::default()
         }
     }
 

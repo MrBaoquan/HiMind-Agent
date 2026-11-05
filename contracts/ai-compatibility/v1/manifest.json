@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "matrix": "CapabilityMatrixV1",
+  "fixtures": [
+    "opencode-tool-media.json",
+    "codex-namespace-web-search.json",
+    "anthropic-to-chat.json",
+    "anthropic-to-responses.json",
+    "responses-to-chat.json",
+    "chat-to-responses.json"
+  ]
+}

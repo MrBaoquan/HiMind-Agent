@@ -118,6 +118,9 @@ enum CapabilityHandler {
     AIClientRemove,
     AIClientImportPlan,
     AIClientRemovePlan,
+    AIClientSyncPlan,
+    AIClientSync,
+    AIClientSyncAll,
     AIServiceList,
     AIServiceCustomUpsert,
     AIServiceCustomRemove,
@@ -771,6 +774,48 @@ impl CapabilityGateway {
                 CapabilityHandler::AIClientRemovePlan,
             ),
             registration(
+                "ai.client.sync.plan",
+                "生成 AI 客户端同步计划",
+                "只读比较已注册客户端的已应用投影与当前 AI 服务/聚合入口期望态，返回待更新原因、写入和备份目标。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientSyncPlan,
+            ),
+            registration(
+                "ai.client.sync",
+                "同步 AI 客户端",
+                "把已注册客户端更新到当前 AI 服务或聚合入口期望态；复用本机令牌与首次注册快照，不执行首次注册。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "expected_revision": {
+                            "type": "string",
+                            "description": "sync.plan 返回的 desired_revision；非空时用于拒绝过期计划"
+                        }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientSync,
+            ),
+            registration(
+                "ai.client.sync-all",
+                "同步全部待更新 AI 客户端",
+                "批量同步当前处于待更新且无阻塞冲突的 AI 客户端；阻塞项保留并单独返回。",
+                "local_write",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::AIClientSyncAll,
+            ),
+            registration(
                 "ai.service.list",
                 "AI 服务列表",
                 "读取本机可用的 AI 服务：HiMind 分发服务摘要与用户自定义服务；不返回 API Key。",
@@ -830,7 +875,7 @@ impl CapabilityGateway {
             registration(
                 "ai.service.custom.model.list",
                 "拉取自定义 AI 服务模型",
-                "读取指定自定义 AI 服务的 /models 接口，返回可用模型 ID 列表；不修改任何配置。",
+                "读取指定自定义 AI 服务的可用模型；标准供应商走 /models，火山方舟 Agent Plan 使用 1 Token Messages 探测并返回目录模型；不修改任何配置。",
                 "read_only",
                 json!({
                     "type": "object",
@@ -843,12 +888,13 @@ impl CapabilityGateway {
             registration(
                 "ai.service.image.set",
                 "设置媒体能力服务",
-                "指定本机哪个 AI 服务用于某个媒体能力（image.generate / image.edit / video.generate）；传空字符串清除，恢复自动选择。不影响对话使用的服务。",
+                "指定本机哪个 AI 服务、哪个模型用于某个媒体能力（image.generate / image.edit / video.generate）；model 留空表示跟随该服务的默认模型。id 传空字符串清除该能力的主选与备用。不影响对话使用的服务。",
                 "local_write",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string", "maxLength": 64 },
+                        "model": { "type": "string", "maxLength": 128 },
                         "capability": {
                             "type": "string",
                             "enum": ["image.generate", "image.edit", "video.generate"]
@@ -3797,9 +3843,21 @@ impl CapabilityGateway {
                 } else {
                     self.dashboard_user_id(context).unwrap_or_default()
                 };
-                Ok(serde_json::to_value(
-                    crate::app::ai_provider_import::import(&self.options, &user_id, &request)?,
-                )?)
+                let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+                let default_gateway = matrix
+                    .client(request.target.as_str())
+                    .is_some_and(|client| client.default_gateway);
+                let result = if default_gateway {
+                    crate::app::ai_provider_import::enable_gateway_binding(
+                        &self.options,
+                        &user_id,
+                        &request.target,
+                        request.service_source(),
+                    )?
+                } else {
+                    crate::app::ai_provider_import::import(&self.options, &user_id, &request)?
+                };
+                Ok(serde_json::to_value(result)?)
             }
             CapabilityHandler::AIClientRemove => {
                 let request: crate::app::ai_provider_import::AIProviderImportRequest =
@@ -3828,6 +3886,32 @@ impl CapabilityGateway {
                     &request.target,
                     "remove",
                 )?)?)
+            }
+            CapabilityHandler::AIClientSyncPlan => {
+                let request: crate::app::ai_provider_import::AIProviderSyncRequest =
+                    serde_json::from_value(input)?;
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::sync_plan(&self.options, &request.target)?,
+                )?)
+            }
+            CapabilityHandler::AIClientSync => {
+                let request: crate::app::ai_provider_import::AIProviderSyncRequest =
+                    serde_json::from_value(input)?;
+                let user_id = self.dashboard_user_id(context).unwrap_or_default();
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::sync_binding(
+                        &self.options,
+                        &user_id,
+                        &request.target,
+                        Some(request.expected_revision.as_str()),
+                    )?,
+                )?)
+            }
+            CapabilityHandler::AIClientSyncAll => {
+                let user_id = self.dashboard_user_id(context).unwrap_or_default();
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::sync_all(&self.options, &user_id),
+                )?)
             }
             CapabilityHandler::AIServiceList => {
                 let custom = crate::store::ai_services::public_snapshot()?;
@@ -3870,16 +3954,37 @@ impl CapabilityGateway {
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
+                let model = input
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
                 let capability = input
                     .get("capability")
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .unwrap_or(crate::store::ai_services::CAP_IMAGE_GENERATE);
-                let selected = crate::store::ai_services::set_media_service(capability, id)?;
+                // 与其他写入路径共用一张路由表：`id` 为空即清空该能力的主选与备用。
+                let entries = if id.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![crate::store::ai_services::CapabilityRouteEntry::new(
+                        id,
+                        model, // 空 `model` 跟随该服务的默认模型（ADR 0023）。
+                    )]
+                };
+                let normalized =
+                    crate::store::ai_services::set_capability_routes(capability, entries)?;
                 Ok(serde_json::json!({
                     "capability": capability,
-                    "service_id": selected.map(|service| service.id).unwrap_or_default(),
+                    "service_id": normalized
+                        .first()
+                        .map(|entry| entry.service_id.clone())
+                        .unwrap_or_default(),
+                    "model": normalized
+                        .first()
+                        .map(|entry| entry.model.clone())
+                        .unwrap_or_default(),
                 }))
             }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
@@ -8287,7 +8392,7 @@ fn media_ai_tag_batch_start_schema() -> Value {
             "max_output_tokens": {"type": "integer", "minimum": 64, "maximum": 2000},
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 4},
             "attempts": {"type": "integer", "minimum": 1, "maximum": 3, "description": "单条失败重试次数，默认 2"},
-            "reasoning_effort": {"enum": ["none", "low", "medium", "high"]},
+            "reasoning_effort": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]},
             "budget_tokens": {"type": "integer", "minimum": 0, "description": "作业 token 上限，0 表示不限"},
             "prompt": {"type": "string", "maxLength": 4000}
         },
@@ -8332,7 +8437,7 @@ fn media_ai_describe_schema() -> Value {
             "profile": {"enum":["fast","full","ocr"], "description":"fast 只出标签，full 出标签+描述+质量，ocr 只出文字"},
             "max_edge": {"type":"integer", "minimum":128, "maximum":1536, "description":"图片最长边；批量建议 320–512"},
             "max_output_tokens": {"type":"integer", "minimum":64, "maximum":2000},
-            "reasoning_effort": {"enum":["none","low","medium","high"], "description":"部分网关支持；不支持会返回错误"},
+            "reasoning_effort": {"enum":["none","minimal","low","medium","high","xhigh","max","ultra"], "description":"按模型能力选择；不支持会返回错误"},
             "service": {"type":"string", "maxLength":120, "description":"custom:<id>；留空使用激活服务"},
             "model": {"type":"string", "maxLength":200}
         },
@@ -9641,6 +9746,9 @@ mod tests {
             "ai.client.remove",
             "ai.client.import.plan",
             "ai.client.remove.plan",
+            "ai.client.sync.plan",
+            "ai.client.sync",
+            "ai.client.sync-all",
         ] {
             assert!(
                 visible.iter().any(|item| item.id == capability_id),
@@ -9663,6 +9771,18 @@ mod tests {
             .iter()
             .find(|item| item.id == "ai.client.remove.plan")
             .is_some_and(|item| item.risk_level == "read_only"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.sync.plan")
+            .is_some_and(|item| item.risk_level == "read_only"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.sync")
+            .is_some_and(|item| item.risk_level == "local_write"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.sync-all")
+            .is_some_and(|item| item.risk_level == "local_write"));
         for capability_id in [
             "ai.service.list",
             "ai.service.custom.upsert",
@@ -9698,6 +9818,8 @@ mod tests {
             "ai.client.remove",
             "ai.client.import.plan",
             "ai.client.remove.plan",
+            "ai.client.sync.plan",
+            "ai.client.sync",
         ] {
             let actual = registry[capability_id]
                 .descriptor
@@ -9800,6 +9922,39 @@ mod tests {
                     "required": ["target"],
                     "additionalProperties": false
                 }),
+            ),
+            (
+                "ai.client.sync.plan",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "ai.client.sync",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() },
+                        "expected_revision": {
+                            "type": "string",
+                            "description": "sync.plan 返回的 desired_revision；非空时用于拒绝过期计划"
+                        }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "ai.client.sync-all",
+                "local_write",
+                json!({ "type": "object", "additionalProperties": false }),
             ),
         ];
 
@@ -10135,6 +10290,113 @@ mod tests {
     }
 
     #[test]
+    fn image_service_capability_pins_the_model_not_just_the_service() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-ai-service-image-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                crate::store::ai_services::CAP_IMAGE_GENERATE.to_string(),
+                crate::store::ai_services::MediaModelBinding {
+                    adapter: "ark-images".to_string(),
+                    model: "doubao-seedream-5-0-pro".to_string(),
+                    models: vec!["doubao-seedream-4-0".to_string()],
+                    execution_mode: None,
+                },
+            );
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "image-west".to_string(),
+                display_name: "西部生图".to_string(),
+                base_url: "https://ark.example/api/v3".to_string(),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+                model: String::new(),
+                models: Vec::new(),
+                image_model: "doubao-seedream-5-0-pro".to_string(),
+                image_adapter: "ark-images".to_string(),
+                media,
+                api_key: "sk-image-west".to_string(),
+            })?;
+
+            let mut options = crate::Options::from_env();
+            options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+            let gateway =
+                CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+            let context = InvocationContext::new(
+                crate::capability::types::InvocationSource::LocalHttp,
+                "local-user",
+            );
+
+            // `model` 必须进路由表：只记服务名就等于把用户的模型选择丢掉（ADR 0023）。
+            let set = gateway.invoke(
+                &context,
+                "ai.service.image.set",
+                json!({
+                    "id": "image-west",
+                    "capability": "image.generate",
+                    "model": "doubao-seedream-4-0",
+                }),
+            )?;
+            assert_eq!(set["service_id"], "image-west");
+            assert_eq!(set["model"], "doubao-seedream-4-0");
+            assert_eq!(
+                crate::store::ai_services::capability_routes(
+                    crate::store::ai_services::CAP_IMAGE_GENERATE
+                )?,
+                vec![crate::store::ai_services::CapabilityRouteEntry::new(
+                    "image-west",
+                    "doubao-seedream-4-0",
+                )]
+            );
+
+            // 不在该服务模型目录里的模型必须被拒绝，而不是悄悄回落成默认模型。
+            let error = gateway
+                .invoke(
+                    &context,
+                    "ai.service.image.set",
+                    json!({
+                        "id": "image-west",
+                        "capability": "image.generate",
+                        "model": "no-such-model",
+                    }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("没有模型"), "实际错误：{error}");
+
+            // `id` 为空 = 清除该能力的主选与备用。
+            let cleared = gateway.invoke(
+                &context,
+                "ai.service.image.set",
+                json!({ "id": "", "capability": "image.generate" }),
+            )?;
+            assert_eq!(cleared["service_id"], "");
+            assert!(crate::store::ai_services::capability_routes(
+                crate::store::ai_services::CAP_IMAGE_GENERATE
+            )?
+            .is_empty());
+            Ok(())
+        })();
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
     fn naming_spec_helper_accepts_elegant_ids_and_flags_the_rest() {
         for id in [
             "media.image.generate",
@@ -10401,6 +10663,7 @@ mod tests {
                 crate::store::ai_services::MediaModelBinding {
                     adapter: "openai-speech".to_string(),
                     model: "tts-fixture".to_string(),
+                    models: Vec::new(),
                     execution_mode: Some(crate::store::ai_services::MediaExecutionMode::Sync),
                 },
             );

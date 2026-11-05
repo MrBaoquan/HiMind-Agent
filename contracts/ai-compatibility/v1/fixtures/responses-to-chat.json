@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "responses-to-chat",
+  "pipeline": "responses_to_chat",
+  "client": "codex",
+  "provider": "openai_chat_compatible",
+  "protocol": "openai-chat",
+  "default_model": "model-a",
+  "input": {
+    "model": "model-a",
+    "instructions": "rules",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_output_tokens": 64,
+    "tool_choice": "auto",
+    "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+  },
+  "expect": {
+    "paths": {"/model": "model-a", "/messages/0/role": "system", "/messages/1/role": "user", "/max_tokens": 64, "/temperature": 0.2, "/top_p": 0.9, "/tools/0/type": "function", "/tool_choice": "auto"},
+    "forbidden_substrings": ["input_image"]
+  }
+}

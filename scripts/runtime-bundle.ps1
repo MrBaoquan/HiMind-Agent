@@ -66,33 +66,50 @@ function Assert-RuntimeReleaseDirectory {
         ManifestPath = $manifestPath
         PackageName = $packageName
         Manifest = $manifest
+        IsExactPackage = [bool]$isExactPackage
     }
 }
 
 function Resolve-RuntimeReleaseDirectory {
-    param([string]$RequestedDirectory)
+    param(
+        [string]$RequestedDirectory,
+        [switch]$RequireExactPackage,
+        [switch]$ExcludeInstalledBundle
+    )
 
     $candidates = [System.Collections.Generic.List[string]]::new()
-    foreach ($value in @(
-            $RequestedDirectory,
-            [Environment]::GetEnvironmentVariable("HIMIND_RUNTIME_RELEASE_DIRECTORY", "Process"),
-            (Join-Path $env:LOCALAPPDATA "HiMindAgent\resources\runtime")
-        )) {
+    $explicitCandidates = @(
+        $RequestedDirectory,
+        [Environment]::GetEnvironmentVariable("HIMIND_RUNTIME_RELEASE_DIRECTORY", "Process")
+    )
+    if (-not $ExcludeInstalledBundle) {
+        $explicitCandidates += (Join-Path $env:LOCALAPPDATA "HiMindAgent\resources\runtime")
+    }
+    foreach ($value in $explicitCandidates) {
         if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
             $candidates.Add([IO.Path]::GetFullPath([string]$value))
         }
     }
-    $manualRoot = Join-Path $Root "manual-releases\deepseek-harness-runtime"
-    if (Test-Path -LiteralPath $manualRoot -PathType Container) {
-        Get-ChildItem -LiteralPath $manualRoot -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "himind-runtime-release.json") -PathType Leaf } |
-            Sort-Object LastWriteTime -Descending |
-            ForEach-Object { $candidates.Add($_.FullName) }
+    $manualRoots = @(
+        (Join-Path $Root "manual-releases\deepseek-harness-runtime"),
+        (Join-Path (Split-Path -Parent $Root) "manual-releases\deepseek-harness-runtime")
+    ) | Select-Object -Unique
+    foreach ($manualRoot in $manualRoots) {
+        if (Test-Path -LiteralPath $manualRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $manualRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "himind-runtime-release.json") -PathType Leaf } |
+                Sort-Object LastWriteTime -Descending |
+                ForEach-Object { $candidates.Add($_.FullName) }
+        }
     }
     $lastError = $null
     foreach ($candidate in $candidates | Select-Object -Unique) {
         try {
-            return Assert-RuntimeReleaseDirectory $candidate
+            $resolved = Assert-RuntimeReleaseDirectory $candidate
+            if ($RequireExactPackage -and -not $resolved.IsExactPackage) {
+                throw "Runtime candidate is an installer-derived package, not the exact Agent-pinned source package: $candidate"
+            }
+            return $resolved
         }
         catch {
             $lastError = $_
@@ -105,17 +122,55 @@ function Resolve-RuntimeReleaseDirectory {
 function Copy-RuntimeBundle {
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeReleaseDirectory,
-        [Parameter(Mandatory = $true)][string]$DestinationDirectory
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [switch]$RequireExactPackage
     )
 
     $runtime = Assert-RuntimeReleaseDirectory $RuntimeReleaseDirectory
-    $destination = [IO.Path]::GetFullPath($DestinationDirectory)
-    if (Test-Path -LiteralPath $destination) {
-        Remove-Item -LiteralPath $destination -Recurse -Force
+    if ($RequireExactPackage -and -not $runtime.IsExactPackage) {
+        throw "Runtime source is not the exact Agent-pinned package: $RuntimeReleaseDirectory"
     }
-    New-Item -ItemType Directory -Path $destination -Force | Out-Null
-    Copy-Item -LiteralPath $runtime.ManifestPath -Destination $destination
-    Copy-Item -LiteralPath (Join-Path $runtime.Directory $runtime.PackageName) -Destination $destination
-    Copy-Item -LiteralPath (Join-Path $runtime.Directory "$($runtime.PackageName).signature.json") -Destination $destination
-    return $destination
+    $destination = [IO.Path]::GetFullPath($DestinationDirectory)
+    $parent = Split-Path -Parent $destination
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        throw "Runtime destination has no parent directory: $destination"
+    }
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+
+    $token = [Guid]::NewGuid().ToString("N")
+    $staging = Join-Path $parent ".runtime.installing-$token"
+    $backup = Join-Path $parent ".runtime.previous-$token"
+    $installed = $false
+    try {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        Copy-Item -LiteralPath $runtime.ManifestPath -Destination $staging
+        Copy-Item -LiteralPath (Join-Path $runtime.Directory $runtime.PackageName) -Destination $staging
+        Copy-Item -LiteralPath (Join-Path $runtime.Directory "$($runtime.PackageName).signature.json") -Destination $staging
+
+        if (Test-Path -LiteralPath $destination) {
+            Move-Item -LiteralPath $destination -Destination $backup
+        }
+        try {
+            Move-Item -LiteralPath $staging -Destination $destination
+            $installed = $true
+        }
+        catch {
+            if (Test-Path -LiteralPath $backup) {
+                Move-Item -LiteralPath $backup -Destination $destination
+            }
+            throw
+        }
+        if (Test-Path -LiteralPath $backup) {
+            Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        return $destination
+    }
+    finally {
+        if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $installed -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $destination)) {
+            Move-Item -LiteralPath $backup -Destination $destination
+        }
+    }
 }

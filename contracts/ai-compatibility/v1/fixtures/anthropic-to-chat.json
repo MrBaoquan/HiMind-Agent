@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "anthropic-to-chat",
+  "pipeline": "anthropic_to_chat",
+  "client": "claude-desktop",
+  "provider": "openai_chat_compatible",
+  "protocol": "openai-chat",
+  "default_model": "model-a",
+  "input": {
+    "model": "model-a",
+    "system": "rules",
+    "max_tokens": 64,
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "tool_choice": {"type": "auto"},
+    "tools": [{"name": "read", "description": "read", "input_schema": {"type": "object"}}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+  },
+  "expect": {
+    "paths": {"/model": "model-a", "/messages/0/role": "system", "/messages/1/role": "user", "/max_tokens": 64, "/temperature": 0.2, "/top_p": 0.9, "/tools/0/type": "function", "/tool_choice": "auto"},
+    "forbidden_substrings": ["input_image"]
+  }
+}

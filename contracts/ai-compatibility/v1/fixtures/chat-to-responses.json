@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "name": "chat-to-responses",
+  "pipeline": "chat_to_responses",
+  "client": "opencode",
+  "provider": "openai_responses_limited",
+  "protocol": "openai-responses",
+  "default_model": "model-a",
+  "input": {
+    "model": "model-a",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_tokens": 64,
+    "tool_choice": "auto",
+    "tools": [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}],
+    "messages": [{"role": "user", "content": "hello"}]
+  },
+  "expect": {
+    "paths": {"/model": "model-a", "/max_output_tokens": 64, "/input/0/type": "message", "/input/0/role": "user", "/tools/0/type": "function"},
+    "absent_paths": ["/temperature", "/top_p"],
+    "forbidden_substrings": ["input_image"],
+    "changes_include": ["sampling_temperature", "sampling_top_p"]
+  }
+}

@@ -13,13 +13,16 @@ import type {
   AIServiceTemplateListResult,
   AcpRuntimeProfileInput,
   AcpRuntimeProfileSnapshot,
+  CustomAIService,
   DashboardIdentityStatus,
   McpConnectionTestResult,
   McpTargetDescriptor,
   InferenceGatewayStatus,
   GatewayProfile,
   GatewayProfileInput,
+  CapabilityRouteEntry,
 } from '../services/agentApi';
+import type { AIServiceCapability } from './aiServiceCapabilities';
 
 type AiConnectionsPageProps = {
   initialTab?: AiConnectionsTab;
@@ -65,14 +68,17 @@ type AiConnectionsPageProps = {
     speech_adapter: string;
     transcribe_model: string;
     transcribe_adapter: string;
+    /** 视觉理解专用模型；留空表示跟随对话模型（ADR 0023 第七条）。 */
+    vision_model: string;
+    media_models: Record<string, string[]>;
     balance_profile_id: string;
     balance_access_token: string;
     balance_user_id: string;
     api_key: string;
   }) => Promise<void>;
-  onSetActiveAIService: (id: string) => Promise<void>;
-  onSetImageAIService: (id: string, capability?: string) => Promise<void>;
+  onSetCapabilityRoutes: (capability: AIServiceCapability, entries: CapabilityRouteEntry[]) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
+  onCloneAIService: (id: string) => Promise<CustomAIService>;
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
@@ -123,9 +129,9 @@ export function AiConnectionsPage({
   onOpenDirectory,
   onTest,
   onSaveAIService,
-  onSetActiveAIService,
-  onSetImageAIService,
+  onSetCapabilityRoutes,
   onRemoveAIService,
+  onCloneAIService,
   onImportAIClient,
   onRemoveAIClient,
   onFetchModels,
@@ -193,6 +199,7 @@ export function AiConnectionsPage({
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}
             onRemoveAIService={onRemoveAIService}
+            onCloneAIService={onCloneAIService}
             onOpenAccount={onOpenAccount}
             onFetchModels={onFetchModels}
             onFetchSavedModels={onFetchSavedModels}
@@ -214,8 +221,7 @@ export function AiConnectionsPage({
           <AiServiceRoutesPanel
             aiServices={aiServices}
             onOpenServices={() => setActiveTab('services')}
-            onSetActiveAIService={onSetActiveAIService}
-            onSetMediaAIService={onSetImageAIService}
+            onSetCapabilityRoutes={onSetCapabilityRoutes}
           />
         </div>
       ) : (

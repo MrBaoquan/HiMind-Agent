@@ -99,4 +99,45 @@ for (const selector of pathSelectors) {
   assert.match(block!.body, /overflow-wrap: anywhere/, `${selector} 需要断词，长路径才能整段显示`);
 }
 
+// 18. 能力路由的四列表格按自身宽度回落：设置窗口默认 996px 时路由表只有 693px，
+//     而 `.ai-page` 的 max-width 把它封在 880px 以内，所以断点必须量表格自身。
+//     断点若挂在 `agent-main`（量的是设置窗口内容列 764/1168px），窗口一放大就会
+//     误判成四列，把备用 chip 挤到截断——这正是默认窗口以前两列、放大后反而更挤的原因。
+const routeGrid = blocks.find(
+  (block) => block.selector === '.ai-route-row' && (block.body.match(/minmax\(/g) ?? []).length === 4,
+);
+assert.ok(routeGrid, 'styles.css 缺少能力路由的四列布局');
+const routePanel = blocks.find((block) => block.selector === '.ai-routes-view' && /container: ai-routes/.test(block.body));
+assert.ok(routePanel, '能力路由必须把容器查询挂到路由面板自身（container: ai-routes）；挂 agent-main 会量错宽度');
+const routeGap = Number(/gap:\s*(\d+)px/.exec(routeGrid!.body)?.[1] ?? 0);
+const routePadding = Number(/padding:\s*\d+px\s+(\d+)px/.exec(routeGrid!.body)?.[1] ?? 0);
+// 四列真正装得下，是指列底限、列间距、左右行内边距与表格边框全都在框内。
+// 少算内边距会得到一个自证式的「临界点」：末列先吃右内边距，量 scrollWidth 永远是 0，
+// 于是 585px 看起来没溢出，其实状态列图标已经贴到边框（真实窗口 586/592/598px 时
+// 右缘距边框只剩 2/8/14px）。所以这里必须按内容盒 + 行内边距 + 边框来算。
+const routeColumnFloor = [...routeGrid!.body.matchAll(/minmax\((\d+)px/g)]
+  .reduce((sum, match) => sum + Number(match[1]), 0) + routeGap * 3;
+const routeTableBorder = 1;
+const routeFullNeed = routeColumnFloor + routePadding * 2 + routeTableBorder * 2;
+const routeBreakpoint = Number(
+  /@container ai-routes \(max-width: (\d+)px\)[\s\S]{0,400}?\.ai-route-row \{ grid-template-columns: minmax\(0, 1fr\) max-content;/
+    .exec(styles)?.[1] ?? 0,
+);
+assert.ok(routeBreakpoint > 0,
+  '能力路由必须用 @container ai-routes 回落；按视口或按内容列写断点时，表格宽度和断点量的不是同一个盒子');
+assert.ok(routePadding > 0, '路由行需要保留左右内边距，否则状态列会贴住表格边框');
+// 断点必须刚好卡在「四列连内边距都装得下」的下方：再窄 1px 就是内边距被挤占。
+assert.equal(routeBreakpoint, routeFullNeed - 1,
+  `回落断点应为 ${routeFullNeed - 1}px（四列含内边距与边框需 ${routeFullNeed}px）：` +
+  `写小了会让末列画进右内边距，图标按钮贴住表格边框`);
+// 默认设置窗口 996px 时路由表实测 693px，必须落在四列区间。
+assert.ok(693 > routeBreakpoint,
+  `默认设置窗口下路由表 693px 应命中四列，但断点是 ${routeBreakpoint}px`);
+// 回落形态是「能力 + 状态一行 / 主选一行 / 备用一行」，不是旧的「能力整行 + 两列对开」。
+const routeFallback = new RegExp(
+  `@container ai-routes \\(max-width: ${routeBreakpoint}px\\)[\\s\\S]{0,600}?\\.ai-route-primary \\{ grid-column: 1 / -1; grid-row: 2;`
+).test(styles);
+assert.ok(routeFallback,
+  '回落形态应让主选独占第二行；旧的两列对开会把整表高度翻倍（实测 1066px 对 890px）');
+
 console.log(`text layout checks passed（${blocks.length} 条规则 / ${pathSelectors.length} 组路径）`);

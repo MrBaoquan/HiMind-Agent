@@ -112,18 +112,46 @@ struct RunLeaseGuard {
 impl RunLeaseGuard {
     fn acquire(ledger: LocalRunLedger, run_id: &str) -> Result<Self, Box<dyn Error>> {
         let owner = format!("workflow-pid-{}-{}", std::process::id(), run_id);
-        if !ledger.acquire_run_lease(run_id, &owner, 300)? {
+        if !ledger.acquire_run_lease(
+            run_id,
+            &owner,
+            crate::store::local_runs::RUN_LEASE_TTL_SECONDS,
+        )? {
             return Err(format!("workflow run is leased by another process: {run_id}").into());
         }
         let (stop_tx, stop_rx) = mpsc::channel();
         let thread_ledger = ledger.clone();
         let thread_run_id = run_id.to_string();
         let thread_owner = owner.clone();
-        let thread = thread::spawn(move || loop {
-            match stop_rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = thread_ledger.renew_run_lease(&thread_run_id, &thread_owner, 300);
+        let thread = thread::spawn(move || {
+            let mut last_error = String::new();
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(30)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let renewal = thread_ledger.renew_run_lease(
+                            &thread_run_id,
+                            &thread_owner,
+                            crate::store::local_runs::RUN_LEASE_TTL_SECONDS,
+                        );
+                        let error = match renewal {
+                            Ok(true) => String::new(),
+                            Ok(false) => "lease row is no longer owned".to_string(),
+                            Err(error) => error.to_string(),
+                        };
+                        if !error.is_empty() && error != last_error {
+                            crate::app::crash::record_event(
+                                "warn",
+                                &format!(
+                                    "workflow lease renewal failed for {thread_run_id}: {error}"
+                                ),
+                            );
+                            eprintln!("workflow lease renewal failed for {thread_run_id}: {error}");
+                            last_error = error;
+                        } else if error.is_empty() {
+                            last_error.clear();
+                        }
+                    }
                 }
             }
         });

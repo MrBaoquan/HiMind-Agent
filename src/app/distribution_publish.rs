@@ -233,6 +233,10 @@ pub(crate) fn resolve_asset(
             if draft.state != crate::extension_contracts::ExtensionCandidateState::Confirmed {
                 return Err("工作流候选版本尚未确认，无法发布".into());
             }
+            let lock = draft.lock.as_ref().ok_or("Workflow 候选缺少依赖锁")?;
+            let package = crate::workflow::load_from_directory(&draft.source_root)?;
+            crate::workflow::validate_release_dependency_versions(&package, lock)?;
+            crate::workflow::ensure_release_preflight_ready(&draft.test_report)?;
             // Workflow 锁里的依赖已经带精确版本与摘要，直接作为声明层输入。
             let declared = draft
                 .lock

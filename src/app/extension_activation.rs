@@ -196,6 +196,22 @@ fn normalized_workspace_path(path: &Path) -> String {
     normalize_path_key(&resolved.to_string_lossy())
 }
 
+/// 未提交的本地包候选可以由当前源码工作区自动接管。
+///
+/// “先导入 dist 包、再从同版本源码构建”是正常的开发路径；只要候选尚未提交，
+/// 源码构建就应成为新的工作区事实，而不是要求用户提升版本或手工移除登记。
+pub(crate) fn can_rebind_authoring_workspace(
+    source: &str,
+    submitted: bool,
+    dashboard_linked: bool,
+    workspace: Option<&Path>,
+) -> bool {
+    !submitted
+        && !dashboard_linked
+        && (source == "local_package"
+            || (source != "workspace" && workspace.map_or(true, |path| !path.is_dir())))
+}
+
 pub(crate) fn ensure_workspace_identity(
     existing: Option<&Path>,
     incoming: &Path,
@@ -817,6 +833,34 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(error.to_string().contains("deployment_id"));
+    }
+
+    #[test]
+    fn unsubmitted_local_package_candidate_can_rebind_to_source_workspace() {
+        assert!(can_rebind_authoring_workspace(
+            "local_package",
+            false,
+            false,
+            Some(Path::new(r"F:\WebProjects\extensions\dist")),
+        ));
+        assert!(!can_rebind_authoring_workspace(
+            "local_package",
+            true,
+            false,
+            Some(Path::new(r"F:\WebProjects\extensions\dist")),
+        ));
+        assert!(!can_rebind_authoring_workspace(
+            "local_package",
+            false,
+            true,
+            Some(Path::new(r"F:\WebProjects\extensions\dist")),
+        ));
+        assert!(!can_rebind_authoring_workspace(
+            "workspace",
+            false,
+            false,
+            Some(Path::new(r"F:\WebProjects\extensions\dist")),
+        ));
     }
 
     #[test]

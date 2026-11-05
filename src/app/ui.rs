@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Stdio},
@@ -403,6 +404,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::list_builtin_ai_sessions,
             super::commands::stop_builtin_ai_session,
             super::commands::open_builtin_ai_web,
+            super::commands::open_builtin_ai_window,
             super::commands::sync_builtin_ai_models,
             super::commands::set_approval_rule,
             super::commands::set_approval_profile,
@@ -523,18 +525,20 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_media_provider_catalog,
             super::commands::plan_ai_capability_route,
             super::commands::test_ai_capability,
-            super::commands::set_ai_capability_fallbacks,
+            super::commands::set_capability_routes,
             super::commands::list_ai_service_templates,
             super::commands::list_acp_runtime_profiles,
             super::commands::save_acp_runtime_profile,
             super::commands::set_acp_runtime_profile_enabled,
             super::commands::remove_acp_runtime_profile,
             super::commands::save_ai_service,
-            super::commands::set_active_ai_service,
-            super::commands::set_image_ai_service,
+            super::commands::clone_ai_service,
             super::commands::remove_ai_service,
             super::commands::import_ai_client,
             super::commands::remove_ai_client,
+            super::commands::plan_ai_client_sync,
+            super::commands::sync_ai_client,
+            super::commands::sync_ai_clients,
             super::commands::fetch_ai_service_models,
             super::commands::fetch_saved_ai_service_models,
             super::commands::fetch_saved_ai_service_balance,
@@ -567,6 +571,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::associate_extension_project,
             super::commands::create_extension_project,
             super::commands::build_extension_project,
+            super::commands::plan_extension_build,
             super::commands::install_extension_candidate,
             super::commands::get_extension_dev_settings,
             super::commands::set_extension_dev_settings,
@@ -1578,6 +1583,40 @@ pub(crate) fn start_builtin_ai_session(
     Ok(session_url)
 }
 
+/// Open the live DSH entry in a standalone Tauri window. The URL is already
+/// the authenticated local proxy, so the window shares the same DSH process
+/// instead of starting another session.
+pub(crate) fn open_builtin_ai_session_window(
+    app: &tauri::AppHandle,
+    session_url: &str,
+) -> Result<(), String> {
+    let url = url::Url::parse(session_url).map_err(|_| "HiMind AI 会话地址无效".to_string())?;
+    let mut hasher = DefaultHasher::new();
+    session_url.hash(&mut hasher);
+    let label = format!("builtin-ai-{:x}", hasher.finish());
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title("HiMind AI")
+        .inner_size(1280.0, 820.0)
+        .min_inner_size(860.0, 600.0)
+        .resizable(true)
+        .center()
+        .on_new_window(|url, _features| {
+            if matches!(url.scheme(), "http" | "https") {
+                let _ = crate::app::system::open_external_url_once(url.as_str());
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .build()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// 这个工作区已经在跑就复用它，而不是重启进程。
 ///
 /// 项目入口要求「进入后落在该项目」时，才需要把分组里的会话行补上；补失败只是
@@ -1787,6 +1826,20 @@ fn start_builtin_ai_session_inner(
     // reason to keep the user out of HiMind AI.
     if let Err(error) = rail_result {
         append_builtin_ai_diagnostic(&diagnostics, &error);
+    }
+    if launch.service_source == "custom" {
+        let routes = crate::app::builtin_ai_router::model_catalog()?;
+        control.sync_local_service_catalog(
+            &launch.default_model,
+            &launch.base_url,
+            &routes,
+            true,
+        )?;
+        if let Err(error) =
+            control.select_latest_session_model(&launch.workspace, &launch.default_model)
+        {
+            append_builtin_ai_diagnostic(&diagnostics, &error);
+        }
     }
     // Capability probing is only consumed by the optional control-plane
     // bridge. It must not delay rendering the local conversation UI.
@@ -2040,6 +2093,57 @@ pub(crate) fn sync_builtin_ai_models(
         session_url: first_builtin_ai_session_url()
             .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?,
     })
+}
+
+/// Apply a local AI service switch to every running DSH host without restarting
+/// it. The stable router resolves the new upstream; this call only points the
+/// current Session at the corresponding catalog alias.
+fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<(), String> {
+    let controls = {
+        let sessions = builtin_ai_sessions()
+            .lock()
+            .map_err(|_| "HiMind AI 会话状态不可用".to_string())?;
+        sessions
+            .values()
+            .map(|session| (session.proxy.control(), session.workspace.clone()))
+            .collect::<Vec<_>>()
+    };
+    if controls.is_empty() {
+        return Ok(());
+    }
+    let base_url = crate::app::builtin_ai_router::api_base_url()?;
+    let model_alias = crate::app::builtin_ai_router::active_model_alias()?;
+    let routes = crate::app::builtin_ai_router::model_catalog()?;
+    let mut failures = Vec::new();
+    for (control, workspace) in controls {
+        if let Err(error) =
+            control.sync_local_service_catalog(&model_alias, &base_url, &routes, activate_default)
+        {
+            failures.push(error);
+            continue;
+        }
+        if activate_default {
+            if let Err(error) = control.select_latest_session_model(&workspace, &model_alias) {
+                failures.push(error);
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "部分 DSH 会话未能刷新模型目录（进程保持运行）：{}",
+            failures.join("；")
+        ))
+    }
+}
+
+pub(crate) fn refresh_builtin_ai_local_catalog() -> Result<(), String> {
+    sync_builtin_ai_local_catalog(false)
+}
+
+pub(crate) fn activate_builtin_ai_local_service() -> Result<(), String> {
+    sync_builtin_ai_local_catalog(true)
 }
 
 pub(crate) fn plugin_view_window_label(plugin_id: &str, view_id: &str) -> String {

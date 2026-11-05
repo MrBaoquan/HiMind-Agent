@@ -66,7 +66,10 @@ fn limit_range(limits: &Value, key: &str) -> Option<(f64, f64)> {
 }
 
 /// Local, non-billable eligibility checks. This never calls the provider.
-pub(crate) fn preflight(capability: &str, service_id: &str, payload: &Value) -> Value {
+///
+/// `model` 是本次尝试真正要用的模型（来自路由计划）。为空时回落到服务在该
+/// 能力上的默认绑定，与 [`ai_services::capability_models`] 的取值一致。
+pub(crate) fn preflight(capability: &str, service_id: &str, model: &str, payload: &Value) -> Value {
     let mut checks = Vec::new();
     let service = match ai_services::load_secret(service_id) {
         Ok((service, api_key)) => {
@@ -81,12 +84,24 @@ pub(crate) fn preflight(capability: &str, service_id: &str, payload: &Value) -> 
         }
     };
     checks.push(json!({"id": "service", "ok": true, "message": service.display_name}));
+    let model = model.trim();
     let mut limits = json!({});
-    if capability == CAP_CHAT {
-        let model = string_field(payload, "model").unwrap_or(service.model.trim());
-        checks.push(json!({"id": "model", "ok": !model.is_empty(), "message": if model.is_empty() { "未配置对话模型" } else { model }}));
+    if capability == CAP_CHAT || capability == CAP_VISION {
+        let resolved = if model.is_empty() {
+            ai_services::capability_models(&service, capability)
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        } else {
+            model.to_string()
+        };
+        checks.push(json!({"id": "model", "ok": !resolved.is_empty(), "message": if resolved.is_empty() { "未配置对话模型" } else { resolved.as_str() }}));
     } else {
-        match ai_services::binding_details_for(&service, capability) {
+        match ai_services::binding_details_for_model(
+            &service,
+            capability,
+            (!model.is_empty()).then_some(model),
+        ) {
             Some(binding) => {
                 limits = adapter_limits(&binding.adapter);
                 checks.push(json!({"id": "binding", "ok": true, "message": binding.adapter}));
@@ -294,10 +309,20 @@ fn local_request_id() -> String {
     format!("cap-{now:x}")
 }
 
-fn with_service(input: &Value, service_id: &str) -> Value {
+/// 把一次路由尝试写成对下游 adapter 的请求：服务与模型都显式写入。
+///
+/// `model` 为空时删掉请求体里的 `model` 键，交回服务的能力绑定去解析
+/// （跟随服务默认模型，ADR 0023）。这让「主选 A/x 失败 → 降到 B」时 B
+/// 收到的是自己的模型，而不是主选的 x。
+fn with_attempt(input: &Value, service_id: &str, model: &str) -> Value {
     let mut object = input.as_object().cloned().unwrap_or_default();
     object.insert("service".to_string(), json!(format!("custom:{service_id}")));
     object.remove("capability");
+    if model.trim().is_empty() {
+        object.remove("model");
+    } else {
+        object.insert("model".to_string(), json!(model.trim()));
+    }
     Value::Object(object)
 }
 
@@ -330,6 +355,7 @@ fn artifacts(value: &Value) -> Vec<Value> {
 fn decorate(
     capability: &str,
     service_id: &str,
+    model: &str,
     request_id: &str,
     attempts: &[Value],
     fallback_used: bool,
@@ -354,6 +380,7 @@ fn decorate(
     object.insert("request_id".to_string(), json!(request_id));
     object.insert("capability".to_string(), json!(capability));
     object.insert("service_id".to_string(), json!(service_id));
+    object.insert("model".to_string(), json!(model));
     object.insert("provider_request_id".to_string(), provider_request_id);
     object.insert("usage".to_string(), usage);
     object.insert("artifacts".to_string(), json!(artifacts(&value)));
@@ -388,7 +415,11 @@ pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Bo
             .get("service_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let preflight_result = preflight(capability, service_id, input);
+        let model = attempt
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let preflight_result = preflight(capability, service_id, model, input);
         if preflight_result.get("state").and_then(Value::as_str) != Some("ready") {
             let messages = preflight_result
                 .get("checks")
@@ -401,8 +432,12 @@ pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Bo
                 .join("；");
             return Err(format!("能力预检失败：{messages}").into());
         }
-        attempt_log.push(json!({"service_id": service_id, "state": "running"}));
-        match invoke(capability, &with_service(input, service_id)) {
+        attempt_log.push(json!({
+            "service_id": service_id,
+            "model": model,
+            "state": "running",
+        }));
+        match invoke(capability, &with_attempt(input, service_id, model)) {
             Ok(result) => {
                 if let Some(last) = attempt_log.last_mut() {
                     last["state"] = json!("succeeded");
@@ -410,6 +445,7 @@ pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Bo
                 return Ok(decorate(
                     capability,
                     service_id,
+                    model,
                     &request_id,
                     &attempt_log,
                     index > 0,
@@ -457,6 +493,35 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
         .get("service_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // 路由计划解析出的模型是权威值。调用方可以指定本次自检的模型，但必须落在
+    // 该服务的模型目录里；否则会绕过「显式模型失效不回落」的判定（ADR 0023）。
+    let planned_model = selected
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let requested_model = input
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let model = match requested_model {
+        Some(requested) if requested != planned_model => {
+            let service = ai_services::load_secret(service_id)?.0;
+            if ai_services::capability_models(&service, capability)
+                .iter()
+                .any(|candidate| candidate == requested)
+            {
+                requested
+            } else {
+                return Err(format!(
+                    "服务 {} 在能力 {capability} 下没有模型 {requested}",
+                    service.display_name
+                )
+                .into());
+            }
+        }
+        _ => planned_model,
+    };
     let confirm_cost = input
         .get("confirm_cost")
         .and_then(Value::as_bool)
@@ -476,7 +541,7 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
             "state": "healthy",
             "capability": capability,
             "service_id": service_id,
-            "message": format!("模型接口可用 · {} 个模型", models.len()),
+            "message": format!("连接可用 · {} 个模型", models.len()),
             "models": models,
             "route": plan,
         }));
@@ -485,15 +550,15 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
         .get("payload")
         .cloned()
         .unwrap_or_else(|| input.clone());
-    let preflight_result = preflight(capability, service_id, &payload);
+    let preflight_result = preflight(capability, service_id, model, &payload);
     if preflight_result.get("state").and_then(Value::as_str) != Some("ready") {
         return Ok(
             json!({"state": "needs_input", "capability": capability, "service_id": service_id, "preflight": preflight_result, "route": plan}),
         );
     }
-    let result = execute_media(capability, &with_service(&payload, service_id))?;
+    let result = execute_media(capability, &with_attempt(&payload, service_id, model))?;
     Ok(
-        json!({"state": "accepted", "capability": capability, "service_id": service_id, "result": result, "route": plan}),
+        json!({"state": "accepted", "capability": capability, "service_id": service_id, "model": model, "result": result, "route": plan}),
     )
 }
 
@@ -501,7 +566,8 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
 mod tests {
     use super::*;
     use crate::store::ai_services::{
-        AIServiceProtocol, CustomAIServiceInput, MediaModelBinding, CAP_VIDEO_GENERATE,
+        AIServiceProtocol, CapabilityRouteEntry, CustomAIServiceInput, MediaModelBinding,
+        CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
     };
     use serde_json::json;
 
@@ -534,6 +600,7 @@ mod tests {
             MediaModelBinding {
                 adapter: adapter.to_string(),
                 model: model.to_string(),
+                models: Vec::new(),
                 execution_mode: None,
             },
         );
@@ -557,9 +624,14 @@ mod tests {
         with_isolated_home(|| {
             video_service("seedance", "ark-video", "doubao-seedance");
             video_service("wan", "wan-video", "wan2.6-i2v-flash");
-            ai_services::set_media_service(CAP_VIDEO_GENERATE, "seedance").unwrap();
-            ai_services::set_capability_fallbacks(CAP_VIDEO_GENERATE, vec!["wan".to_string()])
-                .unwrap();
+            ai_services::set_capability_routes(
+                CAP_VIDEO_GENERATE,
+                vec![
+                    ai_services::CapabilityRouteEntry::new("seedance", ""),
+                    ai_services::CapabilityRouteEntry::new("wan", ""),
+                ],
+            )
+            .unwrap();
             let plan = route_plan(&json!({"capability": CAP_VIDEO_GENERATE})).unwrap();
             assert_eq!(plan["state"], "resolved");
             assert_eq!(plan["selected"]["service_id"], "seedance");
@@ -585,6 +657,7 @@ mod tests {
                 MediaModelBinding {
                     adapter: "ark-video".to_string(),
                     model: "seedance".to_string(),
+                    models: Vec::new(),
                     execution_mode: None,
                 },
             );
@@ -612,10 +685,167 @@ mod tests {
     }
 
     #[test]
+    fn route_plan_resolves_each_route_entry_its_own_model() {
+        with_isolated_home(|| {
+            // 两个服务，各有两个生图模型；主选用第二个模型，备用用自己第一个。
+            for (id, first, second) in [
+                ("ark", "doubao-seedream-first", "doubao-seedream-second"),
+                ("relay", "flux-first", "flux-second"),
+            ] {
+                let mut media = std::collections::BTreeMap::new();
+                media.insert(
+                    CAP_IMAGE_GENERATE.to_string(),
+                    MediaModelBinding {
+                        adapter: "ark-images".to_string(),
+                        model: first.to_string(),
+                        models: vec![first.to_string(), second.to_string()],
+                        execution_mode: None,
+                    },
+                );
+                ai_services::upsert(CustomAIServiceInput {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    base_url: format!("https://{id}.example/v1"),
+                    protocol: AIServiceProtocol::OpenaiChat,
+                    model: "chat".to_string(),
+                    models: vec!["chat".to_string()],
+                    image_model: String::new(),
+                    image_adapter: String::new(),
+                    media,
+                    api_key: format!("sk-{id}"),
+                })
+                .unwrap();
+            }
+            ai_services::set_capability_routes(
+                CAP_IMAGE_GENERATE,
+                vec![
+                    CapabilityRouteEntry::new("ark", "doubao-seedream-second"),
+                    CapabilityRouteEntry::new("relay", ""),
+                ],
+            )
+            .unwrap();
+
+            let plan = route_plan(&json!({"capability": CAP_IMAGE_GENERATE})).unwrap();
+            assert_eq!(plan["schema_version"], "himind.ai-capability-route.v2");
+            assert_eq!(plan["state"], "resolved");
+            assert_eq!(plan["selected"]["service_id"], "ark");
+            assert_eq!(plan["selected"]["model"], "doubao-seedream-second");
+            assert_eq!(plan["selected"]["model_source"], "explicit");
+
+            // 每个尝试带自己的模型：备用服务收到的是它自己的默认模型，不是主选的。
+            let attempts = plan["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0]["model"], "doubao-seedream-second");
+            assert_eq!(attempts[1]["service_id"], "relay");
+            assert_eq!(attempts[1]["model"], "flux-first");
+            assert_eq!(attempts[1]["model_source"], "service_default");
+            assert_eq!(plan["fallbacks"][0]["model"], "flux-first");
+
+            // 候选按 (服务, 模型) 展开：2 个路由项 + 每个服务各 1 个剩余模型 = 4。
+            let candidates = plan["candidates"].as_array().unwrap();
+            assert_eq!(candidates.len(), 4);
+            let relay_models = candidates
+                .iter()
+                .filter(|item| item["service_id"] == "relay")
+                .map(|item| item["model"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert!(relay_models.contains(&"flux-first".to_string()));
+            assert!(relay_models.contains(&"flux-second".to_string()));
+            assert!(candidates
+                .iter()
+                .filter(|item| item["service_id"] == "relay" && item["model"] == "flux-first")
+                .all(|item| item["eligibility"] == "fallback"));
+        });
+    }
+
+    #[test]
+    fn staged_route_model_that_disappeared_is_never_silently_replaced() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_IMAGE_GENERATE.to_string(),
+                MediaModelBinding {
+                    adapter: "ark-images".to_string(),
+                    model: "current-model".to_string(),
+                    models: Vec::new(),
+                    execution_mode: None,
+                },
+            );
+            ai_services::upsert(CustomAIServiceInput {
+                id: "ark".to_string(),
+                display_name: "方舟".to_string(),
+                base_url: "https://ark.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiChat,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-ark".to_string(),
+            })
+            .unwrap();
+
+            // 直接写文件，绕开校验，模拟「模型被服务编辑删掉」的历史路由项。
+            let selection = serde_json::json!({
+                "schema_version": 2,
+                "capability_routes": {
+                    CAP_IMAGE_GENERATE: [{"service_id": "ark", "model": "retired-model"}]
+                }
+            });
+            std::fs::write(
+                crate::store::paths::agent_home().join("ai-service-selection.json"),
+                serde_json::to_vec_pretty(&selection).unwrap(),
+            )
+            .unwrap();
+
+            let plan = route_plan(&json!({"capability": CAP_IMAGE_GENERATE})).unwrap();
+            assert_eq!(plan["state"], "missing");
+            assert_eq!(plan["reason"], "model_unavailable");
+            assert!(plan["attempts"].as_array().unwrap().is_empty());
+            assert_eq!(plan["selected"]["model"], serde_json::Value::Null);
+            let stale = plan["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["model"] == "retired-model")
+                .expect("retired model should still be explained");
+            assert_eq!(stale["eligible"], false);
+            assert_eq!(stale["reason"], "model_unavailable");
+            // 绝不静默改用 current-model 执行。
+            assert!(!plan["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["model"] == "current-model"));
+        });
+    }
+
+    #[test]
+    fn each_attempt_writes_its_own_model_into_the_request() {
+        let input = json!({
+            "capability": CAP_IMAGE_GENERATE,
+            "service": "custom:ark",
+            "model": "doubao-seedream-second",
+            "prompt": "a cat",
+        });
+        // 降级到备用服务时，模型换成备用自己的，主选的模型不能串过去。
+        let fallback = with_attempt(&input, "relay", "flux-first");
+        assert_eq!(fallback["service"], "custom:relay");
+        assert_eq!(fallback["model"], "flux-first");
+        assert_eq!(fallback["prompt"], "a cat");
+        assert!(fallback.get("capability").is_none());
+
+        // 跟随服务默认时删掉 model 键，交回能力绑定解析。
+        let follows = with_attempt(&input, "relay", "");
+        assert!(follows.get("model").is_none());
+        assert_eq!(follows["service"], "custom:relay");
+    }
+
+    #[test]
     fn preflight_is_local_and_reports_missing_video_prompt() {
         with_isolated_home(|| {
             video_service("wan", "wan-video", "wan2.6-i2v-flash");
-            let result = preflight(CAP_VIDEO_GENERATE, "wan", &json!({}));
+            let result = preflight(CAP_VIDEO_GENERATE, "wan", "", &json!({}));
             assert_eq!(result["state"], "invalid");
             assert!(result["checks"]
                 .as_array()
@@ -625,6 +855,7 @@ mod tests {
             let too_many_images = preflight(
                 CAP_VIDEO_GENERATE,
                 "wan",
+                "",
                 &json!({"prompt": "test", "input_images": ["a.png", "b.png"]}),
             );
             assert!(too_many_images["checks"]

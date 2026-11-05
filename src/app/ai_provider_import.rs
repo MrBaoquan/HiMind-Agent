@@ -3,6 +3,7 @@ use rusqlite::{backup::Backup, params, Connection, TransactionBehavior};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -101,6 +102,14 @@ pub(crate) struct AIProviderImportRequest {
     /// 让调用方明确表达"切换"意图，而不是被动覆盖用户已有的注册。
     #[serde(default)]
     pub replace: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct AIProviderSyncRequest {
+    pub target: String,
+    /// 调用方从 sync.plan 拿到的期望修订号；用于拒绝执行过期计划。
+    #[serde(default)]
+    pub expected_revision: String,
 }
 
 impl AIProviderImportRequest {
@@ -510,6 +519,20 @@ pub(crate) struct AIProviderImportResult {
     pub verification_status: String,
 }
 
+const BINDING_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const SYNC_STATE_SYNCED: &str = "synced";
+const SYNC_STATE_NEEDS_UPDATE: &str = "needs_update";
+const SYNC_STATE_BLOCKED: &str = "blocked";
+const SYNC_STATE_CONFLICT: &str = "conflict";
+const SYNC_STATE_FAILED: &str = "failed";
+const SYNC_REASON_METADATA_MISSING: &str = "binding_metadata_missing";
+const SYNC_REASON_SOURCE_CHANGED: &str = "source_changed";
+const SYNC_REASON_PROFILE_CHANGED: &str = "gateway_profile_changed";
+const SYNC_REASON_ENDPOINT_CHANGED: &str = "gateway_endpoint_changed";
+const SYNC_REASON_PROFILE_UNAVAILABLE: &str = "gateway_profile_unavailable";
+const SYNC_REASON_NO_MODELS: &str = "gateway_models_unavailable";
+const SYNC_REASON_CONFIG_MISSING: &str = "client_config_missing";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AIProviderImportBinding {
     service: String,
@@ -530,11 +553,28 @@ struct AIProviderImportBinding {
     /// ADR 0114：最近一次写入后复核得到的验证等级，供状态检测回显。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     verification_status: String,
-    /// ADR 0118：写入时源凭据的修订号（`managed` 为 `updated_at|rotated_at`，
+    /// ADR 0118：写入时源凭据的修订号（`managed` 为 `updated_at|rotated_at|model_metadata_digest`，
     /// `custom:<id>` 为服务 `updated_at`）。客户端持有的凭据与当前接入来源修订号
     /// 不一致，即说明 Key 已轮换或来源已切换，注册已过期。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     service_revision: String,
+    /// 当前期望的客户端投影摘要。只包含会影响客户端文件的非秘密字段。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    desired_revision: String,
+    /// 最近一次成功同步的投影摘要。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    applied_revision: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    applied_at: String,
+    /// synced / needs_update / blocked / conflict / failed。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sync_state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sync_reason_codes: Vec<String>,
+    #[serde(default)]
+    restart_required: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    last_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -582,6 +622,17 @@ pub(crate) struct AIProviderImportStatus {
     /// 持有的凭据是否仍是当前接入来源（Key 轮换 / 来源切换后应显示为待同步）。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub service_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub desired_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub applied_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sync_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sync_reason_codes: Vec<String>,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
     /// 自检告警：条目「看起来已注册、实际会失败」时的可读修复建议（当前用于
     /// Claude Desktop 的 3P 网关档案）。为空表示自检通过。与 `detail` 分开是因为
     /// `detail` 只在未注册时渲染，已注册的告警需要一个独立通道才可见。
@@ -625,6 +676,57 @@ pub(crate) struct AIProviderImportPlan {
     pub will_write: Vec<String>,
     pub will_backup: Vec<String>,
     pub detail: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub(crate) struct AIProviderSyncPlan {
+    pub ok: bool,
+    pub target: String,
+    pub sync_state: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub desired_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub applied_revision: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    pub blocked: bool,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub will_write: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub will_backup: Vec<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub(crate) struct AIProviderSyncResult {
+    pub ok: bool,
+    pub target: String,
+    pub sync_state: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub desired_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub applied_revision: String,
+    pub model_count: usize,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub config_path: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub backup_path: String,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub(crate) struct AIProviderSyncAllResult {
+    pub ok: bool,
+    pub synced: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<serde_json::Value>,
 }
 
 pub(crate) fn plan(
@@ -818,6 +920,15 @@ pub(crate) fn import(
     // 一个客户端只能绑定一个来源：相同来源再次执行即为同步；不同来源需要
     // 显式请求切换（`replace`），否则先返回错误，由调用方决定是否切换。
     let service_source = request.service_source();
+    // Claude Desktop 启动即调用 `/v1/models`。Agent Plan 这类目录型套餐没有发现
+    // 端点，直连会把模型选择器留空；注册阶段自动改走本机聚合网关，由网关生成目录。
+    // 网关模式内部会带 override 再次调用 import，不能在此递归。
+    if target == "claude-desktop"
+        && gateway_override_for(&service_source).is_none()
+        && custom_service_requires_gateway(&service_source)?
+    {
+        return enable_gateway_binding(options, expected_user_id, target, &service_source);
+    }
     let current = status(options)
         .targets
         .into_iter()
@@ -880,19 +991,22 @@ pub(crate) fn import(
     };
     result.verification_status = verification_status.clone();
     let mut bindings = load_import_bindings(options);
-    bindings.clients.insert(
-        target.to_string(),
-        AIProviderImportBinding {
-            service: service_source.to_string(),
-            // 走现有导入路径就是直连：真实凭据写进客户端，用量不计入本机口径。
-            mode: String::new(),
-            gateway: None,
-            updated_at: now_rfc3339(),
-            restore: snapshot,
-            verification_status,
-            service_revision: resolve_service_revision(options, expected_user_id, service_source),
-        },
-    );
+    let mut binding = AIProviderImportBinding {
+        service: service_source.to_string(),
+        // 走现有导入路径就是直连：真实凭据写进客户端，用量不计入本机口径。
+        mode: String::new(),
+        gateway: None,
+        updated_at: now_rfc3339(),
+        restore: snapshot,
+        verification_status,
+        service_revision: resolve_service_revision(options, expected_user_id, service_source),
+        ..Default::default()
+    };
+    let desired = desired_state_for_binding(options, target, &binding);
+    mark_binding_applied(&mut binding, &desired);
+    let desired = desired_state_for_binding(options, target, &binding);
+    apply_desired_state(&mut binding, &desired);
+    bindings.clients.insert(target.to_string(), binding);
     save_import_bindings(options, &bindings)?;
     Ok(result)
 }
@@ -943,6 +1057,331 @@ fn load_import_bindings(options: &Options) -> AIProviderImportBindings {
         .ok()
         .and_then(|content| serde_json::from_slice(&content).ok())
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Default)]
+struct BindingDesiredState {
+    desired_revision: String,
+    profile_revision: String,
+    gateway_endpoint: String,
+    sync_state: String,
+    reason_codes: Vec<String>,
+    restart_required: bool,
+    detail: String,
+}
+
+fn projection_digest(value: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
+    )
+}
+
+fn configured_gateway_endpoint(options: &Options) -> String {
+    format!(
+        "http://127.0.0.1:{}",
+        crate::app::inference_gateway::configured_port(&options.state_path)
+    )
+}
+
+fn adapter_projection_schema(target: &str) -> String {
+    // 适配器投影规则变化时提升这里，让已有绑定进入待更新，而不是静默沿用旧文件布局。
+    // Codex v2 引入模型级推理档位；旧绑定必须重建 himind-models.json。
+    let schema_version = if target.trim() == "codex" { 2 } else { 1 };
+    format!("{}:{schema_version}", target.trim())
+}
+
+fn adapter_requires_restart(target: &str) -> bool {
+    !matches!(target.trim(), "vscode" | "cc-switch")
+}
+
+fn profile_projection_revision(
+    profile: &crate::store::gateway_profiles::GatewayProfile,
+    entry: &crate::store::ai_services::AIServiceProtocol,
+    service_protocols: &BTreeMap<String, crate::store::ai_services::AIServiceProtocol>,
+) -> (String, Vec<String>, String) {
+    let routes = enabled_profile_routes_for_entry(profile, entry, service_protocols);
+    let models = routes
+        .iter()
+        .map(|route| route.exposed_model.clone())
+        .collect::<Vec<_>>();
+    let default_model = if models.iter().any(|model| model == &profile.default_model) {
+        profile.default_model.clone()
+    } else {
+        models.first().cloned().unwrap_or_default()
+    };
+    let route_signature = routes
+        .iter()
+        .map(|route| {
+            json!({
+                "exposed_model": route.exposed_model,
+                "service_id": route.service_id,
+                "upstream_model": route.upstream_model,
+                "service_protocol": service_protocols
+                    .get(&route.service_id)
+                    .map(|protocol| protocol.as_str())
+                    .unwrap_or(""),
+            })
+        })
+        .collect::<Vec<_>>();
+    let revision = projection_digest(&json!({
+        "schema": BINDING_PROJECTION_SCHEMA_VERSION,
+        "profile_id": profile.id,
+        "enabled": profile.enabled,
+        "entry_protocol": entry.as_str(),
+        "default_model": default_model,
+        "routes": route_signature,
+    }));
+    (revision, models, default_model)
+}
+
+fn custom_service_projection_revision(service_id: &str) -> String {
+    let Ok(services) = crate::store::ai_services::list() else {
+        return String::new();
+    };
+    let Some(service) = services
+        .into_iter()
+        .find(|service| service.id == service_id)
+    else {
+        return String::new();
+    };
+    projection_digest(&json!({
+        "schema": BINDING_PROJECTION_SCHEMA_VERSION,
+        "service_id": service.id,
+        "base_url": service.base_url,
+        "protocol": service.protocol.as_str(),
+        "model": service.model,
+        "models": service.models,
+    }))
+}
+
+fn desired_state_for_binding(
+    options: &Options,
+    target: &str,
+    binding: &AIProviderImportBinding,
+) -> BindingDesiredState {
+    let mut result = BindingDesiredState {
+        restart_required: adapter_requires_restart(target),
+        ..Default::default()
+    };
+    let Some(gateway) = binding.gateway.as_ref() else {
+        let current_source_revision = if binding.service.starts_with("custom:") {
+            resolve_service_revision(options, "", &binding.service)
+        } else {
+            binding.service_revision.clone()
+        };
+        if !binding.applied_revision.trim().is_empty()
+            && !current_source_revision.trim().is_empty()
+            && current_source_revision != binding.service_revision
+        {
+            result
+                .reason_codes
+                .push(SYNC_REASON_SOURCE_CHANGED.to_string());
+        }
+        result.desired_revision = projection_digest(&json!({
+            "schema": BINDING_PROJECTION_SCHEMA_VERSION,
+            "target": target,
+            "adapter": adapter_projection_schema(target),
+            "service": binding.service,
+            "source_revision": current_source_revision,
+        }));
+        if binding.applied_revision.trim().is_empty() {
+            result
+                .reason_codes
+                .push(SYNC_REASON_METADATA_MISSING.to_string());
+        } else if result.desired_revision != binding.applied_revision {
+            result
+                .reason_codes
+                .push(SYNC_REASON_SOURCE_CHANGED.to_string());
+        }
+        result.reason_codes.sort();
+        result.reason_codes.dedup();
+        result.sync_state = if result.reason_codes.is_empty() {
+            SYNC_STATE_SYNCED.to_string()
+        } else {
+            SYNC_STATE_NEEDS_UPDATE.to_string()
+        };
+        return result;
+    };
+
+    let endpoint = configured_gateway_endpoint(options);
+    result.gateway_endpoint = endpoint.clone();
+    let mut source_revision = String::new();
+    let mut protocol = gateway.protocol.clone();
+    let mut models = gateway.models.clone();
+    let mut default_model = gateway.default_model.clone();
+    let mut profile_revision = String::new();
+
+    if !gateway.profile_id.trim().is_empty() {
+        let profile = crate::store::gateway_profiles::get(&gateway.profile_id);
+        match profile {
+            Ok(profile) if profile.enabled => {
+                let entry = crate::store::ai_services::AIServiceProtocol::parse(&gateway.protocol)
+                    .unwrap_or_else(|_| profile.entry_protocol.clone());
+                protocol = entry.as_str().to_string();
+                let service_protocols = crate::store::ai_services::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|service| (service.id, service.protocol))
+                    .collect::<BTreeMap<_, _>>();
+                let (revision, projected_models, projected_default) =
+                    profile_projection_revision(&profile, &entry, &service_protocols);
+                profile_revision = revision.clone();
+                models = projected_models;
+                default_model = projected_default;
+                source_revision = revision;
+                if models.is_empty() {
+                    result.reason_codes.push(SYNC_REASON_NO_MODELS.to_string());
+                }
+                if !gateway.profile_revision.trim().is_empty()
+                    && gateway.profile_revision != profile_revision
+                {
+                    result
+                        .reason_codes
+                        .push(SYNC_REASON_PROFILE_CHANGED.to_string());
+                }
+            }
+            Ok(profile) => {
+                profile_revision = projection_digest(&json!({
+                    "profile_id": profile.id,
+                    "enabled": profile.enabled,
+                }));
+                result
+                    .reason_codes
+                    .push(SYNC_REASON_PROFILE_UNAVAILABLE.to_string());
+            }
+            Err(_) => {
+                result
+                    .reason_codes
+                    .push(SYNC_REASON_PROFILE_UNAVAILABLE.to_string());
+            }
+        }
+    } else {
+        source_revision = if binding.service.starts_with("custom:") {
+            binding
+                .service
+                .strip_prefix("custom:")
+                .map(custom_service_projection_revision)
+                .unwrap_or_default()
+        } else {
+            binding.service_revision.clone()
+        };
+    }
+
+    if !gateway.gateway_endpoint.trim().is_empty() && gateway.gateway_endpoint != endpoint {
+        result
+            .reason_codes
+            .push(SYNC_REASON_ENDPOINT_CHANGED.to_string());
+    }
+    result.profile_revision = profile_revision;
+    result.desired_revision = projection_digest(&json!({
+        "schema": BINDING_PROJECTION_SCHEMA_VERSION,
+        "target": target,
+        "adapter": adapter_projection_schema(target),
+        "source_revision": source_revision,
+        "gateway_endpoint": endpoint,
+        "profile_id": gateway.profile_id,
+        "profile_revision": result.profile_revision,
+        "protocol": protocol,
+        "models": models,
+        "default_model": default_model,
+    }));
+    if binding.applied_revision.trim().is_empty() {
+        result
+            .reason_codes
+            .push(SYNC_REASON_METADATA_MISSING.to_string());
+    } else if result.desired_revision != binding.applied_revision {
+        result
+            .reason_codes
+            .push(SYNC_REASON_SOURCE_CHANGED.to_string());
+    }
+    result.reason_codes.sort();
+    result.reason_codes.dedup();
+    if result
+        .reason_codes
+        .iter()
+        .any(|reason| reason == SYNC_REASON_PROFILE_UNAVAILABLE || reason == SYNC_REASON_NO_MODELS)
+    {
+        result.sync_state = SYNC_STATE_BLOCKED.to_string();
+        result.detail = "聚合入口不可用或没有当前客户端协议的模型".to_string();
+    } else if result.reason_codes.is_empty() {
+        result.sync_state = SYNC_STATE_SYNCED.to_string();
+    } else {
+        result.sync_state = SYNC_STATE_NEEDS_UPDATE.to_string();
+    }
+    result
+}
+
+fn apply_desired_state(binding: &mut AIProviderImportBinding, desired: &BindingDesiredState) {
+    binding.desired_revision = desired.desired_revision.clone();
+    binding.sync_state = desired.sync_state.clone();
+    binding.sync_reason_codes = desired.reason_codes.clone();
+    binding.restart_required = desired.restart_required;
+}
+
+fn mark_binding_applied(binding: &mut AIProviderImportBinding, desired: &BindingDesiredState) {
+    apply_desired_state(binding, desired);
+    binding.applied_revision = desired.desired_revision.clone();
+    binding.applied_at = now_rfc3339();
+    binding.last_error.clear();
+    if let Some(gateway) = binding.gateway.as_mut() {
+        gateway.gateway_endpoint = desired.gateway_endpoint.clone();
+        gateway.profile_revision = desired.profile_revision.clone();
+    }
+}
+
+/// 重新计算并持久化所有绑定的同步状态。只在只读状态检查和变更落盘后调用。
+pub(crate) fn refresh_all_binding_sync_states(options: &Options) -> Vec<String> {
+    let mut bindings = load_import_bindings(options);
+    let mut changed = Vec::new();
+    for (target, binding) in bindings.clients.iter_mut() {
+        let desired = desired_state_for_binding(options, target, binding);
+        if binding.desired_revision != desired.desired_revision
+            || binding.sync_state != desired.sync_state
+            || binding.sync_reason_codes != desired.reason_codes
+            || binding.restart_required != desired.restart_required
+        {
+            apply_desired_state(binding, &desired);
+            changed.push(target.clone());
+        }
+    }
+    if !changed.is_empty() {
+        let _ = save_import_bindings(options, &bindings);
+    }
+    changed
+}
+
+pub(crate) fn clients_bound_to_service(options: &Options, service_id: &str) -> Vec<String> {
+    let source = format!("custom:{}", service_id.trim());
+    let profiles = crate::store::gateway_profiles::profiles_referencing_service(service_id)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut clients = load_import_bindings(options)
+        .clients
+        .into_iter()
+        .filter(|(_, binding)| {
+            binding.service == source
+                || binding
+                    .gateway
+                    .as_ref()
+                    .is_some_and(|gateway| profiles.contains(&gateway.profile_id))
+        })
+        .map(|(target, _)| target)
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients
+}
+
+pub(crate) fn clients_bound_to_gateway(options: &Options) -> Vec<String> {
+    let mut clients = load_import_bindings(options)
+        .clients
+        .into_iter()
+        .filter(|(_, binding)| binding.mode == BINDING_MODE_GATEWAY || binding.gateway.is_some())
+        .map(|(target, _)| target)
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients
 }
 
 /// ADR 0118 P1b：把簿记投影成心跳上报的客户端注册事实（不含凭据）。
@@ -997,6 +1436,12 @@ struct AIProviderGatewayBinding {
     /// 翻译请求时的模型名兜底。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     default_model: String,
+    /// 注册/同步时使用的稳定本机网关入口。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    gateway_endpoint: String,
+    /// 聚合 Profile 影响客户端投影的内容摘要；单服务绑定为空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    profile_revision: String,
 }
 
 const BINDING_MODE_GATEWAY: &str = "gateway";
@@ -1008,8 +1453,71 @@ fn new_binding_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// 切换到本机网关模式（ADR 0113）。P1 只落地 Codex：其余客户端要等各自的写入面
-/// 补齐，宁可不做，也不写半套配置。
+fn custom_service_requires_gateway(service_source: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(id) = service_source.trim().strip_prefix("custom:") else {
+        return Ok(false);
+    };
+    let (service, _) = crate::store::ai_services::load_secret(id)?;
+    Ok(service.protocol.is_anthropic()
+        && !crate::store::ai_services::supports_model_discovery(&service.base_url))
+}
+
+fn direct_compatibility_warning(target: &str, service_source: &str) -> String {
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let Some(client) = matrix.client(target) else {
+        return String::new();
+    };
+    if !client.rich_tool_client || !client.default_gateway {
+        return String::new();
+    }
+    let unsupported = service_source
+        .trim()
+        .strip_prefix("custom:")
+        .and_then(|id| crate::store::ai_services::load_secret(id).ok())
+        .map(|(service, _)| {
+            let provider = matrix.resolve_provider(&service.base_url, &service.protocol);
+            matrix
+                .unsupported_features(target, &provider.id)
+                .into_iter()
+                .map(|feature| feature.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let risk = if unsupported.is_empty() {
+        "上游工具结果、历史与可选参数格式尚未被该直连组合证明".to_string()
+    } else {
+        let mut features = unsupported.into_iter().collect::<Vec<_>>();
+        features.sort();
+        format!("已知未证明能力：{}", features.join("、"))
+    };
+    format!(
+        "{} 是富工具客户端，{}。当前为显式直连覆盖，泛化 400 风险较高；建议切回本机网关。",
+        client.display_name, risk
+    )
+}
+/// 本机网关地址：优先使用当前进程已启动的网关；命令行或诊断进程没有网关单例时，
+/// 回退到当前 profile 的持久化端口，并确认该端口确实由 HiMind 网关监听。
+fn local_gateway_url(options: &Options) -> Option<String> {
+    if let Some(url) = crate::app::inference_gateway::url() {
+        return Some(url);
+    }
+    let port = crate::app::inference_gateway::configured_port(&options.state_path);
+    let url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("himind-binding-probe")
+        .send()
+        .ok()?;
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    (status == 401 && body.contains("himind_gateway_unknown_token")).then_some(url)
+}
+
+/// 切换到本机网关模式（ADR 0113）。客户端只拿到本机地址与令牌，真实凭据留在 Agent。
 pub(crate) fn enable_gateway_binding(
     options: &Options,
     expected_user_id: &str,
@@ -1018,11 +1526,12 @@ pub(crate) fn enable_gateway_binding(
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let target = target.trim();
     let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
-    let gateway_url =
-        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法切换到网关模式")?;
+    let gateway_url = local_gateway_url(options).ok_or("本机推理网关未启动，无法切换到网关模式")?;
     let credential = resolve_credential(options, expected_user_id, "gateway-binding", service)?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
+    let mut model_metadata = credential.model_metadata.clone();
+    fill_known_model_metadata(&models, &mut model_metadata);
     let token = new_binding_token();
     // 客户端看到的是网关，网关再按上游真实协议转发或互译。
     let proxy_protocol = gateway_proxy_protocol(adapter.id(), &credential.access.protocol)?;
@@ -1032,7 +1541,7 @@ pub(crate) fn enable_gateway_binding(
     let client_credential = AIClientCredential {
         access: client_access,
         api_key: token.clone(),
-        model_metadata: credential.model_metadata.clone(),
+        model_metadata,
     };
     let service_source = if service.trim().is_empty() {
         "managed".to_string()
@@ -1064,34 +1573,39 @@ pub(crate) fn enable_gateway_binding(
 
     // 客户端配置已写好，再把绑定事实改成网关模式：真实凭据只留在 Agent。
     let mut bindings = load_import_bindings(options);
-    bindings.clients.insert(
-        target.to_string(),
-        AIProviderImportBinding {
-            service: service_source.clone(),
-            mode: BINDING_MODE_GATEWAY.to_string(),
-            gateway: Some(AIProviderGatewayBinding {
-                token_protected: crate::store::credentials::protect_secret_for_current_user(
-                    &token,
-                )?,
-                profile_id: String::new(),
-                base_url: credential.access.base_url.clone(),
-                api_key_protected: crate::store::credentials::protect_secret_for_current_user(
-                    &credential.api_key,
-                )?,
-                protocol: credential.access.protocol.clone(),
-                models: models.clone(),
-                default_model: preferred.clone(),
-            }),
-            updated_at: now_rfc3339(),
-            // 保留 import 刚写下的「用户原始配置」快照，切回直连时用它还原。
-            restore: bindings
-                .clients
-                .get(target)
-                .and_then(|binding| binding.restore.clone()),
-            verification_status,
-            service_revision: resolve_service_revision(options, expected_user_id, &service_source),
-        },
-    );
+    let mut binding = AIProviderImportBinding {
+        service: service_source.clone(),
+        mode: BINDING_MODE_GATEWAY.to_string(),
+        gateway: Some(AIProviderGatewayBinding {
+            token_protected: crate::store::credentials::protect_secret_for_current_user(&token)?,
+            profile_id: String::new(),
+            base_url: credential.access.base_url.clone(),
+            api_key_protected: crate::store::credentials::protect_secret_for_current_user(
+                &credential.api_key,
+            )?,
+            protocol: credential.access.protocol.clone(),
+            models: models.clone(),
+            default_model: preferred.clone(),
+            gateway_endpoint: gateway_url.clone(),
+            profile_revision: String::new(),
+        }),
+        updated_at: now_rfc3339(),
+        // 保留 import 刚写下的「用户原始配置」快照，切回直连时用它还原。
+        restore: bindings
+            .clients
+            .get(target)
+            .and_then(|binding| binding.restore.clone()),
+        verification_status,
+        service_revision: resolve_service_revision(options, expected_user_id, &service_source),
+        ..Default::default()
+    };
+    let desired = desired_state_for_binding(options, target, &binding);
+    mark_binding_applied(&mut binding, &desired);
+    // applied_revision 写入后再计算一次，否则首次绑定会永久残留
+    // `binding_metadata_missing`，界面误报“需要同步”。
+    let desired = desired_state_for_binding(options, target, &binding);
+    apply_desired_state(&mut binding, &desired);
+    bindings.clients.insert(target.to_string(), binding);
     save_import_bindings(options, &bindings)?;
     confirm_gateway_binding(options, target, &gateway_url, &token, &mut result);
     Ok(result)
@@ -1146,8 +1660,7 @@ pub(crate) fn enable_gateway_profile_binding(
         )
         .into());
     }
-    let gateway_url =
-        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法切换到网关模式")?;
+    let gateway_url = local_gateway_url(options).ok_or("本机推理网关未启动，无法切换到网关模式")?;
     let service_source = direct_service
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
@@ -1178,9 +1691,16 @@ pub(crate) fn enable_gateway_profile_binding(
     client_access.models = models.clone();
     let mut model_metadata = BTreeMap::new();
     for route in &routes {
-        if let Some(metadata) = credential.model_metadata.get(&route.upstream_model) {
-            model_metadata.insert(route.exposed_model.clone(), metadata.clone());
-        }
+        let mut metadata = credential
+            .model_metadata
+            .get(&route.upstream_model)
+            .cloned()
+            .unwrap_or_default();
+        crate::api::ai::merge_known_model_metadata(&route.upstream_model, &mut metadata);
+        model_metadata.insert(
+            route.exposed_model.clone(),
+            crate::api::ai::normalize_model_reasoning_metadata(metadata),
+        );
     }
     let client_credential = AIClientCredential {
         access: client_access,
@@ -1210,31 +1730,36 @@ pub(crate) fn enable_gateway_profile_binding(
     let verification_status = result.verification_status.clone();
 
     let mut bindings = load_import_bindings(options);
-    bindings.clients.insert(
-        target.to_string(),
-        AIProviderImportBinding {
-            service: service_source.clone(),
-            mode: BINDING_MODE_GATEWAY.to_string(),
-            gateway: Some(AIProviderGatewayBinding {
-                token_protected: crate::store::credentials::protect_secret_for_current_user(
-                    &token,
-                )?,
-                profile_id: profile.id.clone(),
-                base_url: String::new(),
-                api_key_protected: String::new(),
-                protocol: entry_protocol.as_str().to_string(),
-                models,
-                default_model,
-            }),
-            updated_at: now_rfc3339(),
-            restore: bindings
-                .clients
-                .get(target)
-                .and_then(|binding| binding.restore.clone()),
-            verification_status,
-            service_revision: resolve_service_revision(options, expected_user_id, &service_source),
-        },
-    );
+    let mut binding = AIProviderImportBinding {
+        service: service_source.clone(),
+        mode: BINDING_MODE_GATEWAY.to_string(),
+        gateway: Some(AIProviderGatewayBinding {
+            token_protected: crate::store::credentials::protect_secret_for_current_user(&token)?,
+            profile_id: profile.id.clone(),
+            base_url: String::new(),
+            api_key_protected: String::new(),
+            protocol: entry_protocol.as_str().to_string(),
+            models,
+            default_model,
+            gateway_endpoint: gateway_url.clone(),
+            profile_revision: String::new(),
+        }),
+        updated_at: now_rfc3339(),
+        restore: bindings
+            .clients
+            .get(target)
+            .and_then(|binding| binding.restore.clone()),
+        verification_status,
+        service_revision: resolve_service_revision(options, expected_user_id, &service_source),
+        ..Default::default()
+    };
+    let desired = desired_state_for_binding(options, target, &binding);
+    mark_binding_applied(&mut binding, &desired);
+    // applied_revision 写入后再计算一次，否则首次绑定会永久残留
+    // `binding_metadata_missing`，界面误报“需要同步”。
+    let desired = desired_state_for_binding(options, target, &binding);
+    apply_desired_state(&mut binding, &desired);
+    bindings.clients.insert(target.to_string(), binding);
     save_import_bindings(options, &bindings)?;
     confirm_gateway_binding(options, target, &gateway_url, &token, &mut result);
     Ok(result)
@@ -1277,6 +1802,93 @@ fn profile_client_entry_protocol(
     Err("聚合入口没有客户端协议".into())
 }
 
+struct ProfileBindingProjection {
+    service_source: String,
+    client_credential: AIClientCredential,
+    models: Vec<String>,
+    default_model: String,
+    entry_protocol: crate::store::ai_services::AIServiceProtocol,
+    gateway_url: String,
+    profile_revision: String,
+}
+
+fn build_profile_binding_projection(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    profile_id: &str,
+    direct_service: Option<&str>,
+    token: String,
+) -> Result<ProfileBindingProjection, Box<dyn Error>> {
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let profile = crate::store::gateway_profiles::get(profile_id)?;
+    if !profile.enabled {
+        return Err(format!("聚合入口已停用：{}", profile.name).into());
+    }
+    let entry_protocol = profile_client_entry_protocol(adapter.id(), &profile)?;
+    let service_protocols = crate::store::ai_services::list()?
+        .into_iter()
+        .map(|service| (service.id, service.protocol))
+        .collect::<BTreeMap<_, _>>();
+    let routes = enabled_profile_routes_for_entry(&profile, &entry_protocol, &service_protocols);
+    if routes.is_empty() {
+        return Err(format!(
+            "客户端协议 {} 在聚合入口中没有兼容的启用模型",
+            entry_protocol.as_str()
+        )
+        .into());
+    }
+    let gateway_url =
+        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法切换到网关模式")?;
+    let service_source = direct_service
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| binding_service(options, target))
+        .unwrap_or_else(|| format!("custom:{}", routes[0].service_id));
+    let credential = resolve_credential(
+        options,
+        expected_user_id,
+        "gateway-profile-binding",
+        &service_source,
+    )?;
+    let models = routes
+        .iter()
+        .map(|route| route.exposed_model.clone())
+        .collect::<Vec<_>>();
+    let default_model = if !profile.default_model.trim().is_empty()
+        && models.iter().any(|model| model == &profile.default_model)
+    {
+        profile.default_model.clone()
+    } else {
+        models.first().cloned().unwrap_or_default()
+    };
+    let mut client_access = credential.access.clone();
+    client_access.base_url = gateway_url.clone();
+    client_access.protocol = entry_protocol.as_str().to_string();
+    client_access.model = default_model.clone();
+    client_access.models = models.clone();
+    let mut model_metadata = BTreeMap::new();
+    for route in &routes {
+        if let Some(metadata) = credential.model_metadata.get(&route.upstream_model) {
+            model_metadata.insert(route.exposed_model.clone(), metadata.clone());
+        }
+    }
+    let revision = profile_projection_revision(&profile, &entry_protocol, &service_protocols).0;
+    Ok(ProfileBindingProjection {
+        service_source,
+        client_credential: AIClientCredential {
+            access: client_access,
+            api_key: token,
+            model_metadata,
+        },
+        models,
+        default_model,
+        entry_protocol,
+        gateway_url,
+        profile_revision: revision,
+    })
+}
+
 /// 哪些客户端正在使用某个聚合 Profile。删除前必须为空。
 pub(crate) fn clients_bound_to_profile(options: &Options, profile_id: &str) -> Vec<String> {
     let mut clients = load_import_bindings(options)
@@ -1293,6 +1905,82 @@ pub(crate) fn clients_bound_to_profile(options: &Options, profile_id: &str) -> V
     clients.sort();
     clients
 }
+pub(crate) fn bound_client_protocols_for_profile(
+    options: &Options,
+    profile_id: &str,
+) -> Vec<(String, String)> {
+    let mut clients = load_import_bindings(options)
+        .clients
+        .into_iter()
+        .filter_map(|(target, binding)| {
+            binding
+                .gateway
+                .filter(|gateway| gateway.profile_id == profile_id)
+                .map(|gateway| (target, gateway.protocol))
+        })
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients
+}
+
+pub(crate) fn validate_profile_update_for_bound_clients(
+    options: &Options,
+    input: &crate::store::gateway_profiles::GatewayProfileInput,
+) -> Result<(), Box<dyn Error>> {
+    let bound = bound_client_protocols_for_profile(options, input.id.trim());
+    if bound.is_empty() {
+        return Ok(());
+    }
+    let clients = bound
+        .iter()
+        .map(|(target, _)| target.as_str())
+        .collect::<Vec<_>>()
+        .join("、");
+    if !input.enabled {
+        return Err(format!(
+            "聚合入口仍被这些 AI 工具使用：{clients}。停用前请先切回直连或改用其它入口。"
+        )
+        .into());
+    }
+    let entry_protocols = if input.entry_protocols.is_empty() {
+        vec![input.entry_protocol.trim()]
+    } else {
+        input
+            .entry_protocols
+            .iter()
+            .map(|protocol| protocol.trim())
+            .collect()
+    };
+    let service_protocols = crate::store::ai_services::list()?
+        .into_iter()
+        .map(|service| (service.id, service.protocol))
+        .collect::<BTreeMap<_, _>>();
+    for (target, protocol) in bound {
+        let entry = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
+        if !entry_protocols.iter().any(|value| *value == protocol) {
+            return Err(format!(
+                "AI 工具 {target} 仍绑定协议 {protocol}；保存前请先更新该客户端或解除绑定。"
+            )
+            .into());
+        }
+        let has_route = input.routes.iter().any(|route| {
+            route.enabled
+                && service_protocols
+                    .get(&route.service_id)
+                    .is_some_and(|protocol| {
+                        crate::store::gateway_profiles::protocol_supported(&entry, protocol)
+                    })
+        });
+        if !has_route {
+            return Err(format!(
+                "AI 工具 {target} 使用的协议 {protocol} 在保存后没有兼容模型；请先解除绑定或补充路由。"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// 探本机网关是否认可这枚绑定令牌（`GET /v1/models`）。
 /// 命中即可证明「客户端走网关」这条链路真实可用（ADR 0114 `client_load_verified`）。
 /// 探测失败只降级验证等级，不影响已经写好的客户端配置。
@@ -1355,12 +2043,12 @@ fn gateway_proxy_protocol(
     }
     let anthropic_client = matches!(adapter_id, "claude-code" | "claude-desktop" | "zcode");
     if anthropic_client {
-        if upstream_protocol == "openai-chat" {
-            return Ok("anthropic");
-        }
-        return Err(
-            format!("该客户端只讲 Anthropic 协议，暂不支持接入 {upstream_protocol} 上游").into(),
-        );
+        return match upstream_protocol {
+            // Anthropic 入口直通 Anthropic 上游；模型发现由本机网关补齐。
+            "anthropic" => Ok("anthropic"),
+            "openai-chat" => Ok("anthropic"),
+            other => Err(format!("该客户端只讲 Anthropic 协议，暂不支持接入 {other} 上游").into()),
+        };
     }
     match upstream_protocol {
         "openai-chat" => Ok("openai-chat"),
@@ -1639,9 +2327,34 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                         status.service = binding.service.clone();
                         status.verification_status = binding.verification_status.clone();
                         status.service_revision = binding.service_revision.clone();
+                        let desired =
+                            desired_state_for_binding(options, status.target.as_str(), binding);
+                        status.desired_revision = desired.desired_revision;
+                        status.applied_revision = binding.applied_revision.clone();
+                        status.sync_state = desired.sync_state;
+                        status.sync_reason_codes = desired.reason_codes;
+                        status.restart_required = desired.restart_required;
+                        status.last_error = binding.last_error.clone();
+                        if binding.mode != BINDING_MODE_GATEWAY {
+                            let warning = direct_compatibility_warning(
+                                status.target.as_str(),
+                                binding.service.as_str(),
+                            );
+                            if !warning.is_empty() {
+                                status.warning = if status.warning.is_empty() {
+                                    warning
+                                } else {
+                                    format!("{}；{}", status.warning, warning)
+                                };
+                            }
+                        }
                         // 客户端自己不记时间时，用簿记时间兜底，UI 才能显示「最近同步」。
                         if status.synced_at.is_empty() {
-                            status.synced_at = binding.updated_at.clone();
+                            status.synced_at = if binding.applied_at.is_empty() {
+                                binding.updated_at.clone()
+                            } else {
+                                binding.applied_at.clone()
+                            };
                         }
                     }
                 }
@@ -1649,6 +2362,334 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
             })
             .collect(),
     }
+}
+
+fn mark_binding_sync_failure(options: &Options, target: &str, error: &str) {
+    let mut bindings = load_import_bindings(options);
+    if let Some(binding) = bindings.clients.get_mut(target.trim()) {
+        binding.sync_state = SYNC_STATE_FAILED.to_string();
+        binding.last_error = error.to_string();
+        let _ = save_import_bindings(options, &bindings);
+    }
+}
+
+pub(crate) fn sync_plan(
+    options: &Options,
+    target: &str,
+) -> Result<AIProviderSyncPlan, Box<dyn Error>> {
+    let target = target.trim();
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let bindings = load_import_bindings(options);
+    let binding = bindings
+        .clients
+        .get(target)
+        .ok_or_else(|| format!("客户端 {target} 尚未注册"))?;
+    let desired = desired_state_for_binding(options, target, binding);
+    let current = adapter.status(options);
+    let import_plan = adapter.plan("import", &current);
+    let mut reason_codes = desired.reason_codes.clone();
+    if current.state != "imported" {
+        reason_codes.push(SYNC_REASON_CONFIG_MISSING.to_string());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
+    let blocked = desired.sync_state == SYNC_STATE_BLOCKED || current.state != "imported";
+    let detail = if blocked {
+        if !desired.detail.is_empty() {
+            desired.detail.clone()
+        } else if current.state != "imported" {
+            "客户端当前没有可同步的 HiMind 配置".to_string()
+        } else {
+            "当前绑定被阻止，需先修复来源或聚合入口".to_string()
+        }
+    } else if desired.sync_state == SYNC_STATE_SYNCED {
+        "客户端已是最新期望态".to_string()
+    } else {
+        "客户端配置与当前期望态不一致，可执行同步".to_string()
+    };
+    Ok(AIProviderSyncPlan {
+        ok: !blocked,
+        target: target.to_string(),
+        sync_state: if blocked {
+            SYNC_STATE_BLOCKED.to_string()
+        } else {
+            desired.sync_state
+        },
+        service: binding.service.clone(),
+        desired_revision: desired.desired_revision,
+        applied_revision: binding.applied_revision.clone(),
+        reason_codes,
+        blocked,
+        restart_required: desired.restart_required,
+        will_write: import_plan.will_write,
+        will_backup: import_plan.will_backup,
+        detail,
+    })
+}
+
+fn sync_profile_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    binding: &AIProviderImportBinding,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let gateway = binding
+        .gateway
+        .as_ref()
+        .ok_or("聚合 Profile 绑定缺少网关事实")?;
+    let token =
+        crate::store::credentials::unprotect_secret_for_current_user(&gateway.token_protected)?;
+    let projection = build_profile_binding_projection(
+        options,
+        expected_user_id,
+        target,
+        &gateway.profile_id,
+        Some(binding.service.as_str()),
+        token,
+    )?;
+    let mut result = {
+        let _guard = set_gateway_override(&projection.service_source, projection.client_credential);
+        import(
+            options,
+            expected_user_id,
+            &AIProviderImportRequest {
+                target: target.to_string(),
+                service: if projection.service_source == "managed" {
+                    String::new()
+                } else {
+                    projection.service_source.clone()
+                },
+                replace: true,
+            },
+        )?
+    };
+    result.model = projection.default_model.clone();
+    result.model_count = projection.models.len();
+    let mut bindings = load_import_bindings(options);
+    let binding = bindings
+        .clients
+        .get_mut(target)
+        .ok_or("同步后绑定簿记丢失")?;
+    binding.service = projection.service_source.clone();
+    binding.mode = BINDING_MODE_GATEWAY.to_string();
+    binding.gateway = Some(AIProviderGatewayBinding {
+        token_protected: gateway.token_protected.clone(),
+        profile_id: gateway.profile_id.clone(),
+        base_url: String::new(),
+        api_key_protected: String::new(),
+        protocol: projection.entry_protocol.as_str().to_string(),
+        models: projection.models.clone(),
+        default_model: projection.default_model.clone(),
+        gateway_endpoint: projection.gateway_url.clone(),
+        profile_revision: projection.profile_revision.clone(),
+    });
+    binding.service_revision =
+        resolve_service_revision(options, expected_user_id, &projection.service_source);
+    let desired = desired_state_for_binding(options, target, binding);
+    mark_binding_applied(binding, &desired);
+    save_import_bindings(options, &bindings)?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: target.to_string(),
+        status: "configured".to_string(),
+        model_count: projection.models.len(),
+        model: projection.default_model,
+        config_path: result.config_path,
+        backup_path: result.backup_path,
+        sync_status: result.sync_status,
+        verification_status: result.verification_status,
+        client_detected: true,
+        ..Default::default()
+    })
+}
+
+fn sync_legacy_gateway_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    binding: &AIProviderImportBinding,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let gateway = binding.gateway.as_ref().ok_or("网关绑定缺少网关事实")?;
+    let token =
+        crate::store::credentials::unprotect_secret_for_current_user(&gateway.token_protected)?;
+    let gateway_url =
+        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法同步网关绑定")?;
+    let credential = resolve_credential(
+        options,
+        expected_user_id,
+        "gateway-binding",
+        &binding.service,
+    )?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let mut model_metadata = credential.model_metadata.clone();
+    fill_known_model_metadata(&models, &mut model_metadata);
+    let proxy_protocol = gateway_proxy_protocol(adapter.id(), &credential.access.protocol)?;
+    let mut client_access = credential.access.clone();
+    client_access.base_url = gateway_url.clone();
+    client_access.protocol = proxy_protocol.to_string();
+    let client_credential = AIClientCredential {
+        access: client_access,
+        api_key: token.clone(),
+        model_metadata,
+    };
+    let mut result = {
+        let _guard = set_gateway_override(&binding.service, client_credential);
+        import(
+            options,
+            expected_user_id,
+            &AIProviderImportRequest {
+                target: target.to_string(),
+                service: if binding.service == "managed" {
+                    String::new()
+                } else {
+                    binding.service.clone()
+                },
+                replace: true,
+            },
+        )?
+    };
+    let mut bindings = load_import_bindings(options);
+    let binding = bindings
+        .clients
+        .get_mut(target)
+        .ok_or("同步后绑定簿记丢失")?;
+    binding.mode = BINDING_MODE_GATEWAY.to_string();
+    binding.gateway = Some(AIProviderGatewayBinding {
+        token_protected: gateway.token_protected.clone(),
+        profile_id: String::new(),
+        base_url: credential.access.base_url.clone(),
+        api_key_protected: crate::store::credentials::protect_secret_for_current_user(
+            &credential.api_key,
+        )?,
+        protocol: credential.access.protocol.clone(),
+        models: models.clone(),
+        default_model: preferred.clone(),
+        gateway_endpoint: gateway_url.clone(),
+        profile_revision: String::new(),
+    });
+    binding.service_revision =
+        resolve_service_revision(options, expected_user_id, &binding.service);
+    let desired = desired_state_for_binding(options, target, binding);
+    mark_binding_applied(binding, &desired);
+    save_import_bindings(options, &bindings)?;
+    result.model = preferred;
+    result.model_count = models.len();
+    Ok(result)
+}
+
+pub(crate) fn sync_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    expected_revision: Option<&str>,
+) -> Result<AIProviderSyncResult, Box<dyn Error>> {
+    let target = target.trim();
+    let bindings = load_import_bindings(options);
+    let binding = bindings
+        .clients
+        .get(target)
+        .cloned()
+        .ok_or_else(|| format!("客户端 {target} 尚未注册"))?;
+    let desired = desired_state_for_binding(options, target, &binding);
+    if let Some(expected) = expected_revision.filter(|value| !value.trim().is_empty()) {
+        if expected != desired.desired_revision {
+            return Err("同步计划已过期，请重新读取客户端状态后再同步".into());
+        }
+    }
+    if desired.sync_state == SYNC_STATE_BLOCKED {
+        return Err(desired.detail.into());
+    }
+    let outcome = if binding.mode == BINDING_MODE_GATEWAY {
+        if binding
+            .gateway
+            .as_ref()
+            .is_some_and(|gateway| !gateway.profile_id.trim().is_empty())
+        {
+            sync_profile_binding(options, expected_user_id, target, &binding)
+        } else {
+            sync_legacy_gateway_binding(options, expected_user_id, target, &binding)
+        }
+    } else {
+        import(
+            options,
+            expected_user_id,
+            &AIProviderImportRequest {
+                target: target.to_string(),
+                service: if binding.service == "managed" {
+                    String::new()
+                } else {
+                    binding.service.clone()
+                },
+                replace: true,
+            },
+        )
+    };
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            mark_binding_sync_failure(options, target, &error.to_string());
+            return Err(error);
+        }
+    };
+    let mut bindings = load_import_bindings(options);
+    let Some(binding) = bindings.clients.get_mut(target) else {
+        return Err("同步后绑定簿记丢失".into());
+    };
+    let desired = desired_state_for_binding(options, target, binding);
+    mark_binding_applied(binding, &desired);
+    let desired_revision = desired.desired_revision;
+    let applied_revision = binding.applied_revision.clone();
+    let restart_required = desired.restart_required;
+    save_import_bindings(options, &bindings)?;
+    Ok(AIProviderSyncResult {
+        ok: true,
+        target: target.to_string(),
+        sync_state: SYNC_STATE_SYNCED.to_string(),
+        desired_revision,
+        applied_revision,
+        model_count: result.model_count,
+        model: result.model,
+        config_path: result.config_path,
+        backup_path: result.backup_path,
+        restart_required,
+        detail: "客户端配置已同步；客户端加载状态需另行验证".to_string(),
+    })
+}
+
+pub(crate) fn sync_all(options: &Options, expected_user_id: &str) -> AIProviderSyncAllResult {
+    refresh_all_binding_sync_states(options);
+    let registered = load_import_bindings(options).clients;
+    let statuses = status(options).targets;
+    let mut result = AIProviderSyncAllResult::default();
+    for status in statuses {
+        if !registered.contains_key(&status.target) || status.state != "imported" {
+            continue;
+        }
+        if status.sync_state == SYNC_STATE_SYNCED {
+            result.skipped.push(status.target);
+            continue;
+        }
+        if status.sync_state == SYNC_STATE_BLOCKED {
+            result.skipped.push(status.target);
+            continue;
+        }
+        match sync_binding(
+            options,
+            expected_user_id,
+            &status.target,
+            Some(status.desired_revision.as_str()),
+        ) {
+            Ok(_) => result.synced.push(status.target),
+            Err(error) => result.failed.push(json!({
+                "target": status.target,
+                "error": error.to_string(),
+            })),
+        }
+    }
+    result.ok = result.failed.is_empty();
+    result
 }
 
 pub(crate) fn cancel(
@@ -1706,6 +2747,7 @@ fn resolve_credential(
             model: custom.model,
             models: custom.models,
             protocol: custom.protocol.as_str().to_string(),
+            model_metadata: BTreeMap::new(),
         };
         AIClientCredential {
             access,
@@ -1723,8 +2765,40 @@ fn resolve_credential(
 /// 供应商写死（例如所有模型都写 1,048,576、只允许文本），客户端就会把可用的
 /// 图片入口和真实的上下文预算一起丢掉。这里优先读供应商 `/v1/models`，读不到
 /// 时只对明确已知的 HiMind 模型做保守兜底；未知模型不伪造窗口，交给客户端缺省。
+fn fill_known_model_metadata(
+    models: &[String],
+    metadata: &mut BTreeMap<String, crate::api::ai::AIModelMetadata>,
+) {
+    for model in models {
+        let entry = metadata.entry(model.clone()).or_default();
+        crate::api::ai::merge_known_model_metadata(model, entry);
+        *entry = crate::api::ai::normalize_model_reasoning_metadata(entry.clone());
+    }
+}
+
 fn attach_model_metadata(credential: &mut AIClientCredential) {
-    let mut metadata = fetch_provider_model_metadata(credential);
+    // Dashboard/AI Control metadata is the authoritative, versioned model
+    // contract. Live provider discovery only fills fields the control plane did
+    // not know, and the built-in fallback only fills what neither supplied.
+    let mut metadata = credential.access.model_metadata.clone();
+    for (model, discovered) in fetch_provider_model_metadata(credential) {
+        let entry = metadata.entry(model).or_default();
+        if entry.context_window.is_none() {
+            entry.context_window = discovered.context_window;
+        }
+        if entry.max_output_tokens.is_none() {
+            entry.max_output_tokens = discovered.max_output_tokens;
+        }
+        if entry.input_modalities.is_empty() {
+            entry.input_modalities = discovered.input_modalities;
+        }
+        if entry.reasoning_efforts.is_empty() {
+            entry.reasoning_efforts = discovered.reasoning_efforts;
+        }
+        if entry.default_reasoning_effort.trim().is_empty() {
+            entry.default_reasoning_effort = discovered.default_reasoning_effort;
+        }
+    }
     let mut declared = credential.access.models.clone();
     let default_model = credential.access.model.trim();
     if !default_model.is_empty() {
@@ -1736,7 +2810,8 @@ fn attach_model_metadata(credential: &mut AIClientCredential) {
             continue;
         }
         let entry = metadata.entry(model.to_string()).or_default();
-        merge_known_model_metadata(model, entry);
+        crate::api::ai::merge_known_model_metadata(model, entry);
+        *entry = crate::api::ai::normalize_model_reasoning_metadata(entry.clone());
     }
     credential.model_metadata = metadata;
 }
@@ -1761,7 +2836,7 @@ fn model_metadata_or_known(
     let mut metadata = credential_model_metadata(credential, model)
         .cloned()
         .unwrap_or_default();
-    merge_known_model_metadata(model, &mut metadata);
+    crate::api::ai::merge_known_model_metadata(model, &mut metadata);
     metadata
 }
 
@@ -1837,14 +2912,87 @@ fn parse_provider_model_metadata(
         else {
             continue;
         };
-        let metadata = crate::api::ai::AIModelMetadata {
-            context_window: parse_model_context_window(item),
-            max_output_tokens: parse_model_output_tokens(item),
-            input_modalities: parse_model_input_modalities(item),
-        };
+        let metadata =
+            crate::api::ai::normalize_model_reasoning_metadata(crate::api::ai::AIModelMetadata {
+                context_window: parse_model_context_window(item),
+                max_output_tokens: parse_model_output_tokens(item),
+                input_modalities: parse_model_input_modalities(item),
+                reasoning_efforts: parse_model_reasoning_efforts(item),
+                default_reasoning_effort: parse_model_default_reasoning_effort(item),
+            });
         result.insert(id.to_string(), metadata);
     }
     result
+}
+
+fn reasoning_values(value: &Value) -> Vec<String> {
+    if let Some(text) = value.as_str() {
+        return vec![text.to_string()];
+    }
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for item in items {
+        if let Some(text) = item.as_str() {
+            result.push(text.to_string());
+            continue;
+        }
+        for key in ["effort", "id", "name", "reasoning_effort"] {
+            if let Some(text) = item.get(key).and_then(Value::as_str) {
+                result.push(text.to_string());
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn parse_model_reasoning_efforts(item: &Value) -> Vec<String> {
+    let mut result = Vec::new();
+    for container in [Some(item), item.get("capabilities"), item.get("reasoning")]
+        .into_iter()
+        .flatten()
+    {
+        for key in [
+            "reasoning_efforts",
+            "reasoningEfforts",
+            "reasoning_effort",
+            "reasoningEffort",
+            "supported_reasoning_levels",
+            "supportedReasoningLevels",
+        ] {
+            if let Some(value) = container.get(key) {
+                result.extend(reasoning_values(value));
+            }
+        }
+        if let Some(value) = container.get("efforts") {
+            result.extend(reasoning_values(value));
+        }
+    }
+    crate::api::ai::normalize_reasoning_efforts(&result)
+}
+
+fn parse_model_default_reasoning_effort(item: &Value) -> String {
+    for container in [Some(item), item.get("capabilities"), item.get("reasoning")]
+        .into_iter()
+        .flatten()
+    {
+        for key in [
+            "default_reasoning_effort",
+            "defaultReasoningEffort",
+            "default_reasoning_level",
+            "defaultReasoningLevel",
+        ] {
+            if let Some(value) = container.get(key).and_then(Value::as_str) {
+                return value.trim().to_ascii_lowercase();
+            }
+        }
+        if let Some(value) = container.get("effort").and_then(Value::as_str) {
+            return value.trim().to_ascii_lowercase();
+        }
+    }
+    String::new()
 }
 
 fn model_number(value: Option<&Value>) -> Option<u64> {
@@ -2014,40 +3162,9 @@ fn normalize_input_modalities(values: &[String]) -> Vec<String> {
     }
 }
 
-/// 仅在供应商没有返回能力元数据时使用的保守兜底。窗口只收录各目录一致的
-/// 值；MiniMax 等存在 512K/1M 两种上游窗口的模型不写死窗口，避免把预算放大。
-fn merge_known_model_metadata(model: &str, metadata: &mut crate::api::ai::AIModelMetadata) {
-    let key = model.to_ascii_lowercase();
-    let (context_window, image) = if key.contains("deepseek-v4.1-flash") {
-        (Some(1_000_000), true)
-    } else if key.contains("deepseek-v4-flash") || key.contains("deepseek-v4-pro") {
-        (Some(1_000_000), false)
-    } else if key.contains("qwen3.8-max") {
-        (Some(1_000_000), true)
-    } else if key.contains("kimi-k3") {
-        (Some(1_000_000), true)
-    } else if key.contains("glm-5.3") {
-        (Some(1_000_000), false)
-    } else if key.contains("minimax-m3") {
-        (None, true)
-    } else {
-        (None, false)
-    };
-    if metadata.context_window.is_none() {
-        metadata.context_window = context_window;
-    }
-    if metadata.input_modalities.is_empty() {
-        metadata.input_modalities = if image {
-            vec!["text".to_string(), "image".to_string()]
-        } else {
-            vec!["text".to_string()]
-        };
-    }
-}
-
 /// ADR 0118：解析服务源当前的修订号，供工作台判断客户端持有的凭据是否已过期。
 ///
-/// `managed` 取 Dashboard `/api/integrations/ai/access` 的 `updated_at|rotated_at`
+/// `managed` 取 Dashboard `/api/integrations/ai/access` 的 `updated_at|rotated_at|model_metadata_digest`
 /// （与工作台 `activeServiceRevision` 同源）；`custom:<id>` 取本机服务的 `updated_at`。
 /// 任一步失败都返回空串——空修订号等于退回「不参与对账」的旧行为，绝不把读取失败
 /// 误判成不同步。
@@ -2060,7 +3177,17 @@ fn resolve_service_revision(options: &Options, expected_user_id: &str, service: 
         return String::new();
     };
     crate::store::ai_services::load_secret(custom_id)
-        .map(|(custom, _)| custom.updated_at)
+        .map(|(custom, api_key)| {
+            projection_digest(&json!({
+                "service_id": custom.id,
+                "base_url": custom.base_url,
+                "protocol": custom.protocol.as_str(),
+                "model": custom.model,
+                "models": custom.models,
+                "updated_at": custom.updated_at,
+                "credential": projection_digest(&json!({ "api_key": api_key })),
+            }))
+        })
         .unwrap_or_default()
 }
 
@@ -2372,6 +3499,48 @@ fn import_codex(
 //  * 原生网关可能拒收 Codex 的 freeform `apply_patch`（type=="custom"）工具，故不声明
 //    `apply_patch_tool_type` / `web_search_tool_type` / `model_messages`，编辑改由
 //    `shell_type="shell_command"` 承担。这些结论与 cc-switch 完全一致。
+fn codex_reasoning_description(effort: &str) -> &'static str {
+    match effort {
+        "none" => "Disable reasoning for the fastest responses",
+        "minimal" => "Minimal reasoning for straightforward tasks",
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Maximum reasoning with automatic task delegation",
+        _ => "Model-declared reasoning depth",
+    }
+}
+
+fn codex_reasoning_contract(
+    metadata: Option<&crate::api::ai::AIModelMetadata>,
+) -> (Vec<String>, String) {
+    let fallback = vec!["low".to_string(), "high".to_string()];
+    let mut efforts = metadata
+        .map(|value| &value.reasoning_efforts)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or(fallback);
+    efforts = crate::api::ai::normalize_reasoning_efforts(&efforts);
+    // Ignore future/unknown levels instead of making the whole Codex catalog
+    // unusable on an older client build.
+    efforts.retain(|effort| {
+        matches!(
+            effort.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+        )
+    });
+    if efforts.is_empty() {
+        efforts = vec!["low".to_string(), "high".to_string()];
+    }
+    let requested = metadata
+        .map(|value| value.default_reasoning_effort.as_str())
+        .unwrap_or("");
+    let default = crate::api::ai::choose_default_reasoning_effort(&efforts, requested);
+    (efforts, default)
+}
+
 fn build_codex_models_json(
     models: &[String],
     metadata: &BTreeMap<String, crate::api::ai::AIModelMetadata>,
@@ -2390,17 +3559,23 @@ fn build_codex_models_json(
                 .map(|(_, value)| value)
         });
         let image_input = model_metadata.is_some_and(|value| value.supports_image());
+        let (reasoning_levels, default_reasoning_level) = codex_reasoning_contract(model_metadata);
+        let supported_reasoning_levels = reasoning_levels
+            .iter()
+            .map(|effort| {
+                json!({
+                    "effort": effort,
+                    "description": codex_reasoning_description(effort),
+                })
+            })
+            .collect::<Vec<_>>();
         let mut entry = json!({
             "slug": model,
             "display_name": display,
             "description": "HiMind 网关模型",
             "base_instructions": CODEX_NATIVE_BASE_INSTRUCTIONS,
-            "default_reasoning_level": "high",
-            "supported_reasoning_levels": [
-                {"effort": "low", "description": "Fast responses with lighter reasoning"},
-                {"effort": "high", "description": "Greater reasoning depth for complex problems"},
-                {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"}
-            ],
+            "default_reasoning_level": default_reasoning_level,
+            "supported_reasoning_levels": supported_reasoning_levels,
             "shell_type": "shell_command",
             "visibility": "list",
             "supported_in_api": true,
@@ -2445,6 +3620,23 @@ fn capitalize(value: &str) -> String {
 // `model_reasoning_effort` 只在缺失时补默认值：用户（或 cc-switch，如云渡的 xhigh）
 // 已选好的档位必须保留，不能被固定值改写。
 // `catalog_path` 为 None 表示沿用 Codex 内置模型目录，此时要移除自建目录引用。
+fn codex_default_reasoning_effort(credential: &AIClientCredential, model: &str) -> String {
+    credential
+        .model_metadata
+        .get(model)
+        .map(|metadata| metadata.default_reasoning_effort.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            credential
+                .model_metadata
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(model))
+                .map(|(_, metadata)| metadata.default_reasoning_effort.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "high".to_string())
+}
+
 fn build_codex_config_toml(
     original: &str,
     credential: &AIClientCredential,
@@ -2460,7 +3652,8 @@ fn build_codex_config_toml(
     document["preferred_auth_method"] = value("apikey");
     document["forced_login_method"] = value("api");
     if document.get("model_reasoning_effort").is_none() {
-        document["model_reasoning_effort"] = value("high");
+        document["model_reasoning_effort"] =
+            value(codex_default_reasoning_effort(credential, model).as_str());
     }
     match catalog_path {
         Some(path) => {
@@ -4058,14 +5251,27 @@ fn upsert_claude_desktop_entry(meta: &mut serde_json::Map<String, Value>, entry_
 fn claude_desktop_gateway_entry(
     base_url: &str,
     credential: &AIClientCredential,
-    _models: &[String],
+    models: &[String],
 ) -> Result<String, Box<dyn Error>> {
+    // Claude Desktop 的上下文上限不是从 `/v1/models.context_window` 读取；它按
+    // 发现到的模型名标记 supports1m，再由 `modelPrefer1mContext` 决定是否采用 1M。
+    // 只有本次暴露的全部模型都确实具备 1M 上下文时才打开，避免把 200k 模型放大。
+    let prefer_1m = !models.is_empty()
+        && models.iter().all(|model| {
+            credential
+                .model_metadata
+                .get(model)
+                .and_then(|metadata| metadata.context_window)
+                .is_some_and(|context_window| context_window >= 1_000_000)
+        });
     let entry = json!({
         "inferenceProvider": "gateway",
         "inferenceGatewayBaseUrl": base_url,
         "inferenceGatewayApiKey": credential.api_key,
         "inferenceGatewayAuthScheme": "bearer",
         "inferenceCredentialKind": "static",
+        "modelDiscoveryEnabled": true,
+        "modelPrefer1mContext": prefer_1m,
         "inferenceCustomHeaders": { CLAUDE_DESKTOP_SURFACE_HEADER: CLAUDE_DESKTOP_SURFACE_VALUE },
     });
     Ok(format!("{}\n", serde_json::to_string_pretty(&entry)?))
@@ -8200,6 +9406,7 @@ mod tests {
                 restore: None,
                 verification_status: String::new(),
                 service_revision: String::new(),
+                ..Default::default()
             },
         );
         super::save_import_bindings(&options, &bindings).unwrap();
@@ -8213,6 +9420,247 @@ mod tests {
         // 注册来源不明的客户端没有指向这个服务，不阻止删除。
         assert!(super::ensure_service_not_in_use(&options, "free").is_ok());
 
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_binding_json_defaults_sync_metadata() {
+        let binding: super::AIProviderImportBinding = serde_json::from_value(json!({
+            "service": "managed",
+            "mode": "gateway",
+            "gateway": {
+                "token_protected": "opaque-token",
+                "profile_id": "coding",
+                "protocol": "openai-responses",
+                "models": ["model-a"],
+                "default_model": "model-a"
+            }
+        }))
+        .unwrap();
+        assert!(binding.desired_revision.is_empty());
+        assert!(binding.applied_revision.is_empty());
+        assert!(binding.sync_state.is_empty());
+        assert!(binding.sync_reason_codes.is_empty());
+        assert!(!binding.restart_required);
+        let gateway = binding.gateway.unwrap();
+        assert!(gateway.gateway_endpoint.is_empty());
+        assert!(gateway.profile_revision.is_empty());
+    }
+
+    #[test]
+    fn profile_projection_revision_ignores_name_but_tracks_routes() {
+        use crate::store::ai_services::AIServiceProtocol;
+        use crate::store::gateway_profiles::{GatewayModelRoute, GatewayProfile};
+        use std::collections::BTreeMap;
+        let mut profile = GatewayProfile {
+            id: "coding".to_string(),
+            name: "编码入口".to_string(),
+            entry_protocol: AIServiceProtocol::OpenaiResponses,
+            entry_protocols: vec![AIServiceProtocol::OpenaiResponses],
+            default_model: "service/model-a".to_string(),
+            enabled: true,
+            routes: vec![GatewayModelRoute {
+                exposed_model: "service/model-a".to_string(),
+                service_id: "service".to_string(),
+                upstream_model: "model-a".to_string(),
+                enabled: true,
+            }],
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let services =
+            BTreeMap::from([("service".to_string(), AIServiceProtocol::OpenaiResponses)]);
+        let first = super::profile_projection_revision(
+            &profile,
+            &AIServiceProtocol::OpenaiResponses,
+            &services,
+        )
+        .0;
+        profile.name = "改名不触发同步".to_string();
+        let renamed = super::profile_projection_revision(
+            &profile,
+            &AIServiceProtocol::OpenaiResponses,
+            &services,
+        )
+        .0;
+        assert_eq!(first, renamed);
+        profile.routes[0].upstream_model = "model-b".to_string();
+        let changed = super::profile_projection_revision(
+            &profile,
+            &AIServiceProtocol::OpenaiResponses,
+            &services,
+        )
+        .0;
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn profile_update_guard_and_stale_plan_detect_bound_clients() {
+        use crate::store::ai_services::{AIServiceProtocol, CustomAIServiceInput};
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-ai-sync-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let options = crate::Options::from_env();
+        crate::store::ai_services::upsert(CustomAIServiceInput {
+            id: "service".to_string(),
+            display_name: "服务".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            protocol: AIServiceProtocol::OpenaiResponses,
+            model: "model-a".to_string(),
+            models: vec!["model-a".to_string()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media: Default::default(),
+            api_key: "sk-test".to_string(),
+        })
+        .unwrap();
+        let profile = crate::store::gateway_profiles::save(
+            crate::store::gateway_profiles::GatewayProfileInput {
+                id: "coding".to_string(),
+                name: "编码入口".to_string(),
+                entry_protocol: "openai-responses".to_string(),
+                entry_protocols: vec!["openai-responses".to_string()],
+                default_model: "service/model-a".to_string(),
+                enabled: true,
+                routes: vec![crate::store::gateway_profiles::GatewayModelRouteInput {
+                    exposed_model: "service/model-a".to_string(),
+                    service_id: "service".to_string(),
+                    upstream_model: "model-a".to_string(),
+                    enabled: true,
+                }],
+            },
+        )
+        .unwrap();
+        let mut binding = super::AIProviderImportBinding {
+            service: "custom:service".to_string(),
+            mode: super::BINDING_MODE_GATEWAY.to_string(),
+            gateway: Some(super::AIProviderGatewayBinding {
+                token_protected: "opaque-token".to_string(),
+                profile_id: profile.id.clone(),
+                base_url: String::new(),
+                api_key_protected: String::new(),
+                protocol: "openai-responses".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "service/model-a".to_string(),
+                gateway_endpoint: super::configured_gateway_endpoint(&options),
+                profile_revision: String::new(),
+            }),
+            ..Default::default()
+        };
+        let desired = super::desired_state_for_binding(&options, "codex", &binding);
+        super::mark_binding_applied(&mut binding, &desired);
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings
+            .clients
+            .insert("codex".to_string(), binding.clone());
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let mut disabled = crate::store::gateway_profiles::GatewayProfileInput {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            entry_protocol: "openai-responses".to_string(),
+            entry_protocols: vec!["openai-responses".to_string()],
+            default_model: profile.default_model.clone(),
+            enabled: false,
+            routes: vec![crate::store::gateway_profiles::GatewayModelRouteInput {
+                exposed_model: "service/model-a".to_string(),
+                service_id: "service".to_string(),
+                upstream_model: "model-a".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(super::validate_profile_update_for_bound_clients(&options, &disabled).is_err());
+        disabled.enabled = true;
+        disabled.entry_protocols = vec!["openai-chat".to_string()];
+        disabled.entry_protocol = "openai-chat".to_string();
+        assert!(super::validate_profile_update_for_bound_clients(&options, &disabled).is_err());
+
+        crate::store::ai_services::upsert(CustomAIServiceInput {
+            id: "service".to_string(),
+            display_name: "服务".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            protocol: AIServiceProtocol::OpenaiResponses,
+            model: "model-a".to_string(),
+            models: vec!["model-a".to_string(), "model-b".to_string()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media: Default::default(),
+            api_key: "sk-test".to_string(),
+        })
+        .unwrap();
+        let changed_profile = crate::store::gateway_profiles::save(
+            crate::store::gateway_profiles::GatewayProfileInput {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+                entry_protocol: "openai-responses".to_string(),
+                entry_protocols: vec!["openai-responses".to_string()],
+                default_model: "service/model-b".to_string(),
+                enabled: true,
+                routes: vec![crate::store::gateway_profiles::GatewayModelRouteInput {
+                    exposed_model: "service/model-b".to_string(),
+                    service_id: "service".to_string(),
+                    upstream_model: "model-b".to_string(),
+                    enabled: true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(changed_profile.id, profile.id);
+        let current = super::load_import_bindings(&options)
+            .clients
+            .get("codex")
+            .cloned()
+            .unwrap();
+        let drift = super::desired_state_for_binding(&options, "codex", &current);
+        assert_eq!(drift.sync_state, super::SYNC_STATE_NEEDS_UPDATE);
+        assert!(drift
+            .reason_codes
+            .iter()
+            .any(|reason| reason == super::SYNC_REASON_PROFILE_CHANGED));
+
+        let error = super::sync_binding(&options, "", "codex", Some("stale-revision"))
+            .expect_err("stale sync plan must be rejected");
+        assert!(error.to_string().contains("计划已过期"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
+
+    #[test]
+    fn sync_all_skips_unregistered_clients() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-ai-sync-all-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let options = crate::Options::from_env();
+        let result = super::sync_all(&options, "");
+        assert!(result.ok);
+        assert!(result.synced.is_empty());
+        assert!(result.failed.is_empty());
         let _ = std::fs::remove_dir_all(&root);
         match previous_home {
             Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
@@ -8256,11 +9704,13 @@ mod tests {
                     protocol: "openai-responses".to_string(),
                     models: vec!["model-a".to_string(), "model-b".to_string()],
                     default_model: "model-b".to_string(),
+                    ..Default::default()
                 }),
                 updated_at: String::new(),
                 restore: None,
                 verification_status: String::new(),
                 service_revision: String::new(),
+                ..Default::default()
             },
         );
         super::save_import_bindings(&options, &bindings).unwrap();
@@ -8450,11 +9900,13 @@ mod tests {
                     protocol: protocol.to_string(),
                     models: models.into_iter().map(str::to_string).collect(),
                     default_model: default.to_string(),
+                    ..Default::default()
                 }),
                 updated_at: String::new(),
                 restore: None,
                 verification_status: String::new(),
                 service_revision: String::new(),
+                ..Default::default()
             }
         };
         let codex_token = "codex-profile-token";
@@ -8585,11 +10037,13 @@ mod tests {
                     protocol: "openai-chat".to_string(),
                     models: vec!["himind-gateway".to_string()],
                     default_model: "himind-gateway".to_string(),
+                    ..Default::default()
                 }),
                 updated_at: "2026-10-10T00:00:00Z".to_string(),
                 restore: None,
                 verification_status: "client_load_verified".to_string(),
                 service_revision: "2026-10-09T00:00:00Z|".to_string(),
+                ..Default::default()
             },
         );
         bindings.clients.insert(
@@ -8602,6 +10056,7 @@ mod tests {
                 restore: None,
                 verification_status: "file_verified".to_string(),
                 service_revision: "2026-10-08T00:00:00Z".to_string(),
+                ..Default::default()
             },
         );
         // 空 target 不应出现在上报里。
@@ -8649,6 +10104,7 @@ mod tests {
                 model: models.first().copied().unwrap_or("default").to_string(),
                 models: models.iter().map(|value| value.to_string()).collect(),
                 protocol: "openai-responses".to_string(),
+                model_metadata: std::collections::BTreeMap::new(),
             },
             api_key: "test-secret-key".to_string(),
             model_metadata: std::collections::BTreeMap::new(),
@@ -8711,9 +10167,17 @@ mod tests {
     /// 网关靠这个头才把规范模型名换成 Anthropic 形态的路由名；漏掉就会「能发现但选择器为空」。
     #[test]
     fn claude_desktop_gateway_entry_marks_its_surface() {
+        let mut source = credential(&["deepseek-v4-pro"]);
+        source.model_metadata.insert(
+            "deepseek-v4-pro".to_string(),
+            AIModelMetadata {
+                context_window: Some(1_000_000),
+                ..Default::default()
+            },
+        );
         let body = super::claude_desktop_gateway_entry(
             "http://127.0.0.1:18090/gateway",
-            &credential(&["deepseek-v4-pro"]),
+            &source,
             &["deepseek-v4-pro".to_string()],
         )
         .unwrap();
@@ -8721,6 +10185,8 @@ mod tests {
         assert_eq!(parsed["inferenceProvider"], "gateway");
         assert_eq!(parsed["inferenceGatewayAuthScheme"], "bearer");
         assert_eq!(parsed["inferenceCredentialKind"], "static");
+        assert_eq!(parsed["modelDiscoveryEnabled"], true);
+        assert_eq!(parsed["modelPrefer1mContext"], true);
         assert_eq!(
             parsed["inferenceCustomHeaders"][super::CLAUDE_DESKTOP_SURFACE_HEADER],
             super::CLAUDE_DESKTOP_SURFACE_VALUE
@@ -8931,6 +10397,22 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_clients_can_use_anthropic_gateway_upstream() {
+        assert_eq!(
+            super::gateway_proxy_protocol("claude-desktop", "anthropic").unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            super::gateway_proxy_protocol("claude-upstream", "anthropic").unwrap_or("unsupported"),
+            "unsupported"
+        );
+        assert_eq!(
+            super::gateway_proxy_protocol("claude-desktop", "openai-chat").unwrap(),
+            "anthropic"
+        );
+    }
+
+    #[test]
     fn normalizes_chat_completions_url() {
         assert_eq!(
             chat_completions_url("https://ai.example.com/v1/").unwrap(),
@@ -8951,6 +10433,14 @@ mod tests {
                 context_window: Some(1_000_000),
                 max_output_tokens: Some(64_000),
                 input_modalities: vec!["text".to_string(), "image".to_string()],
+                reasoning_efforts: vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                    "max".to_string(),
+                ],
+                default_reasoning_effort: "medium".to_string(),
             },
         );
         metadata.insert(
@@ -8959,6 +10449,7 @@ mod tests {
                 context_window: Some(1_000_000),
                 max_output_tokens: None,
                 input_modalities: vec!["text".to_string()],
+                ..Default::default()
             },
         );
         let catalog = build_codex_models_json(
@@ -9011,6 +10502,36 @@ mod tests {
         assert_eq!(
             models[0].get("visibility").and_then(Value::as_str),
             Some("list")
+        );
+        assert_eq!(
+            models[0]
+                .get("default_reasoning_level")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            models[0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            models[1]
+                .get("default_reasoning_level")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            models[1]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
         );
         // cc-switch 原生 /responses 模板的必需品：缺 `base_instructions` 或
         // `experimental_supported_tools` 会让 Codex 0.150 拒绝整份目录、客户端起不来。
@@ -9392,6 +10913,7 @@ command = "uvx.exe"
                 context_window: Some(1_000_000),
                 max_output_tokens: Some(64_000),
                 input_modalities: vec!["text".to_string(), "image".to_string()],
+                ..Default::default()
             },
         );
         let opencode =
@@ -9422,7 +10944,9 @@ command = "uvx.exe"
                 {
                     "id": "deepseek-v4.1-flash",
                     "max_input_tokens": 1_000_000,
-                    "input_modalities": ["text", "image"]
+                    "input_modalities": ["text", "image"],
+                    "reasoningEfforts": ["high", "medium", "xhigh", "low"],
+                    "defaultReasoningLevel": "medium"
                 },
                 {
                     "id": "text-only",
@@ -9437,6 +10961,11 @@ command = "uvx.exe"
         let multimodal = parsed.get("deepseek-v4.1-flash").unwrap();
         assert_eq!(multimodal.context_window, Some(1_000_000));
         assert!(multimodal.supports_image());
+        assert_eq!(
+            multimodal.reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(multimodal.default_reasoning_effort, "medium");
         let text_only = parsed.get("text-only").unwrap();
         assert_eq!(text_only.context_window, Some(131_072));
         assert!(!text_only.supports_image());
@@ -9446,13 +10975,97 @@ command = "uvx.exe"
     #[test]
     fn known_model_metadata_fills_multimodal_fallback_but_not_unknown_windows() {
         let mut metadata = AIModelMetadata::default();
-        super::merge_known_model_metadata("deepseek-v4.1-flash", &mut metadata);
+        crate::api::ai::merge_known_model_metadata("deepseek-v4.1-flash", &mut metadata);
         assert_eq!(metadata.context_window, Some(1_000_000));
         assert!(metadata.supports_image());
+        assert_eq!(
+            metadata.reasoning_efforts,
+            vec!["none", "low", "high", "max"]
+        );
+        assert_eq!(metadata.default_reasoning_effort, "high");
         let mut unknown = AIModelMetadata::default();
-        super::merge_known_model_metadata("custom-model", &mut unknown);
+        crate::api::ai::merge_known_model_metadata("custom-model", &mut unknown);
         assert_eq!(unknown.context_window, None);
         assert_eq!(unknown.input_modalities, vec!["text"]);
+        assert!(unknown.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn codex_projection_schema_forces_catalog_rebuild() {
+        assert_eq!(super::adapter_projection_schema("codex"), "codex:2");
+        assert_eq!(super::adapter_projection_schema("claude"), "claude:1");
+    }
+
+    #[test]
+    fn gateway_metadata_fills_models_from_non_default_routes() {
+        let models = vec![
+            "vector-tide/deepseek-v4.1-flash-1017".to_string(),
+            "deepseek/deepseek-flash".to_string(),
+            "opencode-go/deepseek-v4.1-flash".to_string(),
+        ];
+        let mut metadata = std::collections::BTreeMap::new();
+        super::fill_known_model_metadata(&models, &mut metadata);
+        assert_eq!(
+            metadata["vector-tide/deepseek-v4.1-flash-1017"].reasoning_efforts,
+            vec!["none", "low", "high", "max"]
+        );
+        assert_eq!(
+            metadata["deepseek/deepseek-flash"].reasoning_efforts,
+            vec!["none", "low", "high", "max"]
+        );
+        assert_eq!(
+            metadata["opencode-go/deepseek-v4.1-flash"].reasoning_efforts,
+            vec!["none", "low", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn attach_metadata_prefers_dashboard_contract_then_known_fallback() {
+        let mut explicit = credential(&["gpt-yundu/gpt-6-astra"]);
+        explicit.access.model_metadata.insert(
+            "gpt-yundu/gpt-6-astra".to_string(),
+            AIModelMetadata {
+                reasoning_efforts: vec!["low".to_string(), "high".to_string()],
+                default_reasoning_effort: "high".to_string(),
+                ..Default::default()
+            },
+        );
+        super::attach_model_metadata(&mut explicit);
+        let explicit_metadata = &explicit.model_metadata["gpt-yundu/gpt-6-astra"];
+        assert_eq!(explicit_metadata.reasoning_efforts, vec!["low", "high"]);
+
+        let mut fallback = credential(&["gpt-yundu/gpt-6-astra"]);
+        super::attach_model_metadata(&mut fallback);
+        let fallback_metadata = &fallback.model_metadata["gpt-yundu/gpt-6-astra"];
+        assert_eq!(
+            fallback_metadata.reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(fallback_metadata.default_reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn known_namespaced_models_keep_full_reasoning_contracts() {
+        let gpt = crate::api::ai::known_model_metadata("gpt-yundu/gpt-6-astra");
+        assert_eq!(
+            gpt.reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(gpt.default_reasoning_effort, "medium");
+
+        let luna = crate::api::ai::known_model_metadata("opencode-go/gpt-6-luna");
+        assert_eq!(
+            luna.reasoning_efforts,
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(luna.default_reasoning_effort, "medium");
+
+        let deepseek = crate::api::ai::known_model_metadata("opencode-go/deepseek-v4.1-flash");
+        assert_eq!(
+            deepseek.reasoning_efforts,
+            vec!["none", "low", "high", "max"]
+        );
+        assert_eq!(deepseek.default_reasoning_effort, "high");
     }
 
     #[test]
@@ -10215,6 +11828,7 @@ command = "uvx.exe"
                 context_window: Some(1_000_000),
                 max_output_tokens: Some(64_000),
                 input_modalities: vec!["text".to_string(), "image".to_string()],
+                ..Default::default()
             },
         );
         let updated = build_opencode_config("", &credential, &models).unwrap();
@@ -11110,5 +12724,19 @@ command = "uvx.exe"
             super::provider_config_format(Path::new("/tmp/.aider.conf.yml")),
             ProviderConfigFormat::Yaml
         ));
+    }
+    #[test]
+    fn rich_tool_direct_override_has_explicit_warning() {
+        let warning = super::direct_compatibility_warning("opencode", "managed");
+        assert!(warning.contains("富工具客户端"), "{warning}");
+        assert!(warning.contains("显式直连覆盖"), "{warning}");
+        assert!(warning.contains("400"), "{warning}");
+        assert!(warning.contains("切回本机网关"), "{warning}");
+
+        let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+        for target in crate::app::ai_compatibility::DEFAULT_GATEWAY_CLIENT_IDS {
+            let client = matrix.client(target).unwrap();
+            assert!(client.default_gateway, "{target} must default to gateway");
+        }
     }
 }

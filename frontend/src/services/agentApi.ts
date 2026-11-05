@@ -2256,6 +2256,7 @@ export type AuthoringWorkflowDraft = {
     role?: 'owner' | 'contributor';
     sha256?: string;
     test_report?: Record<string, unknown>;
+    warnings?: string[];
     created_at: string;
     updated_at: string;
     tested_at?: string | null;
@@ -2591,6 +2592,15 @@ export type DistributionPublishReport = {
     outcomes: { target: string; status: string; detail?: unknown; error?: string }[];
 };
 
+export type ExtensionAssetKind = 'plugin' | 'skill' | 'workflow';
+
+export type ExtensionBuildDependency = {
+    kind: ExtensionAssetKind;
+    id: string;
+    min_version?: string;
+    required: boolean;
+};
+
 export type ExtensionProject = {
     id: string;
     kind: ExtensionProjectKind;
@@ -2614,6 +2624,10 @@ export type ExtensionProject = {
     distribution_targets_source?: 'manifest' | 'project' | 'unit' | 'default' | string;
     /** 清单声明的同仓插件依赖，首次构建前也能据此排出先后。 */
     plugin_dependencies?: string[];
+    /** 一键构建需要的全部同仓扩展依赖（插件、技能）。 */
+    extension_dependencies?: string[];
+    /** 带最低版本与必需性信息的构建依赖。 */
+    build_dependencies?: ExtensionBuildDependency[];
     updated_at: string;
     source_unit_key?: string;
 };
@@ -2931,7 +2945,7 @@ export type CustomAIService = {
     /** 生图适配器：空/openai-images = OpenAI Images；ark-images = 火山方舟（豆包）。 */
     image_adapter: string;
     /** 媒体能力槽位：图像、视频、TTS、转写 → 适配器 + 模型 + 执行模式。 */
-    media?: Record<string, { adapter: string; model: string; execution_mode?: MediaExecutionMode | null }>;
+    media?: Record<string, { adapter: string; model: string; models?: string[]; execution_mode?: MediaExecutionMode | null }>;
     balance_profile_id?: string | null;
     balance_user_id?: string | null;
     suggested_balance_profile_id?: string | null;
@@ -2948,6 +2962,51 @@ export type AIProviderImportStatus = {
     models?: string[];
     synced_at?: string;
     service?: string;
+    verification_status?: string;
+    service_revision?: string;
+    desired_revision?: string;
+    applied_revision?: string;
+    sync_state?: 'synced' | 'needs_update' | 'blocked' | 'conflict' | 'failed' | string;
+    sync_reason_codes?: string[];
+    restart_required?: boolean;
+    last_error?: string;
+    warning?: string;
+};
+
+export type AIProviderSyncPlan = {
+    ok: boolean;
+    target: string;
+    sync_state: string;
+    service?: string;
+    desired_revision?: string;
+    applied_revision?: string;
+    reason_codes?: string[];
+    blocked: boolean;
+    restart_required: boolean;
+    will_write?: string[];
+    will_backup?: string[];
+    detail: string;
+};
+
+export type AIProviderSyncResult = {
+    ok: boolean;
+    target: string;
+    sync_state: string;
+    desired_revision?: string;
+    applied_revision?: string;
+    model_count: number;
+    model?: string;
+    config_path?: string;
+    backup_path?: string;
+    restart_required: boolean;
+    detail?: string;
+};
+
+export type AIProviderSyncAllResult = {
+    ok: boolean;
+    synced: string[];
+    skipped: string[];
+    failed: Array<{ target: string; error: string }>;
 };
 
 export type AIProviderImportOverview = {
@@ -2988,10 +3047,8 @@ export type AIServiceListResult = {
     custom: {
         services: CustomAIService[];
         balances?: Record<string, AIServiceBalanceSnapshot>;
-        active_service_id?: string;
-        image_service_id?: string;
-        media_services?: Record<string, string>;
-        capability_fallbacks?: Record<string, string[]>;
+        /** 唯一事实源：每个能力一条有序路由表，下标 0 是主选。 */
+        capability_routes?: Record<string, CapabilityRouteEntry[]>;
     };
     managed: ManagedAIServiceSummary;
     clients: AIProviderImportOverview;
@@ -3049,13 +3106,21 @@ export type CapabilityRouteCandidate = {
     eligibility: 'selected' | 'fallback' | 'candidate' | string;
     reason: string;
     adapter: string;
-    model: string;
+    model: string | null;
+    /** `explicit` = 路由项钉死的模型；`service_default` = 跟随服务默认；`catalog` = 仅出现在候选里的模型。 */
+    model_source: 'explicit' | 'service_default' | 'catalog' | string;
     execution_mode: MediaExecutionMode | 'sync' | string;
     credential_present: boolean;
 };
 
+/** 一条能力路由项：在某个服务上使用某个模型。`model` 为空表示跟随服务默认绑定。 */
+export type CapabilityRouteEntry = {
+    service_id: string;
+    model: string;
+};
+
 export type CapabilityRoutePlan = {
-    schema_version: 'himind.ai-capability-route.v1';
+    schema_version: 'himind.ai-capability-route.v2';
     capability: string;
     state: 'resolved' | 'ambiguous' | 'missing' | string;
     reason: string;
@@ -3064,24 +3129,30 @@ export type CapabilityRoutePlan = {
         display_name: string;
         adapter: string | null;
         model: string | null;
+        model_source: string;
         execution_mode: string | null;
     };
-    fallbacks: Array<{ service_id: string; display_name: string }>;
-    attempts: Array<{ service_id: string; display_name: string; role: 'primary' | 'fallback' | string }>;
+    fallbacks: Array<{ service_id: string; display_name: string; model: string | null; model_source: string }>;
+    attempts: Array<{
+        service_id: string;
+        display_name: string;
+        model: string | null;
+        model_source: string;
+        adapter: string;
+        execution_mode: string;
+        role: 'primary' | 'fallback' | string;
+    }>;
     candidates: CapabilityRouteCandidate[];
     requires_cost_confirmation: boolean;
     fallback_policy: 'same_capability_only' | string;
 };
 
 export type MediaProviderCatalogResult = {
-    schema_version: 'himind.media-provider-catalog.v1' | 'himind.media-provider-catalog.v2' | string;
+    schema_version: 'himind.media-provider-catalog.v1' | 'himind.media-provider-catalog.v2' | 'himind.media-provider-catalog.v3' | string;
     adapters: MediaProviderCatalogAdapter[];
     providers: MediaProviderCatalogProvider[];
     capabilities: MediaProviderCatalogCapability[];
     routes?: CapabilityRoutePlan[];
-    defaults: Record<string, string>;
-    fallbacks?: Record<string, string[]>;
-    image_service_id: string;
 };
 
 export type AICapabilityTestResult = {
@@ -3296,6 +3367,7 @@ export const agentApi = {
     listBuiltinAiSessions: () => invoke<BuiltinAiSessionSnapshot[]>('list_builtin_ai_sessions'),
     stopBuiltinAiSession: (workspaceRoot: string) => invoke<boolean>('stop_builtin_ai_session', { workspaceRoot }),
     openBuiltinAiWeb: (target?: { projectId?: string; workspaceRoot?: string }) => invoke<string>('open_builtin_ai_web', target || {}),
+    openBuiltinAiWindow: (target?: { projectId?: string; workspaceRoot?: string }) => invoke<string>('open_builtin_ai_window', target || {}),
     openExternalUrl: (url: string) => invoke<void>('open_external_url', { url }),
     syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
@@ -3419,6 +3491,29 @@ export const agentApi = {
         }),
     createExtensionProject: (input: CreateExtensionProjectInput, parentDir?: string) => invoke<ExtensionProject>('create_extension_project', { input, parentDir: parentDir ?? null }),
     buildExtensionProject: (projectId: string) => invoke<ExtensionCandidate>('build_extension_project', { projectId }),
+    planExtensionBuild: (projectIds: string[]) => invoke<{
+        nodes: Array<{
+            project_id: string;
+            kind: ExtensionProjectKind;
+            extension_id: string;
+            name: string;
+            version: string;
+            workspace_path: string;
+            dependencies: string[];
+            warnings: string[];
+        }>;
+        order: string[];
+        reused: Array<{ kind: ExtensionAssetKind; id: string; version: string; required: boolean }>;
+        blockers: Array<{
+            code: string;
+            project_id: string;
+            dependency_kind: string;
+            dependency_id: string;
+            message: string;
+            remediation: string;
+        }>;
+        warnings: string[];
+    }>('plan_extension_build', { projectIds }),
     installExtensionCandidate: (kind: string, id: string, version: string) => invoke<string>('install_extension_candidate', { kind, id, version }),
     getExtensionDevSettings: () => invoke<{ auto_install_after_build: boolean }>('get_extension_dev_settings'),
     setExtensionDevSettings: (autoInstallAfterBuild: boolean) => invoke<{ auto_install_after_build: boolean }>('set_extension_dev_settings', { autoInstallAfterBuild }),
@@ -3531,13 +3626,14 @@ export const agentApi = {
     getMediaProviderCatalog: () => invoke<MediaProviderCatalogResult>('get_media_provider_catalog'),
     planAICapabilityRoute: (input: Record<string, unknown>) => invoke<CapabilityRoutePlan>('plan_ai_capability_route', { input }),
     testAICapability: (input: Record<string, unknown>) => invoke<AICapabilityTestResult>('test_ai_capability', { input }),
-    setAICapabilityFallbacks: (capability: string, serviceIds: string[]) => invoke<MediaProviderCatalogResult>('set_ai_capability_fallbacks', { capability, serviceIds }),
+    /** 覆盖写入某能力的完整路由表：下标 0 是主选，其余按序是备用。 */
+    setCapabilityRoutes: (capability: string, routes: CapabilityRouteEntry[]) => invoke<{ capability_routes: Record<string, CapabilityRouteEntry[]> }>('set_capability_routes', { capability, routes }),
     listAIServiceTemplates: () => invoke<AIServiceTemplateListResult>('list_ai_service_templates'),
     acpRuntimeProfiles: () => invoke<AcpRuntimeProfileSnapshot>('list_acp_runtime_profiles'),
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -3555,16 +3651,20 @@ export const agentApi = {
             speechAdapter: input.speech_adapter,
             transcribeModel: input.transcribe_model,
             transcribeAdapter: input.transcribe_adapter,
+            visionModel: input.vision_model ?? '',
+            mediaModels: input.media_models ?? {},
             balanceProfileId: input.balance_profile_id,
             balanceAccessToken: input.balance_access_token,
             balanceUserId: input.balance_user_id,
             apiKey: input.api_key,
         }),
-    setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),
-    setImageAIService: (id: string, capability = 'image.generate') => invoke<{ capability: string; service_id: string }>('set_image_ai_service', { id, capability }),
+    cloneAIService: (id: string) => invoke<CustomAIService>('clone_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
+    planAIClientSync: (target: string) => invoke<AIProviderSyncPlan>('plan_ai_client_sync', { target }),
+    syncAIClient: (target: string, expectedRevision?: string) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision }),
+    syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
     setApprovalProfile: (profile: string, confirmed = false, durationSeconds?: number) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed, ...(durationSeconds !== undefined ? { durationSeconds } : {}) }),

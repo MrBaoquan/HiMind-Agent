@@ -21,7 +21,7 @@ type ManagedCapabilitiesPageProps = {
   skillStatus: CodexSkillStatusResponse | null;
   /// 工作流的本机状态来自工作流中心，其余类型用各自的运行态。
   workflows?: WorkflowCenterItem[];
-  /// 组织管理的插件不能停用和卸载，但运行异常时必须让用户能自助恢复，所以只开放「修复并重试」。
+  /// 组织插件不可停用或卸载；异常时只开放「修复并重试」。
   onRepairPlugin?: (pluginId: string) => void;
 };
 

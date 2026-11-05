@@ -86,6 +86,10 @@ pub(crate) fn serve_with_gateway(
     let endpoint = instance.discovery().endpoint.clone();
     let token = instance.discovery().token.clone();
     let registry = RegistryBroadcaster::new(gateway.clone());
+    // 记录是外部可删的（旧版本桥接、清理脚本、手工操作）。删掉之后服务还活着，
+    // 但任何新桥接都看不到它，只能去 spawn 新服务，撞上单例锁又直接退出，
+    // 于是「记录丢了」变成永久不可用。用独立线程持续补写，让它可自愈。
+    instance.spawn_discovery_keeper();
     let mut accepted = 0_usize;
     loop {
         let stream = crate::mcp_pipe::accept(&endpoint)?;
@@ -688,14 +692,15 @@ mod tests {
         let discovery = ServiceDiscovery {
             schema_version: DISCOVERY_SCHEMA_VERSION,
             protocol_version: IPC_PROTOCOL_VERSION,
-            pid: 1234,
+            pid: std::process::id(),
             profile: scope.profile().to_string(),
             identity_hash: scope.identity_hash().to_string(),
             state_hash: scope.state_hash().to_string(),
             endpoint: scope.endpoint(&root),
             token: "test-token".to_string(),
             agent_version: "0.3.76".to_string(),
-            started_at_unix: 1,
+            started_at_unix: crate::mcp_ipc::process_started_at_unix(std::process::id())
+                .unwrap_or(1),
         };
         fs::create_dir_all(&root).unwrap();
         fs::write(

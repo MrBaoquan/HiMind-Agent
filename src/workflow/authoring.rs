@@ -64,6 +64,8 @@ pub(crate) struct WorkflowDraft {
     pub state: ExtensionCandidateState,
     #[serde(default)]
     pub test_report: Value,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -196,6 +198,9 @@ pub(crate) fn submit(
         .ok_or("Workflow Candidate 缺少依赖锁")?;
     let lock = draft.lock.as_ref().ok_or("Workflow Candidate 缺少依赖锁")?;
     lock.validate()?;
+    let package = crate::workflow::load_from_directory(&draft.source_root)?;
+    validate_release_dependency_versions(&package, lock)?;
+    ensure_release_preflight_ready(&draft.test_report)?;
     let access = crate::api::oauth::platform_access_token(
         options,
         crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
@@ -324,6 +329,7 @@ fn save_from_source_to_root(
         candidate_sha256,
         state: ExtensionCandidateState::Candidate,
         test_report: json!({}),
+        warnings: Vec::new(),
         created_at: previous
             .as_ref()
             .map(|value| value.created_at.clone())
@@ -352,8 +358,13 @@ fn test_in_root(
     let preflight = capabilities.map(|capabilities| {
         crate::workflow::preflight(&package, crate::VERSION, capabilities, &Value::Null)
     });
+    let mut preflight_warnings = Vec::new();
     if let Some(report) = preflight.as_ref().filter(|report| !report.ready) {
-        return Err(format!("Workflow Preflight 未通过: {}", report.blockers.join("；")).into());
+        let (blockers, warnings) = partition_preflight_blockers(report);
+        if !blockers.is_empty() {
+            return Err(format!("Workflow Preflight 未通过: {}", blockers.join("；")).into());
+        }
+        preflight_warnings = warnings;
     }
     let test_root = draft_version_root(storage_root, package_id, version).join("test-package");
     stage_local_package(
@@ -376,12 +387,16 @@ fn test_in_root(
         return Err("Workflow 源目录在 Candidate 生成后发生变化".into());
     }
     let contract = crate::workflow::contract_dry_run_report(&package)?;
-    let lock = resolve_dependency_lock(&package, &draft.candidate_sha256, preflight.as_ref())?;
+    let (lock, dependency_warnings) =
+        resolve_dependency_lock(&package, &draft.candidate_sha256, preflight.as_ref())?;
+    let mut all_warnings = dependency_warnings.clone();
+    all_warnings.extend(preflight_warnings.iter().cloned());
     let lock_path =
         draft_version_root(storage_root, package_id, version).join("extension-lock.json");
     fs::write(&lock_path, serde_json::to_vec_pretty(&lock)?)?;
     draft.lock = Some(lock);
     draft.lock_path = Some(lock_path.clone());
+    draft.warnings = all_warnings.clone();
     let lock_sha256 = sha256_file(&lock_path)?;
     draft.test_report = json!({
         "candidate_sha256": draft.candidate_sha256.clone(),
@@ -394,13 +409,22 @@ fn test_in_root(
             "assets": "passed",
             "step_graph": "passed",
             "candidate": "passed",
-            "dependencies": "passed",
+            "dependencies": if dependency_warnings.is_empty() { "passed" } else { "passed_with_warnings" },
             "entrypoints": "passed",
             "loops": "passed",
             "artifacts": "passed",
             "contract_dry_run": "passed",
-            "preflight": if preflight.is_some() { "passed" } else { "skipped" }
+            "preflight": if preflight.is_none() {
+                "skipped"
+            } else if preflight_warnings.is_empty() {
+                "passed"
+            } else {
+                "passed_with_warnings"
+            }
         },
+        "warnings": all_warnings,
+        "preflight_local_warnings": preflight_warnings,
+        "release_blocked": !preflight_warnings.is_empty(),
         "preflight": preflight,
         "contract": contract,
         "workflow": {
@@ -423,24 +447,23 @@ fn resolve_dependency_lock(
     package: &crate::workflow::WorkflowPackage,
     candidate_sha256: &str,
     preflight: Option<&crate::workflow::WorkflowPreflight>,
-) -> Result<ExtensionLock, Box<dyn Error>> {
+) -> Result<(ExtensionLock, Vec<String>), Box<dyn Error>> {
     let mut dependencies = Vec::new();
     let mut missing = Vec::new();
+    let mut warnings = Vec::new();
 
     for declared in &package.dependencies.plugins {
         let plugin_id = declared.id();
         match crate::capability::plugin::find_plugin(plugin_id) {
             Ok(Some(plugin)) if plugin.enabled && plugin.error.is_none() => {
-                record_dependency_gap(
-                    declared.required,
-                    version_gap(
-                        "Plugin",
-                        plugin_id,
-                        &plugin.version,
-                        declared.min_version.trim(),
-                    ),
-                    &mut missing,
-                );
+                if let Some(warning) = version_gap(
+                    "Plugin",
+                    plugin_id,
+                    &plugin.version,
+                    declared.min_version.trim(),
+                ) {
+                    record_dependency_warning(declared.required, warning, &mut warnings);
+                }
                 let sha256 = super::store::package_payload_digest(
                     &crate::capability::plugin::plugin_content_dir(&plugin),
                 )?;
@@ -486,16 +509,14 @@ fn resolve_dependency_lock(
             .find(|record| record.manifest.id == *skill_id)
         {
             Some(record) => {
-                record_dependency_gap(
-                    declared.required,
-                    version_gap(
-                        "Skill",
-                        skill_id,
-                        &record.manifest.version,
-                        declared.min_version.trim(),
-                    ),
-                    &mut missing,
-                );
+                if let Some(warning) = version_gap(
+                    "Skill",
+                    skill_id,
+                    &record.manifest.version,
+                    declared.min_version.trim(),
+                ) {
+                    record_dependency_warning(declared.required, warning, &mut warnings);
+                }
                 let sha256 = super::store::package_payload_digest(&record.version_root)?;
                 dependencies.push(ExtensionLockDependency {
                     kind: ExtensionAssetKind::Skill,
@@ -583,7 +604,7 @@ fn resolve_dependency_lock(
         generated_at: now_stamp(),
     };
     lock.validate()?;
-    Ok(lock)
+    Ok((lock, warnings))
 }
 
 fn list_from_root(root: &Path) -> Result<Vec<WorkflowDraft>, Box<dyn Error>> {
@@ -662,21 +683,163 @@ fn record_dependency_gap(required: bool, reason: String, missing: &mut Vec<Strin
     }
 }
 
-/// 已安装版本低于声明的最低版本时给出说明，满足则返回空串。
-fn version_gap(kind: &str, id: &str, installed: &str, min_version: &str) -> String {
+/// 本地开发可以继续使用尚未授权的控制面能力；发布前必须重新通过完整 Preflight。
+fn partition_preflight_blockers(
+    report: &crate::workflow::WorkflowPreflight,
+) -> (Vec<String>, Vec<String>) {
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    for diagnostic in report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == "blocker")
+    {
+        let control_plane_id = (diagnostic.code == "capability.unavailable")
+            .then(|| {
+                diagnostic
+                    .message
+                    .strip_prefix("required capability is unavailable: ")
+                    .map(str::trim)
+            })
+            .flatten()
+            .filter(|id| id.starts_with("workbench.") || id.starts_with("dashboard."));
+        if let Some(id) = control_plane_id {
+            warnings.push(format!(
+                "工作台能力暂不可用: {id}；本地构建继续，发布前需完成工作台授权"
+            ));
+            continue;
+        }
+        let environment_only = matches!(
+            diagnostic.code.as_str(),
+            "connector.unavailable"
+                | "connector.inactive"
+                | "connector.dashboard_required"
+                | "connector.credential_missing"
+                | "connector.credential_mismatch"
+                | "connector.health_probe_failed"
+                | "runtime.unavailable"
+                | "runtime.auto_unavailable"
+                | "runtime.auto_isolation_unavailable"
+                | "runtime.dependency_unavailable"
+                | "runtime.network_isolation_missing"
+                | "tool.required_unavailable"
+        );
+        if environment_only {
+            warnings.push(format!(
+                "本地环境暂未就绪: {}；本地构建继续，运行或发布前需补齐",
+                diagnostic.message
+            ));
+        } else {
+            blockers.push(diagnostic.message.clone());
+        }
+    }
+    (blockers, warnings)
+}
+
+/// 提审和发布不得沿用“本地控制面能力缺失时继续”的警告。
+pub(crate) fn ensure_release_preflight_ready(test_report: &Value) -> Result<(), Box<dyn Error>> {
+    let warnings = test_report
+        .get("preflight_local_warnings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if warnings.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Workflow 发布前必须先补齐工作台能力并通过完整 Preflight: {}",
+        warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("；")
+    )
+    .into())
+}
+
+fn record_dependency_warning(required: bool, warning: String, warnings: &mut Vec<String>) {
+    if warning.is_empty() {
+        return;
+    }
+    let scope = if required {
+        "必需依赖"
+    } else {
+        "可选依赖"
+    };
+    warnings.push(format!(
+        "{scope} {warning}；本地开发继续使用当前有效版本，发布前需满足最低版本"
+    ));
+}
+
+/// 已安装版本低于声明的最低版本时给出说明，满足则返回 `None`。
+fn version_gap(kind: &str, id: &str, installed: &str, min_version: &str) -> Option<String> {
     if min_version.is_empty() {
-        return String::new();
+        return None;
     }
     let (Ok(installed), Ok(minimum)) = (
         Version::parse(installed.trim()),
         Version::parse(min_version),
     ) else {
-        return String::new();
+        return None;
     };
-    if installed < minimum {
-        return format!("{kind} {id} 版本 {installed} 低于声明的最低版本 {minimum}");
+    (installed < minimum)
+        .then(|| format!("{kind} {id} 版本 {installed} 低于声明的最低版本 {minimum}"))
+}
+
+/// 提审与发布使用严格口径：锁里的实际版本必须满足清单声明的最低版本。
+pub(crate) fn validate_release_dependency_versions(
+    package: &crate::workflow::WorkflowPackage,
+    lock: &ExtensionLock,
+) -> Result<(), Box<dyn Error>> {
+    let mut declared = Vec::new();
+    for dependency in &package.dependencies.plugins {
+        declared.push((
+            ExtensionAssetKind::Plugin,
+            dependency.id(),
+            dependency.min_version.as_str(),
+            dependency.required,
+        ));
     }
-    String::new()
+    for dependency in &package.dependencies.skills {
+        declared.push((
+            ExtensionAssetKind::Skill,
+            dependency.id(),
+            dependency.min_version.as_str(),
+            dependency.required,
+        ));
+    }
+    for (kind, id, minimum, required) in declared {
+        if minimum.trim().is_empty() {
+            continue;
+        }
+        let Some(locked) = lock
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.kind == kind && dependency.id == id)
+        else {
+            if required {
+                return Err(format!("Workflow 发布依赖锁缺少必需依赖 {kind:?} {id}").into());
+            }
+            continue;
+        };
+        let (Ok(actual), Ok(minimum)) = (
+            Version::parse(locked.version.trim()),
+            Version::parse(minimum.trim()),
+        ) else {
+            return Err(format!(
+                "Workflow 发布依赖版本无法比较: {kind:?} {id} actual={} minimum={minimum}",
+                locked.version
+            )
+            .into());
+        };
+        if actual < minimum {
+            return Err(format!(
+                "Workflow 发布依赖版本不满足: {kind:?} {id} 实际 {actual} 低于最低版本 {minimum}"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn draft_version_root(root: &Path, package_id: &str, version: &str) -> PathBuf {
@@ -892,6 +1055,55 @@ mod tests {
     }
 
     #[test]
+    fn local_dependency_version_gap_warns_but_release_is_strict() {
+        let root = workflow_root_with_declared_dependencies(
+            "local-version-warning",
+            json!({
+                "plugins": [],
+                "skills": [{
+                    "id": "com.example.local-version-warning-skill",
+                    "required": true,
+                    "min_version": "0.4.2"
+                }],
+                "connectors": [],
+                "runtimes": []
+            }),
+        );
+        let source = root.join("source");
+        let package = crate::workflow::load_from_directory(&source).unwrap();
+        let warning = version_gap(
+            "Skill",
+            "com.example.local-version-warning-skill",
+            "0.2.2",
+            "0.4.2",
+        )
+        .unwrap();
+        assert!(warning.contains("低于声明的最低版本"));
+        let lock = ExtensionLock {
+            schema_version: EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: "a".repeat(64),
+            },
+            dependencies: vec![ExtensionLockDependency {
+                kind: ExtensionAssetKind::Skill,
+                id: "com.example.local-version-warning-skill".to_string(),
+                version: "0.2.2".to_string(),
+                sha256: "b".repeat(64),
+                source_id: "skill-store".to_string(),
+                required: true,
+            }],
+            environment: ExtensionLockEnvironment::default(),
+            generated_at: now_stamp(),
+        };
+        let error = validate_release_dependency_versions(&package, &lock).unwrap_err();
+        assert!(error.to_string().contains("发布依赖版本不满足"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_blocks_when_a_required_plugin_dependency_cannot_be_resolved() {
         let root = workflow_root_with_dependencies(
             "missing-dependency",
@@ -934,6 +1146,74 @@ mod tests {
             .to_string();
         assert!(error.contains("com.example.missing"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capability_test_allows_unavailable_workbench_capability_with_release_warning() {
+        let root = workflow_root("workbench-capability-warning");
+        let source = root.join("source");
+        let storage = root.join("storage");
+        let manifest_path = source.join("workflow.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["capabilities"] = json!(["workbench.example.missing"]);
+        manifest["steps"] = json!([{
+            "id": "START",
+            "title": "Start",
+            "kind": "capability",
+            "capability_id": "workbench.example.missing",
+            "execution_mode": "sync"
+        }]);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        save_from_source_to_root(&source, &storage).unwrap();
+        let tested = test_in_root("com.example.authoring", "1.0.0", &storage, Some(&[])).unwrap();
+        assert!(tested
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("工作台能力暂不可用")));
+        let error = ensure_release_preflight_ready(&tested.test_report).unwrap_err();
+        assert!(error.to_string().contains("发布前必须先补齐工作台能力"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_environment_errors_are_local_warnings_but_contract_errors_block() {
+        let mut report = crate::workflow::WorkflowPreflight {
+            ready: false,
+            package_id: "com.example.authoring".to_string(),
+            package_version: "1.0.0".to_string(),
+            agent_version: crate::VERSION.to_string(),
+            capabilities: Vec::new(),
+            skills: Vec::new(),
+            runtimes: Vec::new(),
+            connectors: Vec::new(),
+            tools: Vec::new(),
+            diagnostics: vec![crate::workflow::WorkflowDiagnostic {
+                severity: "blocker".to_string(),
+                code: "connector.inactive".to_string(),
+                stage: "connector".to_string(),
+                message: "workflow connector wechat-miniprogram is not active".to_string(),
+                remediation: String::new(),
+                retryable: true,
+            }],
+            blockers: vec!["connector inactive".to_string()],
+            warnings: Vec::new(),
+        };
+        let (blockers, warnings) = partition_preflight_blockers(&report);
+        assert!(blockers.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("本地环境暂未就绪")));
+
+        report.diagnostics[0].code = "connector.capability_undeclared".to_string();
+        report.diagnostics[0].message =
+            "workflow connector exposes undeclared capability".to_string();
+        let (blockers, _) = partition_preflight_blockers(&report);
+        assert_eq!(blockers.len(), 1);
     }
 
     #[test]
