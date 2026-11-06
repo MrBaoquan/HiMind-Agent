@@ -98,14 +98,6 @@ const RUNTIME_EXTERNAL_LINK_BRIDGE: &str = r#"<script data-himind-external-link-
   }, true);
 })();
 </script>"#;
-// DSH's model selector prefers the optional display name over the provider
-// and model id. Keep the user-facing label tied to the real catalog id so a
-// managed HiMind provider cannot turn `deepseek-v4-flash` into `HiMind-v4`.
-fn model_profile_entry(model: &str) -> Value {
-    let model = model.trim();
-    json!({ "id": model, "name": model })
-}
-
 const RUNTIME_BRAND_BRIDGE: &str = r#"<style data-himind-runtime-brand>
 button:has(> svg[viewBox="0 0 182 24"]) > svg {
   display: none !important;
@@ -752,66 +744,6 @@ impl BuiltinAiProxyControl {
         Ok(newest.map(|(_, session_id)| session_id))
     }
 
-    /// Synchronize the Agent-owned provider through DSH's public API carrier.
-    /// The initial browser handshake is important: DSH keeps its own session
-    /// cookie in addition to the Agent proxy cookie, so calling the upstream
-    /// port directly is intentionally avoided.
-    pub(crate) fn sync_model_catalog(
-        &self,
-        default_model: &str,
-        base_url: &str,
-        models: &[String],
-    ) -> Result<(), String> {
-        let model_entries = models
-            .iter()
-            .map(|model| model_profile_entry(model))
-            .filter(|model| {
-                model
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !id.is_empty())
-            })
-            .collect::<Vec<_>>();
-        self.sync_provider_catalog(
-            "himind-proxy",
-            "HiMind AI",
-            "DEEPSEEK_API_KEY",
-            "openai-completions",
-            default_model,
-            base_url,
-            model_entries,
-            false,
-        )
-    }
-
-    pub(crate) fn sync_local_service_catalog(
-        &self,
-        default_model: &str,
-        base_url: &str,
-        routes: &[crate::app::builtin_ai_router::ModelRoute],
-        activate_default: bool,
-    ) -> Result<(), String> {
-        let model_entries = routes
-            .iter()
-            .map(|route| {
-                json!({
-                    "id": route.alias,
-                    "name": route.display_name,
-                })
-            })
-            .collect::<Vec<_>>();
-        self.sync_provider_catalog(
-            crate::app::builtin_ai_router::PROVIDER_ID,
-            "HiMind AI",
-            crate::app::builtin_ai_router::API_KEY_ENV,
-            "openai-completions",
-            default_model,
-            base_url,
-            model_entries,
-            activate_default,
-        )
-    }
-
     /// Point the newest Session in one Workspace at the new local model.
     ///
     /// DSH keeps model selection per Session even when the default provider
@@ -865,81 +797,6 @@ impl BuiltinAiProxyControl {
             }),
         )?;
         runtime_result_value(&response, "切换 DSH 会话模型")?;
-        Ok(())
-    }
-
-    fn sync_provider_catalog(
-        &self,
-        provider_id: &str,
-        display_name: &str,
-        api_key_env: &str,
-        api: &str,
-        default_model: &str,
-        base_url: &str,
-        models: Vec<Value>,
-        force_default: bool,
-    ) -> Result<(), String> {
-        let default_model = default_model.trim();
-        let base_url = base_url.trim();
-        if default_model.is_empty() || base_url.is_empty() || models.is_empty() {
-            return Err("HiMind AI 模型目录为空".to_string());
-        }
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()
-            .map_err(|error| format!("创建 DSH 模型同步客户端失败: {error}"))?;
-        let described = self.call_api(&client, "settings/describe", json!({}))?;
-        let namespaces = described
-            .get("result")
-            .and_then(|result| result.get("ok").and_then(Value::as_bool).filter(|ok| *ok))
-            .and_then(|_| {
-                described
-                    .get("result")
-                    .and_then(|result| result.get("value"))
-            })
-            .and_then(|value| value.get("namespaces"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| "DSH 设置目录不可用".to_string())?;
-
-        let provider_profile = json!({
-            "displayName": display_name,
-            "apiKeyEnv": api_key_env,
-            "api": api,
-            "baseURL": base_url,
-            "models": models,
-        });
-        let llm_revision = namespace_revision(namespaces, "llm-pi-ai");
-        self.mutate_settings(
-            &client,
-            "llm-pi-ai",
-            vec![json!({
-                "op": "set",
-                "path": ["providers", provider_id],
-                "value": provider_profile,
-            })],
-            llm_revision,
-        )?;
-
-        // Catalog refreshes are deliberately non-destructive: adding or editing
-        // any service must not steal the model the user selected in DSH. Only an
-        // explicit activation (launch/default-service switch) moves the default.
-        if force_default {
-            let revision = namespaces
-                .iter()
-                .find(|item| item.get("ns").and_then(Value::as_str) == Some("agent-default-model"))
-                .and_then(|item| item.get("revision"))
-                .and_then(Value::as_i64);
-            self.mutate_settings(
-                &client,
-                "agent-default-model",
-                vec![
-                    json!({ "op": "set", "path": ["provider"], "value": provider_id }),
-                    json!({ "op": "set", "path": ["model"], "value": default_model }),
-                ],
-                revision,
-            )?;
-        }
         Ok(())
     }
 
@@ -1061,32 +918,6 @@ impl BuiltinAiProxyControl {
             .map_err(|error| format!("创建 DSH 能力探测客户端失败: {error}"))?;
         self.call_api(&client, endpoint, args)
     }
-
-    fn mutate_settings(
-        &self,
-        client: &Client,
-        namespace: &str,
-        ops: Vec<Value>,
-        revision: Option<i64>,
-    ) -> Result<(), String> {
-        let mut args = json!({ "ns": namespace, "ops": ops });
-        if let Some(revision) = revision {
-            args["expectedRevision"] = json!(revision);
-        }
-        let response = self.call_api(client, "settings/mutate", args)?;
-        let result = response
-            .get("result")
-            .ok_or_else(|| "DSH 设置同步响应缺少结果".to_string())?;
-        if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            return Ok(());
-        }
-        let message = result
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("DSH 设置同步被拒绝");
-        Err(message.to_string())
-    }
 }
 
 pub(crate) fn runtime_result_value<'a>(
@@ -1112,14 +943,6 @@ pub(crate) fn runtime_result_value<'a>(
         .and_then(Value::as_str)
         .unwrap_or("DSH 拒绝了请求");
     Err(format!("{operation}失败（{code}）：{message}"))
-}
-
-fn namespace_revision(namespaces: &[Value], namespace: &str) -> Option<i64> {
-    namespaces
-        .iter()
-        .find(|item| item.get("ns").and_then(Value::as_str) == Some(namespace))
-        .and_then(|item| item.get("revision"))
-        .and_then(Value::as_i64)
 }
 
 pub(crate) fn unix_millis() -> u128 {
@@ -2564,25 +2387,6 @@ mod tests {
         assert!(RUNTIME_BRAND_BRIDGE.contains("[/DeepSeek Harness/gi, 'HiMind AI']"));
         assert!(!RUNTIME_BRAND_BRIDGE.contains("[/\\bdeepseek\\b/gi, 'HiMind']"));
         assert!(!RUNTIME_BRAND_BRIDGE.contains("deepseek-v4-flash"));
-    }
-
-    #[test]
-    fn model_profile_entry_preserves_the_real_id_as_display_name() {
-        let entry = model_profile_entry(" deepseek-v4-flash ");
-        assert_eq!(
-            entry.get("id").and_then(Value::as_str),
-            Some("deepseek-v4-flash")
-        );
-        assert_eq!(
-            entry.get("name").and_then(Value::as_str),
-            Some("deepseek-v4-flash")
-        );
-        assert!(!entry
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("himind"));
     }
 
     #[test]

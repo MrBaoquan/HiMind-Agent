@@ -12,7 +12,6 @@ use std::sync::{Mutex, OnceLock};
 
 pub(crate) const CLIENT_ID: &str = "himind-ai";
 pub(crate) const PROVIDER_ID: &str = "himind-local-ai";
-pub(crate) const API_KEY_ENV: &str = "HIMIND_LOCAL_AI_API_KEY";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelRoute {
