@@ -1828,13 +1828,11 @@ fn start_builtin_ai_session_inner(
         append_builtin_ai_diagnostic(&diagnostics, &error);
     }
     if launch.service_source == "custom" {
-        let routes = crate::app::builtin_ai_router::model_catalog()?;
-        control.sync_local_service_catalog(
-            &launch.default_model,
-            &launch.base_url,
-            &routes,
-            true,
-        )?;
+        // 本机路由模式的两条行（`llm-pi-ai` / `agent-default-model`）由本次会话
+        // 的 overlay 拥有：DSH 的 settings 编辑接口会把「被 home patch 或命令行
+        // overlay 覆盖」的写入判为冲突并整体拒绝。启动时拿这条写入当失败会让会话
+        // 根本起不来（报 `Configuration for "llm-pi-ai" is overridden ...`），而
+        // 目录本身已经在 overlay 里了，所以这里只把最新的对话模型选进当前会话。
         if let Err(error) =
             control.select_latest_session_model(&launch.workspace, &launch.default_model)
         {
@@ -1854,26 +1852,12 @@ fn start_builtin_ai_session_inner(
             }
         });
     }
-    // 只有真的拿到工作台凭据时才把目录推给 DSH：降级会话用的是本机 AI 服务，
-    // 把它的地址与模型写进工作台的 `himind-proxy` 路由会污染用户 settings.yaml。
-    // The persisted overlay already selects the model; refreshing the optional
-    // catalog can finish after the iframe becomes visible.
-    if launch.service_source == "managed" {
-        let sync_control = control.clone();
-        let default_model = launch.default_model.clone();
-        let base_url = launch.base_url.clone();
-        let models = launch.models.clone();
-        thread::spawn(move || {
-            if let Err(error) = sync_control.sync_model_catalog(&default_model, &base_url, &models)
-            {
-                eprintln!("HiMind AI 模型目录同步失败（会话已启动）：{error}");
-            }
-        });
-    }
+    // 托管路由的 `llm-pi-ai` / `agent-default-model` 行由本次会话的 overlay 写死
+    // （见 `append_managed_model_profile`）。DSH 会把任何被 home patch 或
+    // `--patch` overlay 覆盖的 namespace 的 settings 写入判为冲突并整条拒绝，
+    // 所以启动后不再补一次目录同步：目录变了就走 `restart_required` 重建会话。
     let model_sync = BuiltinAiModelSync::start(ModelSyncSnapshot {
         user_id: launch.user_id,
-        default_model: launch.default_model,
-        base_url: launch.base_url.clone(),
         models: launch.models,
         credential_fingerprint: launch.credential_fingerprint,
         catalog_fingerprint: launch.catalog_fingerprint,
@@ -2057,21 +2041,19 @@ pub(crate) fn sync_builtin_ai_models(
     };
     let mut model_count = 0usize;
     let mut restart_required = false;
-    let mut updated = false;
     for (key, _, _) in &plan {
-        let Some((model_sync, proxy)) = builtin_ai_sessions()
+        let Some(model_sync) = builtin_ai_sessions()
             .lock()
             .map_err(|_| "HiMind AI 会话状态不可用")?
             .get(key)
-            .map(|session| (Arc::clone(&session.model_sync), session.proxy.control()))
+            .map(|session| Arc::clone(&session.model_sync))
         else {
             continue;
         };
         // 远程凭据/模型目录读取不在会话总锁内执行，否则网络抖动会阻塞
         // 其它工作区的启动、停止和状态读取。
-        let result = model_sync.sync_now(options, &proxy)?;
+        let result = model_sync.sync_now(options)?;
         model_count = model_count.max(result.model_count);
-        updated |= result.status == "updated";
         restart_required |= result.status == "restart_required";
     }
     if restart_required {
@@ -2087,7 +2069,7 @@ pub(crate) fn sync_builtin_ai_models(
         });
     }
     Ok(BuiltinAiModelSyncResult {
-        status: if updated { "updated" } else { "unchanged" }.to_string(),
+        status: "unchanged".to_string(),
         model_count,
         restarted: false,
         session_url: first_builtin_ai_session_url()
@@ -2098,6 +2080,14 @@ pub(crate) fn sync_builtin_ai_models(
 /// Apply a local AI service switch to every running DSH host without restarting
 /// it. The stable router resolves the new upstream; this call only points the
 /// current Session at the corresponding catalog alias.
+///
+/// The provider row itself stays owned by the per-session overlay (see
+/// `render_himind_agent_overlay`): DSH refuses settings writes for a namespace a
+/// home patch or `--patch` overlay overrides, and asking for one turned a normal
+/// service switch into an error the caller had to surface. Because that overlay
+/// carries the whole local alias catalog at launch, switching service or model
+/// needs no write at all — only a catalog that grew since launch does, and that
+/// one is picked up when the Session next starts.
 fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<(), String> {
     let controls = {
         let sessions = builtin_ai_sessions()
@@ -2111,28 +2101,28 @@ fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<(), String> {
     if controls.is_empty() {
         return Ok(());
     }
-    let base_url = crate::app::builtin_ai_router::api_base_url()?;
     let model_alias = crate::app::builtin_ai_router::active_model_alias()?;
-    let routes = crate::app::builtin_ai_router::model_catalog()?;
+    if !activate_default {
+        crate::approval::manager::append_event_log(
+            "info",
+            &format!(
+                "本机模型目录已更新；{} 个运行中的 HiMind AI 会话会在下次启动时看到新增的服务与模型",
+                controls.len()
+            ),
+        );
+        return Ok(());
+    }
     let mut failures = Vec::new();
     for (control, workspace) in controls {
-        if let Err(error) =
-            control.sync_local_service_catalog(&model_alias, &base_url, &routes, activate_default)
-        {
+        if let Err(error) = control.select_latest_session_model(&workspace, &model_alias) {
             failures.push(error);
-            continue;
-        }
-        if activate_default {
-            if let Err(error) = control.select_latest_session_model(&workspace, &model_alias) {
-                failures.push(error);
-            }
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "部分 DSH 会话未能刷新模型目录（进程保持运行）：{}",
+            "部分 DSH 会话未能切换到新的本机模型（进程保持运行）：{}",
             failures.join("；")
         ))
     }

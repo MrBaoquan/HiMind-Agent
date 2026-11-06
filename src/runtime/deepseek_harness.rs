@@ -1503,7 +1503,18 @@ fn active_independent_provider_config(
     }
     crate::app::builtin_ai_router::ensure_started()?;
     let model = crate::app::builtin_ai_router::active_model_alias()?;
-    let models = vec![model.clone()];
+    // DSH 的 patch 语义是整段替换 `llm-pi-ai.config`，不是深合并：overlay 里写了
+    // 几个模型，会话里就只剩几个。只写当前别名时模型选择器只剩一项，切换到别的
+    // 服务也会因为别名不在目录里而被 DSH 拒绝（`model-unavailable`）。所以这里
+    // 写本机路由的完整别名目录，DSH 侧与会话内切换都有东西可选。
+    let mut models = vec![model.clone()];
+    models.extend(
+        crate::app::builtin_ai_router::model_catalog()?
+            .into_iter()
+            .map(|route| route.alias),
+    );
+    let mut seen = HashSet::new();
+    models.retain(|alias| !alias.trim().is_empty() && seen.insert(alias.clone()));
     Ok(Some((
         NativeDshProviderConfig {
             provider: INDEPENDENT_ACTIVE_PROVIDER_ID.to_string(),
@@ -5923,6 +5934,12 @@ mod tests {
             assert_eq!(projection.model, "himind:local-gateway:local-model");
             assert_eq!(api_key, crate::app::builtin_ai_router::token());
             assert_ne!(api_key, "sk-local-secret");
+            // overlay 里的 `llm-pi-ai` 是整段替换，会话里能选的模型就是这里写的
+            // 那几个：只写当前别名会让 DSH 的模型选择器只剩一项，切到别的服务也
+            // 会因别名不在目录里被拒。所以完整的本机别名目录必须一起写。
+            assert!(projection
+                .models
+                .contains(&"himind:local-gateway:local-fast".to_string()));
 
             let dsh_home = root.join("dsh-home");
             std::fs::create_dir_all(&dsh_home).unwrap();

@@ -1,5 +1,4 @@
 use crate::api::ai::{fetch_client_credential, AIClientCredential};
-use crate::app::builtin_ai_proxy::BuiltinAiProxyControl;
 use crate::Options;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -10,8 +9,6 @@ const MODEL_DISPLAY_POLICY_VERSION: &str = "model-id-v1";
 #[derive(Clone)]
 pub(crate) struct ModelSyncSnapshot {
     pub user_id: String,
-    pub default_model: String,
-    pub base_url: String,
     pub models: Vec<String>,
     pub credential_fingerprint: String,
     pub catalog_fingerprint: String,
@@ -36,11 +33,7 @@ impl BuiltinAiModelSync {
         }
     }
 
-    pub(crate) fn sync_now(
-        &self,
-        options: &Options,
-        proxy: &BuiltinAiProxyControl,
-    ) -> Result<BuiltinAiModelSyncResult, String> {
+    pub(crate) fn sync_now(&self, options: &Options) -> Result<BuiltinAiModelSyncResult, String> {
         let previous = self
             .snapshot
             .lock()
@@ -58,9 +51,12 @@ impl BuiltinAiModelSync {
         let credential = fetch_client_credential(options, &previous.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
         let next = snapshot(&previous.user_id, &credential);
-        if next.credential_fingerprint != previous.credential_fingerprint {
-            // The API key and base URL are process-scoped. A fresh DSH
-            // process is required when the managed route or credential changes.
+        // 凭据与模型目录都写进了每次会话的 overlay：API key / base URL 是进程级
+        // 的，目录变化又会被 DSH 判成「被 home patch 或命令行 overlay 覆盖」而拒绝
+        // 就地写入。两者都只能按新的 overlay 重建会话，所以这里都不尝试写配置。
+        if next.credential_fingerprint != previous.credential_fingerprint
+            || next.catalog_fingerprint != previous.catalog_fingerprint
+        {
             return Ok(BuiltinAiModelSyncResult {
                 status: "restart_required".to_string(),
                 model_count: next.models.len(),
@@ -68,18 +64,8 @@ impl BuiltinAiModelSync {
                 session_url: String::new(),
             });
         }
-        let status = if next.catalog_fingerprint != previous.catalog_fingerprint {
-            proxy.sync_model_catalog(&next.default_model, &next.base_url, &next.models)?;
-            "updated"
-        } else {
-            "unchanged"
-        };
-        *self
-            .snapshot
-            .lock()
-            .map_err(|_| "HiMind AI 模型同步状态不可用".to_string())? = next.clone();
         Ok(BuiltinAiModelSyncResult {
-            status: status.to_string(),
+            status: "unchanged".to_string(),
             model_count: next.models.len(),
             restarted: false,
             session_url: String::new(),
@@ -115,8 +101,6 @@ pub(crate) fn snapshot(user_id: &str, credential: &AIClientCredential) -> ModelS
     ]);
     ModelSyncSnapshot {
         user_id: user_id.to_string(),
-        default_model,
-        base_url,
         models,
         credential_fingerprint,
         catalog_fingerprint,
