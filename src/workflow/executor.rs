@@ -364,6 +364,7 @@ mod tests {
             candidate_action: String::new(),
             input: serde_json::json!({}),
             execution_mode: "sync".to_string(),
+            role_id: String::new(),
             risk_level: "read_only".to_string(),
             approval_required: false,
             on_failure: String::new(),

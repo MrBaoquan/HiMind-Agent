@@ -12,8 +12,9 @@ use super::{WorkflowPackage, WorkflowStep};
 use crate::agent_core_contracts::{
     InteractionEnvelope, InteractionPrincipal, InteractionSource, InteractionTransport,
     LocalApprovalStatus, LocalRun, LocalRunApproval, LocalRunArtifact, LocalRunExecutionPlan,
-    LocalRunStatus, LocalRunStep, LocalRunUsage, LocalStepStatus, RuntimeEvent, RuntimeEventType,
-    INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION, RUNTIME_EVENT_SCHEMA_VERSION,
+    LocalRunParentKind, LocalRunStatus, LocalRunStep, LocalRunUsage, LocalStepStatus, RuntimeEvent,
+    RuntimeEventType, INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
+    RUNTIME_EVENT_SCHEMA_VERSION,
 };
 use crate::store::local_runs::LocalRunLedger;
 
@@ -197,6 +198,8 @@ impl WorkflowRunner {
         self.start_with_parent(agent_id, package, request_id, input, "")
     }
 
+    /// 起一个从属运行。默认按「重做」记账：loop 迭代是现有唯一的子运行来源，
+    /// 角色委派必须显式用 `start_delegated` 声明，否则会被算进返工率。
     pub(crate) fn start_with_parent(
         &self,
         agent_id: &str,
@@ -204,6 +207,44 @@ impl WorkflowRunner {
         request_id: &str,
         input: &Value,
         parent_run_id: &str,
+    ) -> Result<LocalRun, Box<dyn Error>> {
+        self.start_with_parent_kind(
+            agent_id,
+            package,
+            request_id,
+            input,
+            parent_run_id,
+            LocalRunParentKind::Retry,
+        )
+    }
+
+    /// 起一个委派给另一个角色的子运行：`parent_kind = delegate`，统计上算分工。
+    pub(crate) fn start_delegated(
+        &self,
+        agent_id: &str,
+        package: &WorkflowPackage,
+        request_id: &str,
+        input: &Value,
+        parent_run_id: &str,
+    ) -> Result<LocalRun, Box<dyn Error>> {
+        self.start_with_parent_kind(
+            agent_id,
+            package,
+            request_id,
+            input,
+            parent_run_id,
+            LocalRunParentKind::Delegate,
+        )
+    }
+
+    fn start_with_parent_kind(
+        &self,
+        agent_id: &str,
+        package: &WorkflowPackage,
+        request_id: &str,
+        input: &Value,
+        parent_run_id: &str,
+        parent_kind: LocalRunParentKind,
     ) -> Result<LocalRun, Box<dyn Error>> {
         package.validate().map_err(std::io::Error::other)?;
         // 无论从界面、定时计划还是命令行走进来，都先补齐启动表单声明的默认值，
@@ -273,6 +314,12 @@ impl WorkflowRunner {
             run_id: format!("workflow_run_{request_id}"),
             interaction_id: interaction.interaction_id.clone(),
             parent_run_id: parent_run_id.to_string(),
+            // 顶层运行没有父子语义：写 unspecified，避免空父运行却被标成「返工」。
+            parent_kind: if parent_run_id.trim().is_empty() {
+                LocalRunParentKind::Unspecified
+            } else {
+                parent_kind
+            },
             source: InteractionSource::Workflow,
             transport: InteractionTransport::Local,
             status: LocalRunStatus::Queued,
@@ -303,6 +350,7 @@ impl WorkflowRunner {
                         step.capability_id.clone()
                     },
                     runtime_provider: interaction.runtime_hint.clone(),
+                    role_id: step.role_id.trim().to_string(),
                     attempt: 0,
                     started_at: String::new(),
                     finished_at: String::new(),
@@ -2295,6 +2343,7 @@ mod tests {
                     candidate_action: String::new(),
                     input: serde_json::json!({}),
                     execution_mode: "sync".to_string(),
+                    role_id: String::new(),
                     risk_level: "read_only".to_string(),
                     approval_required: false,
                     on_failure: String::new(),
@@ -2312,6 +2361,7 @@ mod tests {
                     candidate_action: String::new(),
                     input: serde_json::json!({}),
                     execution_mode: "sync".to_string(),
+                    role_id: String::new(),
                     risk_level: "read_only".to_string(),
                     approval_required: false,
                     on_failure: String::new(),
@@ -2329,6 +2379,7 @@ mod tests {
                     candidate_action: String::new(),
                     input: serde_json::json!({}),
                     execution_mode: "sync".to_string(),
+                    role_id: String::new(),
                     risk_level: "R3".to_string(),
                     approval_required: true,
                     on_failure: String::new(),
@@ -2658,6 +2709,68 @@ mod tests {
     }
 
     #[test]
+    fn run_steps_carry_the_declared_role() {
+        let runner = WorkflowRunner::with_ledger(ledger("role-projection"));
+        let mut package = package();
+        package.steps[0].role_id = "software.implementer".to_string();
+        package.steps[1].role_id = "software.verifier".to_string();
+        let executor = RecordingExecutor::default();
+        let run = runner
+            .start("agent-1", &package, "request-role", &serde_json::json!({}))
+            .unwrap();
+
+        let role_of = |step_id: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step_id == step_id)
+                .map(|step| step.role_id.as_str())
+                .unwrap_or("")
+        };
+        // 角色从工作流声明投影到运行台账；没有声明角色的步骤保持空串，
+        // 界面据此决定不渲染徽标，而不是显示一个假角色。
+        assert_eq!(role_of("STEP-1"), "software.implementer");
+        assert_eq!(role_of("STEP-2"), "software.verifier");
+        assert_eq!(role_of("APPROVE"), "");
+
+        let finished = runner
+            .run_ready(&package, run, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(finished.blocked_step_id, "APPROVE");
+    }
+
+    #[test]
+    fn delegated_child_run_is_not_counted_as_rework() {
+        let runner = WorkflowRunner::with_ledger(ledger("delegate-kind"));
+        let package = package();
+        let parent = runner
+            .start("agent-1", &package, "request-parent", &serde_json::json!({}))
+            .unwrap();
+        let delegated = runner
+            .start_delegated(
+                "agent-1",
+                &package,
+                "request-child",
+                &serde_json::json!({}),
+                &parent.run_id,
+            )
+            .unwrap();
+        let retried = runner
+            .start_with_parent(
+                "agent-1",
+                &package,
+                "request-retry",
+                &serde_json::json!({}),
+                &parent.run_id,
+            )
+            .unwrap();
+
+        assert_eq!(parent.parent_kind, LocalRunParentKind::Unspecified);
+        assert!(delegated.parent_kind.is_delegation());
+        // 沿用旧入口建子运行的时间语义是「重做」，不能被新加的委派语义悄悄改掉。
+        assert_eq!(retried.parent_kind, LocalRunParentKind::Retry);
+    }
+
+    #[test]
     fn runner_stops_on_step_failure() {
         struct FailingExecutor;
         impl WorkflowStepExecutor for FailingExecutor {
@@ -2804,6 +2917,7 @@ mod tests {
                 candidate_action: String::new(),
                 input: serde_json::json!({}),
                 execution_mode: "sync".to_string(),
+                role_id: String::new(),
                 risk_level: "read_only".to_string(),
                 approval_required: false,
                 on_failure: String::new(),
@@ -2821,6 +2935,7 @@ mod tests {
                 candidate_action: String::new(),
                 input: serde_json::json!({"fixed": true}),
                 execution_mode: "sync".to_string(),
+                role_id: String::new(),
                 risk_level: "read_only".to_string(),
                 approval_required: false,
                 on_failure: String::new(),
@@ -3002,6 +3117,7 @@ mod tests {
             candidate_action: String::new(),
             input: serde_json::json!({}),
             execution_mode: "sync".to_string(),
+            role_id: String::new(),
             risk_level: "local_write".to_string(),
             approval_required: false,
             on_failure: String::new(),
@@ -3358,6 +3474,7 @@ mod tests {
                     candidate_action: String::new(),
                     input: serde_json::json!({}),
                     execution_mode: "sync".to_string(),
+                    role_id: String::new(),
                     risk_level: "local_write".to_string(),
                     approval_required: false,
                     on_failure: String::new(),
@@ -3369,6 +3486,7 @@ mod tests {
             candidate_action: String::new(),
             input: serde_json::json!({}),
             execution_mode: "long_running".to_string(),
+            role_id: String::new(),
             risk_level: "local_write".to_string(),
             approval_required: false,
             on_failure: String::new(),

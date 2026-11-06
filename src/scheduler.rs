@@ -1146,6 +1146,7 @@ mod tests {
             run_id: run_id.to_string(),
             interaction_id: format!("int-{run_id}"),
             parent_run_id: String::new(),
+            parent_kind: crate::agent_core_contracts::LocalRunParentKind::Unspecified,
             source: InteractionSource::Cron,
             transport: InteractionTransport::Local,
             status,

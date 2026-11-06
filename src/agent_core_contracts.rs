@@ -165,6 +165,29 @@ pub(crate) enum LocalStepStatus {
     Skipped,
 }
 
+/// 子运行为什么挂在父运行下面。
+///
+/// 二者都写 `parent_run_id`，但统计口径不同：重做算返工，委派算分工。
+/// 靠「有没有父运行」推断语义会把多角色团队误报成返工率飙升。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalRunParentKind {
+    /// 旧台账或顶层运行：未标注。
+    #[default]
+    Unspecified,
+    /// 同一动作的下一轮（修复循环）。
+    Retry,
+    /// 交给另一份职责的子运行（角色分工）。
+    Delegate,
+}
+
+impl LocalRunParentKind {
+    /// 空父运行 ID 说明这是顶层运行，语义字段不参与判断。
+    pub(crate) fn is_delegation(self) -> bool {
+        matches!(self, Self::Delegate)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalApprovalStatus {
@@ -185,6 +208,9 @@ pub(crate) struct LocalRunStep {
     pub capability_id: String,
     #[serde(default)]
     pub runtime_provider: String,
+    /// 执行这一步的角色。留空表示工作流没有声明角色；旧台账读出来就是空串。
+    #[serde(default)]
+    pub role_id: String,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -273,6 +299,15 @@ pub(crate) struct LocalRun {
     pub interaction_id: String,
     #[serde(default)]
     pub parent_run_id: String,
+    /// 父子关系的语义，只在与 `parent_run_id` 同时存在时有意义。
+    ///
+    /// - `retry`：同一动作重跑一轮（例如修复循环的下一轮），统计上算返工；
+    /// - `delegate`：另一份职责的委派（例如把审查交给 review 角色），统计上算分工。
+    ///
+    /// 缺省即 `unspecified`：旧台账没有这个字段，有父运行时按 `retry` 处理，
+    /// 保持既有统计口径不变。
+    #[serde(default)]
+    pub parent_kind: LocalRunParentKind,
     pub source: InteractionSource,
     pub transport: InteractionTransport,
     pub status: LocalRunStatus,
@@ -633,6 +668,7 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).unwrap();
         for source in [
             include_str!("../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"),
+            include_str!("../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"),
             include_str!("../workflows/wechat-experience-upload/workflow.json"),
             include_str!("../workflows/engine-build/workflow.json"),
         ] {

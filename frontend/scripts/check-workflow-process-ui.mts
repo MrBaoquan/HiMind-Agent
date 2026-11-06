@@ -42,4 +42,12 @@ assert.match(rail, /<details className="workflow-process-events"/, '每个步骤
 assert.match(styles, /\.workflow-process-events \{/, '过程事件折叠样式必须存在');
 assert.match(styles, /@media \(max-width: 760px\)[\s\S]*\.workflow-process-node-card \{ grid-template-columns: 20px minmax\(0, 1fr\); \}/, '窄窗口过程节点必须收回为单列内容');
 
+// 角色只在步骤声明了角色时才出现在 meta 行；没有角色的包不能凭空多一段文案。
+assert.match(rail, /roleLabel\(node\.roleId\)/, '过程轨道必须展示步骤角色');
+assert.match(
+  page,
+  /<WorkflowProcessRail nodes=\{selectedWorkflowGraph\?\.nodes \|\| \[\]\} mode="definition" \/>/,
+  '定义轨道仍然只吃图节点，不能另起数据源',
+);
+
 console.log('workflow process UI checks passed');

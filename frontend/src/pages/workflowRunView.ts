@@ -14,6 +14,8 @@ export type RunTimelineStep = {
   kind: string;
   capabilityId: string;
   executionMode: string;
+  /** 执行该步骤的角色；空串表示未声明。 */
+  roleId: string;
   depth: number;
   approvalRequired: boolean;
   condition: string;
@@ -195,6 +197,8 @@ function fallbackGraphNode(step: RuntimeStep, index: number): WorkflowGraphNode 
     kind: step.capability_id ? 'capability' : 'runtime',
     capabilityId: step.capability_id || '',
     executionMode: '',
+    // 包丢失时用运行台账里的角色兜底：角色是从步骤声明投影下来的，两者一致。
+    roleId: (step.role_id || '').trim(),
     approvalRequired: false,
     onFailure: 'fail',
     depth: 0,
@@ -268,6 +272,7 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
       kind: node.kind || '',
       capabilityId: node.capabilityId || '',
       executionMode: node.executionMode || '',
+      roleId: node.roleId || '',
       depth: node.depth,
       approvalRequired: node.approvalRequired,
       condition: node.condition,

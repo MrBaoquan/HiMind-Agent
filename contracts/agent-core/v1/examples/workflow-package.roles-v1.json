@@ -1,0 +1,127 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.software-csv-export-roles",
+  "version": "1.0.0",
+  "name": "项目看板 CSV 导出（多角色示例）",
+  "description": "同一任务按角色分段：需求分析、实现、测试修复循环、代码审查、人工批准与 PR 准备。",
+  "min_agent_version": "0.3.90",
+  "execution_policy": "strict",
+  "capabilities": [
+    "workspace.inspect"
+  ],
+  "dependencies": {
+    "skills": [],
+    "plugins": [],
+    "connectors": [],
+    "runtimes": []
+  },
+  "steps": [
+    {
+      "id": "ANALYZE",
+      "title": "梳理导出字段与筛选口径",
+      "kind": "capability",
+      "capability_id": "workspace.inspect",
+      "execution_mode": "sync",
+      "role_id": "software.analyst",
+      "risk_level": "read_only",
+      "input": {}
+    },
+    {
+      "id": "CONFIRM",
+      "title": "确认歧义",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "role_id": "software.analyst",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": ["ANALYZE"]
+    },
+    {
+      "id": "IMPLEMENT",
+      "title": "实现 CSV 导出",
+      "kind": "runtime",
+      "execution_mode": "long_running",
+      "role_id": "software.implementer",
+      "risk_level": "local_write",
+      "runtime": {
+        "provider": "himind.builtin",
+        "prompt": "按已确认的口径实现 CSV 导出"
+      },
+      "depends_on": ["CONFIRM"]
+    },
+    {
+      "id": "VERIFY",
+      "title": "测试与自动修复",
+      "kind": "loop",
+      "execution_mode": "long_running",
+      "role_id": "software.verifier",
+      "risk_level": "local_write",
+      "loop": {
+        "max_iterations": 3,
+        "pause_for_feedback": true,
+        "exit_when": {
+          "operator": "equals",
+          "path": "loops.VERIFY.latest.passed",
+          "value": true
+        },
+        "steps": [
+          {
+            "id": "VERIFY-RUN",
+            "title": "跑测试并对失败做修复",
+            "kind": "runtime",
+            "execution_mode": "long_running",
+            "role_id": "software.verifier",
+            "risk_level": "local_write",
+            "runtime": {
+              "provider": "himind.builtin",
+              "prompt": "运行测试；失败时定位并修复，最多三轮"
+            }
+          }
+        ]
+      },
+      "depends_on": ["IMPLEMENT"]
+    },
+    {
+      "id": "REVIEW",
+      "title": "代码审查",
+      "kind": "runtime",
+      "execution_mode": "long_running",
+      "role_id": "software.reviewer",
+      "risk_level": "read_only",
+      "runtime": {
+        "provider": "himind.builtin",
+        "prompt": "审查本次改动，只依据 diff 与测试结果，不采信实现方的自述"
+      },
+      "depends_on": ["VERIFY"]
+    },
+    {
+      "id": "PREPARE-PR",
+      "title": "准备 PR 说明",
+      "kind": "runtime",
+      "execution_mode": "sync",
+      "role_id": "software.delivery",
+      "risk_level": "local_write",
+      "runtime": {
+        "provider": "himind.builtin",
+        "prompt": "整理变更摘要、验证结果与回滚说明"
+      },
+      "depends_on": ["REVIEW"]
+    },
+    {
+      "id": "CREATE-PR",
+      "title": "创建 PR",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "role_id": "software.delivery",
+      "risk_level": "R4",
+      "approval_required": true,
+      "depends_on": ["PREPARE-PR"]
+    }
+  ],
+  "artifacts": [],
+  "ui": {
+    "mode": "standard"
+  },
+  "supported_runtimes": ["himind.builtin"],
+  "created_at": "2026-11-06T00:00:00Z"
+}

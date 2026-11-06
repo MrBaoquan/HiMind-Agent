@@ -44,6 +44,19 @@ fn run_status_key(status: &LocalRunStatus) -> &'static str {
     }
 }
 
+/// 步骤状态也压平到同一套词表，角色汇总要按它显示「这个角色现在是进行中还是已完成」。
+fn step_status_key(status: &LocalStepStatus) -> &'static str {
+    match status {
+        LocalStepStatus::Pending => "pending",
+        LocalStepStatus::Running => "running",
+        LocalStepStatus::Waiting => "waiting",
+        LocalStepStatus::Succeeded => "completed",
+        LocalStepStatus::Failed => "failed",
+        LocalStepStatus::Canceled => "canceled",
+        LocalStepStatus::Skipped => "skipped",
+    }
+}
+
 fn skill_status_key(status: &str) -> &'static str {
     match status.trim() {
         "running" => "running",
@@ -96,12 +109,88 @@ fn workflow_names() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// 同一角色下有多个步骤时，取「最需要注意」的那个状态。
+///
+/// 排序按用户注意力而不是时间：失败最需要处理，其次是正在跑/等确认，
+/// 然后是已完成。取最大值，所以只要还有一步在跑，角色就不会显示成已完成。
+fn role_status_rank(status: &str) -> u8 {
+    match status {
+        "failed" => 5,
+        "waiting" => 4,
+        "running" => 3,
+        "canceled" => 2,
+        "pending" => 1,
+        "completed" => 0,
+        _ => 0,
+    }
+}
+
+/// 汇总一条运行里出现过的角色。
+///
+/// 顺序按首次出现（反映步骤推进顺序，排序会打乱协作链路）；同一角色可能挂在
+/// 多个步骤上（例如「测试」下面还有修复循环），状态取最需要注意的那个。
+fn role_rollup(steps: &[LocalRunStep]) -> Vec<Value> {
+    let mut roles: Vec<Value> = Vec::new();
+    for step in steps {
+        let id = step.role_id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let status = step_status_key(&step.status);
+        match roles.iter_mut().find(|role| role["id"] == id) {
+            Some(existing) => {
+                let current = existing["status"].as_str().unwrap_or_default();
+                if role_status_rank(status) > role_status_rank(current) {
+                    existing["status"] = Value::String(status.to_string());
+                }
+            }
+            None => roles.push(json!({ "id": id, "status": status })),
+        }
+    }
+    roles
+}
+
+/// 把一个父运行下的子运行汇总成协作计数。
+///
+/// 委派和重做分开算：两者都写 `parent_run_id`，但「多角色分工」和「返工」是
+/// 两种完全不同的事实，合成一个数字会让团队视图误导人。没有子运行时返回 Null，
+/// 前端据此整块不渲染，而不是显示一排 0。
+fn team_rollup(children: Option<&Vec<(bool, bool)>>) -> Value {
+    let Some(items) = children else {
+        return Value::Null;
+    };
+    if items.is_empty() {
+        return Value::Null;
+    }
+    let delegated = items.iter().filter(|(delegated, _)| *delegated).count();
+    let running = items.iter().filter(|(_, terminal)| !*terminal).count();
+    json!({
+        "delegated": delegated,
+        "retries": items.len() - delegated,
+        "running": running,
+    })
+}
+
 /// 本机工作流运行，投影自本地运行台账。
 fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
     let ledger = LocalRunLedger::open_default()?;
     let names = workflow_names();
     let mut items = Vec::new();
-    for run in ledger.list_runs(limit)? {
+    let runs = ledger.list_runs(limit)?;
+    // 一次扫出父子关系：每个父运行下挂了几个子运行，以及子运行是什么语义。
+    // 界面要能回答「这一步是重做还是换了个人做」，逐条再查库会变成 N+1。
+    // 用拥有的 run_id 副本做键，后面才能按值消费 runs。
+    let mut children: HashMap<String, Vec<(bool, bool)>> = HashMap::new();
+    for run in &runs {
+        if run.parent_run_id.trim().is_empty() {
+            continue;
+        }
+        children
+            .entry(run.parent_run_id.clone())
+            .or_default()
+            .push((run.parent_kind.is_delegation(), run.status.is_terminal()));
+    }
+    for run in runs {
         if run.source != InteractionSource::Workflow {
             continue;
         }
@@ -150,6 +239,18 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             format!("工作流 · v{workflow_version}")
         };
         let (progress, step_done, step_total) = step_completion(&run.steps);
+        // 角色取自当前步骤：任务在推进，执行的「谁」也跟着换。
+        let role_id = current_step
+            .map(|step| step.role_id.trim().to_string())
+            .unwrap_or_default();
+        // 整条运行里出现过的角色，按首次出现顺序去重：界面用它画「这个任务由哪几种角色协作」。
+        let roles = role_rollup(&run.steps);
+        // 顶层运行才带团队信息；子运行本身在列表里不出角色团队，避免同一批人重复计数。
+        let team = if run.parent_run_id.trim().is_empty() {
+            team_rollup(children.get(&run.run_id))
+        } else {
+            Value::Null
+        };
         items.push(json!({
             "id": run.run_id,
             "source": "workflow",
@@ -167,6 +268,17 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             "updated_at": iso_from_epoch(&run.updated_at),
             "artifact_count": run.artifacts.len(),
             "workflow_run_id": run.run_id,
+            "role_id": role_id,
+            "roles": roles,
+            "parent_run_id": run.parent_run_id,
+            "parent_kind": if run.parent_run_id.trim().is_empty() {
+                ""
+            } else if run.parent_kind.is_delegation() {
+                "delegate"
+            } else {
+                "retry"
+            },
+            "team": team,
         }));
     }
     Ok(items)
@@ -208,6 +320,12 @@ fn skill_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             "updated_at": if finished.trim().is_empty() { iso_from_epoch(&record.started_at) } else { finished },
             "artifact_count": if record.output_path.trim().is_empty() { 0 } else { 1 },
             "workflow_run_id": "",
+            // 技能运行没有角色和父子关系：字段保持在，值为空，前端据此不渲染协作区。
+            "role_id": "",
+            "roles": Vec::<Value>::new(),
+            "parent_run_id": "",
+            "parent_kind": "",
+            "team": Value::Null,
         }));
     }
     Ok(items)
@@ -231,4 +349,81 @@ pub(crate) fn list(limit: Option<usize>) -> Result<Vec<Value>, Box<dyn Error>> {
     });
     runs.truncate(limit);
     Ok(runs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(delegated: bool, terminal: bool) -> (bool, bool) {
+        (delegated, terminal)
+    }
+
+    #[test]
+    fn no_children_means_no_team_block() {
+        // 没有子运行就别给界面一个「0 委派 · 0 重做」的空壳。
+        assert_eq!(team_rollup(None), Value::Null);
+        assert_eq!(team_rollup(Some(&Vec::new())), Value::Null);
+    }
+
+    #[test]
+    fn delegation_and_rework_are_reported_separately() {
+        let items = vec![
+            child(true, true),
+            child(true, false),
+            child(false, true),
+            child(false, true),
+        ];
+        let rollup = team_rollup(Some(&items));
+        assert_eq!(rollup["delegated"], 2);
+        assert_eq!(rollup["retries"], 2);
+        // 只有未终结的子运行算「进行中」。
+        assert_eq!(rollup["running"], 1);
+    }
+
+    fn step(id: &str, role: &str, status: LocalStepStatus) -> LocalRunStep {
+        LocalRunStep {
+            step_id: id.to_string(),
+            title: id.to_string(),
+            status,
+            capability_id: String::new(),
+            runtime_provider: String::new(),
+            role_id: role.to_string(),
+            attempt: 0,
+            started_at: String::new(),
+            finished_at: String::new(),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn roles_keep_first_seen_order_and_skip_unassigned_steps() {
+        let roles = role_rollup(&[
+            step("A", "software.analyst", LocalStepStatus::Succeeded),
+            step("B", "", LocalStepStatus::Succeeded),
+            step("C", "software.implementer", LocalStepStatus::Running),
+            step("D", "software.analyst", LocalStepStatus::Succeeded),
+        ]);
+        // 顺序反映步骤推进顺序；重复角色合并成一条；没有角色的步骤不产出条目。
+        let ids: Vec<&str> = roles.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["software.analyst", "software.implementer"]);
+    }
+
+    #[test]
+    fn role_status_takes_the_most_attention_demanding_step() {
+        // 一个角色的两步：一步已完成、一步在跑 —— 角色必须显示进行中，
+        // 否则用户会看到「测试已完成」而实际测试还在跑。
+        let roles = role_rollup(&[
+            step("A", "software.verifier", LocalStepStatus::Succeeded),
+            step("B", "software.verifier", LocalStepStatus::Running),
+        ]);
+        assert_eq!(roles[0]["status"], "running");
+
+        // 有失败就报失败，哪怕同时还有在跑的步骤。
+        let roles = role_rollup(&[
+            step("A", "software.verifier", LocalStepStatus::Running),
+            step("B", "software.verifier", LocalStepStatus::Failed),
+        ]);
+        assert_eq!(roles[0]["status"], "failed");
+    }
 }

@@ -303,6 +303,12 @@ pub(crate) struct WorkflowStep {
     pub execution_mode: String,
     #[serde(default)]
     pub risk_level: String,
+    /// 执行这一步的角色（如 `software.implementer`）。
+    ///
+    /// 只描述「谁在做」，不参与能力路由：一个任务里不同步骤可以分属不同角色，
+    /// 但都跑在同一条运行台账上。留空表示未声明角色，界面不显示角色徽标。
+    #[serde(default)]
+    pub role_id: String,
     #[serde(default)]
     pub approval_required: bool,
     /// How the runner treats a failing step.
@@ -1194,6 +1200,12 @@ fn validate_step_scope(
                 step.id
             ));
         }
+        // 角色 ID 与步骤 ID 用同一套字符集：它会被写进运行台账并按角色聚合，
+        // 出现空格或中文会让前端徽标和统计分组各说一套。
+        if !step.role_id.trim().is_empty() {
+            validate_workflow_id(step.role_id.trim())
+                .map_err(|error| format!("workflow step {} role_id: {error}", step.id))?;
+        }
         let kind = normalized_step_kind(step)?;
         match kind {
             "capability" => {
@@ -1853,6 +1865,25 @@ mod tests {
     }
 
     #[test]
+    fn role_id_is_optional_but_validated() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let mut package = load_from_directory(&root).unwrap();
+        // 不声明角色是合法的：老包没有这个字段，读出来就是空串。
+        assert!(package.steps.iter().all(|step| step.role_id.is_empty()));
+        package.validate().unwrap();
+
+        package.steps[0].role_id = "software.implementer".to_string();
+        package.validate().unwrap();
+
+        // 角色 ID 会被写进台账并按角色聚合，带空格或中文会让统计分组各说一套。
+        package.steps[0].role_id = "software implementer".to_string();
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("role_id"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn rejects_custom_ui_path_escape() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
@@ -2042,6 +2073,7 @@ mod tests {
                 candidate_action: String::new(),
                 input: default_object(),
                 execution_mode: "provider_defined".to_string(),
+                role_id: String::new(),
                 risk_level: "local_write".to_string(),
                 approval_required: false,
                 on_failure: String::new(),
@@ -2077,6 +2109,7 @@ mod tests {
                 candidate_action: String::new(),
                 input: default_object(),
                 execution_mode: "sync".to_string(),
+                role_id: String::new(),
                 risk_level: "read_only".to_string(),
                 approval_required: false,
                 on_failure: String::new(),

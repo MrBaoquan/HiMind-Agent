@@ -11,6 +11,8 @@ export type WorkflowGraphNode = {
   kind: string;
   capabilityId: string;
   executionMode: string;
+  /** 执行角色；空串表示工作流没有声明角色。 */
+  roleId: string;
   approvalRequired: boolean;
   onFailure: string;
   depth: number;
@@ -66,6 +68,7 @@ export function buildWorkflowGraph(pkg: WorkflowPackage): WorkflowGraph {
         kind: step.kind || 'provider_defined',
         capabilityId: step.capability_id || '',
         executionMode: step.execution_mode || '',
+        roleId: (step.role_id || '').trim(),
         approvalRequired: Boolean(step.approval_required),
         onFailure: step.on_failure || 'fail',
         depth,

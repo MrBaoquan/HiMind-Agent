@@ -13,6 +13,7 @@ import { Pill } from './Common';
 import type { RunActivityItem, RunStepState, RunTimelineStep } from '../pages/workflowRunView.ts';
 import type { WorkflowGraphNode } from '../pages/workflowGraph.ts';
 import { formatElapsedCn } from '../pages/workflowRunView.ts';
+import { roleLabel } from '../pages/taskView.ts';
 
 export type WorkflowProcessNode = WorkflowGraphNode | RunTimelineStep;
 
@@ -103,7 +104,7 @@ export function WorkflowProcessRail({ nodes, mode, activities = [] }: {
                   {node.loop ? <Repeat2 size={12} aria-label="循环步骤" /> : null}
                 </span>
                 <small className="workflow-process-node-meta">
-                  {[stepKindLabel(node.kind), runStep && runStep.durationSeconds > 0 ? `耗时 ${formatElapsedCn(runStep.durationSeconds)}` : '', runStep?.attempt && runStep.attempt > 1 ? `第 ${runStep.attempt} 次尝试` : ''].filter(Boolean).join(' · ')}
+                  {[stepKindLabel(node.kind), roleLabel(node.roleId), runStep && runStep.durationSeconds > 0 ? `耗时 ${formatElapsedCn(runStep.durationSeconds)}` : '', runStep?.attempt && runStep.attempt > 1 ? `第 ${runStep.attempt} 次尝试` : ''].filter(Boolean).join(' · ')}
                 </small>
                 <span className="workflow-process-node-tags">
                   {node.condition ? <b><GitBranch size={11} />条件：{node.condition}</b> : null}

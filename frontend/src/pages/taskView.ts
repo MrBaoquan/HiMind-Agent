@@ -121,3 +121,122 @@ export function taskElapsedSeconds(startedAt: string | null | undefined, now: nu
   if (Number.isNaN(started)) return null;
   return Math.max(0, Math.round((now - started) / 1000));
 }
+
+/**
+ * 角色 ID 的展示文案。
+ *
+ * 角色是按点分层级的标识（`software.implementer`），界面只显示最后一段再看不懂，
+ * 所以维护一张常见角色的中文表，其余回退到原始 ID——宁可显示 `software.auditor`
+ * 也不猜一个错误的中文名。
+ */
+const ROLE_LABELS: Record<string, string> = {
+  'software.analyst': '需求分析',
+  'software.implementer': '实现',
+  'software.verifier': '测试',
+  'software.reviewer': '代码审查',
+  'software.delivery': '交付',
+};
+
+export function roleLabel(roleId: string | null | undefined) {
+  const value = (roleId || '').trim();
+  if (!value) return '';
+  return ROLE_LABELS[value] || value;
+}
+
+/** 角色徽标的短名：`software.implementer` → `implementer`，用于窄列。 */
+export function roleShortName(roleId: string | null | undefined) {
+  const value = (roleId || '').trim();
+  if (!value) return '';
+  const tail = value.slice(value.lastIndexOf('.') + 1);
+  return tail || value;
+}
+
+
+/**
+ * 父子协作关系的文案。
+ *
+ * `delegate` 是「换了个角色做」，`retry` 是「同一步重做」——两者都挂在父运行下，
+ * 但用户看到的意思完全不同，不能都显示成「子任务」。
+ */
+export function parentKindLabel(kind: string | null | undefined) {
+  const value = (kind || '').trim();
+  if (value === 'delegate') return '委派';
+  if (value === 'retry') return '重做';
+  return '';
+}
+
+export type TeamSummary = {
+  delegated: number;
+  retries: number;
+  running: number;
+};
+
+/**
+ * 归一化团队的协作计数。
+ *
+ * 后端给的 `team` 是可选字段：旧数据或技能运行没有它。任何一项缺失都按 0 处理，
+ * 全部为 0 时返回 null，界面据此整块不渲染——不显示一排 `0 委派` 的空指标。
+ */
+export function teamSummary(team: unknown): TeamSummary | null {
+  if (!team || typeof team !== 'object') return null;
+  const source = team as Record<string, unknown>;
+  const pick = (key: string) => {
+    const value = source[key];
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  };
+  const summary: TeamSummary = {
+    delegated: pick('delegated'),
+    retries: pick('retries'),
+    running: pick('running'),
+  };
+  return summary.delegated || summary.retries || summary.running ? summary : null;
+}
+
+export type RoleChip = { id: string; label: string; status: string };
+
+/**
+ * 归一化「这条运行里出现过的角色」。
+ *
+ * 顺序保持后端给的出现顺序：它反映步骤推进顺序，按名字排序会把协作链路打乱。
+ * 没有角色、role 缺 id、或重复 id 都跳过；结果为空时返回空数组，
+ * 调用方据此完全不渲染角色链。
+ */
+export function roleChips(roles: unknown): RoleChip[] {
+  if (!Array.isArray(roles)) return [];
+  const seen = new Set<string>();
+  const chips: RoleChip[] = [];
+  for (const item of roles) {
+    if (!item || typeof item !== 'object') continue;
+    const source = item as Record<string, unknown>;
+    const id = typeof source.id === 'string' ? source.id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    chips.push({
+      id,
+      label: roleLabel(id),
+      status: typeof source.status === 'string' ? source.status : '',
+    });
+  }
+  return chips;
+}
+
+/**
+ * 是否显示角色徽标。
+ *
+ * 没有角色就不显示：工作台任务和技能运行本来就没有角色，凭空补一个「未分配」
+ * 会让所有记录突然多一个无意义的标签。
+ */
+export function shouldShowRoleBadge(roleId: string | null | undefined) {
+  return Boolean((roleId || '').trim());
+}
+
+/**
+ * 是否显示角色协作链路。
+ *
+ * 至少两个角色才算「协作」：一个角色只是「谁在做」，徽标已经说完了；
+ * 画成链路只是多占一行。
+ */
+export function shouldShowRoleChain(roles: unknown) {
+  return roleChips(roles).length > 1;
+}
+

@@ -187,6 +187,11 @@
           "enum": ["", "fail", "continue"]
         },
         "risk_level": { "type": "string" },
+        "role_id": {
+          "description": "执行该步骤的角色标识；留空表示未声明角色，不参与能力路由。",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]*$"
+        },
         "approval_required": { "type": "boolean" },
         "depends_on": {
           "type": "array",

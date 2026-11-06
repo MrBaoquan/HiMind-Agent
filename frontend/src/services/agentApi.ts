@@ -149,6 +149,16 @@ export type AgentActivityItem = {
     updated_at: string;
     artifact_count?: number;
     workflow_run_id?: string;
+    /** 当前步骤的执行角色；没有声明角色时为空，界面不渲染角色徽标。 */
+    role_id?: string | null;
+    /** 整条运行里出现过的角色及其状态，用于展示协作链路。 */
+    roles?: { id: string; status: string }[] | null;
+    /** 该运行挂在哪个父运行下；顶层运行为空。 */
+    parent_run_id?: string | null;
+    /** 父子语义：delegate 为角色委派，retry 为同一步重做，空为无父子关系。 */
+    parent_kind?: 'delegate' | 'retry' | string | null;
+    /** 顶层运行的协作计数：委派数、重做数、仍在跑的子运行数。 */
+    team?: { delegated?: number; retries?: number; running?: number } | null;
 };
 
 export type CatalogPage<T> = {
@@ -287,6 +297,8 @@ export type WorkflowStep = {
     /** capability | runtime | manual | loop | provider_defined */
     kind?: string;
     capability_id: string;
+    /** 执行角色；缺省表示没有声明角色。 */
+    role_id?: string;
     execution_mode: string;
     risk_level: string;
     approval_required: boolean;
@@ -416,6 +428,8 @@ export type WorkflowLocalRun = {
         title: string;
         status: string;
         capability_id: string;
+        /** 执行角色；缺省表示没有声明角色。 */
+        role_id?: string;
         attempt: number;
         started_at: string;
         finished_at: string;

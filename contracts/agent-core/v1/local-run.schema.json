@@ -19,6 +19,11 @@
     "run_id": { "type": "string", "minLength": 1 },
     "interaction_id": { "type": "string", "minLength": 1 },
     "parent_run_id": { "type": "string" },
+    "parent_kind": {
+      "description": "父子语义：retry 为同一动作重做，delegate 为委派给其他角色。缺省视为 unspecified。",
+      "enum": ["unspecified", "retry", "delegate"],
+      "default": "unspecified"
+    },
     "source": {
       "enum": [
         "dashboard",
@@ -97,6 +102,7 @@
           },
           "capability_id": { "type": "string" },
           "runtime_provider": { "type": "string" },
+          "role_id": { "type": "string" },
           "attempt": { "type": "integer", "minimum": 0 },
           "started_at": { "type": "string" },
           "finished_at": { "type": "string" },

@@ -1728,6 +1728,24 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-center-status.danger { color: #b91c1c; background: #fee2e2; }
 .task-center-status.neutral { color: #475569; background: #f1f5f9; }
 .task-center-source { flex: 0 0 auto; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--text-subtle); background: var(--surface-muted); font-size: 9px; font-weight: 500; }
+/* 角色徽标：实心底色区分于描边的来源徽标——来源是「任务从哪来」，角色是「谁在做」，两者不同层。 */
+.task-center-role { flex: 0 0 auto; padding: 2px 6px; border-radius: 4px; color: #4338ca; background: #eef2ff; font-size: 9px; font-weight: 600; }
+.task-center-row.is-live .task-center-role { color: #3730a3; background: #e0e7ff; }
+/* 委派与重做必须一眼分开：委派是团队分工，重做是返工，混用同一个颜色会误导判断。 */
+.task-center-parent { flex: 0 0 auto; padding: 2px 6px; border: 1px dashed transparent; border-radius: 4px; font-size: 9px; font-weight: 600; }
+.task-center-parent.delegate { color: #0369a1; border-color: #bae6fd; background: #f0f9ff; }
+.task-center-parent.retry { color: #a16207; border-color: #fde68a; background: #fffbeb; }
+.task-center-team { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+/* 角色协作链路：把「谁 → 谁 → 谁」画成一条线。每个节点用状态色，
+   所以读者一眼能看出现在卡在哪个角色，而不是只看整条任务的粗状态。 */
+.task-center-role-chain { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
+.task-center-role-step { display: inline-flex; align-items: center; gap: 2px; }
+.task-center-role-arrow { color: #cbd5e1; font-size: 9px; line-height: 1; }
+.task-center-role-node { padding: 1px 6px; border-radius: 3px; color: var(--text-muted); background: var(--surface-muted); font-size: 9px; font-weight: 600; white-space: nowrap; }
+.task-center-role-node.running { color: var(--primary-hover); background: #dbeafe; }
+.task-center-role-node.pending { color: #a16207; background: #fef3c7; }
+.task-center-role-node.success { color: #15803d; background: #dcfce7; }
+.task-center-role-node.danger { color: #b91c1c; background: #fee2e2; }
 .task-center-filter-stack { min-width: 0; display: grid; gap: 4px; }
 .task-center-filters.sources button { min-height: 25px; font-size: 9px; }
 .task-center-row-action { flex: 0 0 auto; margin: 0; padding: 0; border: 0; color: var(--primary); background: transparent; font: inherit; font-size: 9px; font-weight: 600; cursor: pointer; }

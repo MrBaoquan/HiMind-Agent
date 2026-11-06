@@ -35,7 +35,7 @@ import {
   toEpochSeconds,
 } from './workflowRunView';
 import { buildWorkflowGraph } from './workflowGraph';
-import { shortRunId } from './taskView';
+import { roleLabel, shortRunId } from './taskView';
 import { runtimeProviderLabel } from './runtimeProviderView';
 
 type WorkflowsPageProps = {
@@ -188,7 +188,9 @@ function approvalDescription(step: WorkflowStep | undefined, _run: WorkflowLocal
   }
   if (!step) return '请确认当前操作后继续。';
   const risk = typeof step.risk_level === 'string' ? step.risk_level : 'R3';
-  return `“${step.title || '当前步骤'}”需要你的确认 · ${riskLevelLabel(risk)}风险`;
+  // 审批卡片要说清「谁在请求授权」：同一个高风险动作，由不同角色发起时的判断依据不同。
+  const role = roleLabel(step.role_id);
+  return [`“${step.title || '当前步骤'}”需要你的确认`, role, `${riskLevelLabel(risk)}风险`].filter(Boolean).join(' · ');
 }
 
 function PreflightPanel({

@@ -8,6 +8,7 @@ use super::{WorkflowPackage, WorkflowRunner, WorkflowStep};
 pub(crate) fn contract_dry_run_report(package: &WorkflowPackage) -> Result<Value, Box<dyn Error>> {
     let plans = validate_execution_plans(package)?;
     let risk_gates = validate_risk_gates(&package.steps)?;
+    let roles = collect_roles(&package.steps);
     let schema_count = validate_schema_assets(package)?;
     let loop_count = count_loops(&package.steps);
     Ok(json!({
@@ -28,6 +29,7 @@ pub(crate) fn contract_dry_run_report(package: &WorkflowPackage) -> Result<Value
             "execution_plans": plans,
             "loop_count": loop_count,
             "risk_gated_steps": risk_gates,
+            "roles": roles,
             "schema_assets": schema_count
         },
         "uncovered": [
@@ -184,6 +186,35 @@ fn collect_runtime_schemas(steps: &[WorkflowStep], paths: &mut Vec<String>) {
     }
 }
 
+/// 盘点包内声明的角色：按角色聚合它负责的步骤，供界面展示「这个任务由谁协作完成」。
+fn collect_roles(steps: &[WorkflowStep]) -> Value {
+    fn walk(steps: &[WorkflowStep], roles: &mut std::collections::BTreeMap<String, Vec<String>>) {
+        for step in steps {
+            let role = step.role_id.trim();
+            if !role.is_empty() {
+                roles.entry(role.to_string()).or_default().push(step.id.clone());
+            }
+            if let Some(loop_config) = step.loop_config.as_ref() {
+                walk(&loop_config.steps, roles);
+            }
+        }
+    }
+    let mut roles = std::collections::BTreeMap::<String, Vec<String>>::new();
+    walk(steps, &mut roles);
+    Value::Array(
+        roles
+            .into_iter()
+            .map(|(role_id, step_ids)| {
+                json!({
+                    "role_id": role_id,
+                    "step_count": step_ids.len(),
+                    "step_ids": step_ids,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn count_loops(steps: &[WorkflowStep]) -> usize {
     steps
         .iter()
@@ -220,5 +251,73 @@ mod tests {
         assert!(report["uncovered"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "platform_delivery")));
+        // 这个包没有声明角色：dry-run 要给出空清单，而不是凭空造一个角色出来。
+        assert_eq!(report["coverage"]["roles"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn dry_run_summarizes_declared_roles() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let mut package = super::super::load_from_directory(&root).unwrap();
+        for (index, step) in package.steps.iter_mut().enumerate() {
+            step.role_id = if index == 0 {
+                "software.implementer".to_string()
+            } else {
+                "software.verifier".to_string()
+            };
+        }
+        let report = contract_dry_run_report(&package).unwrap();
+        let roles = report["coverage"]["roles"].as_array().unwrap();
+        let verifier = roles
+            .iter()
+            .find(|role| role["role_id"] == "software.verifier")
+            .expect("verifier role should be reported");
+        // 步骤数要跟实际分到的步骤对上，否则界面会显示错误的协作规模。
+        assert_eq!(
+            verifier["step_count"].as_u64().unwrap(),
+            (package.steps.len() - 1) as u64
+        );
+    }
+
+    #[test]
+    fn role_fixture_package_declares_a_full_software_team() {
+        // 这个 fixture 就是「一个任务分给多个角色」的最小完整样例：
+        // 解析、校验、dry-run 全都要通过，否则示例会变成一个跑不起来的文档。
+        let source = include_str!(
+            "../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"
+        );
+        let mut package: super::super::WorkflowPackage = serde_json::from_str(source).unwrap();
+        package.validate().unwrap();
+        package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+
+        let report = contract_dry_run_report(&package).unwrap();
+        let roles = report["coverage"]["roles"].as_array().unwrap();
+        let role_ids = roles
+            .iter()
+            .map(|role| role["role_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            role_ids,
+            vec![
+                "software.analyst",
+                "software.delivery",
+                "software.implementer",
+                "software.reviewer",
+                "software.verifier",
+            ]
+        );
+        // 循环里的步骤也要按角色统计：测试修复循环就挂在 verifier 名下。
+        let verifier = roles
+            .iter()
+            .find(|role| role["role_id"] == "software.verifier")
+            .unwrap();
+        assert_eq!(verifier["step_count"], 2);
+        assert!(verifier["step_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "VERIFY-RUN"));
     }
 }

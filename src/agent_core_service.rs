@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent_core_contracts::{
     InteractionEnvelope, InteractionPrincipal, InteractionSource, InteractionTransport, LocalRun,
-    LocalRunStatus, LocalRunStep, LocalStepStatus, RunProjection, RuntimeEvent, RuntimeEventType,
-    INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION, RUNTIME_EVENT_SCHEMA_VERSION,
-    RUN_PROJECTION_SCHEMA_VERSION,
+    LocalRunParentKind, LocalRunStatus, LocalRunStep, LocalStepStatus, RunProjection, RuntimeEvent,
+    RuntimeEventType, INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
+    RUNTIME_EVENT_SCHEMA_VERSION, RUN_PROJECTION_SCHEMA_VERSION,
 };
 use crate::capability::types::{InvocationContext, InvocationSource, InvocationTransport};
 use crate::store::local_runs::LocalRunLedger;
@@ -74,6 +74,7 @@ impl AgentCoreRunRecorder {
             run_id: format!("run_{}", context.request_id),
             interaction_id: interaction.interaction_id.clone(),
             parent_run_id: String::new(),
+            parent_kind: LocalRunParentKind::Unspecified,
             source: interaction.source.clone(),
             transport: interaction.transport.clone(),
             status: LocalRunStatus::Running,
@@ -88,6 +89,7 @@ impl AgentCoreRunRecorder {
                 status: LocalStepStatus::Running,
                 capability_id: capability_id.to_string(),
                 runtime_provider: "himind.agent".to_string(),
+                role_id: String::new(),
                 attempt: 1,
                 started_at: now.clone(),
                 finished_at: String::new(),

@@ -1325,8 +1325,8 @@ mod tests {
     use super::*;
     use crate::agent_core_contracts::{
         InteractionSource, InteractionTransport, LocalApprovalStatus, LocalRunApproval,
-        LocalRunArtifact, LocalRunStatus, LocalRunStep, LocalStepStatus, RuntimeEventType,
-        INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
+        LocalRunArtifact, LocalRunParentKind, LocalRunStatus, LocalRunStep, LocalStepStatus,
+        RuntimeEventType, INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
         RUNTIME_EVENT_SCHEMA_VERSION,
     };
     use serde_json::json;
@@ -1365,6 +1365,7 @@ mod tests {
             run_id: "run-1".to_string(),
             interaction_id: "int-1".to_string(),
             parent_run_id: String::new(),
+            parent_kind: LocalRunParentKind::Unspecified,
             source: InteractionSource::Mcp,
             transport: InteractionTransport::Stdio,
             status,
@@ -1379,6 +1380,7 @@ mod tests {
                 status: LocalStepStatus::Running,
                 capability_id: "workspace.inspect".to_string(),
                 runtime_provider: String::new(),
+                role_id: String::new(),
                 attempt: 1,
                 started_at: String::new(),
                 finished_at: String::new(),

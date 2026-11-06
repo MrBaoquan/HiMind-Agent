@@ -21,6 +21,13 @@ import {
   taskStatusTone,
   taskStepLabel,
   taskTypeLabel,
+  parentKindLabel,
+  roleLabel,
+  roleChips,
+  shouldShowRoleBadge,
+  shouldShowRoleChain,
+  teamSummary,
+  type RoleChip,
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
 
@@ -74,6 +81,14 @@ type ActivityEntry = {
   finishedAt: string;
   updatedAt: string;
   workflowRunId: string;
+  /** 当前步骤的执行角色；空串表示没有角色信息。 */
+  roleId: string;
+  /** 父子语义：delegate / retry / 空。 */
+  parentKind: string;
+  /** 顶层运行的协作计数；没有可显示的协作时不渲染。 */
+  team: { delegated: number; retries: number; running: number } | null;
+  /** 这条运行出现过的角色（按步骤出现顺序），用于展示协作链路。 */
+  roles: RoleChip[];
 };
 
 function sourceOf(value: string): ActivitySource {
@@ -111,6 +126,11 @@ function fromTask(item: AgentTaskHistoryItem): ActivityEntry {
     finishedAt: item.finished_at || '',
     updatedAt: item.updated_at,
     workflowRunId: '',
+    // 工作台任务没有角色与父子关系：协作区保持为空，界面按旧行为渲染。
+    roleId: '',
+    parentKind: '',
+    team: null,
+    roles: [],
   };
 }
 
@@ -133,6 +153,10 @@ function fromActivity(item: AgentActivityItem): ActivityEntry {
     finishedAt: item.finished_at || '',
     updatedAt: item.updated_at || item.created_at,
     workflowRunId: item.workflow_run_id || '',
+    roleId: (item.role_id || '').trim(),
+    parentKind: (item.parent_kind || '').trim(),
+    team: teamSummary(item.team),
+    roles: roleChips(item.roles),
   };
 }
 
@@ -304,6 +328,8 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
   const duration = formatDuration(entry.startedAt, entry.finishedAt || entry.updatedAt);
   // 进行中的行显示走动的「已运行」：这是「还活着」最直接的证据。
   const elapsed = active ? taskElapsedSeconds(entry.startedAt || entry.createdAt, now) : null;
+  const team = entry.team;
+  const parentKind = parentKindLabel(entry.parentKind);
   return (
     <article className={`task-center-row${featured ? ' featured' : ''}${active ? ' is-live' : ''}`}>
       <span className={`task-center-state-icon ${tone}${spinning ? ' is-spinning' : ''}`}>
@@ -312,6 +338,9 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
       <div className="task-center-row-main">
         <div className="task-center-row-title">
           <strong>{entry.title}</strong>
+          {/* 角色徽标只在工作流声明了角色时出现：没有角色的运行不该凭空多一个「未分配」。 */}
+          {shouldShowRoleBadge(entry.roleId) ? <span className="task-center-role" title={entry.roleId}>{roleLabel(entry.roleId)}</span> : null}
+          {parentKind ? <span className={`task-center-parent ${entry.parentKind}`} title={entry.parentKind}>{parentKind}</span> : null}
           <span className={`task-center-source ${entry.source}`}>{entry.sourceLabel}</span>
           <span className={`task-center-status ${tone}`}>{taskStatusLabel(entry.status)}</span>
         </div>
@@ -320,9 +349,31 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
           <time title={formatAbsoluteTime(activityTime(entry))}>{formatRelativeTime(activityTime(entry), now)}</time>
           {elapsed !== null ? <span className="task-center-elapsed run-live-label">已运行 {formatElapsedCn(elapsed)}</span> : duration ? <span>耗时 {duration}</span> : null}
           {stepLabel ? <span>{stepLabel}</span> : null}
+          {/* 协作规模：委派和重做分开报，否则「多角色分工」会被读成「返工」。 */}
+          {team ? (
+            <span className="task-center-team">
+              {team.delegated > 0 ? `${team.delegated} 项委派` : null}
+              {team.delegated > 0 && team.retries > 0 ? ' · ' : null}
+              {team.retries > 0 ? `${team.retries} 次重做` : null}
+              {team.running > 0 ? `${team.delegated > 0 || team.retries > 0 ? ' · ' : ''}${team.running} 项进行中` : null}
+            </span>
+          ) : null}
           {entry.subtitle ? <span>{entry.subtitle}</span> : null}
           {entry.workflowRunId && onOpenWorkflowRun ? <button type="button" className="task-center-row-action" onClick={() => onOpenWorkflowRun(entry.workflowRunId)}>查看运行</button> : null}
         </div>
+        {/* 协作链路只在真的有两个以上角色时出现：一个角色不叫协作，画成链路只会占地方。 */}
+        {shouldShowRoleChain(entry.roles) ? (
+          <div className="task-center-role-chain" aria-label="角色协作顺序">
+            {entry.roles.map((role, index) => (
+              <span className="task-center-role-step" key={role.id}>
+                {index > 0 ? <span className="task-center-role-arrow" aria-hidden="true">→</span> : null}
+                <span className={`task-center-role-node ${taskStatusTone(role.status)}`} title={`${role.id} · ${taskStatusLabel(role.status) || '未开始'}`}>
+                  {role.label}
+                </span>
+              </span>
+            ))}
+          </div>
+        ) : null}
         {message ? <p className={entry.error ? 'error' : ''}>{message}</p> : null}
         {active ? (
           progress === null

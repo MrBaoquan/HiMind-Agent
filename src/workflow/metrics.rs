@@ -19,6 +19,9 @@ pub(crate) struct WorkflowMetrics {
     pub total_output_tokens: u64,
     pub estimated_cost: f64,
     pub rework_runs: u64,
+    /// 委派给其他角色执行的子运行数：分工，不算返工。
+    #[serde(default)]
+    pub delegated_runs: u64,
     pub retry_count: u64,
     pub approval_count: u64,
     pub feedback_wait_count: u64,
@@ -72,6 +75,10 @@ pub(crate) fn workflow_metrics_by_package(
             item.total_duration_seconds = item
                 .total_duration_seconds
                 .saturating_add(run_duration_seconds(&run.created_at, &run.updated_at));
+        } else if run.parent_kind.is_delegation() {
+            // 角色分工和返工用了同一个 parent_run_id 位；只有显式委派才算分工，
+            // 剩下的（含旧台账未标注的）保持原来的返工口径。
+            item.delegated_runs = item.delegated_runs.saturating_add(1);
         } else {
             item.rework_runs = item.rework_runs.saturating_add(1);
         }
@@ -138,7 +145,7 @@ mod tests {
     use super::*;
     use crate::agent_core_contracts::{
         InteractionEnvelope, InteractionPrincipal, InteractionSource, InteractionTransport,
-        LocalRun, LocalRunStep, LocalRunUsage, LocalStepStatus,
+        LocalRun, LocalRunParentKind, LocalRunStep, LocalRunUsage, LocalStepStatus,
         INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
     };
 
@@ -193,6 +200,11 @@ mod tests {
             run_id: id.to_string(),
             interaction_id: interaction_id.to_string(),
             parent_run_id: parent_run_id.to_string(),
+            parent_kind: if parent_run_id.is_empty() {
+                crate::agent_core_contracts::LocalRunParentKind::Unspecified
+            } else {
+                crate::agent_core_contracts::LocalRunParentKind::Retry
+            },
             source: InteractionSource::Workflow,
             transport: InteractionTransport::Local,
             status,
@@ -207,6 +219,7 @@ mod tests {
                 status: LocalStepStatus::Succeeded,
                 capability_id: String::new(),
                 runtime_provider: String::new(),
+                role_id: String::new(),
                 attempt: 2,
                 started_at: "100".to_string(),
                 finished_at: "120".to_string(),
@@ -268,5 +281,72 @@ mod tests {
         assert_eq!(item.total_input_tokens, 30);
         assert_eq!(item.total_output_tokens, 15);
         assert!((item.estimated_cost - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn counts_delegated_child_runs_as_teamwork_not_rework() {
+        let ledger = ledger("delegated");
+        ledger
+            .record_interaction(&interaction("interaction-1", "workflow-1"))
+            .unwrap();
+        ledger
+            .record_interaction(&interaction("interaction-2", "workflow-1"))
+            .unwrap();
+        ledger
+            .save_run(&run(
+                "run-1",
+                "interaction-1",
+                "",
+                LocalRunStatus::Succeeded,
+            ))
+            .unwrap();
+        // 同一个父运行下两种子运行：重做一轮 vs 换了个角色做。
+        let mut retry = run("run-retry", "interaction-1", "run-1", LocalRunStatus::Succeeded);
+        retry.parent_kind = LocalRunParentKind::Retry;
+        ledger.save_run(&retry).unwrap();
+        let mut delegated = run(
+            "run-review",
+            "interaction-2",
+            "run-1",
+            LocalRunStatus::Succeeded,
+        );
+        delegated.parent_kind = LocalRunParentKind::Delegate;
+        ledger.save_run(&delegated).unwrap();
+
+        let metrics = workflow_metrics_by_package(&ledger).unwrap();
+        let item = metrics.get("workflow-1").unwrap();
+        // 分工不能被算进返工：否则多角色团队一上线，返工率就跟着虚高。
+        assert_eq!(item.rework_runs, 1);
+        assert_eq!(item.delegated_runs, 1);
+        // 子运行不占顶层运行数。
+        assert_eq!(item.total_runs, 1);
+    }
+
+    #[test]
+    fn legacy_child_runs_without_parent_kind_stay_rework() {
+        let ledger = ledger("legacy");
+        ledger
+            .record_interaction(&interaction("interaction-1", "workflow-1"))
+            .unwrap();
+        ledger
+            .save_run(&run(
+                "run-1",
+                "interaction-1",
+                "",
+                LocalRunStatus::Succeeded,
+            ))
+            .unwrap();
+        // 旧台账没有 parent_kind 字段，反序列化后是 unspecified；
+        // 不能因为加了新语义就让历史返工数忽然变成 0。
+        let legacy = crate::agent_core_contracts::LocalRun {
+            parent_kind: LocalRunParentKind::Unspecified,
+            ..run("run-legacy", "interaction-1", "run-1", LocalRunStatus::Failed)
+        };
+        ledger.save_run(&legacy).unwrap();
+
+        let metrics = workflow_metrics_by_package(&ledger).unwrap();
+        let item = metrics.get("workflow-1").unwrap();
+        assert_eq!(item.rework_runs, 1);
+        assert_eq!(item.delegated_runs, 0);
     }
 }
