@@ -186,6 +186,17 @@ pub(crate) fn protocol_supported(entry: &AIServiceProtocol, upstream: &AIService
     )
 }
 
+/// 该服务能否服务这个入口协议：任一端点兼容即可，而不是只看第一条。
+///
+/// 一个服务现在可以同时声明 OpenAI 兼容与 Anthropic 两个端点；只看
+/// `service.protocol` 会把「两条端点都支持 Claude 客户端」的服务判成不兼容。
+pub(crate) fn service_supports_entry(service: &CustomAIService, entry: &AIServiceProtocol) -> bool {
+    service
+        .endpoints
+        .iter()
+        .any(|endpoint| protocol_supported(entry, &endpoint.protocol))
+}
+
 fn validate_routes(
     inputs: Vec<GatewayModelRouteInput>,
     entry_protocols: &[AIServiceProtocol],
@@ -207,7 +218,7 @@ fn validate_routes(
         }
         if !entry_protocols
             .iter()
-            .any(|entry| protocol_supported(entry, &service.protocol))
+            .any(|entry| service_supports_entry(service, entry))
         {
             return Err(format!(
                 "模型 {upstream_model} 不兼容当前任何客户端入口协议（服务 {service_id} 使用 {}）",
@@ -293,7 +304,7 @@ pub(crate) fn save(input: GatewayProfileInput) -> Result<GatewayProfile, Box<dyn
             .filter(|route| {
                 services
                     .get(&route.service_id)
-                    .is_some_and(|service| protocol_supported(entry, &service.protocol))
+                    .is_some_and(|service| service_supports_entry(service, entry))
             })
             .collect::<Vec<_>>();
         if compatible.is_empty() {
@@ -421,6 +432,7 @@ mod tests {
             image_adapter: String::new(),
             media: BTreeMap::<String, MediaModelBinding>::new(),
             api_key: format!("sk-{id}"),
+            endpoints: Vec::new(),
         })
         .expect("add service");
     }

@@ -22,6 +22,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::api::ai::{fetch_client_credential, fetch_managed_service_revision, AIClientCredential};
 use crate::app::ai_clients::{backup_and_write, workbuddy_executable_exists};
+use crate::store::ai_services::{AIServiceEndpoint, AIServiceProtocolFamily, CustomAIService};
 use crate::Options;
 
 #[cfg(windows)]
@@ -1148,6 +1149,14 @@ fn custom_service_projection_revision(service_id: &str) -> String {
     projection_digest(&json!({
         "schema": BINDING_PROJECTION_SCHEMA_VERSION,
         "service_id": service.id,
+        "endpoints": service
+            .endpoints
+            .iter()
+            .map(|endpoint| json!({
+                "protocol": endpoint.protocol.as_str(),
+                "base_url": endpoint.base_url,
+            }))
+            .collect::<Vec<_>>(),
         "base_url": service.base_url,
         "protocol": service.protocol.as_str(),
         "model": service.model,
@@ -1453,6 +1462,113 @@ fn new_binding_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// 客户端要求的线格式族。注册器只关心「这个客户端讲哪一族」，具体是
+/// Chat 还是 Responses 由服务端点里已声明的写法决定。
+///
+/// 客户端与服务端点各有「族」，两者一致就能直连；不一致才需要网关互译。
+/// 这样同一服务声明了 `openai-responses` + `anthropic` 两条端点后，
+/// Codex 与 Claude Desktop 各自拿到自己那一族，不必建两条服务。
+fn required_protocol_family(target: &str) -> Option<AIServiceProtocolFamily> {
+    match target {
+        "codex" | "workbuddy" | "vscode" | "cc-switch" | "kimi-code" | "qwen-code" => {
+            Some(AIServiceProtocolFamily::OpenAi)
+        }
+        "claude-code" | "claude-desktop" => Some(AIServiceProtocolFamily::Anthropic),
+        _ => None,
+    }
+}
+
+/// 服务在客户端要求的族上实际可用的端点。
+///
+/// 返回 `None` 表示服务没有声明这一族端点——上游就是这个协议，直连不可能成功，
+/// 调用方应提示补端点或改走本机网关，而不是让用户复制一条服务再撞一次同一堵墙。
+fn endpoint_for_required_family(
+    service: &CustomAIService,
+    required: AIServiceProtocolFamily,
+) -> Option<AIServiceEndpoint> {
+    service.endpoint_for(required).cloned()
+}
+
+fn service_family_available(service: &CustomAIService, required: AIServiceProtocolFamily) -> bool {
+    endpoint_for_required_family(service, required).is_some()
+}
+
+/// `custom:<id>` 服务源对应的服务事实；`managed` 或其它来源返回 `None`。
+fn custom_service_for_source(service: &str) -> Option<(CustomAIService, String)> {
+    let id = service.trim().strip_prefix("custom:")?;
+    crate::store::ai_services::load_secret(id).ok()
+}
+
+/// 该族在服务上的端点缺失时，给用户一条可执行的下一步。
+fn missing_family_hint(client_label: &str, required: AIServiceProtocolFamily) -> String {
+    match required {
+        AIServiceProtocolFamily::Anthropic => format!(
+            "{client_label} 只讲 Anthropic Messages，该服务没有声明 Anthropic 端点。\
+             请在服务的「接入端点」里补一条 anthropic 地址（常见为 `<站点>/anthropic`），\
+             或改用本机网关聚合入口。"
+        ),
+        AIServiceProtocolFamily::OpenAi => format!(
+            "{client_label} 只讲 OpenAI 兼容协议，该服务没有声明 OpenAI 兼容端点。\
+             请在服务的「接入端点」里补一条 openai 地址，或改用本机网关聚合入口。"
+        ),
+    }
+}
+
+/// 把服务的凭据投影到客户端要求的那一族上。
+///
+/// 服务只有一族端点时行为与旧版一致；有两族时按客户端选择地址与协议，
+/// 真实 API Key 与模型目录不变——它们属于账号，不属于端点。
+fn rebase_credential_to_family(
+    credential: &AIClientCredential,
+    service: &CustomAIService,
+    required: AIServiceProtocolFamily,
+) -> AIClientCredential {
+    let Some(endpoint) = endpoint_for_required_family(service, required) else {
+        return credential.clone();
+    };
+    let mut rebased = credential.clone();
+    rebased.access.base_url = endpoint.base_url;
+    rebased.access.protocol = required
+        .normalize_protocol(&endpoint.protocol)
+        .as_str()
+        .to_string();
+    rebased
+}
+
+/// 网关转发上游时用哪条端点：入口协议属于哪一族就用哪一族，服务没有该族
+/// （网关会互译）时回落到服务主端点。
+fn gateway_upstream_endpoint(
+    service: &CustomAIService,
+    entry: &crate::store::ai_services::AIServiceProtocol,
+) -> crate::store::ai_services::AIServiceEndpoint {
+    service
+        .endpoint_for(entry.family())
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::store::ai_services::AIServiceEndpoint::new(
+                service.protocol.clone(),
+                service.base_url.clone(),
+            )
+        })
+}
+
+fn gateway_upstream_protocol(
+    service: &CustomAIService,
+    entry: &crate::store::ai_services::AIServiceProtocol,
+) -> String {
+    gateway_upstream_endpoint(service, entry)
+        .protocol
+        .as_str()
+        .to_string()
+}
+
+fn gateway_upstream_base_url(
+    service: &CustomAIService,
+    entry: &crate::store::ai_services::AIServiceProtocol,
+) -> String {
+    gateway_upstream_endpoint(service, entry).base_url
+}
+
 fn custom_service_requires_gateway(service_source: &str) -> Result<bool, Box<dyn Error>> {
     let Some(id) = service_source.trim().strip_prefix("custom:") else {
         return Ok(false);
@@ -1475,7 +1591,15 @@ fn direct_compatibility_warning(target: &str, service_source: &str) -> String {
         .strip_prefix("custom:")
         .and_then(|id| crate::store::ai_services::load_secret(id).ok())
         .map(|(service, _)| {
-            let provider = matrix.resolve_provider(&service.base_url, &service.protocol);
+            // 告警要针对客户端实际走的那一族端点：多端点服务上，按主端点
+            // 评估会把 Anthropic 客户端的风险算到 OpenAI 端点头上。
+            let (base_url, protocol) = match required_protocol_family(target)
+                .and_then(|family| service.endpoint_for(family))
+            {
+                Some(endpoint) => (endpoint.base_url.clone(), endpoint.protocol.clone()),
+                None => (service.base_url.clone(), service.protocol.clone()),
+            };
+            let provider = matrix.resolve_provider(&base_url, &protocol);
             matrix
                 .unsupported_features(target, &provider.id)
                 .into_iter()
@@ -2027,8 +2151,10 @@ fn confirm_gateway_binding(
 
 /// 客户端要求的入口协议与上游真实协议的组合是否有互译实现。
 ///
-/// 只做本轮用得到的组合：Anthropic 入口 ↔ OpenAI Chat 上游。其它组合必须
-/// 明确报错，而不是让客户端拿到一个它读不懂的响应。
+/// 多端点服务在 `resolve_credential` 里已经把上游换成客户端讲得通的那一族，
+/// 这里通常直接命中 `anthropic`；剩下的分支用于服务确实只有单一协议、
+/// 需要网关互译的场景。其它组合必须明确报错，而不是让客户端拿到一个
+/// 它读不懂的响应。
 fn gateway_proxy_protocol(
     adapter_id: &str,
     upstream_protocol: &str,
@@ -2046,7 +2172,7 @@ fn gateway_proxy_protocol(
         return match upstream_protocol {
             // Anthropic 入口直通 Anthropic 上游；模型发现由本机网关补齐。
             "anthropic" => Ok("anthropic"),
-            "openai-chat" => Ok("anthropic"),
+            "openai-chat" | "openai-responses" => Ok("anthropic"),
             other => Err(format!("该客户端只讲 Anthropic 协议，暂不支持接入 {other} 上游").into()),
         };
     }
@@ -2177,9 +2303,9 @@ pub(crate) fn gateway_bindings(
                 else {
                     continue;
                 };
-                if !crate::store::gateway_profiles::protocol_supported(
+                if !crate::store::gateway_profiles::service_supports_entry(
+                    &service,
                     &entry_protocol,
-                    &service.protocol,
                 ) {
                     continue;
                 }
@@ -2203,8 +2329,10 @@ pub(crate) fn gateway_bindings(
                     default_model: route.upstream_model.clone(),
                     upstream_model: route.upstream_model.clone(),
                     is_default: default_model == route.exposed_model,
-                    protocol: service.protocol.as_str().to_string(),
-                    base_url: service.base_url,
+                    // 网关按客户端入口协议选上游端点：同一服务可能同时有
+                    // OpenAI 兼容与 Anthropic 两条地址，转发时必须用入口那一族。
+                    protocol: gateway_upstream_protocol(&service, &entry_protocol),
+                    base_url: gateway_upstream_base_url(&service, &entry_protocol),
                     api_key,
                     token: token.clone(),
                     platform_metered: false,
@@ -2740,19 +2868,28 @@ fn resolve_credential(
             active_entitlement_id: String::new(),
             active_personal_connection_id: String::new(),
             status: "active".to_string(),
-            created_at: custom.created_at,
-            updated_at: custom.updated_at,
+            created_at: custom.created_at.clone(),
+            updated_at: custom.updated_at.clone(),
             rotated_at: String::new(),
-            base_url: custom.base_url,
-            model: custom.model,
-            models: custom.models,
+            base_url: custom.base_url.clone(),
+            model: custom.model.clone(),
+            models: custom.models.clone(),
             protocol: custom.protocol.as_str().to_string(),
             model_metadata: BTreeMap::new(),
         };
-        AIClientCredential {
+        let credential = AIClientCredential {
             access,
             api_key,
             model_metadata: BTreeMap::new(),
+        };
+        // 一个服务可以声明多族端点：按当前客户端挑它讲得通的那一条，
+        // 而不是把服务的「主协议」硬塞给所有客户端。
+        match client_id
+            .strip_suffix("-import")
+            .and_then(required_protocol_family)
+        {
+            Some(family) => rebase_credential_to_family(&credential, &custom, family),
+            None => credential,
         }
     };
     attach_model_metadata(&mut credential);
@@ -3180,6 +3317,16 @@ fn resolve_service_revision(options: &Options, expected_user_id: &str, service: 
         .map(|(custom, api_key)| {
             projection_digest(&json!({
                 "service_id": custom.id,
+                // 端点列表进入修订号：给服务补一条 anthropic 端点后，原先
+                // 因此失败或走网关的绑定必须被判定为「需要同步」。
+                "endpoints": custom
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| json!({
+                        "protocol": endpoint.protocol.as_str(),
+                        "base_url": endpoint.base_url,
+                    }))
+                    .collect::<Vec<_>>(),
                 "base_url": custom.base_url,
                 "protocol": custom.protocol.as_str(),
                 "model": custom.model,
@@ -3420,7 +3567,8 @@ fn import_codex(
     // 会写出一个 CLI 拒绝加载的 config.toml，必须在写入前拦住。
     if openai_protocol_is_chat(&credential) {
         return Err(
-            "Codex 只接受 Responses 协议的服务，当前服务是 chat 协议；请改用 Responses 类服务"
+            "Codex 只接受 Responses 协议的服务，当前服务声明的是 chat 协议；\
+             请把该服务的 OpenAI 兼容端点改成 openai-responses，或改用 Responses 类服务"
                 .into(),
         );
     }
@@ -7569,6 +7717,16 @@ fn import_provider_config(
     let client_detected = (definition.detected)();
     let client_id = format!("{}-import", definition.id);
     let credential = resolve_credential(options, expected_user_id, &client_id, service)?;
+    // 服务声明了两族端点时，凭据已经按本客户端挑好端点；此时族内没有可选项
+    // 才是真问题，直接给出「补一条端点」的修复建议，而不是让探针把它误判成
+    // 网络不可达。
+    if let Some(family) = required_protocol_family(definition.id) {
+        if let Some((custom, _)) = custom_service_for_source(service) {
+            if !service_family_available(&custom, family) {
+                return Err(missing_family_hint(definition.display_name, family).into());
+            }
+        }
+    }
     match definition.protocol_support {
         ProviderProtocolSupport::OpenAiOnly => {
             ensure_openai_compatible(&credential, definition.display_name)?
@@ -8338,6 +8496,12 @@ fn classify_openai_probe(status: u16, body: &str) -> ProbeVerdict {
 ///
 /// 标签为 Anthropic 时，先探测端点是否其实也讲 OpenAI（标签单一、端点多协议），
 /// 探测确认为不支持才拒绝。
+/// 只吃 OpenAI 兼容协议的客户端不得拿到 Anthropic 服务。
+///
+/// 多端点服务在 `resolve_credential` 里已经按客户端挑好端点：只要服务声明了
+/// OpenAI 兼容端点，凭据的 `protocol` 就已经是 OpenAI 系列，标签判定直接放行，
+/// 不会再走探针。走到探针分支意味着服务确实没有这一族端点——此时探测只用于
+/// 放行「标签单一、端点多协议」的老服务。
 fn ensure_openai_compatible(
     credential: &AIClientCredential,
     client_label: &str,
@@ -9428,6 +9592,142 @@ mod tests {
     }
 
     #[test]
+    fn gateway_upstream_endpoint_follows_the_client_entry_protocol() {
+        use crate::store::ai_services::{
+            AIServiceEndpoint, AIServiceProtocol, AIServiceProtocolFamily, CustomAIService,
+        };
+
+        let service = crate::store::ai_services::test_service_with_endpoints(
+            "moonshot",
+            vec![
+                AIServiceEndpoint::new(
+                    AIServiceProtocol::OpenaiResponses,
+                    "https://api.moonshot.cn/v1",
+                ),
+                AIServiceEndpoint::new(
+                    AIServiceProtocol::Anthropic,
+                    "https://api.moonshot.cn/anthropic",
+                ),
+            ],
+            "https://api.moonshot.cn/v1",
+            AIServiceProtocol::OpenaiResponses,
+        );
+
+        // Anthropic 入口必须打到 /anthropic，而不是主端点 /v1。
+        assert_eq!(
+            super::gateway_upstream_base_url(&service, &AIServiceProtocol::Anthropic),
+            "https://api.moonshot.cn/anthropic"
+        );
+        assert_eq!(
+            super::gateway_upstream_protocol(&service, &AIServiceProtocol::Anthropic),
+            "anthropic"
+        );
+        // OpenAI 入口仍然走 /v1，并保留服务声明的 Responses 写法。
+        assert_eq!(
+            super::gateway_upstream_base_url(&service, &AIServiceProtocol::OpenaiResponses),
+            "https://api.moonshot.cn/v1"
+        );
+        assert!(super::service_family_available(
+            &service,
+            AIServiceProtocolFamily::Anthropic
+        ));
+        assert!(super::service_family_available(
+            &service,
+            AIServiceProtocolFamily::OpenAi
+        ));
+
+        // 只有 OpenAi 端点的服务：Anthropic 入口回落到主端点，由网关互译。
+        let openai_only = crate::store::ai_services::test_service_with_endpoints(
+            "openai-only",
+            vec![AIServiceEndpoint::new(
+                AIServiceProtocol::OpenaiResponses,
+                "https://api.example.com/v1",
+            )],
+            "https://api.example.com/v1",
+            AIServiceProtocol::OpenaiResponses,
+        );
+        assert_eq!(
+            super::gateway_upstream_base_url(&openai_only, &AIServiceProtocol::Anthropic),
+            "https://api.example.com/v1"
+        );
+        assert!(!super::service_family_available(
+            &openai_only,
+            AIServiceProtocolFamily::Anthropic
+        ));
+    }
+
+    #[test]
+    fn missing_family_hint_names_the_missing_endpoint() {
+        use crate::store::ai_services::AIServiceProtocolFamily;
+        assert!(
+            super::missing_family_hint("Claude Desktop", AIServiceProtocolFamily::Anthropic)
+                .contains("anthropic")
+        );
+        assert!(
+            super::missing_family_hint("Codex", AIServiceProtocolFamily::OpenAi).contains("openai")
+        );
+    }
+
+    #[test]
+    fn required_protocol_family_maps_the_line_format_clients() {
+        use crate::store::ai_services::AIServiceProtocolFamily;
+        assert_eq!(
+            super::required_protocol_family("codex"),
+            Some(AIServiceProtocolFamily::OpenAi)
+        );
+        assert_eq!(
+            super::required_protocol_family("claude-desktop"),
+            Some(AIServiceProtocolFamily::Anthropic)
+        );
+        assert_eq!(
+            super::required_protocol_family("claude-code"),
+            Some(AIServiceProtocolFamily::Anthropic)
+        );
+        assert_eq!(super::required_protocol_family("opencode"), None);
+    }
+
+    /// 同一服务声明两族端点后，客户端各自的凭据取到自己那一条地址。
+    #[test]
+    fn rebase_credential_picks_the_endpoint_of_the_client_family() {
+        use crate::store::ai_services::{
+            AIServiceEndpoint, AIServiceProtocol, AIServiceProtocolFamily, CustomAIService,
+        };
+
+        let service = crate::store::ai_services::test_service_with_endpoints(
+            "moonshot",
+            vec![
+                AIServiceEndpoint::new(
+                    AIServiceProtocol::OpenaiResponses,
+                    "https://api.moonshot.cn/v1",
+                ),
+                AIServiceEndpoint::new(
+                    AIServiceProtocol::Anthropic,
+                    "https://api.moonshot.cn/anthropic",
+                ),
+            ],
+            "https://api.moonshot.cn/v1",
+            AIServiceProtocol::OpenaiResponses,
+        );
+
+        let base = credential(&["kimi-k2"]);
+        let anthropic =
+            super::rebase_credential_to_family(&base, &service, AIServiceProtocolFamily::Anthropic);
+        assert_eq!(
+            anthropic.access.base_url,
+            "https://api.moonshot.cn/anthropic"
+        );
+        assert_eq!(anthropic.access.protocol, "anthropic");
+        // 账号事实不变：Key 与模型目录仍只有一份。
+        assert_eq!(anthropic.api_key, base.api_key);
+        assert_eq!(anthropic.access.models, base.access.models);
+
+        let openai =
+            super::rebase_credential_to_family(&base, &service, AIServiceProtocolFamily::OpenAi);
+        assert_eq!(openai.access.base_url, "https://api.moonshot.cn/v1");
+        assert_eq!(openai.access.protocol, "openai-responses");
+    }
+
+    #[test]
     fn legacy_binding_json_defaults_sync_metadata() {
         let binding: super::AIProviderImportBinding = serde_json::from_value(json!({
             "service": "managed",
@@ -9525,6 +9825,7 @@ mod tests {
             image_adapter: String::new(),
             media: Default::default(),
             api_key: "sk-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
         let profile = crate::store::gateway_profiles::save(
@@ -9599,6 +9900,7 @@ mod tests {
             image_adapter: String::new(),
             media: Default::default(),
             api_key: "sk-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
         let changed_profile = crate::store::gateway_profiles::save(
@@ -9847,6 +10149,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: format!("sk-{id}"),
+                endpoints: Vec::new(),
             })
             .unwrap();
         }

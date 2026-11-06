@@ -132,12 +132,104 @@ pub(crate) struct ResolvedMediaBinding {
     pub execution_mode: MediaExecutionMode,
 }
 
+/// 一个服务对外提供的接入端点：某种线协议 + 该协议对应的 API 根地址。
+///
+/// 服务是「账号 + 凭据」，协议只是接入方式。同一家供应商常同时给
+/// OpenAI 兼容与 Anthropic 两个端点（`/v1` 与 `/anthropic`），客户端又各自
+/// 只吃一种线格式，因此一个服务需要多条端点。`base_url` / `protocol` 保留为
+/// `endpoints[0]` 的兼容投影，`endpoints` 才是事实源。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AIServiceEndpoint {
+    pub protocol: AIServiceProtocol,
+    pub base_url: String,
+}
+
+impl AIServiceEndpoint {
+    pub(crate) fn new(protocol: AIServiceProtocol, base_url: impl Into<String>) -> Self {
+        Self {
+            protocol,
+            base_url: base_url.into(),
+        }
+    }
+}
+
+/// 端点族：两种 OpenAI 兼容线格式共用同一 `/v1`，只是路由不同，
+/// 因此按族去重——同一服务在同一族下只保留一个端点。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AIServiceProtocolFamily {
+    Anthropic,
+    OpenAi,
+}
+
+impl AIServiceProtocol {
+    pub(crate) fn family(&self) -> AIServiceProtocolFamily {
+        match self {
+            Self::Anthropic => AIServiceProtocolFamily::Anthropic,
+            Self::OpenaiChat | Self::OpenaiResponses => AIServiceProtocolFamily::OpenAi,
+        }
+    }
+}
+
+impl AIServiceProtocolFamily {
+    /// 把任意协议归一成本族的代表协议：Chat 与 Responses 视为同一端点。
+    pub(crate) fn normalize_protocol(&self, protocol: &AIServiceProtocol) -> AIServiceProtocol {
+        match self {
+            Self::Anthropic => AIServiceProtocol::Anthropic,
+            Self::OpenAi => match protocol {
+                AIServiceProtocol::OpenaiChat => AIServiceProtocol::OpenaiChat,
+                _ => AIServiceProtocol::OpenaiResponses,
+            },
+        }
+    }
+}
+
+/// 端点列表的唯一化与补齐。
+///
+/// 旧配置没有 `endpoints`，只有 `protocol` + `base_url`：合成一条端点即可。
+/// 有 `endpoints` 时按协议族去重并保留首次出现顺序：一族只有一个真实上游地址，
+/// 同一族里的第二条（例如 Chat 与 Responses 写同一个 `/v1`）只是重复声明。
+fn normalize_endpoints(
+    base_url: &str,
+    protocol: &AIServiceProtocol,
+    endpoints: Vec<AIServiceEndpoint>,
+) -> Vec<AIServiceEndpoint> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for endpoint in endpoints {
+        let base_url = endpoint.base_url.trim().trim_end_matches('/').to_string();
+        if base_url.is_empty() {
+            continue;
+        }
+        let protocol = endpoint
+            .protocol
+            .family()
+            .normalize_protocol(&endpoint.protocol);
+        if seen.insert(protocol.family()) {
+            normalized.push(AIServiceEndpoint { protocol, base_url });
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(AIServiceEndpoint::new(
+            protocol.clone(),
+            base_url.trim().trim_end_matches('/').to_string(),
+        ));
+    }
+    normalized
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CustomAIService {
     pub id: String,
     pub display_name: String,
+    /// `endpoints[0].base_url` 的兼容投影；按协议取地址请用 `endpoint_for`。
     pub base_url: String,
+    /// `endpoints[0].protocol` 的兼容投影。
     pub protocol: AIServiceProtocol,
+    /// 服务可用的全部接入端点，非空且同族唯一（见 `normalize_endpoints`）。
+    #[serde(default)]
+    pub endpoints: Vec<AIServiceEndpoint>,
     pub model: String,
     pub models: Vec<String>,
     /// 生图模型。留空表示该服务不用于生图。
@@ -168,6 +260,8 @@ struct PersistedCustomAIService {
     display_name: String,
     base_url: String,
     protocol: AIServiceProtocol,
+    #[serde(default)]
+    endpoints: Vec<AIServiceEndpoint>,
     model: String,
     models: Vec<String>,
     #[serde(default)]
@@ -230,11 +324,14 @@ struct PersistedAIServiceSelection {
 
 impl From<PersistedCustomAIService> for CustomAIService {
     fn from(value: PersistedCustomAIService) -> Self {
+        // 旧配置只有 `protocol` + `base_url`：读时补成一条端点，标量继续作为投影。
+        let endpoints = normalize_endpoints(&value.base_url, &value.protocol, value.endpoints);
         Self {
             id: value.id,
             display_name: value.display_name,
             base_url: value.base_url,
             protocol: value.protocol,
+            endpoints,
             model: value.model,
             models: value.models,
             image_model: value.image_model,
@@ -257,6 +354,7 @@ impl From<&CustomAIService> for PersistedCustomAIService {
             display_name: value.display_name.clone(),
             base_url: value.base_url.clone(),
             protocol: value.protocol.clone(),
+            endpoints: value.endpoints.clone(),
             model: value.model.clone(),
             models: value.models.clone(),
             image_model: value.image_model.clone(),
@@ -280,6 +378,9 @@ pub(crate) struct CustomAIServiceInput {
     pub protocol: AIServiceProtocol,
     pub model: String,
     pub models: Vec<String>,
+    /// 端点列表。留空时按 `protocol` + `base_url` 合成一条，其余调用点无需改动。
+    #[serde(default)]
+    pub endpoints: Vec<AIServiceEndpoint>,
     /// 生图模型。可留空。
     #[serde(default)]
     pub image_model: String,
@@ -295,12 +396,48 @@ pub(crate) struct CustomAIServiceInput {
 }
 
 impl CustomAIService {
+    /// 该服务在指定端点族上的端点。
+    ///
+    /// 服务没有这一族端点时返回 `None`：调用方必须显式决定是「改用网关互译」
+    /// 还是「拒绝注册」，而不是把另一族的地址硬塞给一个读不懂它的客户端。
+    pub(crate) fn endpoint_for(
+        &self,
+        family: AIServiceProtocolFamily,
+    ) -> Option<&AIServiceEndpoint> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.protocol.family() == family)
+    }
+
+    /// 服务声明了哪些端点族（用于在注册前判断「一条服务能否同时喂多个客户端」）。
+    pub(crate) fn protocol_families(&self) -> Vec<AIServiceProtocolFamily> {
+        let mut families = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.protocol.family())
+            .collect::<Vec<_>>();
+        families.sort();
+        families.dedup();
+        families
+    }
+
+    /// 把服务的端点族映射成具体线格式：同一族里优先沿用服务已声明的写法
+    /// （原本标 Chat 的服务不要把客户端静默改成 Responses）。
+    pub(crate) fn protocol_in_family(
+        &self,
+        family: AIServiceProtocolFamily,
+    ) -> Option<AIServiceProtocol> {
+        self.endpoint_for(family)
+            .map(|endpoint| family.normalize_protocol(&endpoint.protocol))
+    }
+
     pub(crate) fn public_json(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
             "display_name": self.display_name,
             "base_url": self.base_url,
             "protocol": self.protocol.as_str(),
+            "endpoints": self.endpoints,
             "model": self.model,
             "models": self.models,
             "image_model": self.image_model,
@@ -320,6 +457,34 @@ pub(crate) fn store_path() -> Result<PathBuf, Box<dyn Error>> {
     let dir = crate::store::paths::agent_home();
     fs::create_dir_all(&dir)?;
     Ok(dir.join(STORE_FILE))
+}
+
+/// 测试可见的构造器：`encrypted_*` 字段不需要真的走 DPAPI 才能测端点投影。
+#[cfg(test)]
+pub(crate) fn test_service_with_endpoints(
+    id: &str,
+    endpoints: Vec<AIServiceEndpoint>,
+    base_url: &str,
+    protocol: AIServiceProtocol,
+) -> CustomAIService {
+    CustomAIService {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        base_url: base_url.to_string(),
+        protocol,
+        endpoints,
+        model: "test-model".to_string(),
+        models: vec!["test-model".to_string()],
+        image_model: String::new(),
+        image_adapter: String::new(),
+        media: Default::default(),
+        balance_profile_id: None,
+        balance_user_id: None,
+        encrypted_balance_access_token: None,
+        encrypted_api_key: String::new(),
+        created_at: "1".to_string(),
+        updated_at: "1".to_string(),
+    }
 }
 
 fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
@@ -680,6 +845,15 @@ fn upsert_internal(
     if input.display_name.trim().is_empty() {
         return Err("display_name 不能为空".into());
     }
+    // 端点列表是事实源，标量只是它的第一条投影：先归一，再看标量该写什么。
+    let endpoints = normalize_endpoints(&input.base_url, &input.protocol, input.endpoints);
+    for endpoint in &endpoints {
+        validate_base_url(&endpoint.base_url)?;
+    }
+    let primary_endpoint = endpoints
+        .first()
+        .cloned()
+        .expect("normalize_endpoints always returns at least one endpoint");
     let has_media_model = !input.image_model.trim().is_empty()
         || input
             .media
@@ -691,7 +865,7 @@ fn upsert_internal(
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
     let mut services = load_all()?;
     let existing = services.get(&id);
-    let normalized_base_url = input.base_url.trim().trim_end_matches('/').to_string();
+    let normalized_base_url = primary_endpoint.base_url.clone();
     let balance_profile_id = profile_override
         .unwrap_or_else(|| existing.and_then(|item| item.balance_profile_id.clone()));
     let api_key_replaced = !input.api_key.trim().is_empty();
@@ -796,8 +970,10 @@ fn upsert_internal(
     let service = CustomAIService {
         id: id.clone(),
         display_name: input.display_name.trim().to_string(),
-        base_url: normalized_base_url,
-        protocol: input.protocol,
+        // 标量投影跟随第一条端点，避免 `protocol`/`base_url` 与 `endpoints` 分叉。
+        base_url: primary_endpoint.base_url.clone(),
+        protocol: primary_endpoint.protocol.clone(),
+        endpoints,
         model: input.model.trim().to_string(),
         models: input
             .models
@@ -2024,9 +2200,10 @@ pub(crate) fn list_models(id: &str) -> Result<Vec<String>, Box<dyn Error>> {
 mod tests {
     use super::{
         binding_details_for, binding_for, default_execution_mode, validate_base_url,
-        AIServiceProtocol, CapabilityRouteEntry, CustomAIServiceInput, MediaExecutionMode,
-        MediaModelBinding, CAP_AUDIO_SPEECH, CAP_AUDIO_TRANSCRIBE, CAP_CHAT, CAP_IMAGE_EDIT,
-        CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
+        AIServiceEndpoint, AIServiceProtocol, AIServiceProtocolFamily, CapabilityRouteEntry,
+        CustomAIService, CustomAIServiceInput, MediaExecutionMode, MediaModelBinding,
+        CAP_AUDIO_SPEECH, CAP_AUDIO_TRANSCRIBE, CAP_CHAT, CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE,
+        CAP_VIDEO_GENERATE,
     };
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -2068,6 +2245,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-test-secret-123".to_string(),
+                endpoints: Vec::new(),
             };
             let saved = super::upsert(input).expect("upsert custom service");
             assert_eq!(saved.id, "my-gateway");
@@ -2103,6 +2281,7 @@ mod tests {
             image_adapter: String::new(),
             media: Default::default(),
             api_key: api_key.to_string(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -2224,6 +2403,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "ark-test-secret".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("save source service");
 
@@ -2256,6 +2436,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-original".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("create service");
             super::upsert(CustomAIServiceInput {
@@ -2269,6 +2450,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: String::new(),
+                endpoints: Vec::new(),
             })
             .expect("update service without rotating key");
             let (service, api_key) = super::load_secret("editable").expect("load service");
@@ -2293,6 +2475,7 @@ mod tests {
                     image_adapter: String::new(),
                     media: Default::default(),
                     api_key: format!("sk-{id}"),
+                    endpoints: Vec::new(),
                 })
                 .expect("create service");
             }
@@ -2332,6 +2515,7 @@ mod tests {
                     image_adapter: "ark-images".to_string(),
                     media: Default::default(),
                     api_key: format!("sk-{id}"),
+                    endpoints: Vec::new(),
                 })
                 .expect("create service");
             }
@@ -2398,6 +2582,7 @@ mod tests {
                     },
                     media: Default::default(),
                     api_key: format!("sk-{id}"),
+                    endpoints: Vec::new(),
                 })
                 .expect("create service");
             }
@@ -2476,6 +2661,7 @@ mod tests {
                 image_adapter: "ark-images".to_string(),
                 media: Default::default(),
                 api_key: "sk-multi".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("create service");
 
@@ -2523,6 +2709,7 @@ mod tests {
                     image_adapter: String::new(),
                     media: Default::default(),
                     api_key: format!("sk-{id}"),
+                    endpoints: Vec::new(),
                 })
                 .expect("create service");
             }
@@ -2582,6 +2769,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-chat".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("chat service");
             super::upsert(CustomAIServiceInput {
@@ -2595,6 +2783,7 @@ mod tests {
                 image_adapter: "ark-images".to_string(),
                 media: Default::default(),
                 api_key: "sk-image".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("image service");
 
@@ -2660,6 +2849,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-x".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("upsert");
 
@@ -2696,6 +2886,7 @@ mod tests {
                 image_adapter: "openai-images".to_string(),
                 media: std::collections::BTreeMap::new(),
                 api_key: "sk-legacy".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("upsert legacy");
             let (service, _) = super::load_secret("legacy").expect("load");
@@ -2735,6 +2926,7 @@ mod tests {
                         std::collections::BTreeMap::new()
                     },
                     api_key: "sk".to_string(),
+                    endpoints: Vec::new(),
                 })
                 .expect("upsert");
             }
@@ -2783,6 +2975,7 @@ mod tests {
                 image_adapter: "ark-images".to_string(),
                 media,
                 api_key: "sk-image".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("upsert");
 
@@ -2850,6 +3043,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-catalog-secret".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("upsert voice");
 
@@ -2917,6 +3111,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-media-only".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("media-only service");
             assert!(saved.model.is_empty());
@@ -2941,6 +3136,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: std::collections::BTreeMap::new(),
                 api_key: "sk-empty".to_string(),
+                endpoints: Vec::new(),
             })
             .expect_err("empty model service must fail");
             assert!(error.to_string().contains("至少配置一个对话或媒体模型"));
@@ -2978,6 +3174,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-bad".to_string(),
+                endpoints: Vec::new(),
             })
             .expect_err("business binding must be rejected");
             assert!(error.to_string().contains("不支持的媒体能力槽位"));
@@ -3016,6 +3213,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-voice".to_string(),
+                endpoints: Vec::new(),
             })
             .expect("upsert audio slots");
 
@@ -3064,6 +3262,7 @@ mod tests {
             image_adapter: String::new(),
             media: Default::default(),
             api_key: "k".to_string(),
+            endpoints: Vec::new(),
         };
         let err = super::upsert(invalid).err().expect("must reject");
         assert!(err.to_string().contains("只允许"));
@@ -3277,5 +3476,129 @@ mod tests {
         .err()
         .expect("must reject");
         assert!(err.to_string().contains("401"));
+    }
+
+    /// 同一账号同时声明 OpenAI 兼容与 Anthropic 两条端点：这是「一条服务喂
+    /// Codex + Claude Desktop」的持久化形态，必须能原样读写。
+    #[test]
+    fn multi_protocol_endpoints_persist_and_project_to_scalar_fields() {
+        with_isolated_home(|| {
+            let input = CustomAIServiceInput {
+                id: "moonshot".to_string(),
+                display_name: "Moonshot".to_string(),
+                // 旧式标量：投影应跟随 endpoints[0]。
+                base_url: "https://api.moonshot.cn/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "kimi-k2".to_string(),
+                models: vec!["kimi-k2".to_string()],
+                endpoints: vec![
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::OpenaiResponses,
+                        "https://api.moonshot.cn/v1/",
+                    ),
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::Anthropic,
+                        "https://api.moonshot.cn/anthropic",
+                    ),
+                ],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-moonshot".to_string(),
+            };
+            let saved = super::upsert(input).expect("upsert multi-endpoint service");
+            assert_eq!(saved.endpoints.len(), 2);
+            assert_eq!(saved.base_url, "https://api.moonshot.cn/v1");
+            assert_eq!(saved.protocol, AIServiceProtocol::OpenaiResponses);
+
+            let openai = saved
+                .endpoint_for(AIServiceProtocolFamily::OpenAi)
+                .expect("openai endpoint");
+            assert_eq!(openai.base_url, "https://api.moonshot.cn/v1");
+            let anthropic = saved
+                .endpoint_for(AIServiceProtocolFamily::Anthropic)
+                .expect("anthropic endpoint");
+            assert_eq!(anthropic.base_url, "https://api.moonshot.cn/anthropic");
+
+            // 落盘再读回：端点必须还在，而不是退化成单端点。
+            let (loaded, _) = super::load_secret("moonshot").expect("load");
+            assert_eq!(loaded.endpoints, saved.endpoints);
+            assert_eq!(
+                loaded.protocol_in_family(AIServiceProtocolFamily::Anthropic),
+                Some(AIServiceProtocol::Anthropic)
+            );
+        });
+    }
+
+    /// 同一族只保留一条：Chat 与 Responses 指向同一 `/v1`，重复声明不是第二个上游。
+    #[test]
+    fn duplicate_endpoints_in_one_family_collapse_to_the_first() {
+        with_isolated_home(|| {
+            let saved = super::upsert(CustomAIServiceInput {
+                id: "dedupe".to_string(),
+                display_name: "去重".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiChat,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: vec![
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::OpenaiResponses,
+                        "https://api.example.com/v1",
+                    ),
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::OpenaiChat,
+                        "https://api.example.com/v1/",
+                    ),
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::Anthropic,
+                        "https://api.example.com/anthropic",
+                    ),
+                ],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-dedupe".to_string(),
+            })
+            .expect("upsert");
+
+            assert_eq!(saved.endpoints.len(), 2, "{:?}", saved.endpoints);
+            // 保留首次出现的那条，不静默改写成 Chat。
+            assert_eq!(
+                saved.endpoints[0].protocol,
+                AIServiceProtocol::OpenaiResponses
+            );
+            assert_eq!(saved.protocol, AIServiceProtocol::OpenaiResponses);
+            assert_eq!(
+                saved.protocol_families(),
+                vec![
+                    AIServiceProtocolFamily::Anthropic,
+                    AIServiceProtocolFamily::OpenAi
+                ]
+            );
+        });
+    }
+
+    /// 旧配置文件没有 `endpoints`：读时必须补出单端点，且标量仍是投影。
+    #[test]
+    fn legacy_service_without_endpoints_upgrades_to_single_endpoint() {
+        let legacy = serde_json::json!({
+            "id": "legacy",
+            "display_name": "旧服务",
+            "base_url": "https://api.example.com/v1/",
+            "protocol": "openai-chat",
+            "model": "m",
+            "models": ["m"],
+            "encrypted_api_key": "sealed",
+            "created_at": "1",
+            "updated_at": "2"
+        });
+        let persisted: super::PersistedCustomAIService =
+            serde_json::from_value(legacy).expect("legacy payload parses");
+        let service: CustomAIService = persisted.into();
+        assert_eq!(service.endpoints.len(), 1);
+        assert_eq!(service.endpoints[0].protocol, AIServiceProtocol::OpenaiChat);
+        assert_eq!(service.endpoints[0].base_url, "https://api.example.com/v1");
+        assert_eq!(service.protocol, AIServiceProtocol::OpenaiChat);
     }
 }

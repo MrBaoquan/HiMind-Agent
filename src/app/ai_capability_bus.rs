@@ -615,6 +615,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key: format!("sk-{id}"),
+            endpoints: Vec::new(),
         })
         .unwrap();
     }
@@ -672,6 +673,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-vision-a".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             ai_services::set_media_service(CAP_VISION, "vision-a").unwrap();
@@ -713,6 +715,7 @@ mod tests {
                     image_adapter: String::new(),
                     media,
                     api_key: format!("sk-{id}"),
+                    endpoints: Vec::new(),
                 })
                 .unwrap();
             }
@@ -782,6 +785,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-ark".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
 

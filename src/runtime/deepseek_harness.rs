@@ -5918,6 +5918,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-local-secret".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-gateway").unwrap();
@@ -6008,6 +6009,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-deepseek-secret".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             crate::store::ai_services::set_active("deepseek").unwrap();

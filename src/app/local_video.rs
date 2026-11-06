@@ -1034,6 +1034,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-video".to_string(),
+                endpoints: Vec::new(),
             })?;
             crate::store::ai_services::set_media_service(CAP_VIDEO_GENERATE, "ark-video")?;
 
@@ -1118,6 +1119,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-wan".to_string(),
+                endpoints: Vec::new(),
             })?;
             crate::store::ai_services::set_media_service(CAP_VIDEO_GENERATE, "wan-video")?;
             let submitted = generate(&json!({

@@ -10253,6 +10253,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "sk-test-image".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-image").unwrap();
@@ -10326,6 +10327,7 @@ mod tests {
                 image_adapter: "ark-images".to_string(),
                 media,
                 api_key: "sk-image-west".to_string(),
+                endpoints: Vec::new(),
             })?;
 
             let mut options = crate::Options::from_env();
@@ -10678,6 +10680,7 @@ mod tests {
                 image_adapter: String::new(),
                 media,
                 api_key: "sk-speech-fixture".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             crate::store::ai_services::set_active("speech-fixture").unwrap();

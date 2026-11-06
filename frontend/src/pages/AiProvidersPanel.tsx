@@ -34,6 +34,16 @@ const protocolLabels: Record<AIServiceProtocol, string> = {
   anthropic: 'Anthropic',
 };
 
+/** 协议族：两种 OpenAI 兼容线格式共用同一 `/v1`，同一族只能有一条端点。 */
+function protocolFamily(protocol: AIServiceProtocol): 'openai' | 'anthropic' {
+  return protocol === 'anthropic' ? 'anthropic' : 'openai';
+}
+
+/** 第二端点里与主端点同族的选项没有意义（同一 `/v1` 只会被去重丢掉）。 */
+function secondaryProtocolOptions(primary: AIServiceProtocol): Array<{ value: AIServiceProtocol; label: string }> {
+  return protocolOptions.filter(option => protocolFamily(option.value) !== protocolFamily(primary));
+}
+
 /** 火山方舟 Agent Plan 只有 Messages 推理入口，没有 `/models` 发现接口。 */
 function isVolcengineAgentPlan(baseUrl: string): boolean {
   try {
@@ -105,6 +115,8 @@ type AiProvidersPanelProps = {
     display_name: string;
     base_url: string;
     protocol: AIServiceProtocol;
+    /** 全部接入端点；省略时后端按 `protocol` + `base_url` 合成单端点。 */
+    endpoints?: Array<{ protocol: AIServiceProtocol; base_url: string }>;
     model: string;
     models: string[];
     image_model: string;
@@ -142,6 +154,10 @@ const emptyDraft = {
   display_name: '',
   base_url: '',
   protocol: 'openai-responses' as AIServiceProtocol,
+  // 第二条接入端点（可选）：同一账号在另一套线协议上的地址。
+  // 主 Base URL + 接口类型是第一条端点；这里只补「另一个协议族」那一条。
+  secondary_protocol: '' as AIServiceProtocol | '',
+  secondary_base_url: '',
   model: '',
   models: '',
   image_model: '',
@@ -324,6 +340,8 @@ export function AiProvidersPanel({
       display_name: preset.name,
       base_url: preset.base_url,
       protocol: preset.protocol,
+      secondary_protocol: '',
+      secondary_base_url: '',
       model: preset.default_model,
       models: preset.models.join(', '),
       image_model: imageModel,
@@ -481,6 +499,14 @@ export function AiProvidersPanel({
         display_name: draft.display_name.trim(),
         base_url: draft.base_url.trim(),
         protocol: draft.protocol,
+        // 只提交「另一个协议族」的端点；主端点由 protocol + base_url 表达，
+        // 后端会把它补成 endpoints[0]。第二行留空就不传，旧行为不变。
+        endpoints: draft.secondary_base_url.trim() && draft.secondary_protocol
+          ? [
+              { protocol: draft.protocol, base_url: draft.base_url.trim() },
+              { protocol: draft.secondary_protocol, base_url: draft.secondary_base_url.trim() },
+            ]
+          : undefined,
         model: enabled.has('chat') ? draft.model.trim() : '',
         models: enabled.has('chat') ? draft.models.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) : [],
         image_model: enabled.has('image.generate') ? draft.image_model.trim() : '',
@@ -636,6 +662,17 @@ export function AiProvidersPanel({
       display_name: service.display_name,
       base_url: service.base_url,
       protocol: service.protocol,
+      // 「主端点」与「第二端点」按协议族分工：第一条是 base_url/protocol，
+      // 另一族的端点回填到第二行。旧服务没有 endpoints 时第二行为空。
+      ...(() => {
+        const secondary = (service.endpoints ?? []).slice(1).find(
+          endpoint => protocolFamily(endpoint.protocol) !== protocolFamily(service.protocol),
+        );
+        return {
+          secondary_protocol: secondary?.protocol ?? ('' as AIServiceProtocol | ''),
+          secondary_base_url: secondary?.base_url ?? '',
+        };
+      })(),
       model: service.model,
       models: service.models.join(', '),
       image_model: service.image_model ?? '',
@@ -797,6 +834,15 @@ export function AiProvidersPanel({
                     <label className="field-label ai-service-field"><span>接口类型</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                   </div>
                   <small className="ai-service-hint">主协议用于服务连接；媒体适配器在下一步选择。</small>
+                </div>
+
+                <div className="ai-service-form-group">
+                  <div className="ai-service-group-label">第二接入端点（可选）</div>
+                  <div className="ai-service-form-grid">
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>第二 Base URL</span><input value={draft.secondary_base_url} onChange={(event) => setDraft((current) => ({ ...current, secondary_base_url: event.target.value }))} placeholder="https://api.example.com/anthropic" /></label>
+                    <label className="field-label ai-service-field"><span>第二接口类型</span><select value={draft.secondary_protocol} onChange={(event) => setDraft((current) => ({ ...current, secondary_protocol: event.target.value as AIServiceProtocol | '' }))}><option value="">不配置</option>{secondaryProtocolOptions(draft.protocol).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                  </div>
+                  <small className="ai-service-hint">同一账号若另有另一套线协议的地址，填在这里即可让 Codex 与 Claude Desktop 共用一条服务；留空表示只有主端点。</small>
                 </div>
               </> : null}
 

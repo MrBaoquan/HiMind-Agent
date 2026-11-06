@@ -193,6 +193,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "secret-multi".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
 
@@ -359,6 +360,7 @@ mod tests {
                         image_adapter: String::new(),
                         media: Default::default(),
                         api_key: format!("secret-{id}"),
+                        endpoints: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -384,6 +386,7 @@ mod tests {
                 image_adapter: String::new(),
                 media: Default::default(),
                 api_key: "secret-switch-c".to_string(),
+                endpoints: Vec::new(),
             })
             .unwrap();
             assert!(send_chat(&gateway_base, "himind:switch-c:model-c-fast")

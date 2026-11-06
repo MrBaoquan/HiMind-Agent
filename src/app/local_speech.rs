@@ -779,6 +779,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key: "sk-transcribe-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
 
@@ -826,6 +827,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key: "sk-fish-asr-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
 
@@ -888,6 +890,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key: "sk-fish-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
 
@@ -957,6 +960,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key,
+            endpoints: Vec::new(),
         })
         .unwrap();
 
@@ -1029,6 +1033,7 @@ mod tests {
             image_adapter: String::new(),
             media,
             api_key: "sk-speech-test".to_string(),
+            endpoints: Vec::new(),
         })
         .unwrap();
 

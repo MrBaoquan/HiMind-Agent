@@ -3356,6 +3356,13 @@ pub(crate) fn remove_acp_runtime_profile(
     }))
 }
 
+/// 表单里的一行接入端点。前端按「协议 + 地址」成对提交。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct EndpointInput {
+    pub protocol: String,
+    pub base_url: String,
+}
+
 #[tauri::command]
 pub(crate) fn save_ai_service(
     app: AppHandle,
@@ -3385,8 +3392,24 @@ pub(crate) fn save_ai_service(
     balance_access_token: Option<String>,
     balance_user_id: Option<String>,
     api_key: String,
+    // 可选端点：同一服务可以同时提供 OpenAI 兼容与 Anthropic 两个地址。
+    // 留空时由 `protocol` + `base_url` 合成单端点，旧前端无需改动。
+    endpoints: Option<Vec<EndpointInput>>,
 ) -> Result<serde_json::Value, String> {
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
+    let endpoints_from_form = endpoints
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.base_url.trim().is_empty())
+        .map(|item| {
+            let protocol = crate::store::ai_services::AIServiceProtocol::parse(&item.protocol)
+                .map_err(|error| error.to_string())?;
+            Ok(crate::store::ai_services::AIServiceEndpoint::new(
+                protocol,
+                item.base_url.trim(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     // 媒体能力槽位：表单里的每一行映射到一个稳定的媒体原语。
     let mut media = std::collections::BTreeMap::new();
     let image_model = image_model.unwrap_or_default();
@@ -3493,6 +3516,7 @@ pub(crate) fn save_ai_service(
         protocol,
         model,
         models,
+        endpoints: endpoints_from_form,
         image_model,
         image_adapter,
         media,

@@ -2894,6 +2894,16 @@ export type CodexSkillActionResponse = {
 
 export type AIServiceProtocol = 'openai-chat' | 'openai-responses' | 'anthropic';
 
+/**
+ * 服务的一条接入端点。服务是「账号 + 凭据」，协议只是接入方式：同一家供应商
+ * 常同时给 OpenAI 兼容与 Anthropic 两个地址，一条服务可以同时供 Codex 与
+ * Claude Desktop 使用，不必复制成两条。
+ */
+export type AIServiceEndpoint = {
+    protocol: AIServiceProtocol;
+    base_url: string;
+};
+
 /** 本机 AI 服务预设模板：事实源是工作台 AI 服务目录，Agent 只做协议映射与缓存。 */
 export type AIServiceTemplate = {
     id: string;
@@ -2952,6 +2962,8 @@ export type CustomAIService = {
     display_name: string;
     base_url: string;
     protocol: AIServiceProtocol;
+    /** 全部接入端点；`base_url` / `protocol` 是第一条端点的兼容投影。 */
+    endpoints?: AIServiceEndpoint[];
     model: string;
     models: string[];
     /** 生图模型。留空表示该来源不用于生图。 */
@@ -3647,12 +3659,13 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
             baseUrl: input.base_url,
             protocol: input.protocol,
+            endpoints: input.endpoints ?? [],
             model: input.model,
             models: input.models,
             imageModel: input.image_model,
