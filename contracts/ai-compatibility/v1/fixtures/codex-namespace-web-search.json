@@ -11,21 +11,72 @@
     "top_p": 0.9,
     "tool_choice": "auto",
     "tools": [
-      {"type": "function", "name": "shell", "parameters": {"type": "object"}},
-      {"type": "namespace", "name": "mcp__cua", "tools": []},
-      {"type": "web_search"}
+      {
+        "type": "function",
+        "name": "shell",
+        "parameters": {
+          "type": "object"
+        }
+      },
+      {
+        "type": "namespace",
+        "name": "mcp__cua",
+        "tools": []
+      },
+      {
+        "type": "web_search"
+      }
     ],
     "input": [
-      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
-      {"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"},
-      {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "继续"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "shell",
+        "arguments": "{}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "ok"
+      }
     ]
   },
   "expect": {
-    "lengths": {"/tools": 1},
-    "paths": {"/tools/0/type": "function", "/input/1/type": "message", "/input/2/type": "message", "/tool_choice": "auto"},
-    "absent_paths": ["/temperature", "/top_p"],
-    "forbidden_substrings": ["namespace", "web_search", "function_call"],
-    "changes_include": ["namespace_tools", "function_call_history", "sampling_temperature", "sampling_top_p"]
+    "lengths": {
+      "/tools": 1,
+      "/input": 1
+    },
+    "paths": {
+      "/tools/0/type": "function",
+      "/input/0/type": "message",
+      "/input/0/role": "user"
+    },
+    "absent_paths": [
+      "/input/1",
+      "/temperature",
+      "/top_p"
+    ],
+    "forbidden_substrings": [
+      "namespace",
+      "web_search",
+      "function_call",
+      "Earlier the assistant"
+    ],
+    "changes_include": [
+      "namespace_tools",
+      "function_call_history",
+      "sampling_temperature",
+      "sampling_top_p"
+    ]
   }
 }

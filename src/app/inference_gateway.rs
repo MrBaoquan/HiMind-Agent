@@ -837,6 +837,10 @@ fn response_tool_output_media_fallback(body: &[u8]) -> Option<Vec<u8>> {
 /// 有些声称为 Responses 兼容的上游（例如 VectorTide）不接受
 /// `function_call` / `function_call_output` 作为输入项。工具定义本身可以保留，
 /// 只要把历史轨迹改成普通 assistant/user 消息即可继续对话。
+///
+/// 两条轨迹都以 user 身份转述，并使用与兼容层相同的 `TOOL_HISTORY_PREFIX`：
+/// 降级文本一旦写成 assistant 口吻（`[历史工具调用] ...`），模型会把它当成自己
+/// 说过的话继续续写，客户端再把这段续写当成最终答复，工具就永远不执行。
 fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let input = value.get_mut("input")?.as_array_mut()?;
@@ -853,10 +857,13 @@ fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
                     .unwrap_or_default();
                 downgraded.push(json!({
                     "type": "message",
-                    "role": "assistant",
+                    "role": "user",
                     "content": [{
-                        "type": "output_text",
-                        "text": format!("[历史工具调用] {name} {arguments}")
+                        "type": "input_text",
+                        "text": format!(
+                            "{}the {name} tool was invoked with arguments {arguments}",
+                            crate::app::ai_compatibility::TOOL_HISTORY_PREFIX
+                        )
                     }]
                 }));
             }
@@ -876,7 +883,10 @@ fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
                     "role": "user",
                     "content": [{
                         "type": "input_text",
-                        "text": format!("[历史工具结果] {output}")
+                        "text": format!(
+                            "{}the tool call returned: {output}",
+                            crate::app::ai_compatibility::TOOL_HISTORY_PREFIX
+                        )
                     }]
                 }));
             }
@@ -3045,6 +3055,22 @@ fn write_json_error(
 mod tests {
     use super::*;
 
+    /// 相邻同角色消息（尤其连续两条 user）会让要求角色交替的上游直接 400。
+    fn has_adjacent_same_role(value: &Value) -> bool {
+        let Some(input) = value.get("input").and_then(Value::as_array) else {
+            return false;
+        };
+        let mut previous: Option<&str> = None;
+        for item in input {
+            let role = item.get("role").and_then(Value::as_str);
+            if role.is_some() && role == previous {
+                return true;
+            }
+            previous = role;
+        }
+        false
+    }
+
     fn binding(client: &str, protocol: &str, token: &str) -> GatewayBinding {
         GatewayBinding {
             id: format!("{client}:svc"),
@@ -3629,11 +3655,17 @@ mod tests {
             .map(|item| item["type"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(types, vec!["message", "message", "message"]);
-        assert_eq!(value["input"][1]["role"], "assistant");
+        // 两条轨迹都必须以 user 身份转述：写成 assistant 口吻会让模型把它当成
+        // 自己说过的话继续续写，客户端再把这续写当成最终答复，工具永不执行。
+        assert_eq!(value["input"][1]["role"], "user");
         assert!(value["input"][1]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("read"));
+        assert!(value["input"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::app::ai_compatibility::TOOL_HISTORY_PREFIX));
         assert_eq!(value["input"][2]["role"], "user");
         assert!(value["input"][2]["content"][0]["text"]
             .as_str()
@@ -3881,6 +3913,112 @@ mod tests {
             "response={response}"
         );
     }
+    /// 能力不足的上游收到降级后的工具历史时，文本必须是模型不会照抄的形态。
+    ///
+    /// 回归背景：旧降级产物写成助手口吻的 "Earlier the assistant used the
+    /// exec_command tool"，模型读到自己历史里的这句话就把它当成正文续写，客户端
+    /// 把这段伪叙述当最终答复，工具永远不执行（codex 会话里反复出现的就是这一句）。
+    ///
+    /// 命中真实域名才能拿到 opencode_zen 之类的指纹，而测试的上游只能是 127.0.0.1，
+    /// 所以这里覆盖的是「降级发生时产物长什么样」这一半；「该上游本不该降级」由
+    /// `ai_compatibility::tests::opencode_zen_keeps_structured_tool_history` 保证。
+    #[test]
+    fn degraded_gateway_tool_history_is_not_imitable_prose() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (_, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected upstream request"),
+            };
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let input = value["input"].as_array().unwrap();
+            // 降级确实发生了（能力不足的上游拿不到结构化历史）……
+            assert!(
+                input.iter().all(|item| item["type"] == "message"),
+                "expected degraded history: {value}"
+            );
+            // ……但产物必须是第三方转述，不能是助手口吻，也不能伪装成工具调用语法，
+            // 否则模型会照着续写，客户端把续写当成最终答复。
+            let encoded = String::from_utf8_lossy(&body);
+            for banned in ["Earlier the assistant", "[工具调用", "[历史工具调用"] {
+                assert!(
+                    !encoded.contains(banned),
+                    "imitable transcript leaked upstream ({banned}): {encoded}"
+                );
+            }
+            assert!(
+                encoded.contains(crate::app::ai_compatibility::TOOL_HISTORY_PREFIX.trim_end()),
+                "transcript should be attributed as a record: {encoded}"
+            );
+            // 相邻 user 消息会让要求角色交替的上游 400，轨迹必须合并成一条。
+            let user_runs = input.iter().filter(|item| item["role"] == "user").count();
+            assert!(
+                user_runs >= 1 && !has_adjacent_same_role(&value),
+                "degraded turns must not produce adjacent user messages: {value}"
+            );
+            let accepted = br#"{"id":"resp-test","usage":{"input_tokens":3,"output_tokens":1}}"#;
+            let accepted_head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                accepted.len()
+            );
+            stream.write_all(accepted_head.as_bytes()).unwrap();
+            stream.write_all(accepted).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "opencode-zen-structured-history-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "codex:profile:opencode-go/deepseek-v4.1-flash".to_string(),
+                client: "codex".to_string(),
+                service: "custom:opencode-go".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "openai-responses".to_string(),
+                exposed_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                models: vec!["opencode-go/deepseek-v4.1-flash".to_string()],
+                default_model: "deepseek-v4.1-flash".to_string(),
+                upstream_model: "deepseek-v4.1-flash".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                // 真实上游的 Zen 路径前缀，用于命中 opencode_zen_responses 指纹。
+                base_url: format!("http://{upstream_address}/zen/go/v1"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "/home/user"}
+            ],
+            "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+    }
+
     #[test]
     fn responses_request_through_gateway_offloads_large_images_before_upstream() {
         use base64::Engine as _;
