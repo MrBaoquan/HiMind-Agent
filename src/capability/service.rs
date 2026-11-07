@@ -252,6 +252,8 @@ enum CapabilityHandler {
     MediaImageGenerateLocal,
     MediaImageEditLocal,
     MediaVideoGenerateLocal,
+    MediaProviderCatalogLocal,
+    MediaAudioVoiceListLocal,
     MediaAudioSpeechLocal,
     MediaAudioTranscribeLocal,
     MediaAIDescribe,
@@ -497,6 +499,7 @@ impl CapabilityGateway {
                     "description": capability.description,
                     "version": capability.version,
                     "source": capability.source,
+                    "sourceKind": capability.source_kind(),
                     "contractSource": capability.contract_source,
                     "contractGeneration": capability.contract_generation,
                     "availability": capability.availability,
@@ -551,6 +554,7 @@ impl CapabilityGateway {
             "description": capability.description,
             "version": capability.version,
             "source": capability.source,
+            "sourceKind": capability.source_kind(),
             "contractSource": capability.contract_source,
             "contractGeneration": capability.contract_generation,
             "availability": capability.availability,
@@ -3142,6 +3146,27 @@ impl CapabilityGateway {
             local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，未连接时同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
             local_media_registration("media.image.edit", "编辑图片（本机）", "用本机配置的图片模型按参考图改图（图生图）：参考图可以是工作区内的图片路径或上一轮生成结果的 media:<id>；结果落盘并登记 media_id，便于继续多轮修改。不依赖 AI 工作台。", "local_write", media_image_edit_local_schema(), CapabilityHandler::MediaImageEditLocal),
             local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", media_video_generate_local_schema(), CapabilityHandler::MediaVideoGenerateLocal),
+            local_media_registration("media.provider.catalog", "媒体 Provider 目录", "列出本机 AI 服务、媒体适配器、能力绑定、路由和默认服务；供领域插件按声明式能力依赖读取 Provider 元数据。", "read_only", json!({"type":"object","properties":{},"required":[],"additionalProperties":false}), CapabilityHandler::MediaProviderCatalogLocal),
+            local_media_registration(
+                "media.audio.voice.list",
+                "列出语音音色（本机）",
+                "读取本机语音 Provider 的声音模型目录；当前支持 Fish Audio 的模型列表、语言、标签、样本与可见性元数据。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string", "maxLength": 80, "description": "服务源：custom:<id>；留空使用 audio.speech 默认服务"},
+                        "query": {"type": "string", "maxLength": 200},
+                        "language": {"type": "string", "maxLength": 32},
+                        "tag": {"type": "string", "maxLength": 64},
+                        "self_only": {"type": "boolean", "description": "仅列当前工作区自有声音，默认 true"},
+                        "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                        "page_number": {"type": "integer", "minimum": 1, "default": 1}
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MediaAudioVoiceListLocal,
+            ),
             local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", media_audio_speech_local_schema(), CapabilityHandler::MediaAudioSpeechLocal),
             local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", media_audio_transcribe_local_schema(), CapabilityHandler::MediaAudioTranscribeLocal),
             local_media_registration("media.ai.describe", "描述图片内容", "使用已接入的多模态模型分析一张本地图片，返回标签、描述与画面质量；用于素材打标、精选评分与 OCR 兜底。", "local_action", media_ai_describe_schema(), CapabilityHandler::MediaAIDescribe),
@@ -3184,6 +3209,7 @@ impl CapabilityGateway {
                         &mut registry,
                         &plugin.id,
                         &plugin.version,
+                        &plugin.package_role,
                         availability,
                         capability,
                         &mut conflicts,
@@ -3528,8 +3554,10 @@ impl CapabilityGateway {
             context.session_id_hash.as_str(),
             context.request_id.as_str(),
         );
+        let audit_risk_level =
+            policy::effective_risk_level(capability_id, &registration.descriptor.risk_level);
         let agent_core_recording = if context.record_agent_core_run
-            && should_record_agent_core_run(capability_id)
+            && should_record_agent_core_run(capability_id, audit_risk_level, context.source)
         {
             match crate::agent_core_service::AgentCoreRunRecorder::open_default() {
                 Ok(recorder) => {
@@ -4648,6 +4676,12 @@ impl CapabilityGateway {
                     &input,
                 )
             }
+            CapabilityHandler::MediaProviderCatalogLocal => {
+                crate::store::ai_services::media_provider_catalog()
+            }
+            CapabilityHandler::MediaAudioVoiceListLocal => {
+                crate::app::local_speech::voice_list(&input)
+            }
             CapabilityHandler::MediaAudioSpeechLocal => {
                 crate::app::ai_capability_bus::execute_media(
                     crate::store::ai_services::CAP_AUDIO_SPEECH,
@@ -4671,10 +4705,13 @@ impl CapabilityGateway {
             CapabilityHandler::MediaJobCancelLocal => crate::app::local_video::job_cancel(&input),
             CapabilityHandler::PluginCapability(id) => {
                 validate_mcp_capability_workspace(context, &id, &input)?;
+                let (_capability_broker, capability_env) =
+                    self.capability_broker_env(context, &id)?;
                 let output = invoke_plugin_capability(
                     &id,
                     input.clone(),
                     self.trusted_dashboard_url().as_deref(),
+                    &capability_env,
                 )?;
                 finalize_plugin_capability(context, &id, &input, output)
             }
@@ -5939,13 +5976,98 @@ impl CapabilityGateway {
         }
         let params = input.get("input").cloned().unwrap_or_else(|| json!({}));
         validate_mcp_capability_workspace(context, capability_id, &params)?;
+        let (_capability_broker, capability_env) =
+            self.capability_broker_env(context, capability_id)?;
         let output = invoke_plugin_capability_for_plugin(
             &plugin.id,
             capability_id,
             params.clone(),
             self.trusted_dashboard_url().as_deref(),
+            &capability_env,
         )?;
         finalize_plugin_capability(context, capability_id, &params, output)
+    }
+
+    fn capability_broker_env(
+        &self,
+        context: &InvocationContext,
+        capability_id: &str,
+    ) -> Result<
+        (
+            Option<crate::capability::capability_broker::CapabilityBrokerSession>,
+            Vec<(String, String)>,
+        ),
+        Box<dyn Error>,
+    > {
+        let Some(plugin) = scan_plugins()?.into_iter().find(|plugin| {
+            plugin.enabled
+                && plugin
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.id == capability_id)
+        }) else {
+            return Ok((None, Vec::new()));
+        };
+        if plugin.capability_dependencies.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+
+        let plugin_id = plugin.id.clone();
+        let parent_capability = capability_id.to_string();
+        let parent_context = context.clone();
+        let gateway = self.clone();
+        let dispatch: crate::capability::capability_broker::Dispatcher =
+            Arc::new(move |child_capability, child_input| {
+                let mut child_context = parent_context.clone();
+                child_context.source = crate::capability::types::InvocationSource::Plugin;
+                child_context.transport = crate::capability::types::InvocationTransport::Internal;
+                child_context.principal = format!("plugin:{plugin_id}");
+                child_context.delegated_user_id.clear();
+                child_context.ai_client_id.clear();
+                child_context.session_id_hash.clear();
+                child_context.request_id = format!(
+                    "{}:{}:{}",
+                    parent_context.request_id, parent_capability, child_capability
+                );
+                child_context.record_agent_core_run = false;
+                child_context.capability_chain = parent_context.capability_chain.clone();
+                child_context
+                    .capability_chain
+                    .push(parent_capability.clone());
+                child_context
+                    .capability_chain
+                    .push(child_capability.to_string());
+                gateway
+                    .invoke(&child_context, child_capability, child_input)
+                    .map_err(|error| error.to_string())
+            });
+
+        let mut chain = context.capability_chain.clone();
+        chain.push(capability_id.to_string());
+        let session = crate::capability::capability_broker::CapabilityBrokerSession::start(
+            &plugin.id,
+            capability_id,
+            &plugin.capability_dependencies,
+            chain,
+            Duration::from_secs(600),
+            dispatch,
+        )?;
+        let env = session
+            .as_ref()
+            .map(|session| {
+                vec![
+                    (
+                        crate::capability::capability_broker::BROKER_URL_ENV.to_string(),
+                        session.url.clone(),
+                    ),
+                    (
+                        crate::capability::capability_broker::BROKER_TOKEN_ENV.to_string(),
+                        session.token.clone(),
+                    ),
+                ]
+            })
+            .unwrap_or_default();
+        Ok((session, env))
     }
 
     fn trusted_dashboard_url(&self) -> Option<String> {
@@ -6704,7 +6826,25 @@ fn extension_review_identity(input: &Value) -> Result<(String, String), Box<dyn 
     Ok((kind, id))
 }
 
-fn should_record_agent_core_run(capability_id: &str) -> bool {
+fn should_record_agent_core_run(
+    capability_id: &str,
+    risk_level: &str,
+    source: crate::capability::types::InvocationSource,
+) -> bool {
+    // The canvas polls many read-only capabilities while rendering. Recording
+    // every poll creates a write-heavy audit stream that contends with the
+    // actual work and eventually fills the local ledger. Keep audits for MCP,
+    // CLI, workflows, schedulers, and all mutating calls; omit only local UI
+    // reads.
+    if policy::risk_rank(risk_level) <= policy::risk_rank("R1")
+        && matches!(
+            source,
+            crate::capability::types::InvocationSource::LocalHttp
+                | crate::capability::types::InvocationSource::Tauri
+        )
+    {
+        return false;
+    }
     !matches!(
         capability_id,
         "system.health"
@@ -8736,11 +8876,17 @@ fn register_plugin_capability(
     registry: &mut BTreeMap<String, CapabilityRegistration>,
     plugin_id: &str,
     plugin_version: &str,
+    package_role: &str,
     availability: CapabilityAvailability,
     capability: &crate::capability::plugin::PluginCapabilityManifest,
     conflicts: &mut Vec<String>,
 ) {
     let capability_id = capability.id.clone();
+    let source_prefix = if package_role == "application" {
+        "app"
+    } else {
+        "plugin"
+    };
     let mut registration = CapabilityRegistration {
         descriptor: CapabilityDescriptor {
             id: capability_id.clone(),
@@ -8748,7 +8894,7 @@ fn register_plugin_capability(
             name: capability.description.clone(),
             description: capability.description.clone(),
             risk_level: capability.risk_level.clone(),
-            source: format!("plugin:{plugin_id}"),
+            source: format!("{source_prefix}:{plugin_id}"),
             contract_source: format!("plugin:{plugin_id}:manifest"),
             contract_generation: None,
             availability,
@@ -8876,6 +9022,40 @@ mod tests {
     use crate::capability::types::{InvocationSource, InvocationTransport};
 
     #[test]
+    fn local_ui_reads_skip_agent_core_audit_but_important_sources_keep_it() {
+        assert!(!should_record_agent_core_run(
+            "media.workbench.asset.read",
+            "R1",
+            InvocationSource::LocalHttp,
+        ));
+        assert!(!should_record_agent_core_run(
+            "media.workbench.asset.read",
+            "R1",
+            InvocationSource::Tauri,
+        ));
+        assert!(should_record_agent_core_run(
+            "media.workbench.asset.read",
+            "R1",
+            InvocationSource::Mcp,
+        ));
+        assert!(should_record_agent_core_run(
+            "media.workbench.asset.read",
+            "R1",
+            InvocationSource::Workflow,
+        ));
+        assert!(should_record_agent_core_run(
+            "media.workbench.candidate.promote",
+            "local_write",
+            InvocationSource::LocalHttp,
+        ));
+        assert!(!should_record_agent_core_run(
+            "system.health",
+            "R1",
+            InvocationSource::Mcp,
+        ));
+    }
+
+    #[test]
     fn svn_admin_capabilities_are_worker_only() {
         assert!(is_svn_admin_capability("svn.project.repository.create"));
         assert!(is_svn_admin_capability("svn.user.provision"));
@@ -8964,6 +9144,7 @@ mod tests {
             &mut registry,
             "com.himind.work-log",
             "1.0.0",
+            "extension",
             CapabilityAvailability::Local,
             &capability,
             &mut conflicts,
@@ -8976,6 +9157,7 @@ mod tests {
             &mut registry,
             "com.himind.work-log-copy",
             "1.0.0",
+            "extension",
             CapabilityAvailability::Local,
             &capability,
             &mut conflicts,
@@ -8994,12 +9176,42 @@ mod tests {
             &mut registry,
             "com.himind.work-log-copy",
             "1.0.0",
+            "extension",
             CapabilityAvailability::Local,
             &other,
             &mut conflicts,
         );
         assert!(registry.contains_key("work-log.entry.upsert"));
         assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    }
+
+    #[test]
+    fn application_package_capabilities_use_app_source() {
+        let mut registry = BTreeMap::new();
+        let mut conflicts = Vec::new();
+        let capability: crate::capability::plugin::PluginCapabilityManifest =
+            serde_json::from_value(json!({
+                "id": "media.workbench.canvas.plan",
+                "description": "Plan a canvas action"
+            }))
+            .unwrap();
+
+        register_plugin_capability(
+            &mut registry,
+            "com.himind.media-workbench",
+            "1.0.0",
+            "application",
+            CapabilityAvailability::Local,
+            &capability,
+            &mut conflicts,
+        );
+
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        let item = registry.get("media.workbench.canvas.plan").unwrap();
+        assert_eq!(item.descriptor.source, "app:com.himind.media-workbench");
+        assert_eq!(item.descriptor.source_kind(), "app");
+        assert_eq!(item.descriptor.discovery_group(), "app");
+        assert_eq!(item.descriptor.discovery_surface(), "application");
     }
 
     #[test]

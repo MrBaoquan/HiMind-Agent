@@ -317,6 +317,10 @@ pub(crate) struct PluginManifest {
     pub categories: Vec<String>,
     #[serde(default = "default_plugin_governance")]
     pub governance: String,
+    /// Package role. Applications ship their capabilities with the app; only
+    /// independently distributed packages are extensions.
+    #[serde(default = "default_package_role")]
+    pub package_role: String,
     /// 能力命名空间（ADR 0119）：留空时取插件 ID 的可读 slug（`com.himind.work-log` → `work-log`）。
     #[serde(default)]
     pub capability_namespace: String,
@@ -332,6 +336,11 @@ pub(crate) struct PluginManifest {
     pub credentials: Vec<PluginCredentialRequest>,
     #[serde(default)]
     pub plugin_dependencies: Vec<PluginDependencyManifest>,
+    /// Registered capabilities this plugin backend may call through the
+    /// per-invocation capability broker. Installation dependencies are declared
+    /// separately in `plugin_dependencies`.
+    #[serde(default)]
+    pub capability_dependencies: Vec<String>,
     #[serde(default)]
     pub contributes: PluginContributions,
 }
@@ -395,6 +404,8 @@ pub(crate) struct PluginRegistryItem {
     pub runtime: String,
     pub min_agent_version: String,
     pub governance: String,
+    #[serde(default = "default_package_role")]
+    pub package_role: String,
     #[serde(default)]
     pub availability: String,
     #[serde(default)]
@@ -421,6 +432,7 @@ pub(crate) struct PluginRegistryItem {
     pub credentials: Vec<PluginCredentialRequest>,
     pub permissions: Vec<String>,
     pub plugin_dependencies: Vec<PluginDependencyManifest>,
+    pub capability_dependencies: Vec<String>,
     pub views: Vec<PluginViewContribution>,
     pub commands: Vec<PluginCommandContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1123,6 +1135,7 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 runtime: manifest.runtime.clone(),
                 min_agent_version: manifest.min_agent_version.clone(),
                 governance: manifest.governance.clone(),
+                package_role: manifest.package_role.clone(),
                 availability: "local".to_string(),
                 source: "candidate".to_string(),
                 status: "installed".to_string(),
@@ -1141,6 +1154,7 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 credentials: manifest.credentials.clone(),
                 permissions: manifest.permissions.clone(),
                 plugin_dependencies: manifest.plugin_dependencies.clone(),
+                capability_dependencies: manifest.capability_dependencies.clone(),
                 views: manifest.contributes.views.clone(),
                 commands: manifest.contributes.commands.clone(),
                 error: None,
@@ -1385,6 +1399,7 @@ fn builtin_plugin(
         runtime: "builtin".to_string(),
         min_agent_version: crate::VERSION.to_string(),
         governance: "required".to_string(),
+        package_role: "application".to_string(),
         availability: availability.to_string(),
         source: "builtin".to_string(),
         status: "installed".to_string(),
@@ -1415,6 +1430,7 @@ fn builtin_plugin(
             .map(|value| (*value).to_string())
             .collect(),
         plugin_dependencies: Vec::new(),
+        capability_dependencies: Vec::new(),
         views: Vec::new(),
         commands: Vec::new(),
         error: None,
@@ -1580,6 +1596,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 runtime: manifest.runtime,
                 min_agent_version: manifest.min_agent_version,
                 governance,
+                package_role: manifest.package_role.clone(),
                 availability,
                 source,
                 kind: "plugin".to_string(),
@@ -1607,6 +1624,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 credentials: manifest.credentials,
                 permissions: manifest.permissions,
                 plugin_dependencies: manifest.plugin_dependencies,
+                capability_dependencies: manifest.capability_dependencies,
                 views: manifest.contributes.views,
                 commands: manifest.contributes.commands,
                 error: validation
@@ -1628,6 +1646,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             runtime: String::new(),
             min_agent_version: String::new(),
             governance: "optional".to_string(),
+            package_role: default_package_role(),
             availability: "local".to_string(),
             source: "local".to_string(),
             status: "failed".to_string(),
@@ -1646,6 +1665,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
+            capability_dependencies: Vec::new(),
             views: Vec::new(),
             commands: Vec::new(),
             error: Some(error.to_string()),
@@ -1804,6 +1824,7 @@ pub(crate) fn invoke_plugin_capability(
     capability_id: &str,
     input: Value,
     trusted_dashboard_url: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> Result<Value, Box<dyn Error>> {
     let plugin = scan_plugins()?
         .into_iter()
@@ -1817,7 +1838,13 @@ pub(crate) fn invoke_plugin_capability(
         })
         .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
 
-    invoke_plugin_capability_for_item(&plugin, capability_id, input, trusted_dashboard_url)
+    invoke_plugin_capability_for_item(
+        &plugin,
+        capability_id,
+        input,
+        trusted_dashboard_url,
+        extra_env,
+    )
 }
 
 /// 候选包的运行时契约探针：只验证「能启动、能读一行 JSON、能写一行 JSON」，
@@ -1843,6 +1870,7 @@ pub(crate) fn probe_plugin_transport(plugin_id: &str) -> Result<Value, Box<dyn E
         "__himind.contract.probe",
         json!({}),
         None,
+        &[],
         Duration::from_secs(30),
     );
     let latency_ms = started.elapsed().as_millis();
@@ -1878,12 +1906,19 @@ pub(crate) fn invoke_plugin_capability_for_plugin(
     capability_id: &str,
     input: Value,
     trusted_dashboard_url: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> Result<Value, Box<dyn Error>> {
     let plugin = scan_plugins()?
         .into_iter()
         .find(|item| item.id == plugin_id && item.enabled)
         .ok_or_else(|| format!("plugin not found or unavailable: {plugin_id}"))?;
-    invoke_plugin_capability_for_item(&plugin, capability_id, input, trusted_dashboard_url)
+    invoke_plugin_capability_for_item(
+        &plugin,
+        capability_id,
+        input,
+        trusted_dashboard_url,
+        extra_env,
+    )
 }
 
 fn invoke_plugin_capability_for_item(
@@ -1891,6 +1926,7 @@ fn invoke_plugin_capability_for_item(
     capability_id: &str,
     input: Value,
     trusted_dashboard_url: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> Result<Value, Box<dyn Error>> {
     let capability = plugin
         .capabilities
@@ -1912,6 +1948,7 @@ fn invoke_plugin_capability_for_item(
         capability_id,
         input,
         trusted_dashboard_url,
+        extra_env,
         timeout,
     );
     let health_root = plugin_health_root(
@@ -1960,6 +1997,7 @@ fn invoke_plugin_process(
     capability_id: &str,
     input: Value,
     trusted_dashboard_url: Option<&str>,
+    extra_env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Value, Box<dyn Error>> {
     if plugin.status != "installed" {
@@ -1990,6 +2028,9 @@ fn invoke_plugin_process(
         .env_remove("HIMIND_API_BASE")
         .env_remove(crate::capability::credential_broker::BROKER_URL_ENV)
         .env_remove(crate::capability::credential_broker::BROKER_TOKEN_ENV);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     if let Some(broker) = broker_session.as_ref() {
         command
             .env(
@@ -2390,6 +2431,16 @@ pub(crate) fn validate_manifest_contributions(
             return Err(format!("plugin view entry must be an HTML file: {}", view.entry).into());
         }
     }
+    if manifest.capability_dependencies.len() > 32 {
+        return Err("plugin may declare at most 32 capability dependencies".into());
+    }
+    let mut capability_dependencies = std::collections::HashSet::new();
+    for pattern in &manifest.capability_dependencies {
+        validate_external_capability_pattern(pattern)?;
+        if !capability_dependencies.insert(pattern.as_str()) {
+            return Err(format!("duplicate capability dependency: {pattern}").into());
+        }
+    }
     for view in &manifest.contributes.views {
         let mut external = std::collections::HashSet::new();
         for pattern in &view.external_capabilities {
@@ -2584,6 +2635,12 @@ fn next_request_id() -> String {
 
 pub(crate) fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, serde_json::Error> {
     let manifest: PluginManifest = serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+    if !matches!(manifest.package_role.as_str(), "application" | "extension") {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin package_role must be application or extension",
+        )));
+    }
     if !manifest.icon.trim().is_empty()
         && crate::app::extension_icons::validate_icon_reference(&manifest.icon).is_err()
     {
@@ -2634,6 +2691,10 @@ fn default_plugin_governance() -> String {
     "optional".to_string()
 }
 
+fn default_package_role() -> String {
+    "extension".to_string()
+}
+
 fn default_plugin_author() -> String {
     "未知作者".to_string()
 }
@@ -2649,6 +2710,34 @@ fn default_view_icon() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_role_defaults_to_extension_and_accepts_application() {
+        let base = r#"{
+            "id":"com.test.role","name":"Role","version":"1.0.0",
+            "runtime":"process-jsonrpc-stdio","entry":"plugin.exe"
+        }"#;
+        let manifest = parse_plugin_manifest(base).unwrap();
+        assert_eq!(manifest.package_role, "extension");
+
+        let application = base.replace(
+            r#""runtime":"process-jsonrpc-stdio""#,
+            r#""runtime":"process-jsonrpc-stdio","package_role":"application""#,
+        );
+        let manifest = parse_plugin_manifest(&application).unwrap();
+        assert_eq!(manifest.package_role, "application");
+    }
+
+    #[test]
+    fn package_role_rejects_unknown_values() {
+        let invalid = r#"{
+            "id":"com.test.role","name":"Role","version":"1.0.0",
+            "runtime":"process-jsonrpc-stdio","entry":"plugin.exe",
+            "package_role":"media"
+        }"#;
+        let error = parse_plugin_manifest(invalid).unwrap_err();
+        assert!(error.to_string().contains("package_role"));
+    }
 
     #[test]
     fn authoring_capabilities_get_the_build_ceiling_not_the_plugin_default() {
@@ -3429,11 +3518,13 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            package_role: default_package_role(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
+            capability_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
@@ -3474,11 +3565,13 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            package_role: default_package_role(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
+            capability_dependencies: Vec::new(),
             contributes: PluginContributions::default(),
         };
         assert!(validate_manifest_contributions(&root, &manifest).is_ok());
@@ -3521,11 +3614,13 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            package_role: default_package_role(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
+            capability_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
@@ -3569,11 +3664,13 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            package_role: default_package_role(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
+            capability_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
@@ -3904,7 +4001,7 @@ fn valid_capability_segment(segment: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
-fn validate_external_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_external_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error>> {
     let value = pattern.trim();
     if value.is_empty() {
         return Err("external capability pattern is empty".into());

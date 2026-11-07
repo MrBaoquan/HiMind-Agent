@@ -842,7 +842,7 @@ export function AiProvidersPanel({
                     <label className="field-label ai-service-field ai-service-field-wide"><span>第二 Base URL</span><input value={draft.secondary_base_url} onChange={(event) => setDraft((current) => ({ ...current, secondary_base_url: event.target.value }))} placeholder="https://api.example.com/anthropic" /></label>
                     <label className="field-label ai-service-field"><span>第二接口类型</span><select value={draft.secondary_protocol} onChange={(event) => setDraft((current) => ({ ...current, secondary_protocol: event.target.value as AIServiceProtocol | '' }))}><option value="">不配置</option>{secondaryProtocolOptions(draft.protocol).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                   </div>
-                  <small className="ai-service-hint">同一账号若另有另一套线协议的地址，填在这里即可让 Codex 与 Claude Desktop 共用一条服务；留空表示只有主端点。</small>
+                  <small className="ai-service-hint">同一账号的另一种协议地址；留空时只使用主端点。</small>
                 </div>
               </> : null}
 

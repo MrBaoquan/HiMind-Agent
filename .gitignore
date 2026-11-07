@@ -40,3 +40,7 @@
 /dist/
 /resources/runtime/*.zip
 /resources/runtime/*.signature.json
+
+# 本机 e2e 验收产物（WebView2 用户目录、启动日志、实例状态）。
+# 每份 WebView2 目录近百 MB，只服务本机界面验收，不能进版本库。
+/.himind/

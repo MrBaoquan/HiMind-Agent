@@ -199,7 +199,11 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
         .iter()
         .flat_map(|snapshot| snapshot.workspaces.iter().cloned())
         .collect();
-    let ((), mut records) = with_registry_mut(|records| {
+    // Project listing is a read path. Its reconciliation is useful, but a
+    // transient failure to persist that reconciliation must not turn a usable
+    // registry into an empty/error page. Write commands still use the strict
+    // variant below and fail when they cannot guarantee persistence.
+    let ((), mut records, registry_warning) = with_registry_mut_best_effort(|records| {
         let mut changed = migrate_legacy_projects(records, &workspaces);
         changed |= merge_shared_workspace_projects(records);
         changed |= rebind_extension_source_workspaces(records, &workspaces);
@@ -226,6 +230,9 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
         }
         Ok(((), changed))
     })?;
+    if let Some(warning) = registry_warning {
+        crate::app::crash::record_event("warn", &warning);
+    }
 
     let settings = crate::app::extension_source::settings().unwrap_or_default();
     for record in &mut records {
@@ -260,21 +267,40 @@ fn workspace_matches(left: &Path, right: &Path) -> bool {
 /// The source directory is shared, while this registry (and all drafts/candidates)
 /// remains profile-local. Existing manually registered projects are preserved.
 fn merge_shared_workspace_projects(records: &mut Vec<ProjectRecord>) -> bool {
+    let discovered_items = crate::extension_workspace::discover();
+    merge_discovered_projects(records, discovered_items)
+}
+
+fn merge_discovered_projects(
+    records: &mut Vec<ProjectRecord>,
+    discovered_items: Vec<crate::extension_workspace::DiscoveredExtension>,
+) -> bool {
     let mut changed = false;
-    if !crate::extension_workspace::settings().valid {
+    // 没有任何有效工作区时保留现有登记，避免一次暂时不可用的目录把项目列表清空。
+    if discovered_items.is_empty() {
         return false;
     }
-    let discovered_items = crate::extension_workspace::discover();
-    // 扩展身份而不是登记 id：同名扩展在多个工作区登记时，第二条的 id 会带
-    // `@<工作区摘要>` 后缀，拿 id 去比对会把共享清单里的登记误判成"清单已经不要了"，
-    // 于是在每次刷新里删掉又加回来。
-    let discovered_ids: std::collections::HashSet<String> = discovered_items
+    for record in records.iter_mut() {
+        if record.workspace_key.is_empty() {
+            record.workspace_key = workspace_key_of(&record.workspace_path);
+            changed = true;
+        }
+    }
+    // 以「扩展身份 + 项目路径」校准自动发现的项目。只用扩展身份会让多个工作区
+    // 里的同名扩展互相覆盖；只用路径则无法在 catalog 删项后正确清理。
+    let discovered_keys: std::collections::HashSet<(String, String)> = discovered_items
         .iter()
-        .map(|item| format!("{}:{}", item.kind, item.id))
+        .map(|item| {
+            (
+                format!("{}:{}", item.kind, item.id),
+                workspace_key_of(&item.path),
+            )
+        })
         .collect();
     let before = records.len();
     records.retain(|record| {
-        record.source != "git_workspace" || discovered_ids.contains(&record_identity(record))
+        record.source != "git_workspace"
+            || discovered_keys.contains(&(record_identity(record), record.workspace_key.clone()))
     });
     changed |= records.len() != before;
     for discovered in discovered_items {
@@ -289,19 +315,12 @@ fn merge_shared_workspace_projects(records: &mut Vec<ProjectRecord>) -> bool {
         candidate.source_subdirectory = discovered.source_subdirectory.clone();
         let identity = record_identity(&candidate);
         let workspace_key = candidate.workspace_key.clone();
-        // 先找同一工作区的那条登记；找不到才回落到共享清单自己名下的登记（源码目录
-        // 搬了位置时把路径同步过来）。开发者手动打开的工作区永远不会被这条覆盖，
-        // 因为它的 source 不是 git_workspace —— 同名扩展因此可以并存两条登记。
-        let index = records
-            .iter()
-            .position(|record| {
-                record_identity(record) == identity && record.workspace_key == workspace_key
-            })
-            .or_else(|| {
-                records.iter().position(|record| {
-                    record_identity(record) == identity && record.source == "git_workspace"
-                })
-            });
+        // 只匹配同一个工作区里的同一扩展。不同工作区的同名扩展必须各自保留；
+        // 源码目录搬动时 catalog 路径变化，会由 discovered_keys 先清掉旧记录，
+        // 再用新路径登记。
+        let index = records.iter().position(|record| {
+            record_identity(record) == identity && record.workspace_key == workspace_key
+        });
         let Some(existing) = index.map(|index| &mut records[index]) else {
             records.push(candidate);
             changed = true;
@@ -1259,6 +1278,7 @@ fn invoke_development_tool(capability_id: &str, input: Value) -> Result<Value, B
         capability_id,
         input,
         None,
+        &[],
     )
     .map_err(|error| friendly_tool_error(&error.to_string()).into())
 }
@@ -1769,6 +1789,48 @@ fn with_registry_mut<T>(
     with_registry_mut_at(&registry_path(), mutate)
 }
 
+/// Read paths run the same reconciliation as write paths, but persistence is
+/// best effort. The returned records already contain the in-memory result, so
+/// callers can still render a truthful registry view while the warning records
+/// that the repaired snapshot could not be saved.
+fn with_registry_mut_best_effort<T>(
+    mutate: impl FnOnce(&mut Vec<ProjectRecord>) -> Result<(T, bool), Box<dyn Error>>,
+) -> Result<(T, Vec<ProjectRecord>, Option<String>), Box<dyn Error>> {
+    let path = registry_path();
+    let lock = crate::store::atomic_file::lock(&path);
+    let mut warning = match &lock {
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "扩展项目登记表暂时无法加锁（{}），本次仅返回最近一次完整快照：{error}",
+            path.display()
+        )),
+    };
+    let mut records = read_records(&path).map_err(|error| {
+        std::io::Error::other(format!(
+            "扩展项目登记表读取失败（{}）：{error}",
+            path.display()
+        ))
+    })?;
+    let (output, changed) = mutate(&mut records).map_err(|error| {
+        std::io::Error::other(format!(
+            "扩展项目登记表校准失败（{}）：{error}",
+            path.display()
+        ))
+    })?;
+    if changed {
+        assign_record_ids(&mut records);
+        if lock.is_ok() {
+            if let Err(error) = write_records(&path, &records) {
+                warning = Some(format!(
+                    "扩展项目登记表校准结果未能持久化（{}）：{error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok((output, records, warning))
+}
+
 /// 与 `with_registry_mut` 同语义，只是把登记表文件显式传入 —— 测试要能在临时目录里
 /// 反复跑「多个工作区并发写同一份登记表」，而不是把进程级的 `HIMIND_EXTENSION_PROJECTS_FILE`
 /// 改来改去（测试并行跑，改环境变量会串到别的用例）。
@@ -2211,6 +2273,58 @@ mod tests {
     use super::*;
     use crate::app::extension_source::LocalSourceWorkspace;
 
+    #[test]
+    fn multi_workspace_merge_keeps_same_extension_in_each_workspace() {
+        let root = env::temp_dir().join(format!("himind-project-multi-workspace-{}", now_stamp()));
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        let plugin_a = workspace_a.join("plugins/shared");
+        let plugin_b = workspace_b.join("plugins/shared");
+        for plugin in [&plugin_a, &plugin_b] {
+            fs::create_dir_all(plugin).unwrap();
+            fs::write(
+                plugin.join("plugin.json"),
+                r#"{"id":"com.test.shared","name":"Shared","description":"Shared across workspaces","version":"1.0.0"}"#,
+            )
+            .unwrap();
+        }
+        let discovered_a = crate::extension_workspace::DiscoveredExtension {
+            kind: "plugin".to_string(),
+            id: "com.test.shared".to_string(),
+            path: plugin_a.canonicalize().unwrap(),
+            workspace_root: workspace_a.canonicalize().unwrap(),
+            source_repository: "owner/workspace-a".to_string(),
+            source_default_branch: "main".to_string(),
+            source_subdirectory: "plugins/shared".to_string(),
+        };
+        let discovered_b = crate::extension_workspace::DiscoveredExtension {
+            kind: "plugin".to_string(),
+            id: "com.test.shared".to_string(),
+            path: plugin_b.canonicalize().unwrap(),
+            workspace_root: workspace_b.canonicalize().unwrap(),
+            source_repository: "owner/workspace-b".to_string(),
+            source_default_branch: "main".to_string(),
+            source_subdirectory: "plugins/shared".to_string(),
+        };
+        let mut records = Vec::new();
+        assert!(merge_discovered_projects(
+            &mut records,
+            vec![discovered_a.clone(), discovered_b]
+        ));
+        assign_record_ids(&mut records);
+        assert_eq!(records.len(), 2, "不同工作区的同名扩展必须各自保留");
+        assert!(records
+            .iter()
+            .any(|record| record.id == "plugin:com.test.shared"));
+        assert!(records
+            .iter()
+            .any(|record| record.id.starts_with("plugin:com.test.shared@")));
+
+        assert!(merge_discovered_projects(&mut records, vec![discovered_a]));
+        assert_eq!(records.len(), 1, "移除一个工作区不应保留它的自动发现记录");
+        assert_eq!(records[0].workspace_path, plugin_a.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn project_view_exposes_workflow_plugin_and_skill_dependencies() {
         let root = env::temp_dir().join(format!(

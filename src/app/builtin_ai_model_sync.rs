@@ -33,6 +33,15 @@ impl BuiltinAiModelSync {
         }
     }
 
+    /// 这次会话启动时拿到的模型目录。overlay 已经把目录固定下来，进程内改不了，
+    /// 调用方用它判断目录是否已经和当前配置不一致、需要换进程。
+    pub(crate) fn launched_models(&self) -> Vec<String> {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.models.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn sync_now(&self, options: &Options) -> Result<BuiltinAiModelSyncResult, String> {
         let previous = self
             .snapshot

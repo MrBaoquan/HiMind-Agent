@@ -36,9 +36,29 @@ pub(crate) struct CapabilityDescriptor {
 }
 
 impl CapabilityDescriptor {
+    /// Domain-neutral capability ownership kind.
+    ///
+    /// `source` remains the concrete owner identity for compatibility, while
+    /// this method answers only "who owns the contract" so the Agent does not
+    /// need to understand any application's domain.
+    pub(crate) fn source_kind(&self) -> &'static str {
+        if self.source.starts_with("app:") {
+            "app"
+        } else if self.source.starts_with("plugin:") {
+            "extension"
+        } else if self.source.starts_with("mcp:") {
+            "mcp"
+        } else {
+            "core"
+        }
+    }
+
     pub(crate) fn discovery_group(&self) -> &'static str {
         if self.source.starts_with("mcp:") {
             return "integration";
+        }
+        if self.source.starts_with("app:") && !self.dashboard_provider {
+            return "app";
         }
         if self.source.starts_with("plugin:") && !self.dashboard_provider {
             return "plugin";
@@ -69,6 +89,9 @@ impl CapabilityDescriptor {
     pub(crate) fn discovery_surface(&self) -> &'static str {
         if self.source.starts_with("mcp:") {
             return "integration";
+        }
+        if self.source.starts_with("app:") && !self.dashboard_provider {
+            return "application";
         }
         if self.source.starts_with("plugin:") && !self.dashboard_provider {
             return if self.execution_mode != "sync"
@@ -135,6 +158,9 @@ pub(crate) enum InvocationSource {
     Mcp,
     Acp,
     Workflow,
+    /// A plugin backend calling another registered capability through the
+    /// per-invocation capability broker.
+    Plugin,
     /// Workflow 定时策略到点后由 Agent 自己发起的 Run。
     Scheduler,
 }
@@ -173,6 +199,7 @@ impl InvocationSource {
             Self::Mcp => "mcp",
             Self::Acp => "acp",
             Self::Workflow => "workflow",
+            Self::Plugin => "plugin",
             Self::Scheduler => "scheduler",
         }
     }
@@ -191,6 +218,9 @@ pub(crate) struct InvocationContext {
     pub session_id_hash: String,
     pub request_id: String,
     pub record_agent_core_run: bool,
+    /// Registered capabilities already traversed in this invocation chain.
+    /// The plugin capability broker uses it to reject cycles and excessive nesting.
+    pub capability_chain: Vec<String>,
 }
 
 impl InvocationContext {
@@ -203,6 +233,7 @@ impl InvocationContext {
             InvocationSource::Mcp => InvocationTransport::Stdio,
             InvocationSource::Acp => InvocationTransport::Stdio,
             InvocationSource::Workflow => InvocationTransport::Internal,
+            InvocationSource::Plugin => InvocationTransport::Internal,
             InvocationSource::Scheduler => InvocationTransport::Internal,
         };
         Self::with_transport(source, transport, principal)
@@ -234,6 +265,7 @@ impl InvocationContext {
             session_id_hash: String::new(),
             request_id: next_request_id(),
             record_agent_core_run: true,
+            capability_chain: Vec::new(),
         }
     }
 

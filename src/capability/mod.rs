@@ -1,3 +1,4 @@
+pub(crate) mod capability_broker;
 pub(crate) mod credential_broker;
 pub(crate) mod dashboard_catalog;
 pub(crate) mod execution;

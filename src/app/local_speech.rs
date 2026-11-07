@@ -341,6 +341,113 @@ impl TranscriptionRequest {
     }
 }
 
+/// `media.audio.voice.list`: list provider voice models through the same
+/// speech-provider binding. This is a read-only catalogue primitive; project
+/// voice selection and licensing remain domain state.
+pub(crate) fn voice_list(input: &Value) -> Result<Value, Box<dyn Error>> {
+    let service_id = optional_string(input, "service", 80)?.unwrap_or_default();
+    let query = optional_string(input, "query", 200)?.unwrap_or_default();
+    let language = optional_string(input, "language", 32)?.unwrap_or_default();
+    let tag = optional_string(input, "tag", 64)?.unwrap_or_default();
+    let self_only = input
+        .get("self_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let page_size = input
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let page_number = input
+        .get("page_number")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    let (service, api_key) = ai_services::resolve_media_service(CAP_AUDIO_SPEECH, &service_id)?;
+    let binding = resolve_binding(&service, CAP_AUDIO_SPEECH, None)?;
+    if binding.adapter != ADAPTER_FISH_SPEECH {
+        return Err("当前 voice.list 只支持 Fish Audio 语音适配器".into());
+    }
+    let mut client_builder = Client::builder().timeout(Duration::from_secs(60));
+    if is_loopback_url(&service.base_url) {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
+    let mut request = client
+        .get(fish_model_endpoint(&service.base_url))
+        .bearer_auth(&api_key)
+        .query(&[
+            ("page_size", page_size.to_string()),
+            ("page_number", page_number.to_string()),
+            ("self", self_only.to_string()),
+        ]);
+    if !query.is_empty() {
+        request = request.query(&[("title", query)]);
+    }
+    if !language.is_empty() {
+        request = request.query(&[("language", language)]);
+    }
+    if !tag.is_empty() {
+        request = request.query(&[("tag", tag)]);
+    }
+    let response = request.send()?;
+    let status = response.status();
+    let raw = response.text()?;
+    if !status.is_success() {
+        return Err(normalized_provider_error(Some(status.as_u16()), &raw).into());
+    }
+    let parsed: Value = serde_json::from_str(&raw)?;
+    let items = parsed
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            let id = item
+                .get("_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": id.clone(),
+                "voice_model_id": id,
+                "title": item.get("title").cloned().unwrap_or(Value::Null),
+                "description": item.get("description").cloned().unwrap_or(Value::Null),
+                "type": item.get("type").cloned().unwrap_or(Value::Null),
+                "state": item.get("state").cloned().unwrap_or(Value::Null),
+                "visibility": item.get("visibility").cloned().unwrap_or(Value::Null),
+                "languages": item.get("languages").cloned().unwrap_or_else(|| json!([])),
+                "tags": item.get("tags").cloned().unwrap_or_else(|| json!([])),
+                "cover_image": item.get("cover_image").cloned().unwrap_or(Value::Null),
+                "samples": item.get("samples").cloned().unwrap_or_else(|| json!([])),
+                "licensed": item.get("licensed").cloned().unwrap_or(Value::Null),
+                "quality": item.get("quality").cloned().unwrap_or(Value::Null),
+                "created_at": item.get("created_at").cloned().unwrap_or(Value::Null),
+                "updated_at": item.get("updated_at").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "state": "ready",
+        "capability": "audio.voice.list",
+        "provider": service.id,
+        "adapter": binding.adapter,
+        "model": binding.model,
+        "items": items,
+        "total": parsed.get("total").cloned().unwrap_or(Value::Null),
+        "has_more": parsed.get("has_more").cloned().unwrap_or(Value::Bool(false)),
+        "page_number": page_number,
+        "page_size": page_size,
+        "raw": parsed,
+    }))
+}
+
 /// `media.audio.transcribe`: one synchronous provider invocation.
 pub(crate) fn transcribe(input: &Value) -> Result<Value, Box<dyn Error>> {
     let request = TranscriptionRequest::parse(input)?;
@@ -521,6 +628,10 @@ fn is_loopback_url(base_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+}
+
+fn fish_model_endpoint(base_url: &str) -> String {
+    format!("{}/model", base_url.trim().trim_end_matches('/'))
 }
 
 fn fish_asr_endpoint(base_url: &str) -> String {
@@ -794,6 +905,87 @@ mod tests {
         let request = captured.lock().unwrap().clone();
         assert!(request.contains("multipart/form-data"));
         assert!(request.contains("whisper-test"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fish_audio_voice_list_maps_model_catalog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut buffer = [0_u8; 8192];
+            let mut request = String::new();
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => request.push_str(&String::from_utf8_lossy(&buffer[..read])),
+                    Err(_) => break,
+                }
+            }
+            *sink.lock().unwrap() = request;
+            let body = r#"{"total":1,"has_more":false,"items":[{"_id":"fish-voice-1","title":"叙事女声","description":"温暖","type":"tts","state":"trained","visibility":"private","languages":["zh"],"tags":["narration"],"licensed":true,"samples":[{"audio":"https://example.test/sample.mp3"}]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        let _guard = crate::store::paths::test_env_lock();
+        let home = temp_dir("fish-voice-list-home");
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
+        let service_id = "fish-voice-list";
+        let mut media = std::collections::BTreeMap::new();
+        media.insert(
+            CAP_AUDIO_SPEECH.to_string(),
+            ai_services::MediaModelBinding {
+                adapter: ADAPTER_FISH_SPEECH.to_string(),
+                model: "s2.1-pro-free".to_string(),
+                models: Vec::new(),
+                execution_mode: Some(MediaExecutionMode::Sync),
+            },
+        );
+        ai_services::upsert(ai_services::CustomAIServiceInput {
+            id: service_id.to_string(),
+            display_name: "Fish Voice List".to_string(),
+            base_url: format!("http://{address}"),
+            protocol: AIServiceProtocol::OpenaiResponses,
+            endpoints: Vec::new(),
+            model: "chat".to_string(),
+            models: vec!["chat".to_string()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media,
+            api_key: "sk-fish-voice-list-test".to_string(),
+        })
+        .unwrap();
+        let result = voice_list(&json!({
+            "service": format!("custom:{service_id}"),
+            "query": "叙事",
+            "self_only": true,
+            "page_size": 10,
+            "page_number": 1
+        }))
+        .expect("Fish voice list should succeed");
+        assert_eq!(result["items"][0]["voice_model_id"], "fish-voice-1");
+        assert_eq!(result["items"][0]["title"], "叙事女声");
+        let request = captured.lock().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /model?"));
+        assert!(request.contains("authorization: bearer sk-fish-voice-list-test"));
+        assert!(request.contains("title="));
+        assert!(!result.to_string().contains("sk-fish-voice-list-test"));
         let _ = fs::remove_dir_all(&home);
     }
 

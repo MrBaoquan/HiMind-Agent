@@ -29,6 +29,10 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0021](0021-user-data-location.md) | User data can move to another local disk, the program stays put | accepted | 2026-10-31 |
 | [0022](0022-mcp-discovery-liveness-is-process-scoped.md) | MCP discovery liveness is decided by the process, never by probing the pipe | accepted | 2026-11-04 |
 | [0023](0023-capability-route-selects-service-and-model.md) | 能力路由的选择单位是「服务 + 模型」 | accepted | 2026-11-05 |
+| [0024](0024-plugin-capability-dependencies.md) | Plugins call registered capabilities through declared dependencies | accepted | 2026-11-03 |
+| [0025](0025-release-binary-development-profile-acceptance.md) | Release binary acceptance runs against the development profile | accepted | 2026-11-03 |
+| [0026](0026-local-ui-read-audit-sampling.md) | Local UI reads stay out of the Agent Core run ledger | accepted | 2026-11-03 |
+| [0027](0027-application-capability-source.md) | Application capabilities use an explicit source without entering Agent Core | accepted | 2026-11-05 |
 
 ## How these relate
 
@@ -74,6 +78,8 @@ stopped at service granularity; 0023 removes that gap and accepts a hard
 migration of the persisted selection to do it. It deliberately does not touch
 0020's `GatewayModelRoute`: that record owns the model aliases exposed to
 external clients, while 0023 owns the model HiMind's own capabilities use.
+
+0024–0027 were already developed in the working tree while 0022/0023 landed upstream. They keep their original decisions but use non-conflicting ADR numbers: 0024 plugin capability dependencies, 0025 release acceptance, 0026 local UI read sampling, 0027 application capability ownership.
 
 ## Adding a record
 

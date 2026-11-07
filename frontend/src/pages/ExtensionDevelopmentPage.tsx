@@ -236,8 +236,8 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     () => models.filter(project => workspaceKeyFor(project, workspaceItems) === activeKey),
     [activeKey, models, workspaceItems],
   );
-  // 「一键构建」只覆盖源码目录还在的扩展：目录已被移走的项目没有可构建源码，
-  // 混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
+  // 「一键构建」只覆盖源码目录还在的扩展：远端协作项目、目录已被移走的项目没有
+  // 可构建的源码，混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
   const buildableProjects = useMemo(
     () => workspaceProjects.filter(project => project.local?.workspace_available),
     [workspaceProjects],
@@ -467,15 +467,15 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           <EmptyState icon={FolderPlus} title="还没有开发工作区" text="用页头的「添加工作区」挑一个本机目录，就能在里面开发扩展。" />
         </div> : !workspaceProjects.length ? <div className="development-workspace-empty">
           <EmptyState icon={Blocks} title="这个工作区还没有扩展" text="新建一个扩展，或者让 AI 直接在这个目录里开始开发。" />
-          <div className="development-workspace-empty-actions">
+          {!activeItem ? null : <div className="development-workspace-empty-actions">
             <button className="btn" disabled={busy} onClick={() => setCreateOpen(true)}><Plus size={15} />新建扩展</button>
             <button className="btn" disabled={busy} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
-          </div>
+          </div>}
         </div> : <section className={`development-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
           <aside className="development-project-list">
             <div className="development-list-heading"><strong>扩展</strong><span>{visible.length}</span></div>
             <div className="development-list-body">
-             {visible.map(project => <ProjectListItem key={project.key} project={project} activation={activationForProject(project, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} busyAction={props.busyAction} selected={project.key === selected?.key} onSelect={key => { setSelectedKey(key); setDetailOpen(true); }} />)}
+              {visible.map(project => <ProjectListItem key={project.key} project={project} activation={activationForProject(project, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} busyAction={props.busyAction} selected={project.key === selected?.key} onSelect={key => { setSelectedKey(key); setDetailOpen(true); }} />)}
               {!visible.length ? <EmptyState icon={Blocks} title="没有匹配的扩展" text="换个关键词或类型再试。" /> : null}
             </div>
           </aside>
@@ -727,6 +727,7 @@ function BuildSummary({ project, activation, dashboardEnabled, draft, active, bu
   const developmentLabel = developmentActive
     ? activation?.status === 'partial' ? '开发版已激活 · 部分目标待验证' : '开发版已激活'
     : '候选已确认 · 开发版未激活';
+  // 项目规则不进工作台审核：构建即生成并确认候选，收敛动作是发布到本机规则库。
   if (draft.kind === 'instruction') {
     const published = Boolean(draft.value.published_at);
     return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '已发布到本机规则库' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} activation={activation} published={published} />{published ? <small>可在「AI 对话 → 项目规则」里选择并同步到客户端。</small> : <button className="btn btn-primary" disabled={busy} onClick={() => void onPublishInstruction(id, version)}><Send size={15} />发布到规则库</button>}</div>;
@@ -977,8 +978,15 @@ function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remo
     if (description && !project.description) project.description = description;
     return project;
   };
-  props.remoteProjects.forEach(remote => { const kind = remote.product_type === 'agent_plugin' ? 'plugin' : remote.product_type === 'workflow_package' ? 'workflow' : remote.product_type === 'agent_expert' ? 'expert' : 'skill'; const project = ensure(kind, remote.product_key, remote.name, remote.description); project.remote = remote; project.name = remote.name; project.description = remote.description; });
   props.projects.forEach(local => { const project = ensure(local.kind, local.extension_id, local.name, local.description); project.local = local; project.name = local.name; project.description = local.description; });
+  props.remoteProjects.forEach(remote => {
+    const kind = remote.product_type === 'agent_plugin' ? 'plugin' : remote.product_type === 'workflow_package' ? 'workflow' : remote.product_type === 'agent_expert' ? 'expert' : 'skill';
+    const project = map.get(`${kind}:${remote.product_key}`);
+    if (!project?.local) return;
+    project.remote = remote;
+    project.name = remote.name;
+    project.description = remote.description;
+  });
   props.pluginDrafts.forEach(value => ensure('plugin', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'plugin', value }));
   props.skillDrafts.forEach(value => ensure('skill', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'skill', value }));
   props.workflowDrafts.forEach(value => ensure('workflow', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'workflow', value }));
@@ -991,8 +999,6 @@ function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remo
     project.drafts.sort((left, right) => compareVersions(draftVersion(right), draftVersion(left)) || right.value.updated_at.localeCompare(left.value.updated_at));
     project.submissions.sort((left, right) => right.value.updated_at.localeCompare(left.value.updated_at));
   }
-  // 开发工作区只承载本机有源码目录的项目。远端 Workbench 项目只用于给匹配上的
-  // 本地项目补充协作/审核信息，不能单独生成项目或虚拟工作区。
   return [...map.values()]
     .filter(project => Boolean(project.local))
     .sort((left, right) => projectUpdatedAt(right).localeCompare(projectUpdatedAt(left)) || left.name.localeCompare(right.name, 'zh-CN'));
@@ -1054,6 +1060,21 @@ function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: 
   return { label: '可提交', tone: 'success' };
 }
 
+function activationForProject(project: ProjectModel, activations: ExtensionActivationReceipt[]) {
+  if (!project.local) return undefined;
+  const workspace = normalizeFsPath(project.local.workspace_path);
+  return activations.find(item =>
+    item.kind === project.kind
+    && item.extension_id === project.extensionId
+    && normalizeFsPath(item.target.workspace_root) === workspace,
+  );
+}
+
+function activationMatchesDraft(activation: ExtensionActivationReceipt, draft: DraftRef) {
+  const draftSha = String(draft.value.candidate_sha256 || '').replace(/^sha256:/i, '').toLowerCase();
+  return Boolean(draftSha) && activation.candidate_sha256.toLowerCase() === draftSha;
+}
+
 function submissionStatus(submission: SubmissionRef): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
   if (submission.value.status === 'superseded') return { label: '已被替代', tone: 'neutral' };
   if (submission.value.release_status === 'revoked') return { label: '已撤回', tone: 'danger' };
@@ -1070,19 +1091,11 @@ function retryableFailure(message: string): boolean {
   return /(dial tcp|connection attempt failed|timed out|timeout|TLS handshake|connection reset|proxy\.golang\.org|502 Bad Gateway|503|504|下载失败|请稍后重试|拉取|network)/i.test(message);
 }
 
-function activationForProject(project: ProjectModel, activations: ExtensionActivationReceipt[]) {
-  if (!project.local) return undefined;
-  const workspace = normalizeFsPath(project.local.workspace_path);
-  return activations.find(item =>
-    item.kind === project.kind
-    && item.extension_id === project.extensionId
-    && normalizeFsPath(item.target.workspace_root) === workspace,
-  );
-}
-
-function activationMatchesDraft(activation: ExtensionActivationReceipt, draft: DraftRef) {
-  const draftSha = String(draft.value.candidate_sha256 || '').replace(/^sha256:/i, '').toLowerCase();
-  return Boolean(draftSha) && activation.candidate_sha256.toLowerCase() === draftSha;
+/// 候选建出来 ≠ 本机已经能用了：试运行 + 确认那一步失败时，只报「已构建」会误导。
+function draftIsActivated(draft: DraftRef | undefined): boolean {
+  if (!draft) return false;
+  if (draft.kind === 'workflow') return draft.value.state === 'confirmed' || draft.value.state === 'submitted';
+  return Boolean(draft.value.confirmed_at);
 }
 
 function draftDependencies(draft: DraftRef | undefined, available: PluginCatalogItem[]) {
@@ -1211,7 +1224,7 @@ function projectWorkspaceRoot(project: ProjectModel) {
 }
 
 /// 项目归属哪个工作区：取「目录包含这个扩展」的工作区根目录（最长匹配优先，
-/// 因为工作区可以互相嵌套）。返回空字符串表示它没有可归属的本地目录。
+/// 因为工作区可以互相嵌套）。返回空字符串表示它还没有本地目录。
 function workspaceKeyFor(project: ProjectModel, items: { key: string }[]) {
   const own = normalizeFsPath(projectWorkspaceRoot(project));
   if (!own) return '';

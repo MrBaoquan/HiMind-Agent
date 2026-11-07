@@ -1,9 +1,12 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::agent_core_contracts::{
@@ -18,17 +21,19 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// every 30 seconds, and the stale sweep also verifies that the owning process
 /// is gone before declaring the run abandoned.
 pub(crate) const RUN_LEASE_TTL_SECONDS: u64 = 900;
-const BEST_EFFORT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-// Schema creation is idempotent, but SQLite still takes a write lock for DDL
-// and migration inserts. Serialize initialization inside one Agent process so
-// concurrent readers/writers do not contend while opening the same ledger.
-static SCHEMA_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Capability audit writes are best effort, but a burst of concurrent reads can
+// legitimately keep SQLite busy longer than a quarter second. Waiting briefly
+// preserves the audit trail without delaying the capability result indefinitely.
+const BEST_EFFORT_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
+// DDL and migration inserts need a write lock. Initialize each ledger once per
+// Agent process; every later connection then skips the expensive locked path.
+static INITIALIZED_LEDGERS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalRunLedger {
     path: PathBuf,
     busy_timeout: Duration,
-    fail_fast_on_schema_lock: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,7 +86,6 @@ impl LocalRunLedger {
         Self {
             path: path.into(),
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
-            fail_fast_on_schema_lock: false,
         }
     }
 
@@ -89,7 +93,6 @@ impl LocalRunLedger {
         Self {
             path: path.into(),
             busy_timeout: BEST_EFFORT_BUSY_TIMEOUT,
-            fail_fast_on_schema_lock: true,
         }
     }
 
@@ -1143,37 +1146,28 @@ impl LocalRunLedger {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let database_exists = self.path.is_file();
         let connection = Connection::open(&self.path)?;
-        // Set the SQLite busy handler before schema initialization and before
-        // any transaction can contend with a concurrent Agent thread.
         connection.busy_timeout(self.busy_timeout)?;
-        if !database_exists {
-            // Two Agent threads can open a brand-new ledger at the same time.
-            // The first connection wins the WAL transition; the loser must
-            // continue using the already-initialized database instead of
-            // surfacing a transient SQLITE_BUSY/LOCKED error.
-            if let Err(error) = connection.execute_batch("PRAGMA journal_mode = WAL;") {
-                if !is_sqlite_busy(&error) {
-                    return Err(error.into());
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let key = self
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| self.path.clone());
+        let mut initialized = INITIALIZED_LEDGERS
+            .lock()
+            .map_err(|_| std::io::Error::other("local ledger initialization lock is poisoned"))?;
+        if !initialized.contains(&key) {
+            if !self.path.is_file() {
+                if let Err(error) = connection.execute_batch("PRAGMA journal_mode = WAL;") {
+                    if !is_sqlite_busy(&error) {
+                        return Err(error.into());
+                    }
                 }
             }
+            initialize_schema(&connection)?;
+            initialized.insert(key);
         }
-        let _schema_guard = if self.fail_fast_on_schema_lock {
-            SCHEMA_INIT_LOCK.try_lock().map_err(|error| match error {
-                std::sync::TryLockError::Poisoned(_) => {
-                    std::io::Error::other("local ledger schema lock is poisoned")
-                }
-                std::sync::TryLockError::WouldBlock => {
-                    std::io::Error::other("local ledger schema initialization is busy")
-                }
-            })?
-        } else {
-            SCHEMA_INIT_LOCK
-                .lock()
-                .map_err(|_| std::io::Error::other("local ledger schema lock is poisoned"))?
-        };
-        initialize_schema(&connection)?;
+        drop(initialized);
         Ok(connection)
     }
 }
@@ -1433,9 +1427,9 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_ledger_fails_fast_when_schema_initialization_is_busy() {
+    fn concurrent_best_effort_connections_initialize_once() {
         let root = std::env::temp_dir().join(format!(
-            "himind-local-runs-schema-busy-{}-{}",
+            "himind-local-runs-concurrent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1443,14 +1437,25 @@ mod tests {
                 .as_nanos()
         ));
         let ledger = LocalRunLedger::new_best_effort(root.join(LOCAL_RUN_DB_FILE));
-        let schema_guard = SCHEMA_INIT_LOCK.lock().unwrap();
         let started = Instant::now();
-        let result = ledger.connection();
+        let handles = (0..16)
+            .map(|_| {
+                let ledger = ledger.clone();
+                std::thread::spawn(move || {
+                    ledger
+                        .connection()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
         let elapsed = started.elapsed();
-        drop(schema_guard);
-
-        assert!(result.is_err());
-        assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
+        assert!(results.iter().all(Result::is_ok), "results={results:?}");
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
     }
 
     #[test]
@@ -1892,6 +1897,8 @@ mod tests {
         drop(connection);
 
         let connection = ledger.connection().unwrap();
+        // 模拟旧库首次升级：普通打开会跳过迁移写锁，迁移由首次初始化显式完成。
+        initialize_schema(&connection).unwrap();
         let next_sequence: i64 = connection
             .query_row(
                 "SELECT next_sequence FROM runtime_sequence_allocations WHERE run_id = 'run-1'",

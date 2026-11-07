@@ -255,6 +255,7 @@ impl AgentCoreRunRecorder {
             InvocationSource::Mcp => InteractionSource::Mcp,
             InvocationSource::Acp => InteractionSource::Acp,
             InvocationSource::Workflow => InteractionSource::Workflow,
+            InvocationSource::Plugin => InteractionSource::Workflow,
             InvocationSource::Scheduler => InteractionSource::Cron,
         };
         let transport = match context.transport {

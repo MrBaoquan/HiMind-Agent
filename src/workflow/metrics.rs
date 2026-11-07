@@ -301,7 +301,12 @@ mod tests {
             ))
             .unwrap();
         // 同一个父运行下两种子运行：重做一轮 vs 换了个角色做。
-        let mut retry = run("run-retry", "interaction-1", "run-1", LocalRunStatus::Succeeded);
+        let mut retry = run(
+            "run-retry",
+            "interaction-1",
+            "run-1",
+            LocalRunStatus::Succeeded,
+        );
         retry.parent_kind = LocalRunParentKind::Retry;
         ledger.save_run(&retry).unwrap();
         let mut delegated = run(
@@ -340,7 +345,12 @@ mod tests {
         // 不能因为加了新语义就让历史返工数忽然变成 0。
         let legacy = crate::agent_core_contracts::LocalRun {
             parent_kind: LocalRunParentKind::Unspecified,
-            ..run("run-legacy", "interaction-1", "run-1", LocalRunStatus::Failed)
+            ..run(
+                "run-legacy",
+                "interaction-1",
+                "run-1",
+                LocalRunStatus::Failed,
+            )
         };
         ledger.save_run(&legacy).unwrap();
 
