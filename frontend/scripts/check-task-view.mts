@@ -53,6 +53,10 @@ assert.equal(taskStatusTone('failed'), 'danger');
 assert.equal(taskStatusTone('canceled'), 'neutral');
 assert.equal(taskStatusTone('pending'), 'pending');
 assert.equal(taskStatusTone('running'), 'running');
+// 跳过的步骤既不是成功也不是在跑：角色链路上必须画成灰色，
+// 否则「这一步根本没执行」看起来像「正在做」。
+assert.equal(taskStatusTone('skipped'), 'neutral');
+assert.equal(taskStatusLabel('skipped'), '已跳过');
 assert.equal(taskStatusLabel('canceling'), '取消中');
 assert.equal(taskTypeLabel('agent_run'), 'AI 任务');
 assert.equal(taskTypeLabel('unknown_type'), 'unknown_type');

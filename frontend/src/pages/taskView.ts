@@ -30,13 +30,16 @@ export function taskTypeLabel(taskType: string) {
 }
 
 export function taskStatusLabel(status: string) {
-  return ({ pending: '等待中', running: '运行中', canceling: '取消中', waiting: '等待确认', completed: '已完成', failed: '失败', canceled: '已取消' } as Record<string, string>)[status] || status || '未知';
+  return ({ pending: '等待中', running: '运行中', canceling: '取消中', waiting: '等待确认', completed: '已完成', failed: '失败', canceled: '已取消', skipped: '已跳过' } as Record<string, string>)[status] || status || '未知';
 }
 
 export function taskStatusTone(status: string): TaskTone {
   if (TASK_COMPLETED_STATUSES.has(status)) return 'success';
   if (TASK_ATTENTION_STATUSES.has(status)) return status === 'failed' ? 'danger' : 'neutral';
   if (status === 'pending') return 'pending';
+  // 跳过既不是成功也不是在跑：角色链路上的节点必须是灰色，
+  // 否则「这一步根本没执行」会被画成蓝色「进行中」。
+  if (status === 'skipped') return 'neutral';
   return 'running';
 }
 
