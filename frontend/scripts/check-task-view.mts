@@ -24,6 +24,7 @@ import {
   roleChips,
   shouldShowRoleBadge,
   shouldShowRoleChain,
+  childRuns,
 } from '../src/pages/taskView.ts';
 
 // 状态集合必须互斥，否则同一个任务会被同时算进「进行中」和「需处理」。
@@ -177,5 +178,29 @@ assert.equal(shouldShowRoleChain([
   { id: 'software.analyst', status: 'completed' },
   { id: 'software.verifier', status: 'running' },
 ]), true);
+
+// 子运行明细：缺 run_id 的条目不能渲染（点了会打不开），未知 kind 保留原文案。
+assert.deepEqual(childRuns(null), []);
+assert.deepEqual(childRuns([]), []);
+assert.deepEqual(
+  childRuns([
+    { run_id: 'workflow_run_1', kind: 'delegate', role_id: 'software.verifier', status: 'running' },
+    { run_id: 'workflow_run_2', kind: 'retry', status: 'completed' },
+    { run_id: '', kind: 'delegate', status: 'running' },
+    null,
+  ]),
+  [
+    {
+      runId: 'workflow_run_1', kind: 'delegate', kindLabel: '委派',
+      roleId: 'software.verifier', roleLabel: '测试',
+      status: 'running', statusLabel: '运行中', error: '', updatedAt: '',
+    },
+    {
+      runId: 'workflow_run_2', kind: 'retry', kindLabel: '重做',
+      roleId: '', roleLabel: '',
+      status: 'completed', statusLabel: '已完成', error: '', updatedAt: '',
+    },
+  ],
+);
 
 console.log('task view checks passed');

@@ -246,6 +246,10 @@ impl WorkflowRunner {
         parent_run_id: &str,
         parent_kind: LocalRunParentKind,
     ) -> Result<LocalRun, Box<dyn Error>> {
+        // 运行期覆盖先落到包上：它只影响本次运行，且只允许收紧风险边界。
+        // 必须在 build_execution_plan 之前应用，否则计划会按未覆盖的图算出来。
+        let patched = super::apply_execution_overrides(package, input)?;
+        let package = &patched;
         package.validate().map_err(std::io::Error::other)?;
         // 无论从界面、定时计划还是命令行走进来，都先补齐启动表单声明的默认值，
         // 运行计划、上下文和步骤输入看到的是同一份输入。
@@ -563,6 +567,11 @@ impl WorkflowRunner {
         enforce_required_artifacts: bool,
         loop_context: Option<&Value>,
     ) -> Result<WorkflowRunOutcome, Box<dyn Error>> {
+        // 恢复运行也必须重放同一份覆盖：输入随 interaction 存过，恢复时后端拿不到
+        // 原始调用参数，只能以存的 input 为准。否则「我批准过的这次多一层闸门」
+        // 会在恢复后消失。
+        let patched = super::apply_execution_overrides(package, workflow_input)?;
+        let package = &patched;
         package.validate().map_err(std::io::Error::other)?;
         let merged_workflow_input = super::with_launch_defaults(package, workflow_input);
         let workflow_input = &merged_workflow_input;
@@ -2322,6 +2331,7 @@ mod tests {
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
             capabilities: vec!["test.first".to_string(), "test.second".to_string()],
+            roles: Default::default(),
             capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,

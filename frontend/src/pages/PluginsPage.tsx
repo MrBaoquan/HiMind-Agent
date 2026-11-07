@@ -269,7 +269,7 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
           用户会以为插件被降级或者装了个别的版本。 */}
       {item.development ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div>{item.overrides_installed_version
         ? <><strong>本机开发版本生效中</strong><span>已安装 v{item.overrides_installed_version}，当前运行的是本机开发版本 v{item.version || '--'}。构建、测试和移除统一在“扩展开发”中管理。</span></>
-                    : <><strong>本机开发版本</strong><span>本机未装副本，直接运行扩展开发目录里的构建产物；构建、测试和移除统一在「扩展开发」中管理。</span></>}</div></div> : null}
+                    : <><strong>本机开发版本</strong><span>未装副本，运行开发目录的构建产物；构建和测试在「扩展开发」。</span></>}</div></div> : null}
       {item.description ? <p className="plugin-product-description">{item.description}</p> : null}
        {!item.development && catalogEnabled ? <DetailTabs value={tab} onChange={setTab} /> : null}
        {!item.development && catalogEnabled && tab === 'versions' ? <PluginVersionList versions={versions.length ? versions : catalogItem ? [catalogItem] : []} currentVersion={item.version} lockedLabel={item.governance === 'blocked' ? '不可安装' : managed ? '组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={onPlanVersion} /> : <>

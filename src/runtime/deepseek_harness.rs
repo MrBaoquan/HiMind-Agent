@@ -2429,7 +2429,8 @@ pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &
     command.env("NODE_PATH", runtime_root.join("node_modules"));
     command.env("NO_PROXY", loopback_no_proxy());
     command.env("NODE_ENV", "production");
-    // Node 22 can persist V8 compile cache across host starts. Keep it outside
+    // Node 22+ (the Runtime now bundles 24) can persist V8 compile cache across
+    // host starts. Keep it outside
     // the immutable Runtime and partition it by runtime version. A cache that
     // cannot be written is non-fatal for Node, so sandboxed child processes may
     // inherit the variable without turning a denied cache write into a tool
@@ -6943,10 +6944,10 @@ mod tests {
     #[test]
     fn embedded_runtime_manifest_pins_an_exact_release() {
         let manifest = super::expected_runtime_manifest().unwrap();
-        assert_eq!(manifest.version, "0.2.1-rc.2");
+        assert_eq!(manifest.version, "0.2.2-rc.1");
         assert_eq!(
             manifest.file_name,
-            "deepseek-harness-runtime-0.2.1-rc.2-windows-x64.zip"
+            "deepseek-harness-runtime-0.2.2-rc.1-windows-x64.zip"
         );
         assert_eq!(manifest.sha256.len(), 64);
         assert!(manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -6964,7 +6965,7 @@ mod tests {
 
         let derived = json!({
             "version": expected.version.clone(),
-            "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64-install-stored.zip",
+            "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64-install-stored.zip",
             "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
             "source_package_file_name": expected.file_name.clone(),
             "source_package_sha256": expected.sha256.clone(),
@@ -6973,7 +6974,7 @@ mod tests {
 
         let wrong_source = json!({
             "version": expected.version.clone(),
-            "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64-install-stored.zip",
+            "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64-install-stored.zip",
             "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
             "source_package_file_name": expected.file_name.clone(),
             "source_package_sha256": "0".repeat(64),

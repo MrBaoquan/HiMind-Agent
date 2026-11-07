@@ -9,6 +9,30 @@
   "capabilities": [
     "workspace.inspect"
   ],
+  "roles": {
+    "software.analyst": {
+      "label": "需求分析",
+      "brief": "你是需求分析角色。只梳理导出字段、筛选口径与歧义点，不写实现代码。产出必须能让实现者直接开始工作。"
+    },
+    "software.implementer": {
+      "label": "实现",
+      "brief": "你是实现角色。只改达成目标所需的代码，不做顺带重构。完成后说明改了哪些文件以及为什么。"
+    },
+    "software.verifier": {
+      "label": "测试",
+      "brief": "你是测试角色。运行真实测试并读取真实输出；测试失败就定位并修复，再重跑，直到通过或用完轮次。不得修改断言来迁就实现。"
+    },
+    "software.reviewer": {
+      "label": "代码审查",
+      "brief": "你是代码审查角色。只依据 diff 与测试结果判断，不采信实现方的自述。发现问题要给出具体位置和修改建议。",
+      "tool_policy": "none"
+    },
+    "software.delivery": {
+      "label": "交付",
+      "brief": "你是交付角色。整理变更摘要、验证证据与回滚说明，交给人工确认后再创建 PR。",
+      "tool_policy": "none"
+    }
+  },
   "dependencies": {
     "skills": [],
     "plugins": [],

@@ -1,0 +1,65 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "软件交付（多角色）",
+  "sections": [
+    {
+      "id": "workspace",
+      "title": "工作区",
+      "fields": [
+        {
+          "id": "workspace_root",
+          "label": "代码仓库",
+          "type": "text",
+          "required": true,
+          "picker": "directory",
+          "placeholder": "选择要改动的仓库目录",
+          "hint": "分析与实现都在这个目录里进行。",
+          "span": "full"
+        }
+      ]
+    },
+    {
+      "id": "requirement",
+      "title": "需求",
+      "fields": [
+        {
+          "id": "requirement",
+          "label": "要做什么",
+          "type": "textarea",
+          "required": true,
+          "placeholder": "例如：给项目看板增加 CSV 导出，支持按日期与项目筛选",
+          "hint": "从「实现」入口开始时必填；从需求分析开始可以留空。",
+          "span": "full"
+        },
+        {
+          "id": "constraints",
+          "label": "约束",
+          "type": "textarea",
+          "placeholder": "例如：不改动既有筛选组件，导出字段固定五项",
+          "span": "full"
+        }
+      ]
+    },
+    {
+      "id": "checks",
+      "title": "验证",
+      "fields": [
+        {
+          "id": "test_command",
+          "label": "测试命令",
+          "type": "text",
+          "placeholder": "留空由实现者自行判断",
+          "hint": "指定后测试角色只跑这条命令。"
+        },
+        {
+          "id": "max_repair_rounds",
+          "label": "最多修复轮次",
+          "type": "number",
+          "default": 3,
+          "hint": "测试失败时自动修复的轮数上限。"
+        }
+      ]
+    }
+  ],
+  "actions": []
+}

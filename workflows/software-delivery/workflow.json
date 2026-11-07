@@ -1,0 +1,235 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.software-delivery",
+  "version": "1.0.0",
+  "distribution_targets": [
+    "workbench",
+    "github"
+  ],
+  "name": "软件交付（多角色）",
+  "description": "从需求分析到 PR 准备的多角色交付流程：分析、实现、测试修复循环、代码审查、人工批准后交付。",
+  "release_notes": "首个版本：五个执行角色分工，测试失败自动修复最多三轮，审查与创建 PR 各有独立闸门。",
+  "min_agent_version": "0.3.90",
+  "local_requirements": {
+    "platform": "windows",
+    "required_tools": []
+  },
+  "execution_policy": "segmented",
+  "entrypoints": [
+    {
+      "id": "full",
+      "at_step": "ANALYZE",
+      "label": "从需求开始",
+      "requires": [
+        "workspace"
+      ]
+    },
+    {
+      "id": "implement",
+      "at_step": "IMPLEMENT",
+      "label": "已有需求直接实现",
+      "requires": [
+        "workspace",
+        "requirement"
+      ]
+    }
+  ],
+  "default_entrypoint": "full",
+  "exits": [
+    {
+      "id": "reviewed",
+      "at_step": "REVIEW",
+      "label": "审查通过",
+      "produces": [
+        "review-report"
+      ]
+    },
+    {
+      "id": "pr_ready",
+      "at_step": "PREPARE-PR",
+      "label": "PR 说明就绪",
+      "produces": [
+        "pr-draft"
+      ]
+    }
+  ],
+  "default_exitpoint": "pr_ready",
+  "capabilities": [],
+  "roles": {
+    "software.analyst": {
+      "label": "需求分析",
+      "brief": "你是需求分析角色。只梳理要做什么、字段口径与歧义点，不写实现代码。产出要让实现者能直接开始，不要复述原始需求。",
+      "tool_policy": "default"
+    },
+    "software.implementer": {
+      "label": "实现",
+      "brief": "你是实现角色。只改达成目标所需的代码，不做顺带重构。完成后说明改了哪些文件、为什么改。",
+      "tool_policy": "default"
+    },
+    "software.verifier": {
+      "label": "测试",
+      "brief": "你是测试角色。运行真实测试并读取真实输出；失败就定位并修复再重跑，直到通过或用完轮次。不得修改断言来迁就实现。",
+      "tool_policy": "default"
+    },
+    "software.reviewer": {
+      "label": "代码审查",
+      "brief": "你是代码审查角色。只依据 diff 与测试结果判断，不采信实现方的自述。发现问题给出具体位置与修改建议。",
+      "tool_policy": "none"
+    },
+    "software.delivery": {
+      "label": "交付",
+      "brief": "你是交付角色。整理变更摘要、验证证据与回滚说明；创建 PR 属于外部写操作，必须由人工确认后再执行。",
+      "tool_policy": "none"
+    }
+  },
+  "dependencies": {
+    "skills": [],
+    "plugins": [],
+    "connectors": [],
+    "runtimes": []
+  },
+  "steps": [
+    {
+      "id": "ANALYZE",
+      "title": "梳理需求与验收标准",
+      "kind": "runtime",
+      "execution_mode": "sync",
+      "role_id": "software.analyst",
+      "risk_level": "read_only",
+      "runtime": {
+        "provider": "auto",
+        "prompt": "阅读需求并产出：要实现什么、验收标准、歧义点清单。不要开始写代码。",
+        "tool_policy": "default",
+        "timeout_seconds": 900
+      },
+      "input": {}
+    },
+    {
+      "id": "CONFIRM",
+      "title": "确认歧义",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "role_id": "software.analyst",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": [
+        "ANALYZE"
+      ]
+    },
+    {
+      "id": "IMPLEMENT",
+      "title": "实现",
+      "kind": "runtime",
+      "execution_mode": "long_running",
+      "role_id": "software.implementer",
+      "risk_level": "local_write",
+      "runtime": {
+        "provider": "auto",
+        "prompt": "按已确认的需求实现改动。完成后列出改动的文件与理由。",
+        "tool_policy": "default",
+        "timeout_seconds": 3600
+      },
+      "input": {},
+      "depends_on": [
+        "CONFIRM"
+      ]
+    },
+    {
+      "id": "VERIFY",
+      "title": "测试与自动修复",
+      "kind": "loop",
+      "execution_mode": "long_running",
+      "role_id": "software.verifier",
+      "risk_level": "local_write",
+      "loop": {
+        "max_iterations": 3,
+        "pause_for_feedback": true,
+        "exit_when": {
+          "operator": "equals",
+          "path": "loops.VERIFY.latest.passed",
+          "value": true
+        },
+        "steps": [
+          {
+            "id": "VERIFY-RUN",
+            "title": "运行测试并对失败做修复",
+            "kind": "runtime",
+            "execution_mode": "long_running",
+            "role_id": "software.verifier",
+            "risk_level": "local_write",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "运行测试。全部通过则输出 passed=true；失败则定位根因并修复，再重跑。不要为了让测试通过而改断言。",
+              "tool_policy": "default",
+              "timeout_seconds": 3600
+            }
+          }
+        ]
+      },
+      "depends_on": [
+        "IMPLEMENT"
+      ]
+    },
+    {
+      "id": "REVIEW",
+      "title": "代码审查",
+      "kind": "runtime",
+      "execution_mode": "long_running",
+      "role_id": "software.reviewer",
+      "risk_level": "read_only",
+      "runtime": {
+        "provider": "auto",
+        "prompt": "审查本次改动。只依据代码与测试结果判断，不要采信实现方的描述。列出问题与建议。",
+        "tool_policy": "none",
+        "timeout_seconds": 1800
+      },
+      "depends_on": [
+        "VERIFY"
+      ]
+    },
+    {
+      "id": "PREPARE-PR",
+      "title": "准备 PR 说明",
+      "kind": "runtime",
+      "execution_mode": "sync",
+      "role_id": "software.delivery",
+      "risk_level": "local_write",
+      "runtime": {
+        "provider": "auto",
+        "prompt": "整理变更摘要、验证证据（测试结果）与回滚说明，形成 PR 描述草稿。不要创建 PR。",
+        "tool_policy": "none",
+        "timeout_seconds": 900
+      },
+      "depends_on": [
+        "REVIEW"
+      ]
+    },
+    {
+      "id": "CREATE-PR",
+      "title": "创建 PR",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "role_id": "software.delivery",
+      "risk_level": "R4",
+      "approval_required": true,
+      "depends_on": [
+        "PREPARE-PR"
+      ]
+    }
+  ],
+  "artifacts": [],
+  "ui": {
+    "mode": "declarative",
+    "surfaces": [
+      "agent",
+      "dashboard"
+    ],
+    "entry": "ui/workflow-view.json"
+  },
+  "supported_runtimes": [
+    "himind.builtin",
+    "personal.codex",
+    "personal.github-copilot"
+  ],
+  "created_at": "2026-11-07T00:00:00Z"
+}

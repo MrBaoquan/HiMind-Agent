@@ -8,7 +8,7 @@ use super::{WorkflowPackage, WorkflowRunner, WorkflowStep};
 pub(crate) fn contract_dry_run_report(package: &WorkflowPackage) -> Result<Value, Box<dyn Error>> {
     let plans = validate_execution_plans(package)?;
     let risk_gates = validate_risk_gates(&package.steps)?;
-    let roles = collect_roles(&package.steps);
+    let roles = collect_roles(package);
     let schema_count = validate_schema_assets(package)?;
     let loop_count = count_loops(&package.steps);
     Ok(json!({
@@ -187,7 +187,11 @@ fn collect_runtime_schemas(steps: &[WorkflowStep], paths: &mut Vec<String>) {
 }
 
 /// 盘点包内声明的角色：按角色聚合它负责的步骤，供界面展示「这个任务由谁协作完成」。
-fn collect_roles(steps: &[WorkflowStep]) -> Value {
+///
+/// 角色配置（brief / provider / tool_policy）来自 `package.roles`；只写 role_id
+/// 而没有配置的角色也会出现，此时 `configured = false`——界面据此区分
+/// 「有角色但没配行为」与「角色真有执行语义」。
+fn collect_roles(package: &WorkflowPackage) -> Value {
     fn walk(steps: &[WorkflowStep], roles: &mut std::collections::BTreeMap<String, Vec<String>>) {
         for step in steps {
             let role = step.role_id.trim();
@@ -200,19 +204,64 @@ fn collect_roles(steps: &[WorkflowStep]) -> Value {
         }
     }
     let mut roles = std::collections::BTreeMap::<String, Vec<String>>::new();
-    walk(steps, &mut roles);
+    walk(&package.steps, &mut roles);
     Value::Array(
         roles
             .into_iter()
             .map(|(role_id, step_ids)| {
+                let role = package.roles.get(&role_id);
+                let resolved_provider = role
+                    .map(|role| role.runtime_provider.trim())
+                    .filter(|value| !value.is_empty())
+                    /* 角色没指定 provider 时，各步骤可能自己声明了不同的；
+                       只有全部一致才报出确定值，否则留空。 */
+                    .map(str::to_string)
+                    .or_else(|| {
+                        let providers = step_ids
+                            .iter()
+                            .filter_map(|step_id| {
+                                find_step(&package.steps, step_id)
+                                    .and_then(|step| step.runtime.as_ref())
+                                    .map(|runtime| runtime.provider.trim().to_string())
+                            })
+                            .filter(|provider| !provider.is_empty())
+                            .collect::<std::collections::BTreeSet<_>>();
+                        if providers.len() == 1 {
+                            providers.into_iter().next()
+                        } else {
+                            None
+                        }
+                    });
                 json!({
                     "role_id": role_id,
+                    "label": role.map(|role| role.label.trim()).unwrap_or_default(),
                     "step_count": step_ids.len(),
                     "step_ids": step_ids,
+                    "configured": role.is_some(),
+                    "runtime_provider": resolved_provider.unwrap_or_default(),
+                    "tool_policy": role.map(|role| role.tool_policy.trim()).unwrap_or_default(),
+                    "has_brief": role
+                        .map(|role| !role.brief.trim().is_empty())
+                        .unwrap_or(false),
                 })
             })
             .collect(),
     )
+}
+
+/// 在（可能嵌套的）步骤树里按键查一步。
+fn find_step<'a>(steps: &'a [WorkflowStep], step_id: &str) -> Option<&'a WorkflowStep> {
+    for step in steps {
+        if step.id == step_id {
+            return Some(step);
+        }
+        if let Some(loop_config) = step.loop_config.as_ref() {
+            if let Some(found) = find_step(&loop_config.steps, step_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn count_loops(steps: &[WorkflowStep]) -> usize {
@@ -319,5 +368,30 @@ mod tests {
             .unwrap()
             .iter()
             .any(|id| id == "VERIFY-RUN"));
+    }
+
+    #[test]
+    fn role_config_is_reported_with_effective_execution_settings() {
+        let source = include_str!(
+            "../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"
+        );
+        let mut package: super::super::WorkflowPackage = serde_json::from_str(source).unwrap();
+        package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+        package.validate().unwrap();
+
+        let report = contract_dry_run_report(&package).unwrap();
+        let roles = report["coverage"]["roles"].as_array().unwrap();
+        let reviewer = roles
+            .iter()
+            .find(|role| role["role_id"] == "software.reviewer")
+            .unwrap();
+        // 审查角色声明了 none 工具策略和独立 provider：这两项必须原样报出来，
+        // 界面才有依据说明「审查者看不到实现方的推理过程」。
+        assert_eq!(reviewer["configured"], true);
+        assert_eq!(reviewer["tool_policy"], "none");
+        assert_eq!(reviewer["runtime_provider"], "himind.builtin");
+        assert_eq!(reviewer["has_brief"], true);
+        // 角色没声明 provider 时才回落到步骤声明；这里是角色自己声明的。
+        assert_eq!(reviewer["label"], "代码审查");
     }
 }

@@ -832,61 +832,17 @@ fn response_tool_output_media_fallback(body: &[u8]) -> Option<Vec<u8>> {
     changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
-/// 将 Responses 输入里的工具调用轨迹降级成普通消息。
+/// 将 Responses 输入里的工具调用轨迹投影成只读历史块。
 ///
 /// 有些声称为 Responses 兼容的上游（例如 VectorTide）不接受
-/// `function_call` / `function_call_output` 作为输入项。工具定义本身可以保留，
-/// 只要把历史轨迹改成普通 assistant/user 消息即可继续对话。
+/// `function_call` / `function_call_output` 作为输入项。此时不能把调用轨迹
+/// 伪装成 assistant 消息，否则模型会把历史摘要当成下一轮输出模板。
 fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let input = value.get_mut("input")?.as_array_mut()?;
-    let mut changed = false;
-    let mut downgraded = Vec::with_capacity(input.len());
-    for item in input.drain(..) {
-        match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => {
-                changed = true;
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                downgraded.push(json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": format!("[历史工具调用] {name} {arguments}")
-                    }]
-                }));
-            }
-            Some("function_call_output") => {
-                changed = true;
-                let output = item
-                    .get("output")
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| value.to_string())
-                    })
-                    .unwrap_or_default();
-                downgraded.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!("[历史工具结果] {output}")
-                    }]
-                }));
-            }
-            _ => downgraded.push(item),
-        }
-    }
-    if !changed {
+    if !crate::app::ai_compatibility::project_responses_tool_history(input) {
         return None;
     }
-    *input = downgraded;
     serde_json::to_vec(&value).ok()
 }
 
@@ -1977,6 +1933,24 @@ fn forward_anthropic_responses_translated(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let display_model = binding_exposed_model(binding).to_string();
+    let recovery_tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.get("type").and_then(Value::as_str) != Some("BatchTool"))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let capability_matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = capability_matrix.resolve_provider(
+        &binding.base_url,
+        &crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+    );
+    let buffer_text_for_recovery =
+        !provider.function_call_history.is_supported() && !recovery_tools.is_empty();
     let responses_body = match crate::app::anthropic_responses::request_to_responses(
         &request,
         &binding.default_model,
@@ -2064,7 +2038,11 @@ fn forward_anthropic_responses_translated(
         write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
             .map_err(|_| GatewayError::Answered)?;
         let mut translator =
-            crate::app::anthropic_responses::AnthropicResponsesStream::new(display_model.clone());
+            crate::app::anthropic_responses::AnthropicResponsesStream::new_with_tool_recovery(
+                display_model.clone(),
+                recovery_tools.clone(),
+                buffer_text_for_recovery,
+            );
         let mut buffer = String::new();
         let mut chunk = [0_u8; 8192];
         let mut client_gone = false;
@@ -2114,9 +2092,10 @@ fn forward_anthropic_responses_translated(
     let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
     let usage = extract_usage("openai-responses", &upstream);
     if streaming {
-        let payload = match crate::app::anthropic_responses::response_to_anthropic_sse(
+        let payload = match crate::app::anthropic_responses::response_to_anthropic_sse_with_tools(
             &upstream,
             &display_model,
+            &recovery_tools,
         ) {
             Ok(payload) => payload,
             Err(error) => return Err(translate_error(stream, &error)),
@@ -2126,12 +2105,14 @@ fn forward_anthropic_responses_translated(
         let _ = stream.write_all(payload.as_bytes());
         let _ = stream.flush();
     } else {
-        let payload =
-            match crate::app::anthropic_responses::response_to_anthropic(&upstream, &display_model)
-            {
-                Ok(payload) => payload.to_string(),
-                Err(error) => return Err(translate_error(stream, &error)),
-            };
+        let payload = match crate::app::anthropic_responses::response_to_anthropic_with_tools(
+            &upstream,
+            &display_model,
+            &recovery_tools,
+        ) {
+            Ok(payload) => payload.to_string(),
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
         let head = format!(
             "{}content-length: {}\r\n\r\n",
             gateway_response_head(status.as_u16(), "application/json", &binding.id),
@@ -3300,6 +3281,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn claude_desktop_models_payload_exposes_gpt_61_sol_context() {
+        let mut gpt = binding("claude-desktop", "anthropic", "tok-1");
+        gpt.exposed_model = "gpt-yundu/gpt-6.1-sol".to_string();
+        gpt.models = vec![gpt.exposed_model.clone()];
+        gpt.upstream_model = "gpt-6.1-sol".to_string();
+        let payload: Value = serde_json::from_str(&models_payload(&[&gpt], true)).unwrap();
+        let item = &payload["data"][0];
+        assert_eq!(item["display_name"], "HiMind · gpt-yundu/gpt-6.1-sol");
+        assert_eq!(item["context_window"], 1_000_000);
+        assert_eq!(item["max_input_tokens"], 1_000_000);
+        assert_eq!(item["supports_1m"], true);
+        assert_eq!(item["max_output_tokens"], 64_000);
+    }
+
     /// 别名要稳定且互不碰撞：可读部分相同的两个不同 exposed 名不能共用一个
     /// 别名，否则请求会被路由到另一个服务的同名模型上。
     #[test]
@@ -3610,7 +3606,7 @@ mod tests {
     }
 
     #[test]
-    fn downgrades_responses_tool_history_to_messages() {
+    fn projects_responses_tool_history_to_read_only_context() {
         let original = json!({
             "model": "model-a",
             "input": [
@@ -3628,17 +3624,13 @@ mod tests {
             .iter()
             .map(|item| item["type"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(types, vec!["message", "message", "message"]);
-        assert_eq!(value["input"][1]["role"], "assistant");
-        assert!(value["input"][1]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("read"));
-        assert_eq!(value["input"][2]["role"], "user");
-        assert!(value["input"][2]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("file body"));
+        assert_eq!(types, vec!["message", "message"]);
+        assert_eq!(value["input"][1]["role"], "user");
+        let history = value["input"][1]["content"][0]["text"].as_str().unwrap();
+        assert!(history.starts_with("<himind_tool_history"));
+        assert!(history.contains("read"));
+        assert!(history.contains("file body"));
+        assert!(!history.contains("Earlier the assistant used"));
         assert!(value.get("tools").is_some());
     }
 
@@ -4137,6 +4129,82 @@ mod tests {
         assert!(response.contains(r#""text":"ok""#), "response={response}");
         assert!(
             response.contains(r#""model":"service/model-a""#),
+            "response={response}"
+        );
+    }
+
+    #[test]
+    fn anthropic_entry_recovers_leaked_bash_tool_call() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (_head, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected request"),
+            };
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "model-a");
+            let response = br#"{"id":"resp_leaked","object":"response","model":"model-a","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"PowerShell 7 available.\n\nEarlier the assistant used the Bash tool. Arguments: {\"command\":\"pwsh -NoProfile -File deploy.ps1\"}"}]}],"usage":{"input_tokens":3,"output_tokens":2}}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+        });
+
+        let token = "anthropic-recovery-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "claude-desktop:profile:service/model-a".to_string(),
+                client: "claude-desktop".to_string(),
+                service: "custom:service".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "anthropic".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = r#"{"model":"service/model-a","max_tokens":8,"messages":[{"role":"user","content":"部署"}],"tools":[{"name":"Bash","input_schema":{"type":"object","required":["command"],"properties":{"command":{"type":"string"}},"additionalProperties":false}}]}"#.as_bytes();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let _ = client.write_all(head.as_bytes());
+        let _ = client.write_all(request_body);
+        let _ = client.flush();
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""type":"tool_use""#),
+            "response={response}"
+        );
+        assert!(response.contains(r#""name":"Bash""#), "response={response}");
+        assert!(
+            response.contains(r#""stop_reason":"tool_use""#),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""command":"pwsh -NoProfile -File deploy.ps1""#),
             "response={response}"
         );
     }

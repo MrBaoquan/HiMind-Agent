@@ -646,6 +646,7 @@ mod tests {
             optional_providers: Vec::new(),
             capabilities: vec!["wechat.miniprogram.preview".to_string()],
             capability_alternatives: Default::default(),
+            roles: Default::default(),
             dependencies: Default::default(),
             candidate: None,
             execution_policy: "strict".to_string(),

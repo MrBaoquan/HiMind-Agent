@@ -21,9 +21,24 @@ pub(crate) fn execute_runtime_step(
         .runtime
         .as_ref()
         .ok_or_else(|| format!("workflow runtime step {} is missing runtime", step.id))?;
-    let provider = resolve_provider(&runtime.provider)?;
+    // 角色可以覆盖 provider / prompt / tool_policy；未覆盖的沿用步骤声明。
+    // 这不是「换了个 Agent」——同一条运行、同一份台账，只是这一段的执行配置不同。
+    let role = resolve_role(package, step);
+    let provider_name = role
+        .map(|role| role.runtime_provider.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(runtime.provider.trim());
+    let tool_policy = role
+        .map(|role| role.tool_policy.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(runtime.tool_policy.trim());
+    let base_prompt = role
+        .map(|role| role.prompt.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(runtime.prompt.trim());
+    let provider = resolve_provider(provider_name)?;
     enforce_runtime_network_policy(&provider, runtime.allow_network)?;
-    let disable_tools = enforce_runtime_tool_policy(&provider, &runtime.tool_policy)?;
+    let disable_tools = enforce_runtime_tool_policy(&provider, tool_policy)?;
     let workspace = resolve_workspace(&runtime.workspace_path, input)?;
     // 声明了 input_artifacts 的步骤不从提示词里带上游输出：数据已经以文件路径
     // 注入 input_artifacts，提示词长度因此与 Artifact 体量无关。
@@ -35,7 +50,10 @@ pub(crate) fn execute_runtime_step(
     if disable_tools && !runtime.input_artifacts.is_empty() {
         inline_input_artifacts(&mut prompt_input)?;
     }
-    let prompt = build_prompt(&runtime.prompt, &prompt_input);
+    let prompt = match role {
+        Some(role) => build_prompt(&format!("{}{}", role_prompt_prefix(role), base_prompt), &prompt_input),
+        None => build_prompt(base_prompt, &prompt_input),
+    };
     // 运行时提示是通过命令行传给 Runtime 的，Windows 上整条命令行有 ~32KB 上限；
     // 超了会以 "os error 206" 这种看不出原因的方式失败，这里提前给出可读错误。
     const MAX_RUNTIME_PROMPT_CHARS: usize = 24_000;
@@ -359,6 +377,36 @@ fn without_step_outputs(input: &Value) -> Value {
         context.remove("steps");
     }
     value
+}
+
+/// 解析步骤实际生效的角色配置。
+///
+/// 角色在 package.roles 里按 ID 声明；步骤只带 ID。找不到就返回 None——
+/// 允许「步骤写了角色但包没定义」的中间状态，那是渐进迁移，不该让运行失败。
+fn resolve_role<'a>(package: &'a WorkflowPackage, step: &WorkflowStep) -> Option<&'a super::WorkflowRole> {
+    let role_id = step.role_id.trim();
+    if role_id.is_empty() {
+        return None;
+    }
+    package.roles.get(role_id).filter(|role| {
+        // 空配置的角色等价于「只标注负责人」，不产生任何覆盖。
+        !role.brief.trim().is_empty()
+            || !role.runtime_provider.trim().is_empty()
+            || !role.prompt.trim().is_empty()
+            || !role.tool_policy.trim().is_empty()
+    })
+}
+
+/// 角色 brief 拼成提示词前缀。
+///
+/// 用独立段落而不是塞进 base prompt：Runtime 看到的是「你是这个角色」+「这一步要做
+/// 什么」两段，角色职责不会因为步骤提示词被改而丢失。
+fn role_prompt_prefix(role: &super::WorkflowRole) -> String {
+    let brief = role.brief.trim();
+    if brief.is_empty() {
+        return String::new();
+    }
+    format!("【你的角色】{brief}\n\n")
 }
 
 fn build_prompt(base: &str, input: &Value) -> String {
@@ -753,5 +801,85 @@ mod tests {
         assert!(enforce_runtime_network_policy("personal.codex", Some(true)).is_ok());
         // 未声明网络约束时不得把「无法证明隔离」当成拒绝服务的理由。
         assert!(enforce_runtime_network_policy("personal.codex", None).is_ok());
+    }
+
+    fn role_package(roles: &[(&str, super::super::WorkflowRole)]) -> WorkflowPackage {
+        let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": "workflow_package.v1",
+            "id": "test.roles",
+            "version": "1.0.0",
+            "name": "Roles",
+            "min_agent_version": "0.3.90",
+            "steps": [],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        for (id, role) in roles {
+            package.roles.insert(id.to_string(), role.clone());
+        }
+        package
+    }
+
+    fn role_step(role_id: &str, provider: &str, tool_policy: &str, prompt: &str) -> WorkflowStep {
+        serde_json::from_value(serde_json::json!({
+            "id": "STEP",
+            "title": "Step",
+            "kind": "runtime",
+            "execution_mode": "sync",
+            "role_id": role_id,
+            "runtime": {
+                "provider": provider,
+                "prompt": prompt,
+                "tool_policy": tool_policy
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn role_overrides_step_runtime_settings() {
+        let package = role_package(&[(
+            "software.reviewer",
+            super::super::WorkflowRole {
+                label: "代码审查".to_string(),
+                brief: "只依据 diff 判断".to_string(),
+                runtime_provider: "himind.fixture".to_string(),
+                prompt: "审查这次改动".to_string(),
+                tool_policy: "none".to_string(),
+            },
+        )]);
+        let step = role_step("software.reviewer", "personal.codex", "default", "步骤原始提示");
+        let role = resolve_role(&package, &step).expect("declared role must resolve");
+        // 角色声明的三项都优先于步骤声明：这是角色隔离的实质。
+        assert_eq!(role.runtime_provider, "himind.fixture");
+        assert_eq!(role.tool_policy, "none");
+        assert_eq!(role.prompt, "审查这次改动");
+        // brief 走独立段落，不混进 base prompt。
+        assert!(role_prompt_prefix(role).contains("只依据 diff 判断"));
+        assert!(role_prompt_prefix(role).starts_with("【你的角色】"));
+    }
+
+    #[test]
+    fn role_without_config_falls_back_to_step_settings() {
+        // 只声明 label 的角色是「标注负责人」，不该改变任何执行行为。
+        let package = role_package(&[(
+            "software.analyst",
+            super::super::WorkflowRole {
+                label: "需求分析".to_string(),
+                ..Default::default()
+            },
+        )]);
+        let step = role_step("software.analyst", "himind.fixture", "default", "原始提示");
+        assert!(resolve_role(&package, &step).is_none());
+    }
+
+    #[test]
+    fn undeclared_role_id_does_not_break_execution() {
+        // 老包可能逐步迁移：步骤写了角色但包还没定义，此时按无角色处理而不是报错。
+        let package = role_package(&[]);
+        let step = role_step("software.mystery", "himind.fixture", "default", "原始提示");
+        assert!(resolve_role(&package, &step).is_none());
+        assert_eq!(role_prompt_prefix(&super::super::WorkflowRole::default()), "");
     }
 }

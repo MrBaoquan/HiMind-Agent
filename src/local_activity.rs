@@ -155,20 +155,49 @@ fn role_rollup(steps: &[LocalRunStep]) -> Vec<Value> {
 /// 委派和重做分开算：两者都写 `parent_run_id`，但「多角色分工」和「返工」是
 /// 两种完全不同的事实，合成一个数字会让团队视图误导人。没有子运行时返回 Null，
 /// 前端据此整块不渲染，而不是显示一排 0。
-fn team_rollup(children: Option<&Vec<(bool, bool)>>) -> Value {
+fn team_rollup(children: Option<&Vec<ChildFacts>>) -> Value {
     let Some(items) = children else {
         return Value::Null;
     };
     if items.is_empty() {
         return Value::Null;
     }
-    let delegated = items.iter().filter(|(delegated, _)| *delegated).count();
-    let running = items.iter().filter(|(_, terminal)| !*terminal).count();
+    let delegated = items.iter().filter(|child| child.delegated).count();
+    let running = items.iter().filter(|child| !child.terminal).count();
     json!({
         "delegated": delegated,
         "retries": items.len() - delegated,
         "running": running,
     })
+}
+
+/// 一条子运行在父行里需要的全部事实。
+///
+/// 子运行原本只贡献三个计数；用户点开「2 项委派」时想看到的是「哪两项、
+/// 谁在做、卡在哪」，所以这里连同角色、状态、错误一起带出去。
+struct ChildFacts {
+    run_id: String,
+    delegated: bool,
+    terminal: bool,
+    role_id: String,
+    status: String,
+    error: String,
+    started_at: String,
+    updated_at: String,
+}
+
+impl ChildFacts {
+    fn to_json(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "kind": if self.delegated { "delegate" } else { "retry" },
+            "role_id": self.role_id,
+            "status": self.status,
+            "error": self.error,
+            "started_at": self.started_at,
+            "updated_at": self.updated_at,
+        })
+    }
 }
 
 /// 本机工作流运行，投影自本地运行台账。
@@ -180,15 +209,33 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
     // 一次扫出父子关系：每个父运行下挂了几个子运行，以及子运行是什么语义。
     // 界面要能回答「这一步是重做还是换了个人做」，逐条再查库会变成 N+1。
     // 用拥有的 run_id 副本做键，后面才能按值消费 runs。
-    let mut children: HashMap<String, Vec<(bool, bool)>> = HashMap::new();
+    let mut children: HashMap<String, Vec<ChildFacts>> = HashMap::new();
     for run in &runs {
-        if run.parent_run_id.trim().is_empty() {
+        let parent = run.parent_run_id.trim();
+        if parent.is_empty() {
             continue;
         }
+        // 子运行的角色取当前步骤（没有就取最后一步），与父行同一口径。
+        let step = run
+            .steps
+            .iter()
+            .find(|step| step.step_id == run.current_step_id)
+            .or_else(|| run.steps.last());
         children
-            .entry(run.parent_run_id.clone())
+            .entry(parent.to_string())
             .or_default()
-            .push((run.parent_kind.is_delegation(), run.status.is_terminal()));
+            .push(ChildFacts {
+                run_id: run.run_id.clone(),
+                delegated: run.parent_kind.is_delegation(),
+                terminal: run.status.is_terminal(),
+                role_id: step
+                    .map(|step| step.role_id.trim().to_string())
+                    .unwrap_or_default(),
+                status: run_status_key(&run.status).to_string(),
+                error: run.error.clone(),
+                started_at: iso_from_epoch(&run.created_at),
+                updated_at: iso_from_epoch(&run.updated_at),
+            });
     }
     for run in runs {
         if run.source != InteractionSource::Workflow {
@@ -279,6 +326,15 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
                 "retry"
             },
             "team": team,
+            // 子运行明细：父行展开时直接渲染，不再为每条子运行单独查询。
+            "children": if run.parent_run_id.trim().is_empty() {
+                children
+                    .get(&run.run_id)
+                    .map(|items| items.iter().map(ChildFacts::to_json).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }));
     }
     Ok(items)
@@ -326,6 +382,7 @@ fn skill_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             "parent_run_id": "",
             "parent_kind": "",
             "team": Value::Null,
+            "children": Vec::<Value>::new(),
         }));
     }
     Ok(items)
@@ -355,8 +412,17 @@ pub(crate) fn list(limit: Option<usize>) -> Result<Vec<Value>, Box<dyn Error>> {
 mod tests {
     use super::*;
 
-    fn child(delegated: bool, terminal: bool) -> (bool, bool) {
-        (delegated, terminal)
+    fn child(delegated: bool, terminal: bool) -> ChildFacts {
+        ChildFacts {
+            run_id: format!("run-{}", if delegated { "d" } else { "r" }),
+            delegated,
+            terminal,
+            role_id: String::new(),
+            status: if terminal { "completed" } else { "running" }.to_string(),
+            error: String::new(),
+            started_at: String::new(),
+            updated_at: String::new(),
+        }
     }
 
     #[test]
@@ -379,6 +445,22 @@ mod tests {
         assert_eq!(rollup["retries"], 2);
         // 只有未终结的子运行算「进行中」。
         assert_eq!(rollup["running"], 1);
+    }
+
+    #[test]
+    fn child_facts_expose_what_the_parent_row_shows_on_expand() {
+        let mut delegated = child(true, false);
+        delegated.role_id = "software.reviewer".to_string();
+        delegated.error = String::new();
+        let facts = delegated.to_json();
+        // 展开子运行要能回答「谁在做、什么状态、有没有错」，只给计数不够。
+        assert_eq!(facts["run_id"], "run-d");
+        assert_eq!(facts["kind"], "delegate");
+        assert_eq!(facts["role_id"], "software.reviewer");
+        assert_eq!(facts["status"], "running");
+
+        let retry = child(false, true);
+        assert_eq!(retry.to_json()["kind"], "retry");
     }
 
     fn step(id: &str, role: &str, status: LocalStepStatus) -> LocalRunStep {

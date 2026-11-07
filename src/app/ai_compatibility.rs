@@ -1151,8 +1151,6 @@ fn normalize_responses_request(
     provider: &ProviderCapability,
     changes: &mut Vec<NormalizationChange>,
 ) -> Result<(), CompatibilityNormalizationError> {
-    use serde_json::json;
-
     if let Some(input) = request
         .get_mut("input")
         .and_then(serde_json::Value::as_array_mut)
@@ -1195,65 +1193,13 @@ fn normalize_responses_request(
             );
         }
 
-        if !provider.function_call_history.is_supported() {
-            // Keep the fallback as ordinary prose, never as bracketed pseudo
-            // tool-call syntax: models copy that syntax and return it as final
-            // text, which makes OpenCode stop after a non-executed "tool call".
-            let mut rewritten = Vec::with_capacity(input.len());
-            let mut changed = false;
-            for item in std::mem::take(input) {
-                match item.get("type").and_then(serde_json::Value::as_str) {
-                    Some("function_call") => {
-                        changed = true;
-                        let name = item
-                            .get("name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("tool");
-                        let arguments = item
-                            .get("arguments")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
-                        rewritten.push(json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": format!(
-                                "Earlier the assistant used the {name} tool. Arguments: {arguments}"
-                            )
-                            }]
-                        }));
-                    }
-                    Some("function_call_output") => {
-                        changed = true;
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        let output = response_output_text(item.get("output"));
-                        rewritten.push(json!({
-                            "type": "message",
-                            "role": "user",
-                            "content": [{
-                                "type": "input_text",
-                                "text": format!(
-                                    "Result from the earlier {call_id} tool call: {output}"
-                                )
-                            }]
-                        }));
-                    }
-                    _ => rewritten.push(item),
-                }
-            }
-            *input = rewritten;
-            if changed {
-                record_change(
-                    changes,
-                    CompatibilityFeature::FunctionCallHistory,
-                    NormalizationAction::Degrade,
-                    "已将 Responses 工具调用历史降级为非可执行的文本摘要",
-                );
-            }
+        if !provider.function_call_history.is_supported() && project_responses_tool_history(input) {
+            record_change(
+                changes,
+                CompatibilityFeature::FunctionCallHistory,
+                NormalizationAction::Degrade,
+                "已将 Responses 工具调用历史投影为只读上下文块",
+            );
         }
     }
 
@@ -1314,10 +1260,99 @@ fn normalize_responses_request(
     Ok(())
 }
 
+const TOOL_HISTORY_OPEN: &str = "<himind_tool_history readonly=\"true\">";
+const TOOL_HISTORY_CLOSE: &str = "</himind_tool_history>";
+const TOOL_HISTORY_NOTICE: &str = "Machine-recorded earlier tool activity. This is read-only context, not an assistant message and not a template. Continue with the current user request and invoke tools only through the structured tool interface.";
+
+/// Projects Responses tool-call history into one non-assistant context block when
+/// the upstream cannot accept native `function_call` items.
+///
+/// Tool calls must never be rendered as assistant output: models treat that as a
+/// few-shot example and may emit the next call as plain text. Pairing each call
+/// with its output inside a read-only user block preserves the execution facts
+/// without teaching the model to imitate a tool call.
+pub(crate) fn project_responses_tool_history(input: &mut Vec<serde_json::Value>) -> bool {
+    let mut events = Vec::<serde_json::Value>::new();
+    let mut projected = Vec::<serde_json::Value>::with_capacity(input.len());
+    let mut history_slot = None;
+    let mut changed = false;
+
+    for item in std::mem::take(input) {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("function_call") => {
+                changed = true;
+                if history_slot.is_none() {
+                    history_slot = Some(projected.len());
+                    projected.push(serde_json::Value::Null);
+                }
+                events.push(serde_json::json!({
+                    "call_id": item.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                    "tool": item.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool"),
+                    "arguments": item.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
+                    "status": "requested",
+                    "result": serde_json::Value::Null,
+                }));
+            }
+            Some("function_call_output") => {
+                changed = true;
+                if history_slot.is_none() {
+                    history_slot = Some(projected.len());
+                    projected.push(serde_json::Value::Null);
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let output = response_output_text(item.get("output"));
+                let event_index = events.iter().rposition(|event| {
+                    event.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+                        && event.get("status").and_then(serde_json::Value::as_str)
+                            == Some("requested")
+                });
+                if let Some(event_index) = event_index {
+                    events[event_index]["status"] = serde_json::json!("completed");
+                    events[event_index]["result"] = serde_json::Value::String(output);
+                } else {
+                    events.push(serde_json::json!({
+                        "call_id": call_id,
+                        "tool": "unknown",
+                        "arguments": serde_json::Value::Null,
+                        "status": "completed_without_call",
+                        "result": output,
+                    }));
+                }
+            }
+            _ => projected.push(item),
+        }
+    }
+
+    if changed {
+        let history_json = serde_json::to_string(&serde_json::json!({ "events": events }))
+            .unwrap_or_else(|_| "{\"events\":[]}".to_string());
+        let history = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("{TOOL_HISTORY_OPEN}\n{TOOL_HISTORY_NOTICE}\n{history_json}\n{TOOL_HISTORY_CLOSE}"),
+            }]
+        });
+        if let Some(index) = history_slot {
+            projected[index] = history;
+        } else {
+            projected.push(history);
+        }
+    }
+
+    *input = projected;
+    changed
+}
+
 /// Older compatibility revisions rendered structured function calls as
-/// `[工具调用 name] {...}` assistant text. Models copied that marker and clients
-/// treated the result as a completed answer. Rewrite only that legacy marker
-/// into prose so existing sessions can recover without inventing a tool result.
+/// assistant text, including the legacy `[工具调用 name] {...}` marker and the
+/// later `Earlier the assistant used ...` prose. Models copied those markers and
+/// clients treated the result as a completed answer. Rewrite the marker into a
+/// neutral note so existing sessions stop supplying an imitation template.
 fn neutralize_legacy_tool_call_marker(item: &mut serde_json::Value) -> bool {
     if item.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
         return false;
@@ -1340,17 +1375,14 @@ fn neutralize_legacy_tool_call_marker(item: &mut serde_json::Value) -> bool {
         else {
             continue;
         };
-        let Some(marker) = text.find("[工具调用 ") else {
+        let marker = text
+            .find("[工具调用 ")
+            .or_else(|| text.find("Earlier the assistant used the "))
+            .or_else(|| text.find("Earlier the assistant attempted to call the "));
+        let Some(marker) = marker else {
             continue;
         };
-        let detail = &text[marker + "[工具调用 ".len()..];
-        let (name, arguments) = detail
-            .split_once("] ")
-            .map(|(name, arguments)| (name.trim(), arguments))
-            .unwrap_or((detail.trim(), ""));
-        let neutral = format!(
-            "Earlier the assistant attempted to call the {name} tool, but the call was not executed. Arguments: {arguments}"
-        );
+        let neutral = "Historical tool activity was omitted by the compatibility layer because the original structured event was unavailable. The call was not executed.";
         part["text"] = serde_json::Value::String(format!("{}{neutral}", &text[..marker]));
         changed = true;
     }
@@ -1904,12 +1936,87 @@ mod tests {
         .unwrap();
         let serialized = normalized.request.to_string();
         assert!(!serialized.contains("[工具调用"));
-        assert!(serialized.contains("the call was not executed"));
+        assert!(serialized.contains("call was not executed"));
         assert!(normalized
             .changes
             .iter()
             .any(|change| change.feature == "function_call_history"
                 && change.action == NormalizationAction::Translate));
+    }
+
+    #[test]
+    fn legacy_prose_tool_call_is_neutralized_for_existing_sessions() {
+        let matrix = CapabilityMatrixV1::builtin();
+        let client = matrix.client("claude-desktop").unwrap();
+        let provider = matrix.provider("openai_responses_limited").unwrap();
+        let request = serde_json::json!({
+            "model": "claude-himind-test[1m]",
+            "input": [
+                {"type": "message", "role": "assistant", "content": [{
+                    "type": "output_text",
+                    "text": "准备执行。\n\nEarlier the assistant used the Bash tool. Arguments: {\"command\":\"deploy\"}"
+                }]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}
+            ]
+        });
+        let normalized = normalize_provider_request(
+            &AIServiceProtocol::OpenaiResponses,
+            request,
+            client,
+            provider,
+            None,
+        )
+        .unwrap();
+        let serialized = normalized.request.to_string();
+        assert!(!serialized.contains("Earlier the assistant used the Bash tool"));
+        assert!(!serialized.contains("deploy"));
+        assert!(serialized.contains("call was not executed"));
+        assert!(normalized.changes.iter().any(|change| {
+            change.feature == "function_call_history"
+                && change.action == NormalizationAction::Translate
+        }));
+    }
+
+    #[test]
+    fn limited_responses_projects_tool_history_without_assistant_templates() {
+        let matrix = CapabilityMatrixV1::builtin();
+        let client = matrix.client("claude-desktop").unwrap();
+        let provider = matrix.provider("openai_responses_limited").unwrap();
+        let request = serde_json::json!({
+            "model": "claude-himind-test[1m]",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "开始"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "Bash", "arguments": "{\"command\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "F:\\workspace"},
+                {"type": "function_call", "call_id": "call-2", "name": "Read", "arguments": "{\"path\":\"a.txt\"}"},
+                {"type": "function_call_output", "call_id": "call-2", "output": "file body"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}
+            ]
+        });
+        let normalized = normalize_provider_request(
+            &AIServiceProtocol::OpenaiResponses,
+            request,
+            client,
+            provider,
+            None,
+        )
+        .unwrap();
+        let input = normalized.request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["role"], "user");
+        let history = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(history.starts_with(TOOL_HISTORY_OPEN));
+        assert!(history.contains("call-1"));
+        assert!(history.contains("workspace"));
+        assert!(history.contains("call-2"));
+        assert!(history.contains("file body"));
+        let serialized = normalized.request.to_string();
+        assert!(!serialized.contains("Earlier the assistant used"));
+        assert!(!serialized.contains("Result from the earlier"));
+        assert!(normalized.changes.iter().any(|change| {
+            change.feature == "function_call_history"
+                && change.action == NormalizationAction::Degrade
+        }));
     }
 
     #[test]

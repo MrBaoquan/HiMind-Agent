@@ -332,6 +332,7 @@ mod tests {
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
             capabilities: vec!["test.capability".to_string()],
+            roles: Default::default(),
             capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,

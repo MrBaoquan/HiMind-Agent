@@ -197,6 +197,52 @@ export function teamSummary(team: unknown): TeamSummary | null {
 
 export type RoleChip = { id: string; label: string; status: string };
 
+/** 父行可展开的一行子运行。 */
+export type ChildRun = {
+  runId: string;
+  /** delegate / retry / 其它原样保留 */
+  kind: string;
+  kindLabel: string;
+  roleId: string;
+  roleLabel: string;
+  status: string;
+  statusLabel: string;
+  error: string;
+  updatedAt: string;
+};
+
+/**
+ * 归一化子运行明细。
+ *
+ * 后端已经算好委派/重做的语义，前端只做展示映射：缺 role_id 的角色留空，
+ * 未知 kind 原样保留文案，不用一个「其它」把信息抹掉。
+ */
+export function childRuns(children: unknown): ChildRun[] {
+  if (!Array.isArray(children)) return [];
+  const out: ChildRun[] = [];
+  for (const item of children) {
+    if (!item || typeof item !== 'object') continue;
+    const source = item as Record<string, unknown>;
+    const runId = typeof source.run_id === 'string' ? source.run_id.trim() : '';
+    if (!runId) continue;
+    const kind = typeof source.kind === 'string' ? source.kind.trim() : '';
+    const roleId = typeof source.role_id === 'string' ? source.role_id.trim() : '';
+    const status = typeof source.status === 'string' ? source.status.trim() : '';
+    out.push({
+      runId,
+      kind,
+      kindLabel: parentKindLabel(kind),
+      roleId,
+      roleLabel: roleLabel(roleId),
+      status,
+      statusLabel: taskStatusLabel(status),
+      error: typeof source.error === 'string' ? source.error : '',
+      updatedAt: typeof source.updated_at === 'string' ? source.updated_at : '',
+    });
+  }
+  return out;
+}
+
 /**
  * 归一化「这条运行里出现过的角色」。
  *

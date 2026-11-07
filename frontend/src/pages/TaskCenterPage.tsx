@@ -24,9 +24,11 @@ import {
   parentKindLabel,
   roleLabel,
   roleChips,
+  childRuns,
   shouldShowRoleBadge,
   shouldShowRoleChain,
   teamSummary,
+  type ChildRun,
   type RoleChip,
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
@@ -89,6 +91,8 @@ type ActivityEntry = {
   team: { delegated: number; retries: number; running: number } | null;
   /** 这条运行出现过的角色（按步骤出现顺序），用于展示协作链路。 */
   roles: RoleChip[];
+  /** 子运行明细；父行展开时渲染，空数组表示不渲染展开入口。 */
+  childrenRuns: ChildRun[];
 };
 
 function sourceOf(value: string): ActivitySource {
@@ -131,6 +135,7 @@ function fromTask(item: AgentTaskHistoryItem): ActivityEntry {
     parentKind: '',
     team: null,
     roles: [],
+    childrenRuns: [],
   };
 }
 
@@ -157,6 +162,7 @@ function fromActivity(item: AgentActivityItem): ActivityEntry {
     parentKind: (item.parent_kind || '').trim(),
     team: teamSummary(item.team),
     roles: roleChips(item.roles),
+    childrenRuns: childRuns(item.children),
   };
 }
 
@@ -373,6 +379,26 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
               </span>
             ))}
           </div>
+        ) : null}
+        {/* 子运行明细：只在真有子运行时给展开入口，否则不留一个空三角。 */}
+        {entry.childrenRuns.length > 0 ? (
+          <details className="task-center-children">
+            <summary>
+              <span>子运行 {entry.childrenRuns.length} 条</span>
+            </summary>
+            <div className="task-center-children-list" role="list">
+              {entry.childrenRuns.map(child => (
+                <div className="task-center-child" role="listitem" key={child.runId}>
+                  <span className={`task-center-child-kind ${child.kind}`}>{child.kindLabel || child.kind || '子运行'}</span>
+                  {child.roleLabel ? <span className="task-center-child-role">{child.roleLabel}</span> : null}
+                  <span className={`task-center-child-status ${taskStatusTone(child.status)}`}>{child.statusLabel || child.status}</span>
+                  <code title={child.runId}>{shortRunId(child.runId)}</code>
+                  {child.error ? <span className="task-center-child-error" title={child.error}>{child.error}</span> : null}
+                  {child.updatedAt ? <time title={formatAbsoluteTime(child.updatedAt)}>{formatRelativeTime(child.updatedAt, now)}</time> : null}
+                </div>
+              ))}
+            </div>
+          </details>
         ) : null}
         {message ? <p className={entry.error ? 'error' : ''}>{message}</p> : null}
         {active ? (

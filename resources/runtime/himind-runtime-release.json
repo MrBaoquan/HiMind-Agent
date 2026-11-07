@@ -1,20 +1,20 @@
 {
   "schema_version": 1,
   "product_id": "com.himind.runtime.deepseek-harness",
-  "version": "0.2.1-rc.2",
+  "version": "0.2.2-rc.1",
   "channel": "stable",
   "platform": "windows",
   "architecture": "x64",
   "package_type": "directory-zip",
-  "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64.zip",
-  "size": 172037966,
-  "sha256": "cf10a0b39e10c128773b4093e9fb52bdd0d60f433ef156df70fb2977a649fb7b",
-  "signature": "T2kZ0Kd+Md1qsDlKREJ6wDjgKTfLRaCjwgkWx74i6ZgKfu55cQ8pV2fyXAJIwD2sUVAfoukXheBAuvaSV22Z0jGRkW17RwO9yxmBc/SwXJl3XFL6QLsTWJCpQ4WbOCVWixN4O2JCIfcUBUPoJw6CiyjjZDRKT0BVcYU5WT01VGC8Tq3OFmyHYRtrZ/5v4gYVU87Pp93Kp2YkOiDhSp+wtVdD/CuyPngHWEpkFL6J8DTXxCqfcXc/n2vunQokubpqRENPn7z6kOCvM10bpy5dbBnM4gfPgsiYkfv7jSXhXXL7pcVN9RkUbOvX+jNB0umklD5Wr78urP1LRJQMSyJiK/aFTU1xJNF6XJZzvQ98DgVMap7NnCjAH0eAnpNTczdcjEvYaDfqXBXx4PCcFVClU5FrZvYt3J3xj/pNyQ4ju0BSB0JRwAmZSsvdipb9Ta5xmXybeRiqLB2MhdnzO1NvBpfJ2xrXOi8HtPWHqNir6r1bEzvn8M3HBB6u7HovKsn6",
+  "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64.zip",
+  "size": 195316745,
+  "sha256": "f781b3f4018acb9a4ecf01060d5c2d007c9c36eeaaab39c52624b401eab1352c",
+  "signature": "n4bGanadEo6i0GUs/KOIAYyYvQmzLTWKdeKhoIhoo5wucjEt8bI2kgxtflMyzuHjXa8BNjnzOY9aiWfTa+Q1DiLzBmV5+5BugzXrS2ofzO5S5b7CDDX7OirxIQncCCkDSGGjxFD3KtUj6w/ra+ntr23pC4iVNPmDQuldqU0tHr2vED22I0BFm21hGPy0XVzkgj74Ox1Dq+xlDcAre0r8Cd4bHnBXkU3Wj/aQ6HFPy9lFd9te69iyaq+ceW7akzf9tQVfRgEtxitdasIN6Eg2+pjFrff2fn6VmmzuKo1ptZmJsolSefmC7lUFd5kAkLIWyamy6fvhHEQWAkxgE/rPYqdOntuSQ+qJWiKhgrViSzgD6aUbhMpCJOK88dMxopmpnGBbD0m3Dfl91EhAi0CcJinHMD27iAgTVxvZw5WaQ3ovkCCtXQ0RgB6qrkgMiGoCnInet+Bu0oOdTXgPPiYmGf2A7vSMLlaFSy9XwVOVWHcmF8Jfld+5sO5CYQS0jahe",
   "signature_key_id": "himind-production-2026",
   "signature_algorithm": "rsa-pss-sha256",
-  "min_agent_version": "0.3.82",
+  "min_agent_version": "0.3.92",
   "max_agent_version": "",
-  "engine_version": "0.2.1-rc.2",
+  "engine_version": "0.2.2-rc.1",
   "capabilities": [
     "interactive",
     "headless",
@@ -22,5 +22,5 @@
     "office"
   ],
   "mandatory": false,
-  "release_notes": "DSH 0.2.1-rc.2: DeepSeek-V4.1-Flash-1017 and Search/Fetch API support; bundled with HiMind Agent 0.3.83."
+  "release_notes": "DSH 0.2.2-rc.1: Node 24.x engine floor, official-bundles and liveshare bundles; bundled with HiMind Agent 0.3.92."
 }

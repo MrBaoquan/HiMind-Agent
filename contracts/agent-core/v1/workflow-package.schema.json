@@ -51,6 +51,22 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "roles": {
+      "description": "执行角色配置；步骤用 role_id 引用这里的键。未定义的 role_id 视为只标注负责人，不改变执行。",
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z0-9._-]+$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "label": { "type": "string" },
+          "brief": { "description": "角色职责说明，作为独立段落拼在步骤提示词之前。", "type": "string" },
+          "runtime_provider": { "description": "覆盖步骤的 Runtime Provider；必须在 supported_runtimes 内。", "type": "string" },
+          "prompt": { "description": "覆盖步骤的提示词模板。", "type": "string" },
+          "tool_policy": { "description": "覆盖步骤的工具策略。none 表示不挂载任何模型可见工具。", "enum": ["", "default", "none"] }
+        }
+      }
+    },
     "dependencies": { "type": "object" },
     "candidate": { "$ref": "#/$defs/candidate" },
     "execution_policy": {

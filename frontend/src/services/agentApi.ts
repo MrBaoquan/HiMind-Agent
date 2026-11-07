@@ -159,6 +159,17 @@ export type AgentActivityItem = {
     parent_kind?: 'delegate' | 'retry' | string | null;
     /** 顶层运行的协作计数：委派数、重做数、仍在跑的子运行数。 */
     team?: { delegated?: number; retries?: number; running?: number } | null;
+    /** 子运行明细；父行展开时直接渲染，不需要再查一次。 */
+    children?: Array<{
+        run_id: string;
+        /** delegate 为角色委派，retry 为同一步重做。 */
+        kind: 'delegate' | 'retry' | string;
+        role_id?: string;
+        status: string;
+        error?: string;
+        started_at?: string;
+        updated_at?: string;
+    }> | null;
 };
 
 export type CatalogPage<T> = {

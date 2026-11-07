@@ -1561,6 +1561,7 @@ mod tests {
             local_requirements: json!({"required_tools": required_tools}),
             optional_providers: Vec::new(),
             capabilities: vec!["system.health".to_string()],
+            roles: Default::default(),
             capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,

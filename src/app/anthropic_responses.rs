@@ -343,8 +343,168 @@ fn translate_tool_choice(choice: &Value) -> Value {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TextualToolRecovery {
+    NoMatch,
+    Recovered(Vec<Value>),
+    Invalid(String),
+}
+
+const LEAKED_TOOL_PREFIX: &str = "Earlier the assistant used the ";
+const LEAKED_TOOL_MARKER: &str = " tool. Arguments: ";
+
+/// Recovers the known plain-text tool-call leak that can occur when a limited
+/// Responses provider imitates a degraded history summary.
+///
+/// Recovery is intentionally strict: the tool must exist in the current request,
+/// the arguments must be a JSON object, required schema fields must be present,
+/// and additional properties are rejected when the schema disables them.
+pub(crate) fn recover_textual_tool_calls(text: &str, tools: &[Value]) -> TextualToolRecovery {
+    let mut cursor = 0_usize;
+    let mut recovered_index = 0_usize;
+    let mut found = false;
+    let mut blocks = Vec::<Value>::new();
+
+    while let Some(relative) = text[cursor..].find(LEAKED_TOOL_PREFIX) {
+        let start = cursor + relative;
+        let after_prefix = &text[start + LEAKED_TOOL_PREFIX.len()..];
+        let Some(marker) = after_prefix.find(LEAKED_TOOL_MARKER) else {
+            return TextualToolRecovery::Invalid(
+                "tool-call prefix has no arguments marker".to_string(),
+            );
+        };
+        let name = after_prefix[..marker].trim();
+        if name.is_empty() || name.contains('\n') {
+            return TextualToolRecovery::Invalid("tool name is empty or multiline".to_string());
+        }
+        let raw_rest = &after_prefix[marker + LEAKED_TOOL_MARKER.len()..];
+        let arguments_text = raw_rest.trim_start();
+        let leading_whitespace = raw_rest.len() - arguments_text.len();
+        let Some((json_text, consumed)) = take_json_object_prefix(arguments_text) else {
+            return TextualToolRecovery::Invalid(format!(
+                "tool {name} has no complete JSON object"
+            ));
+        };
+        let input: Value = match serde_json::from_str(json_text) {
+            Ok(value) => value,
+            Err(error) => {
+                return TextualToolRecovery::Invalid(format!(
+                    "tool {name} arguments are invalid JSON: {error}"
+                ))
+            }
+        };
+        if let Err(error) = validate_recovered_tool_input(tools, name, &input) {
+            return TextualToolRecovery::Invalid(error);
+        }
+        if start > cursor {
+            blocks.push(json!({ "type": "text", "text": &text[cursor..start] }));
+        }
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": format!("toolu_himind_recovered_{recovered_index}"),
+            "name": name,
+            "input": input,
+        }));
+        recovered_index += 1;
+        found = true;
+        cursor = start
+            + LEAKED_TOOL_PREFIX.len()
+            + marker
+            + LEAKED_TOOL_MARKER.len()
+            + leading_whitespace
+            + consumed;
+    }
+
+    if !found {
+        return TextualToolRecovery::NoMatch;
+    }
+    if cursor < text.len() {
+        blocks.push(json!({ "type": "text", "text": &text[cursor..] }));
+    }
+    TextualToolRecovery::Recovered(blocks)
+}
+
+fn take_json_object_prefix(input: &str) -> Option<(&str, usize)> {
+    if !input.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = offset + 1;
+                    return Some((&input[..end], end));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn validate_recovered_tool_input(tools: &[Value], name: &str, input: &Value) -> Result<(), String> {
+    let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+    else {
+        return Err(format!(
+            "recovered tool {name} is not available in this request"
+        ));
+    };
+    if !input.is_object() {
+        return Err(format!(
+            "recovered tool {name} arguments must be a JSON object"
+        ));
+    }
+    let schema = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object" }));
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("recovered tool {name} has an invalid input schema: {error}"))?;
+    let errors = validator
+        .iter_errors(input)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "recovered tool {name} input violates its schema: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
 /// OpenAI Responses 响应 → Anthropic Messages 响应。
 pub(crate) fn response_to_anthropic(response: &Value, model: &str) -> Result<Value, String> {
+    response_to_anthropic_with_tools(response, model, &[])
+}
+
+pub(crate) fn response_to_anthropic_with_tools(
+    response: &Value,
+    model: &str,
+    tools: &[Value],
+) -> Result<Value, String> {
     validate_terminal_status(response)?;
     let completed = response.get("status").and_then(Value::as_str) != Some("incomplete");
     let mut content = Vec::<Value>::new();
@@ -377,7 +537,17 @@ pub(crate) fn response_to_anthropic(response: &Value, model: &str) -> Result<Val
                     })
                     .unwrap_or_default();
                 if !text.is_empty() {
-                    content.push(json!({ "type": "text", "text": text }));
+                    match recover_textual_tool_calls(&text, tools) {
+                        TextualToolRecovery::Recovered(blocks) => {
+                            has_tool_use |= blocks.iter().any(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                            });
+                            content.extend(blocks);
+                        }
+                        TextualToolRecovery::Invalid(_) | TextualToolRecovery::NoMatch => {
+                            content.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
                 }
             }
             Some("function_call") => {
@@ -419,7 +589,15 @@ pub(crate) fn response_to_anthropic(response: &Value, model: &str) -> Result<Val
 /// 非流式 Responses 响应补齐为完整 Anthropic SSE 生命周期。
 /// 上游偶尔忽略 stream=true 并直接返回 JSON；客户端仍期待 SSE 时使用。
 pub(crate) fn response_to_anthropic_sse(response: &Value, model: &str) -> Result<String, String> {
-    let message = response_to_anthropic(response, model)?;
+    response_to_anthropic_sse_with_tools(response, model, &[])
+}
+
+pub(crate) fn response_to_anthropic_sse_with_tools(
+    response: &Value,
+    model: &str,
+    tools: &[Value],
+) -> Result<String, String> {
+    let message = response_to_anthropic_with_tools(response, model, tools)?;
     let mut output = String::new();
     output.push_str(&sse(
         "message_start",
@@ -615,6 +793,9 @@ pub(crate) struct AnthropicResponsesStream {
     has_tool_use: bool,
     terminal_stop_reason: Option<String>,
     usage: Value,
+    recovery_tools: Vec<Value>,
+    buffer_text_for_recovery: bool,
+    buffered_text: String,
 }
 
 struct ToolBlock {
@@ -628,6 +809,14 @@ struct ToolBlock {
 
 impl AnthropicResponsesStream {
     pub(crate) fn new(model: String) -> Self {
+        Self::new_with_tool_recovery(model, Vec::new(), false)
+    }
+
+    pub(crate) fn new_with_tool_recovery(
+        model: String,
+        tools: Vec<Value>,
+        buffer_text_for_recovery: bool,
+    ) -> Self {
         Self {
             response_id: "msg_himind_gateway".to_string(),
             model,
@@ -640,6 +829,9 @@ impl AnthropicResponsesStream {
             has_tool_use: false,
             terminal_stop_reason: None,
             usage: json!({}),
+            recovery_tools: tools,
+            buffer_text_for_recovery,
+            buffered_text: String::new(),
         }
     }
 
@@ -672,7 +864,10 @@ impl AnthropicResponsesStream {
                 self.message_start()
             }
             "response.content_part.added" => {
-                if event.pointer("/part/type").and_then(Value::as_str) == Some("output_text") {
+                if self.buffer_text_for_recovery {
+                    Vec::new()
+                } else if event.pointer("/part/type").and_then(Value::as_str) == Some("output_text")
+                {
                     self.start_text_block()
                 } else {
                     Vec::new()
@@ -683,6 +878,10 @@ impl AnthropicResponsesStream {
                     return Vec::new();
                 };
                 if text.is_empty() {
+                    return Vec::new();
+                }
+                if self.buffer_text_for_recovery {
+                    self.buffered_text.push_str(text);
                     return Vec::new();
                 }
                 let mut events = self.message_start();
@@ -697,10 +896,20 @@ impl AnthropicResponsesStream {
                 ));
                 events
             }
-            "response.output_text.done" => self.close_text_block(),
+            "response.output_text.done" => {
+                if self.buffer_text_for_recovery {
+                    self.flush_buffered_text()
+                } else {
+                    self.close_text_block()
+                }
+            }
             "response.output_item.done" => {
                 if event.pointer("/item/type").and_then(Value::as_str) == Some("message") {
-                    self.close_text_block()
+                    if self.buffer_text_for_recovery {
+                        self.flush_buffered_text()
+                    } else {
+                        self.close_text_block()
+                    }
                 } else if event.pointer("/item/type").and_then(Value::as_str)
                     == Some("function_call")
                 {
@@ -728,7 +937,9 @@ impl AnthropicResponsesStream {
                 {
                     self.terminal_stop_reason = Some("max_tokens".to_string());
                 }
-                self.finish_lifecycle()
+                let mut events = self.flush_buffered_text();
+                events.extend(self.finish_lifecycle());
+                events
             }
             "response.failed" | "error" => {
                 let message = event
@@ -749,7 +960,9 @@ impl AnthropicResponsesStream {
     }
 
     pub(crate) fn finish(&mut self) -> Vec<String> {
-        self.finish_lifecycle()
+        let mut events = self.flush_buffered_text();
+        events.extend(self.finish_lifecycle());
+        events
     }
 
     pub(crate) fn usage(&self) -> (u64, u64) {
@@ -1022,6 +1235,91 @@ impl AnthropicResponsesStream {
         )]
     }
 
+    fn flush_buffered_text(&mut self) -> Vec<String> {
+        if !self.buffer_text_for_recovery || self.buffered_text.is_empty() {
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.buffered_text);
+        let blocks = match recover_textual_tool_calls(&text, &self.recovery_tools) {
+            TextualToolRecovery::Recovered(blocks) => blocks,
+            TextualToolRecovery::Invalid(_) | TextualToolRecovery::NoMatch => {
+                vec![json!({ "type": "text", "text": text })]
+            }
+        };
+        let mut events = self.message_start();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let Some(text) = block.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let index = self.ensure_text_block();
+                    events.push(sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": { "type": "text", "text": "" },
+                        }),
+                    ));
+                    events.push(sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": { "type": "text_delta", "text": text },
+                        }),
+                    ));
+                    events.extend(self.close_text_block());
+                }
+                Some("tool_use") => {
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_himind_recovered");
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    events.push(sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": {},
+                            },
+                        }),
+                    ));
+                    events.push(sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
+                            },
+                        }),
+                    ));
+                    events.push(sse(
+                        "content_block_stop",
+                        json!({ "type": "content_block_stop", "index": index }),
+                    ));
+                    self.has_tool_use = true;
+                }
+                _ => {}
+            }
+        }
+        events
+    }
+
     fn finish_lifecycle(&mut self) -> Vec<String> {
         if self.finished || !self.message_started {
             return Vec::new();
@@ -1195,5 +1493,141 @@ mod tests {
         assert!(output.contains(r#""stop_reason":"tool_use""#));
         assert!(output.contains("event: message_stop"));
         assert_eq!(stream.usage(), (5, 2));
+    }
+
+    #[test]
+    fn leaked_bash_call_is_recovered_to_structured_tool_use() {
+        let response = json!({
+            "id": "resp_leak",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "PowerShell 7 可用。\n\nEarlier the assistant used the Bash tool. Arguments: {\"command\":\"pwsh -NoProfile -File deploy.ps1\",\"run_in_background\":true}"
+                }]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        });
+        let tools = vec![json!({
+            "name": "Bash",
+            "input_schema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "run_in_background": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }
+        })];
+        let translated = response_to_anthropic_with_tools(&response, "alias", &tools).unwrap();
+        assert_eq!(translated["content"][0]["type"], "text");
+        assert_eq!(translated["content"][1]["type"], "tool_use");
+        assert_eq!(translated["content"][1]["name"], "Bash");
+        assert_eq!(
+            translated["content"][1]["input"]["command"],
+            "pwsh -NoProfile -File deploy.ps1"
+        );
+        assert_eq!(translated["content"][1]["input"]["run_in_background"], true);
+        assert_eq!(translated["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn unknown_leaked_tool_stays_text() {
+        let response = json!({
+            "id": "resp_unknown",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Earlier the assistant used the Bash tool. Arguments: {\"command\":\"whoami\"}"
+                }]
+            }]
+        });
+        let tools = vec![json!({
+            "name": "Read",
+            "input_schema": {"type": "object"}
+        })];
+        let translated = response_to_anthropic_with_tools(&response, "alias", &tools).unwrap();
+        assert_eq!(translated["content"].as_array().unwrap().len(), 1);
+        assert_eq!(translated["content"][0]["type"], "text");
+        assert_eq!(translated["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn invalid_leaked_tool_schema_stays_text() {
+        let response = json!({
+            "id": "resp_invalid",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Earlier the assistant used the Bash tool. Arguments: {\"run_in_background\":true}"
+                }]
+            }]
+        });
+        let tools = vec![json!({
+            "name": "Bash",
+            "input_schema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "run_in_background": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }
+        })];
+        let translated = response_to_anthropic_with_tools(&response, "alias", &tools).unwrap();
+        assert_eq!(translated["content"].as_array().unwrap().len(), 1);
+        assert_eq!(translated["content"][0]["type"], "text");
+        assert_eq!(translated["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn buffered_stream_recovers_leaked_tool_call() {
+        let tools = vec![json!({
+            "name": "Bash",
+            "input_schema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {"command": {"type": "string"}},
+                "additionalProperties": false
+            }
+        })];
+        let mut stream =
+            AnthropicResponsesStream::new_with_tool_recovery("alias".to_string(), tools, true);
+        let events = [
+            json!({"type":"response.created","response":{"id":"resp_1"}}),
+            json!({"type":"response.output_text.delta","delta":"准备执行。\n\nEarlier the assistant used the Bash tool. Arguments: "}),
+            json!({"type":"response.output_text.delta","delta":"{\"command\":\"whoami\"}"}),
+            json!({"type":"response.output_text.done"}),
+            json!({"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}),
+        ];
+        let mut output = String::new();
+        for event in events {
+            output.push_str(&stream.push_line(&format!("data: {event}")).concat());
+        }
+        output.push_str(&stream.finish().concat());
+        assert!(
+            output.contains(r#""text":"准备执行。\n\n""#),
+            "output={output}"
+        );
+        assert!(output.contains(r#""type":"tool_use""#), "output={output}");
+        assert!(output.contains(r#""name":"Bash""#), "output={output}");
+        assert!(
+            output.contains(r#""partial_json":"{\"command\":\"whoami\"}""#),
+            "output={output}"
+        );
+        assert!(
+            output.contains(r#""stop_reason":"tool_use""#),
+            "output={output}"
+        );
     }
 }

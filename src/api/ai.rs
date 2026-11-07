@@ -74,6 +74,15 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
+    fn gpt_61_sol_metadata_preserves_one_million_context() {
+        let metadata = known_model_metadata("gpt-yundu/gpt-6.1-sol");
+        assert_eq!(metadata.context_window, Some(1_000_000));
+        assert_eq!(metadata.max_output_tokens, Some(64_000));
+        assert!(!metadata.reasoning_efforts.is_empty());
+        assert!(!metadata.supports_image());
+    }
+
+    #[test]
     fn agent_plan_model_metadata_matches_provider_catalog() {
         let cases = [
             ("doubao-seed-evolving", true),
@@ -431,6 +440,7 @@ pub(crate) fn merge_known_model_metadata(model: &str, metadata: &mut AIModelMeta
         "glm-5.3" => (Some(1_000_000), Some(64_000), false),
         "glm-5.3-flash" => (Some(1_000_000), Some(64_000), true),
         "kimi-k2.8-preview" | "kimi-k3" | "kimi-k3.1-pro" => (Some(1_000_000), Some(64_000), true),
+        "gpt-6.1-sol" => (Some(1_000_000), Some(64_000), false),
         "deepseek-v4.1-flash" | "deepseek-v4.1-flash-economy" => {
             (Some(1_000_000), Some(64_000), true)
         }

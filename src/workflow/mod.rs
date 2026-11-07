@@ -69,6 +69,101 @@ pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
 
+/// 运行期步参数覆盖在 `input` 里的键。
+///
+/// 工作流包是签名制品，结构改动必须走版本化路径；但「这次要多一层批准」
+/// 「最多重试几轮」属于执行策略，用户应当在启动前就能调，不必为此发新版本。
+/// 覆盖只放在本次运行的输入里，所以它天然随 interaction 存档、随恢复回放。
+pub(crate) const EXECUTION_OVERRIDES_KEY: &str = "execution_overrides";
+
+/// 应用运行期步参数覆盖。
+///
+/// 只接受「收紧」这一个方向：
+/// - 可以给一步加审批闸门，不能撤掉包里已有的；
+/// - 可以把循环轮数调小，不能调大；
+/// - 只能把 `on_failure` 改成 `fail`，不能改成 `continue` 把失败吞掉。
+///
+/// 反方向等于用运行参数绕过签名包声明的风险边界，所以直接拒绝而不是静默忽略。
+pub(crate) fn apply_execution_overrides(
+    package: &WorkflowPackage,
+    input: &Value,
+) -> Result<WorkflowPackage, Box<dyn Error>> {
+    let Some(overrides) = input
+        .get(EXECUTION_OVERRIDES_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Ok(package.clone());
+    };
+    let mut patched = package.clone();
+    for (step_id, spec) in overrides {
+        let spec = spec
+            .as_object()
+            .ok_or_else(|| format!("execution override for {step_id} must be an object"))?;
+        let step = find_step_mut(&mut patched.steps, step_id)
+            .ok_or_else(|| format!("execution override references unknown step: {step_id}"))?;
+        if let Some(approval) = spec.get("approval_required").and_then(Value::as_bool) {
+            if !approval && step.approval_required {
+                return Err(format!(
+                    "execution override cannot remove the approval gate on {step_id}"
+                )
+                .into());
+            }
+            if approval {
+                if step.risk_level.trim().is_empty() {
+                    return Err(format!(
+                        "workflow step {step_id} approval requires a risk level"
+                    )
+                    .into());
+                }
+                step.approval_required = true;
+            }
+        }
+        if let Some(rounds) = spec.get("max_iterations").and_then(Value::as_u64) {
+            let rounds = u32::try_from(rounds).unwrap_or(u32::MAX);
+            if rounds == 0 {
+                return Err(format!("execution override max_iterations must be >= 1: {step_id}").into());
+            }
+            let loop_config = step.loop_config.as_mut().ok_or_else(|| {
+                format!("execution override max_iterations requires a loop step: {step_id}")
+            })?;
+            if rounds > loop_config.max_iterations {
+                return Err(format!(
+                    "execution override can only lower max_iterations on {step_id} ({} -> {rounds})",
+                    loop_config.max_iterations
+                )
+                .into());
+            }
+            loop_config.max_iterations = rounds;
+        }
+        if let Some(on_failure) = spec.get("on_failure").and_then(Value::as_str) {
+            if on_failure.trim() != "fail" {
+                return Err(format!(
+                    "execution override on_failure only accepts \"fail\": {step_id}"
+                )
+                .into());
+            }
+            step.on_failure = "fail".to_string();
+        }
+    }
+    // 覆盖后必须仍然是一个合法包：例如给 runtime 步骤加审批会撞上能力步骤的约束。
+    patched.validate().map_err(std::io::Error::other)?;
+    Ok(patched)
+}
+
+fn find_step_mut<'a>(steps: &'a mut [WorkflowStep], step_id: &str) -> Option<&'a mut WorkflowStep> {
+    for step in steps.iter_mut() {
+        if step.id == step_id {
+            return Some(step);
+        }
+        if let Some(loop_config) = step.loop_config.as_mut() {
+            if let Some(found) = find_step_mut(&mut loop_config.steps, step_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// 能力在当下是否可用：控制面能力只有接上工作台（dashboard_provider）才算可用。
 ///
 /// 预检与运行期必须共用这一条判据，否则会出现「预检说可用、运行期调不到」。
@@ -114,6 +209,13 @@ pub(crate) struct WorkflowPackage {
     pub optional_providers: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 执行角色及其执行配置。
+    ///
+    /// 步骤通过 `role_id` 引用这里的键。角色只描述「谁在做、怎么做」，
+    /// 不改变能力路由：一个任务里不同步骤分属不同角色，但都跑在同一条运行台账上。
+    /// 未声明的角色 ID 允许存在于步骤上（老包渐进迁移），只是不获得任何覆盖。
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, WorkflowRole>,
     /// 声明能力的候选提供方：主能力不可用时，任一候选可用即视为满足。
     ///
     /// 典型用途是控制面/独立模式的差异：软件发布工作流声明
@@ -356,10 +458,35 @@ pub(crate) struct WorkflowRuntimeStep {
     pub timeout_seconds: u64,
 }
 
+/// 一个执行角色的配置。
+///
+/// 步骤上的 `role_id` 指向这里。所有字段都是可选的：只声明一个角色 ID 而不写
+/// 任何配置，等价于「这一步由某人负责」，不改变任何执行行为。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowRole {
+    #[serde(default)]
+    pub label: String,
+    /// 该角色负责步骤的职责说明；会拼进提示词前缀，让同一 Runtime 按角色行事。
+    #[serde(default)]
+    pub brief: String,
+    /// 覆盖步骤声明的 Runtime Provider。留空沿用步骤自己的。
+    #[serde(default)]
+    pub runtime_provider: String,
+    /// 覆盖步骤的提示词模板。留空沿用步骤自己的（角色 brief 仍会追加）。
+    #[serde(default)]
+    pub prompt: String,
+    /// 覆盖步骤的工具策略：`default` / `none`。留空沿用步骤自己的。
+    ///
+    /// 这是角色隔离的实质手段之一：审查角色挂 `none` 就看不到上游推理过程，
+    /// 只能依据显式注入的 Artifact（diff、测试报告）判断。
+    #[serde(default)]
+    pub tool_policy: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WorkflowLoop {
-    pub max_iterations: u32,
+pub(crate) struct WorkflowLoop {    pub max_iterations: u32,
     #[serde(default)]
     pub pause_for_feedback: bool,
     #[serde(default)]
@@ -569,6 +696,23 @@ impl WorkflowPackage {
         }
         validate_unique_text("optional provider", &self.optional_providers)?;
         validate_unique_text("supported runtime", &self.supported_runtimes)?;
+        // 角色键必须能被步骤的 role_id 引用到，所以用同一套字符集校验；
+        // 角色里的 provider 也必须是包已声明的 runtime，否则预检会放行一个跑不起来的包。
+        for (role_id, role) in &self.roles {
+            validate_workflow_id(role_id)
+                .map_err(|error| format!("workflow role {role_id}: {error}"))?;
+            if !matches!(role.tool_policy.trim(), "" | "default" | "none") {
+                return Err(format!(
+                    "workflow role {role_id} tool_policy must be default or none"
+                ));
+            }
+            let provider = role.runtime_provider.trim();
+            if !provider.is_empty() && !self.supported_runtimes.iter().any(|item| item == provider) {
+                return Err(format!(
+                    "workflow role {role_id} runtime_provider is not declared in supported_runtimes: {provider}"
+                ));
+            }
+        }
         validate_dependency_refs("skill", &self.dependencies.skills)?;
         validate_dependency_refs("plugin", &self.dependencies.plugins)?;
         let declared_targets = self
@@ -2159,5 +2303,100 @@ mod tests {
             }
         }
         Ok(())
+    }
+    #[test]
+    fn execution_override_can_only_tighten_risk_boundaries() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("software-delivery");
+        let package = load_from_directory(&root).unwrap();
+
+        // 收紧：给实现步骤加审批闸门。
+        let tightened = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": {
+                    "IMPLEMENT": { "approval_required": true }
+                }
+            }),
+        )
+        .unwrap();
+        let step = tightened.steps.iter().find(|s| s.id == "IMPLEMENT").unwrap();
+        assert!(step.approval_required);
+
+        // 放宽：撤掉包里已有的闸门必须被拒绝，而不是静默忽略。
+        let error = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "CONFIRM": { "approval_required": false } }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot remove the approval gate"));
+    }
+
+    #[test]
+    fn execution_override_can_lower_loop_rounds_but_not_raise_them() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("software-delivery");
+        let package = load_from_directory(&root).unwrap();
+        let declared = package
+            .steps
+            .iter()
+            .find(|s| s.id == "VERIFY")
+            .and_then(|s| s.loop_config.as_ref())
+            .unwrap()
+            .max_iterations;
+
+        let lowered = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "VERIFY": { "max_iterations": 1 } }
+            }),
+        )
+        .unwrap();
+        let rounds = lowered
+            .steps
+            .iter()
+            .find(|s| s.id == "VERIFY")
+            .and_then(|s| s.loop_config.as_ref())
+            .unwrap()
+            .max_iterations;
+        assert_eq!(rounds, 1);
+
+        // 调大轮数会突破包里声明的重试预算，必须拒绝。
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "VERIFY": { "max_iterations": declared + 5 } }
+            }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn execution_override_rejects_unknown_steps_and_bad_values() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("software-delivery");
+        let package = load_from_directory(&root).unwrap();
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "NOPE": { "approval_required": true } } }),
+        )
+        .is_err());
+        // 只有 loop 步骤能配轮数。
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "IMPLEMENT": { "max_iterations": 2 } } }),
+        )
+        .is_err());
+        // on_failure 只接受 fail：改成 continue 会把失败吞掉。
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "IMPLEMENT": { "on_failure": "continue" } } }),
+        )
+        .is_err());
     }
 }
