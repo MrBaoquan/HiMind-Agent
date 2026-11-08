@@ -25,6 +25,7 @@ import {
   shouldShowRoleBadge,
   shouldShowRoleChain,
   childRuns,
+  chainState,
 } from '../src/pages/taskView.ts';
 
 // 状态集合必须互斥，否则同一个任务会被同时算进「进行中」和「需处理」。
@@ -201,6 +202,71 @@ assert.deepEqual(
       status: 'completed', statusLabel: '已完成', error: '', updatedAt: '',
     },
   ],
+);
+
+// 链路上的状态比徽标多一档：等待审批要单独可辨，不能和「还没轮到」同色。
+// 这两者在真实任务里的处置完全不同——前者需要人点一下，后者只是还没开始。
+assert.equal(chainState('completed'), 'success');
+assert.equal(chainState('succeeded'), 'success');
+assert.equal(chainState('running'), 'running');
+assert.equal(chainState('waiting'), 'waiting');
+assert.equal(chainState('failed'), 'danger');
+assert.equal(chainState('canceled'), 'danger');
+assert.equal(chainState('pending'), 'pending');
+// 后端在投影时就把 LocalStepStatus::Succeeded 归一成 completed，所以链路只会收到
+// 归一后的词表；未归一的原始词不需要在这里再认一遍。
+assert.equal(chainState('skipped'), 'pending');
+assert.equal(chainState(''), 'pending');
+// taskStatusTone 把 waiting 归到 neutral 是对的（徽标复用配色），
+// 但链路必须区分二者 —— 这条断言锁住两者不相等。
+assert.notEqual(chainState('waiting'), taskStatusTone('waiting'));
+
+// ── 行内操作的可判定条件 ─────────────────────────────────────────────────
+// 这里锁的是「什么时候按钮才出现」。错误地显示一个点了没反应的按钮，
+// 比不显示更糟——用户会以为功能坏了。
+import { readFileSync } from 'node:fs';
+const page = readFileSync(new URL('../src/pages/TaskCenterPage.tsx', import.meta.url), 'utf8');
+assert.match(
+  page,
+  /const canCancel = Boolean\(onCancelRun\) && active && Boolean\(entry\.workflowRunId\);/,
+  '取消只在「有回调 + 正在跑 + 有运行号」时出现',
+);
+assert.match(
+  page,
+  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind !== 'user';/,
+  '审批入口只认 waiting 且非用户暂停',
+);
+assert.match(
+  page,
+  /const canDecide = Boolean\(onApproveRun && onRejectRun\) && awaitingApproval && Boolean\(entry\.workflowRunId\);/,
+  '批准/拒绝必须同时具备两个回调',
+);
+assert.match(
+  page,
+  /const canPause = Boolean\(onPauseRun\) && entry\.status === 'running' && Boolean\(entry\.workflowRunId\);/,
+  '暂停只对正在跑的运行出现：等审批/等反馈不是「在跑」',
+);
+assert.match(
+  page,
+  /const canResume = Boolean\(onResumePausedRun\) && entry\.status === 'waiting'\s*&& entry\.pauseKind === 'user'/,
+  '恢复只对用户主动暂停出现，不能用来绕过审批或反馈等待',
+);
+// 等审批的判定必须排除用户暂停，否则暂停中的运行会同时出现「继续」和「批准」。
+assert.match(
+  page,
+  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind !== 'user';/,
+  '用户暂停的运行不得出现审批按钮',
+);
+assert.match(
+  page,
+  /const canRetry = Boolean\(onRetryStep\) && entry\.status === 'failed'\s*&& Boolean\(entry\.workflowRunId\) && Boolean\(entry\.failedStepId\);/,
+  '重试只对失败且已停下的运行出现',
+);
+// 不允许出现「禁用但可见」的占位按钮。
+assert.equal(
+  /task-center-row-action[^>]*disabled=\{!on/.test(page),
+  false,
+  '不得用 disabled 表达「没有权限」，应直接不渲染',
 );
 
 console.log('task view checks passed');

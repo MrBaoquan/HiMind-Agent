@@ -21,6 +21,13 @@ export type WorkflowStartField = {
   optionSourceCached: boolean;
   placeholder: string;
   target: string;
+  /**
+   * 该字段不是步骤输入，而是一条运行期覆盖。
+   *
+   * 例如「最多打磨轮次」不该写进输入让模型去读，而应落成
+   * `execution_overrides["POLISH-LOOP"].max_iterations`，由 runner 在启动时应用。
+   */
+  override?: { stepId: string; key: string };
   picker: string;
   hint: string;
   budget: { maxQueries?: number; intervalMs?: number };
@@ -112,6 +119,7 @@ export function normalizeStartField(field: WorkflowViewField): WorkflowStartFiel
     optionSourceCached: Boolean(field.option_source_cached),
     placeholder: field.placeholder || '',
     target: field.target || '',
+    override: parseOverride((field as { override?: unknown }).override),
     picker: field.picker || '',
     hint: field.hint || '',
     budget: {
@@ -169,9 +177,45 @@ export function initialFieldValue(field: WorkflowStartField): unknown {
   return '';
 }
 
+/** 从视图字段定义里读出 override 声明；形状不对就当没声明。 */
+function parseOverride(value: unknown): { stepId: string; key: string } | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const stepId = typeof record.stepId === 'string' ? record.stepId.trim() : '';
+  const key = typeof record.key === 'string' ? record.key.trim() : '';
+  if (!stepId || !key) return undefined;
+  return { stepId, key };
+}
+
+/**
+ * 把带 `override` 的字段值抽成 `execution_overrides`。
+ *
+ * 与 `fieldsToInput` 分开：前者产出「这一步要做什么」，这里产出「这次允许跑几轮」，
+ * 两者在 runner 里走不同路径，混在一起会被当成步骤输入传给模型。
+ */
+export function fieldsToExecutionOverrides(
+  fields: WorkflowStartField[],
+  values: Record<string, unknown>,
+): Record<string, Record<string, unknown>> {
+  const overrides: Record<string, Record<string, unknown>> = {};
+  for (const field of fields) {
+    if (!field.override) continue;
+    const raw = values[field.id];
+    const numeric = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
+    if (!Number.isFinite(numeric) || numeric <= 0) continue;
+    overrides[field.override.stepId] = {
+      ...(overrides[field.override.stepId] || {}),
+      [field.override.key]: Math.floor(numeric),
+    };
+  }
+  return overrides;
+}
+
 export function fieldsToInput(fields: WorkflowStartField[], values: Record<string, unknown>): Record<string, unknown> {
   const input: Record<string, unknown> = {};
   for (const field of fields) {
+    // override 字段不走步骤输入：它们由 fieldsToExecutionOverrides 收集。
+    if (field.override) continue;
     const value = values[field.id];
     if (field.type === 'credential') {
       const handle = String(value || '').trim();

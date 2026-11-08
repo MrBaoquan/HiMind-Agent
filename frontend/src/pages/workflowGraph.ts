@@ -23,6 +23,8 @@ export type WorkflowGraphNode = {
   condition: string;
   failureCondition: string;
   loop: { maxIterations: number; pauseForFeedback: boolean } | null;
+  /** 并行委派的分支摘要；null 表示不是委派步骤。 */
+  delegate: { branchCount: number; minSucceeded: number; branches: Array<{ id: string; title: string; roleId: string }> } | null;
 };
 
 export type WorkflowGraph = {
@@ -79,6 +81,17 @@ export function buildWorkflowGraph(pkg: WorkflowPackage): WorkflowGraph {
         condition: conditionSummary(step.when),
         failureCondition: conditionSummary(step.fail_when),
         loop: step.loop ? { maxIterations: step.loop.max_iterations, pauseForFeedback: Boolean(step.loop.pause_for_feedback) } : null,
+        delegate: step.delegate
+          ? {
+            branchCount: step.delegate.branches?.length ?? 0,
+            minSucceeded: step.delegate.min_succeeded ?? 0,
+            branches: (step.delegate.branches ?? []).map(branch => ({
+              id: branch.id,
+              title: branch.title,
+              roleId: (branch.role_id || '').trim(),
+            })),
+          }
+          : null,
       });
       if (step.loop?.steps?.length) walk(step.loop.steps, depth + 1, id);
     }

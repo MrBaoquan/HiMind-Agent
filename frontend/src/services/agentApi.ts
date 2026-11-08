@@ -159,6 +159,12 @@ export type AgentActivityItem = {
     parent_kind?: 'delegate' | 'retry' | string | null;
     /** 顶层运行的协作计数：委派数、重做数、仍在跑的子运行数。 */
     team?: { delegated?: number; retries?: number; running?: number } | null;
+    /** 当前停留的步骤；行内审批按它定位。 */
+    current_step_id?: string | null;
+    /** 停下来的原因：user / approval / feedback / external。 */
+    pause_kind?: string | null;
+    /** 第一个失败步骤；行内重试按它定位。 */
+    failed_step_id?: string | null;
     /** 子运行明细；父行展开时直接渲染，不需要再查一次。 */
     children?: Array<{
         run_id: string;
@@ -328,6 +334,17 @@ export type WorkflowStep = {
         exit_when?: WorkflowCondition | null;
         steps: WorkflowStep[];
     } | null;
+    /** 并行委派：一步拆成多条子运行，各跑一条分支。 */
+    delegate?: {
+        min_succeeded?: number;
+        branches: Array<{
+            id: string;
+            title: string;
+            role_id?: string;
+            runtime?: WorkflowStep['runtime'];
+            input?: Record<string, unknown>;
+        }>;
+    } | null;
     when?: WorkflowCondition | null;
     fail_when?: WorkflowCondition | null;
     on_failure?: string;
@@ -432,6 +449,8 @@ export type WorkflowLocalRun = {
     interaction_id: string;
     status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'canceled' | string;
     current_step_id: string;
+    /** 停下来的原因：user / approval / feedback / external；非 waiting 时为 none。 */
+    pause_kind?: 'none' | 'user' | 'approval' | 'feedback' | 'external' | string;
     runtime_provider: string;
     workspace_ref: string;
     steps: Array<{
@@ -676,6 +695,17 @@ export type WorkflowRunSnapshot = {
     projections: Array<{ id: number; status: string; attempts: number; last_error: string; payload: unknown }>;
     interaction_request?: WorkflowInteractionRequest | null;
     workflow: { package: WorkflowPackage; enabled: boolean; view: WorkflowView | null } | null;
+    /** 按步骤归拢的结构化证据：谁、用什么能力、看到什么结构、产出哪些产物。 */
+    step_evidence?: Record<string, StepEvidence> | null;
+};
+
+export type StepEvidence = {
+    role_id?: string;
+    capability_id?: string;
+    runtime_provider?: string;
+    /** 步骤输入的脱敏形状：只含键名与规模，不含值。 */
+    inputs?: unknown;
+    artifact_ids?: string[];
 };
 
 export type WorkflowRunVerification = {
@@ -3462,6 +3492,9 @@ export const agentApi = {
     approveWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('approve_workflow_step', { runId, stepId }),
     rejectWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('reject_workflow_step', { runId, stepId }),
     cancelWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('cancel_workflow_run', { runId }),
+    pauseWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('pause_workflow_run', { runId }),
+    retryWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('retry_workflow_step', { runId, stepId }),
+    resumePausedWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('resume_paused_workflow_run', { runId }),
     resumeWorkflowRun: (runId: string, feedback?: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId, feedback }),
     startWorkflowRun: (packageId: string, input: Record<string, unknown>) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('start_workflow_run', { packageId, input }),
     preflightWorkflowRun: (packageId: string, input: Record<string, unknown>) => invoke<WorkflowPreflight>('preflight_workflow_run', { packageId, input }),

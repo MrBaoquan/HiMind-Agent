@@ -3,6 +3,7 @@
 // 运行期才在能力入参校验里报错，而用户只看到「运行失败」。
 import { strict as assert } from 'node:assert';
 import {
+  fieldsToExecutionOverrides,
   fieldsToInput,
   initialFormValues,
   invalidOptionValue,
@@ -94,6 +95,55 @@ const plan = themeSelectionPlan(themeFields, { category_ids: ['ai-video', 'code-
 assert.equal(plan?.queryCount, 8);
 assert.equal(plan?.resolvedTopics.includes('remotion'), true);
 assert.match(themeBudgetError(themeFields, { category_ids: ['ai-video', 'code-animation'], extra_topics: [] }) || '', /超过上限/);
+// ── override 字段：不进步骤输入，落成 execution_overrides ──────────────────
+const overrideFields = [
+  normalizeStartField({
+    id: 'max_rounds',
+    label: '最多打磨轮次',
+    type: 'number',
+    default: 3,
+    override: { stepId: 'POLISH-LOOP', key: 'max_iterations' },
+  }),
+  normalizeStartField({
+    id: 'workspace_root',
+    label: '工作区',
+    type: 'text',
+    required: true,
+  }),
+];
+
+{
+  const values = { max_rounds: 5, workspace_root: '/repo' };
+  // override 字段不得出现在步骤输入里，否则会被当成参数传给模型。
+  const input = fieldsToInput(overrideFields, values);
+  assert.equal(input.max_rounds, undefined, 'override 字段不能进步骤输入');
+  assert.equal(input.workspace_root, '/repo', '普通字段照常进输入');
+
+  const overrides = fieldsToExecutionOverrides(overrideFields, values);
+  assert.deepEqual(
+    overrides,
+    { 'POLISH-LOOP': { max_iterations: 5 } },
+    '轮数应落成对应步骤的覆盖',
+  );
+}
+
+// 空值 / 非数字 / 0 都不产生覆盖：宁可让包用自己的默认值，也不要写一个非法轮数。
+{
+  for (const bad of ['', 'abc', 0, -1, null, undefined]) {
+    const overrides = fieldsToExecutionOverrides(overrideFields, {
+      max_rounds: bad,
+      workspace_root: '/repo',
+    });
+    assert.deepEqual(overrides, {}, `值 ${String(bad)} 不应产生覆盖`);
+  }
+}
+
+// 小数向下取整：轮数是整数概念。
+{
+  const overrides = fieldsToExecutionOverrides(overrideFields, { max_rounds: 4.7 });
+  assert.equal((overrides['POLISH-LOOP'] as { max_iterations: number }).max_iterations, 4);
+}
+
 console.log('start form conversion checks passed');
 
 // topic-groups：计划内采集组保存为对象数组，跨组同名 topic 只计一次预算。

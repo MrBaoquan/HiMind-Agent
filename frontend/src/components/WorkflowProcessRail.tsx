@@ -50,6 +50,7 @@ function stepKindLabel(kind?: string) {
     runtime: 'AI 步骤',
     manual: '人工步骤',
     loop: '循环步骤',
+    delegate: '并行委派',
     provider_defined: '扩展步骤',
   } as Record<string, string>)[kind || ''] || '工作流步骤';
 }
@@ -109,6 +110,15 @@ export function WorkflowProcessRail({ nodes, mode, activities = [] }: {
                 <span className="workflow-process-node-tags">
                   {node.condition ? <b><GitBranch size={11} />条件：{node.condition}</b> : null}
                   {node.loop ? <b><Repeat2 size={11} />最多 {node.loop.maxIterations} 轮{node.loop.pauseForFeedback ? ' · 每轮可反馈' : ''}</b> : null}
+                  {node.delegate ? (
+                    <b title={node.delegate.branches.map(branch => branch.title).join(' / ')}>
+                      <GitBranch size={11} />
+                      {node.delegate.branchCount} 路并行
+                      {node.delegate.minSucceeded > 0 && node.delegate.minSucceeded < node.delegate.branchCount
+                        ? ` · 至少 ${node.delegate.minSucceeded} 路成功`
+                        : ''}
+                    </b>
+                  ) : null}
                   {node.onFailure === 'continue' ? <b>失败后继续</b> : null}
                   {artifactCount ? <b><FileText size={11} />产出 {artifactCount} 个文件</b> : null}
                 </span>

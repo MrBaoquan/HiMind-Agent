@@ -856,6 +856,24 @@ function AgentApp() {
     }
   }
 
+  async function retryWorkflowStep(runId: string, stepId: string) {
+    await agentApi.retryWorkflowStep(runId, stepId);
+    notify('success', '已重置该步骤及其下游，等待重新执行');
+    await refreshWorkflowCenter(false, true);
+  }
+
+  async function pauseWorkflowRun(runId: string) {
+    await agentApi.pauseWorkflowRun(runId);
+    notify('info', '已暂停，当前步骤结束后不再推进');
+    await refreshWorkflowCenter(false, true);
+  }
+
+  async function resumePausedWorkflowRun(runId: string) {
+    await agentApi.resumePausedWorkflowRun(runId);
+    notify('success', '已恢复，将继续执行下一步');
+    await refreshWorkflowCenter(false, true);
+  }
+
   async function cancelWorkflowRun(runId: string) {
     await agentApi.cancelWorkflowRun(runId);
     notify('info', '工作流已取消');
@@ -2285,6 +2303,12 @@ function AgentApp() {
       onLoadLocalActivity={agentApi.localActivity}
       onOpenDashboard={() => run(agentApi.openDashboard)}
       onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
+      onCancelRun={cancelWorkflowRun}
+      onApproveRun={approveWorkflowRun}
+      onRejectRun={rejectWorkflowRun}
+      onPauseRun={pauseWorkflowRun}
+      onResumePausedRun={resumePausedWorkflowRun}
+      onRetryStep={retryWorkflowStep}
     />;
     if (page === 'extensions') return <ExtensionsPage
       loading={pluginsLoading || workflowLoading || extensionSourcesLoading}

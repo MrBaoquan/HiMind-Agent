@@ -25,6 +25,7 @@ import {
   roleLabel,
   roleChips,
   childRuns,
+  chainState,
   shouldShowRoleBadge,
   shouldShowRoleChain,
   teamSummary,
@@ -32,6 +33,7 @@ import {
   type RoleChip,
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
+import { formatError } from '../types';
 
 type TaskFilter = 'all' | 'running' | 'completed' | 'attention';
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
@@ -44,6 +46,15 @@ type TaskCenterPageProps = {
   onLoadLocalActivity: () => Promise<AgentActivityItem[]>;
   onOpenDashboard: () => void;
   onOpenWorkflowRun?: (runId: string) => void;
+  /** 取消本机工作流运行；缺省时该操作不渲染。 */
+  onCancelRun?: (runId: string) => Promise<void>;
+  /** 批准/拒绝当前等待审批的步骤；缺省时这两个操作不渲染。 */
+  onApproveRun?: (runId: string, stepId: string) => Promise<void>;
+  onRejectRun?: (runId: string, stepId: string) => Promise<void>;
+  onPauseRun?: (runId: string) => Promise<void>;
+  onResumePausedRun?: (runId: string) => Promise<void>;
+  /** 重试失败的步骤；缺省时不渲染该操作。 */
+  onRetryStep?: (runId: string, stepId: string) => Promise<void>;
 };
 
 const ACTIVE_STATUSES = TASK_ACTIVE_STATUSES;
@@ -91,6 +102,12 @@ type ActivityEntry = {
   team: { delegated: number; retries: number; running: number } | null;
   /** 这条运行出现过的角色（按步骤出现顺序），用于展示协作链路。 */
   roles: RoleChip[];
+  /** 当前停留的步骤；行内审批按它定位。空串表示没有可审批步骤。 */
+  currentStepId: string;
+  /** 停下来的原因；只有 waiting 状态有意义。 */
+  pauseKind: string;
+  /** 失败的那一步；行内重试按它定位。空串表示没有失败步骤。 */
+  failedStepId: string;
   /** 子运行明细；父行展开时渲染，空数组表示不渲染展开入口。 */
   childrenRuns: ChildRun[];
 };
@@ -135,6 +152,9 @@ function fromTask(item: AgentTaskHistoryItem): ActivityEntry {
     parentKind: '',
     team: null,
     roles: [],
+    currentStepId: '',
+    pauseKind: '',
+    failedStepId: '',
     childrenRuns: [],
   };
 }
@@ -162,6 +182,9 @@ function fromActivity(item: AgentActivityItem): ActivityEntry {
     parentKind: (item.parent_kind || '').trim(),
     team: teamSummary(item.team),
     roles: roleChips(item.roles),
+    currentStepId: (item.current_step_id || '').trim(),
+    pauseKind: (item.pause_kind || '').trim(),
+    failedStepId: (item.failed_step_id || '').trim(),
     childrenRuns: childRuns(item.children),
   };
 }
@@ -170,7 +193,7 @@ function activityTime(entry: ActivityEntry) {
   return entry.finishedAt || entry.updatedAt || entry.createdAt;
 }
 
-export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun }: TaskCenterPageProps) {
+export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun, onCancelRun, onApproveRun, onRejectRun, onPauseRun, onResumePausedRun, onRetryStep }: TaskCenterPageProps) {
   const [items, setItems] = useState<ActivityEntry[]>([]);
   const [filter, setFilter] = useState<TaskFilter>('all');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
@@ -265,7 +288,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
       {active.length > 0 ? (
         <section className="task-center-current" aria-labelledby="task-center-current-title">
           <div className="task-center-section-heading"><div><span className="task-center-section-kicker"><Clock3 size={14} />实时状态</span><h3 id="task-center-current-title">正在进行</h3></div><span>{active.length} 项</span></div>
-          <div className="task-center-current-list">{active.map(item => <ActivityRow key={item.id} entry={item} featured={item.id === currentItem?.id} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} />)}</div>
+          <div className="task-center-current-list">{active.map(item => <ActivityRow key={item.id} entry={item} featured={item.id === currentItem?.id} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} onCancelRun={onCancelRun} onApproveRun={onApproveRun} onRejectRun={onRejectRun} onPauseRun={onPauseRun} onResumePausedRun={onResumePausedRun} />)}</div>
         </section>
       ) : null}
 
@@ -298,7 +321,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
         {loading && items.length === 0
           ? <div className="task-center-loading"><BusyIndicator />正在读取运行记录</div>
           : filteredItems.length > 0
-            ? <div className="task-center-list">{filteredItems.map(item => <ActivityRow key={item.id} entry={item} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} />)}</div>
+            ? <div className="task-center-list">{filteredItems.map(item => <ActivityRow key={item.id} entry={item} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} onCancelRun={onCancelRun} onApproveRun={onApproveRun} onRejectRun={onRejectRun} onPauseRun={onPauseRun} onResumePausedRun={onResumePausedRun} />)}</div>
             : <div className="task-center-empty">
                 <EmptyState
                   icon={filter === 'attention' ? XCircle : Activity}
@@ -321,7 +344,17 @@ function SummaryItem({ label, value, tone }: { label: string; value: number; ton
   return <div className={`task-center-summary-item ${tone}${tone === 'running' && value > 0 ? ' is-live' : ''}`}><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entry: ActivityEntry; featured?: boolean; now: number; onOpenWorkflowRun?: (runId: string) => void }) {
+type RowActions = {
+  onOpenWorkflowRun?: (runId: string) => void;
+  onCancelRun?: (runId: string) => Promise<void>;
+  onApproveRun?: (runId: string, stepId: string) => Promise<void>;
+  onRejectRun?: (runId: string, stepId: string) => Promise<void>;
+  onPauseRun?: (runId: string) => Promise<void>;
+  onResumePausedRun?: (runId: string) => Promise<void>;
+  onRetryStep?: (runId: string, stepId: string) => Promise<void>;
+};
+
+function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun, onCancelRun, onApproveRun, onRejectRun, onPauseRun, onResumePausedRun, onRetryStep }: { entry: ActivityEntry; featured?: boolean; now: number } & RowActions) {
   const active = ACTIVE_STATUSES.has(entry.status);
   const tone = taskStatusTone(entry.status);
   const progress = taskProgressValue(entry.progress);
@@ -336,6 +369,40 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
   const elapsed = active ? taskElapsedSeconds(entry.startedAt || entry.createdAt, now) : null;
   const team = entry.team;
   const parentKind = parentKindLabel(entry.parentKind);
+  // 行内操作：只有在调用方提供了回调、且这条运行确实支持该动作时才渲染。
+  // 不做「灰按钮」——那会让用户以为功能坏了。
+  const [busy, setBusy] = useState<'cancel' | 'approve' | 'reject' | 'pause' | 'resume' | 'retry' | ''>('');
+  const [actionError, setActionError] = useState('');
+  const canCancel = Boolean(onCancelRun) && active && Boolean(entry.workflowRunId);
+  // 暂停只对「正在跑」有意义；等审批/等反馈的运行不是「在跑」，暂停它没有语义。
+  const canPause = Boolean(onPauseRun) && entry.status === 'running' && Boolean(entry.workflowRunId);
+  // 恢复只对「用户主动暂停」出现，不能用来绕过审批或反馈等待。
+  const canResume = Boolean(onResumePausedRun) && entry.status === 'waiting'
+    && entry.pauseKind === 'user' && Boolean(entry.workflowRunId);
+  const awaitingApproval = entry.status === 'waiting' && entry.pauseKind !== 'user';
+  const canDecide = Boolean(onApproveRun && onRejectRun) && awaitingApproval && Boolean(entry.workflowRunId);
+  // 重试只对失败且已停下的运行出现：跑着的时候重跑会和执行线程打架。
+  const canRetry = Boolean(onRetryStep) && entry.status === 'failed'
+    && Boolean(entry.workflowRunId) && Boolean(entry.failedStepId);
+  async function perform(action: 'cancel' | 'approve' | 'reject' | 'pause' | 'resume' | 'retry') {
+    if (busy) return;
+    setBusy(action);
+    setActionError('');
+    try {
+      if (action === 'cancel') await onCancelRun?.(entry.workflowRunId);
+      if (action === 'approve') await onApproveRun?.(entry.workflowRunId, entry.currentStepId);
+      if (action === 'reject') await onRejectRun?.(entry.workflowRunId, entry.currentStepId);
+      if (action === 'pause') await onPauseRun?.(entry.workflowRunId);
+      if (action === 'resume') await onResumePausedRun?.(entry.workflowRunId);
+      if (action === 'retry') await onRetryStep?.(entry.workflowRunId, entry.failedStepId);
+    } catch (error) {
+      const label = action === 'cancel' ? '取消失败' : action === 'pause' ? '暂停失败'
+        : action === 'resume' ? '恢复失败' : action === 'retry' ? '重试失败' : '审批失败';
+      setActionError(formatError(error, label));
+    } finally {
+      setBusy('');
+    }
+  }
   return (
     <article className={`task-center-row${featured ? ' featured' : ''}${active ? ' is-live' : ''}`}>
       <span className={`task-center-state-icon ${tone}${spinning ? ' is-spinning' : ''}`}>
@@ -355,29 +422,69 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun }: { entr
           <time title={formatAbsoluteTime(activityTime(entry))}>{formatRelativeTime(activityTime(entry), now)}</time>
           {elapsed !== null ? <span className="task-center-elapsed run-live-label">已运行 {formatElapsedCn(elapsed)}</span> : duration ? <span>耗时 {duration}</span> : null}
           {stepLabel ? <span>{stepLabel}</span> : null}
-          {/* 协作规模：委派和重做分开报，否则「多角色分工」会被读成「返工」。 */}
+          {/* 协作规模：委派和重做分开报，否则「多角色分工」会被读成「返工」。
+              用独立节点而不是拼一串文字，分隔线由样式统一画，窄窗也不会粘在一起。 */}
           {team ? (
-            <span className="task-center-team">
-              {team.delegated > 0 ? `${team.delegated} 项委派` : null}
-              {team.delegated > 0 && team.retries > 0 ? ' · ' : null}
-              {team.retries > 0 ? `${team.retries} 次重做` : null}
-              {team.running > 0 ? `${team.delegated > 0 || team.retries > 0 ? ' · ' : ''}${team.running} 项进行中` : null}
+            <span className="task-center-team" aria-label="协作规模">
+              {team.delegated > 0 ? <span><b>{team.delegated}</b> 项委派</span> : null}
+              {team.retries > 0 ? <span><b>{team.retries}</b> 次重做</span> : null}
+              {team.running > 0 ? <span className="is-live"><b>{team.running}</b> 项进行中</span> : null}
             </span>
           ) : null}
           {entry.subtitle ? <span>{entry.subtitle}</span> : null}
           {entry.workflowRunId && onOpenWorkflowRun ? <button type="button" className="task-center-row-action" onClick={() => onOpenWorkflowRun(entry.workflowRunId)}>查看运行</button> : null}
+          {/* 行内操作：看见任务的地方就该能处理它，不必跳页。
+              只在动作真的可用时出现，不做灰按钮。 */}
+          {canDecide ? (
+            <>
+              <button type="button" className="task-center-row-action is-primary" disabled={Boolean(busy)} onClick={() => void perform('approve')}>
+                {busy === 'approve' ? '处理中' : '批准'}
+              </button>
+              <button type="button" className="task-center-row-action is-danger" disabled={Boolean(busy)} onClick={() => void perform('reject')}>
+                {busy === 'reject' ? '处理中' : '拒绝'}
+              </button>
+            </>
+          ) : null}
+          {canPause ? (
+            <button type="button" className="task-center-row-action" disabled={Boolean(busy)} onClick={() => void perform('pause')}>
+              {busy === 'pause' ? '暂停中' : '暂停'}
+            </button>
+          ) : null}
+          {canResume ? (
+            <button type="button" className="task-center-row-action is-primary" disabled={Boolean(busy)} onClick={() => void perform('resume')}>
+              {busy === 'resume' ? '恢复中' : '继续'}
+            </button>
+          ) : null}
+          {canRetry ? (
+            <button type="button" className="task-center-row-action is-primary" disabled={Boolean(busy)} onClick={() => void perform('retry')}>
+              {busy === 'retry' ? '重试中' : '重试'}
+            </button>
+          ) : null}
+          {canCancel ? (
+            <button type="button" className="task-center-row-action is-danger" disabled={Boolean(busy)} onClick={() => void perform('cancel')}>
+              {busy === 'cancel' ? '取消中' : '取消'}
+            </button>
+          ) : null}
         </div>
+        {actionError ? <p className="error" role="alert">{actionError}</p> : null}
         {/* 协作链路只在真的有两个以上角色时出现：一个角色不叫协作，画成链路只会占地方。 */}
         {shouldShowRoleChain(entry.roles) ? (
-          <div className="task-center-role-chain" aria-label="角色协作顺序">
-            {entry.roles.map((role, index) => (
-              <span className="task-center-role-step" key={role.id}>
-                {index > 0 ? <span className="task-center-role-arrow" aria-hidden="true">→</span> : null}
-                <span className={`task-center-role-node ${taskStatusTone(role.status)}`} title={`${role.id} · ${taskStatusLabel(role.status) || '未开始'}`}>
-                  {role.label}
+          <div className="task-center-role-chain" role="list" aria-label="角色协作顺序">
+            {entry.roles.map((role, index) => {
+              const state = chainState(role.status);
+              const last = index === entry.roles.length - 1;
+              return (
+                <span
+                  className={`task-center-role-step is-${state}${last ? ' is-last' : ''}`}
+                  role="listitem"
+                  key={role.id}
+                  title={`${role.id} · ${taskStatusLabel(role.status) || '未开始'}`}
+                >
+                  <span className="task-center-role-dot" aria-hidden="true" />
+                  <span className="task-center-role-name">{role.label}</span>
                 </span>
-              </span>
-            ))}
+              );
+            })}
           </div>
         ) : null}
         {/* 子运行明细：只在真有子运行时给展开入口，否则不留一个空三角。 */}

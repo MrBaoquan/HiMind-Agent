@@ -16,6 +16,8 @@ export type RunTimelineStep = {
   executionMode: string;
   /** 执行该步骤的角色；空串表示未声明。 */
   roleId: string;
+  /** 并行委派的分支摘要；null 表示不是委派步骤。 */
+  delegate: WorkflowGraphNode['delegate'];
   depth: number;
   approvalRequired: boolean;
   condition: string;
@@ -209,6 +211,7 @@ function fallbackGraphNode(step: RuntimeStep, index: number): WorkflowGraphNode 
     condition: '',
     failureCondition: '',
     loop: null,
+    delegate: null,
   };
 }
 
@@ -273,6 +276,7 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
       capabilityId: node.capabilityId || '',
       executionMode: node.executionMode || '',
       roleId: node.roleId || '',
+      delegate: node.delegate,
       depth: node.depth,
       approvalRequired: node.approvalRequired,
       condition: node.condition,

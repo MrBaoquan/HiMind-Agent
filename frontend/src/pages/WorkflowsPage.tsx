@@ -14,6 +14,7 @@ import { extensionStatus } from '../data/statusPresentation';
 import {
   WorkflowStartFieldError,
   fieldsToInput,
+  fieldsToExecutionOverrides,
   filledFieldCount,
   initialFormValues,
   initialFieldValue,
@@ -36,6 +37,8 @@ import {
 } from './workflowRunView';
 import { buildWorkflowGraph } from './workflowGraph';
 import { roleLabel, shortRunId } from './taskView';
+import { buildApprovalEvidence } from './approvalEvidence';
+import { buildInteractionForm, formToFeedback, initialFormState } from './interactionForm';
 import { runtimeProviderLabel } from './runtimeProviderView';
 
 type WorkflowsPageProps = {
@@ -533,6 +536,15 @@ function draftFromPreset(preset: WorkflowRunPreset | null, fields: WorkflowStart
   };
 }
 
+/** 把 override 字段收进 `execution_overrides`；没有就不加这个键。 */
+function withExecutionOverrides(
+  fields: ReturnType<typeof normalizeStartField>[],
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const overrides = fieldsToExecutionOverrides(fields, values);
+  return Object.keys(overrides).length ? { execution_overrides: overrides } : {};
+}
+
 export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
   // 工作流页把「有哪些能力」和「跑成什么样」拆成两个页签：进来先看到能跑的工作流，
   // 而不是一张运行记录表；有活动运行时才在列表上方补一条运行态。
@@ -549,6 +561,9 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
   const [runDetailRetry, setRunDetailRetry] = useState(0);
   const [actionBusy, setActionBusy] = useState('');
   const [resumeFeedback, setResumeFeedback] = useState('');
+  // schema 表单的本地状态；schema 缺失时保持为空，走原文本框路径。
+  const [interactionValues, setInteractionValues] = useState<Record<string, unknown>>({});
+  const [interactionError, setInteractionError] = useState('');
   const [startOpen, setStartOpen] = useState(false);
   const [startInput, setStartInput] = useState('');
   const [startError, setStartError] = useState('');
@@ -833,7 +848,12 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
     let input: Record<string, unknown> = startBaseInput;
     try {
       const candidate = startMode === 'form'
-        ? { ...startBaseInput, ...fieldsToInput(startFields, startForm) }
+        ? {
+          ...startBaseInput,
+          ...fieldsToInput(startFields, startForm),
+          // 轮数这类「这次怎么跑」的参数不进步骤输入，单独落成执行覆盖。
+          ...withExecutionOverrides(startFields, startForm),
+        }
         : JSON.parse(startInput);
       if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
         input = candidate as Record<string, unknown>;
@@ -892,6 +912,20 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
   }, [runs]);
 
   const timeline = useMemo(() => (runDetail ? buildRunTimeline(runDetail, nowMs) : null), [runDetail, nowMs]);
+  // 审批依据只在真要审批时算：它是纯派生数据，没必要为其他状态做无用功。
+  // 结构化反馈表单：schema 能解析成表单就用表单，否则回落文本框。
+  const interactionForm = useMemo(() => buildInteractionForm(waitingRequest), [waitingRequest]);
+  // 每次换到一个新的交互请求就重置表单，免得上一轮的残值带进来。
+  useEffect(() => {
+    if (!waitingForFeedback) return;
+    setInteractionValues(initialFormState(interactionForm.fields));
+    setInteractionError('');
+  }, [waitingRequest?.id, waitingForFeedback, interactionForm.fields]);
+
+  const approvalEvidence = useMemo(
+    () => (waitingForApproval ? buildApprovalEvidence(runDetail, timeline) : null),
+    [waitingForApproval, runDetail, timeline],
+  );
   const activity = useMemo(() => (runDetail ? buildRunActivity(runDetail) : []), [runDetail]);
 
   /**
@@ -1031,7 +1065,12 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
         throw new WorkflowStartFieldError(themeField, budgetError);
       }
       // 预设里可能有视图没声明的键（例如自定义产物目录），它们要跟着这一跑继续传递。
-      return { ...startBaseInput, ...fieldsToInput(fields, startForm) };
+      // override 字段（轮数等）不进步骤输入，落成执行覆盖。
+      return {
+        ...startBaseInput,
+        ...fieldsToInput(fields, startForm),
+        ...withExecutionOverrides(fields, startForm),
+      };
     }
     const parsed = JSON.parse(startInput);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -1427,7 +1466,11 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
       chooseStartPreset(preset);
       return;
     }
-    const input = { ...(preset.input || {}), ...fieldsToInput(fields, values) };
+    const input = {
+      ...(preset.input || {}),
+      ...fieldsToInput(fields, values),
+      ...withExecutionOverrides(fields, values),
+    };
     const execution = presetExecution(preset);
     const payload = execution ? { ...input, execution } : input;
     setPresetBusy(`run:${preset.id}`);
@@ -1728,20 +1771,100 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                 {waitingForFeedback ? (
                   <section className="workflow-action-card feedback">
                     <div><MessageCircle size={18} /><div><strong>{waitingRequest?.title || '需要你的反馈'}</strong><span>{currentFeedbackQuestion(runDetail) || '说明下一轮需要修改或验证的内容。'}</span><small>{waitingRequest?.required_action ? interactionActionLabel(waitingRequest.required_action) : '提交后继续运行'}</small>{waitingRequest?.schema ? <details className="workflow-interaction-schema"><summary>查看提交格式</summary><pre>{JSON.stringify(waitingRequest.schema, null, 2)}</pre></details> : null}</div></div>
-                    <textarea
-                      className="workflow-run-feedback"
-                      value={resumeFeedback}
-                      onChange={event => setResumeFeedback(event.target.value)}
-                      placeholder="说明下一轮需要修改或验证的内容"
-                      maxLength={8000}
-                    />
-                    <button type="button" className="btn btn-primary" disabled={Boolean(actionBusy) || !resumeFeedback.trim()} onClick={() => void performRunAction(runDetail.run.run_id, 'resume', async () => { await onResume(runDetail.run.run_id, resumeFeedback.trim()); setResumeFeedback(''); })}>
+                    {/* 有 schema 就渲染结构化表单：用户点选而不是写自然语言，
+                        模型也不用再把自由文本解析回可执行指令。
+                        schema 缺失或无法解析时保留原文本框，行为与改动前一致。 */}
+                    {interactionForm.fallbackReason ? (
+                      <textarea
+                        className="workflow-run-feedback"
+                        value={resumeFeedback}
+                        onChange={event => setResumeFeedback(event.target.value)}
+                        placeholder="说明下一轮需要修改或验证的内容"
+                        maxLength={8000}
+                      />
+                    ) : (
+                      <div className="workflow-interaction-form">
+                        {interactionForm.fields.map(field => (
+                          <label className="workflow-interaction-field" key={field.name}>
+                            <span>{field.label}{field.required ? <b aria-hidden="true"> *</b> : null}</span>
+                            {field.kind === 'boolean' ? (
+                              <input
+                                type="checkbox"
+                                checked={Boolean(interactionValues[field.name])}
+                                onChange={event => setInteractionValues(current => ({ ...current, [field.name]: event.target.checked }))}
+                              />
+                            ) : field.kind === 'select' ? (
+                              <select
+                                value={String(interactionValues[field.name] ?? '')}
+                                onChange={event => setInteractionValues(current => ({ ...current, [field.name]: event.target.value }))}
+                              >
+                                <option value="">未选择</option>
+                                {field.options.map(option => (
+                                  <option value={option.value} key={option.value}>{option.label}</option>
+                                ))}
+                              </select>
+                            ) : field.kind === 'number' ? (
+                              <input
+                                type="number"
+                                value={String(interactionValues[field.name] ?? '')}
+                                onChange={event => setInteractionValues(current => ({ ...current, [field.name]: event.target.value }))}
+                              />
+                            ) : field.kind === 'textarea' ? (
+                              <textarea
+                                value={String(interactionValues[field.name] ?? '')}
+                                onChange={event => setInteractionValues(current => ({ ...current, [field.name]: event.target.value }))}
+                              />
+                            ) : (
+                              <input
+                                type="text"
+                                value={String(interactionValues[field.name] ?? '')}
+                                onChange={event => setInteractionValues(current => ({ ...current, [field.name]: event.target.value }))}
+                              />
+                            )}
+                            {field.hint ? <small>{field.hint}</small> : null}
+                          </label>
+                        ))}
+                        {interactionError ? <p className="workflow-inline-error" role="alert">{interactionError}</p> : null}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={Boolean(actionBusy) || (interactionForm.fallbackReason ? !resumeFeedback.trim() : false)}
+                      onClick={() => void performRunAction(runDetail.run.run_id, 'resume', async () => {
+                        // 表单路径先把值序列化成 JSON 文本，后端契约不变。
+                        let feedback = resumeFeedback.trim();
+                        if (!interactionForm.fallbackReason) {
+                          const encoded = formToFeedback(interactionForm.fields, interactionValues);
+                          if (encoded.error) {
+                            setInteractionError(encoded.error);
+                            return;
+                          }
+                          feedback = encoded.feedback;
+                        }
+                        await onResume(runDetail.run.run_id, feedback);
+                        setResumeFeedback('');
+                        setInteractionError('');
+                      })}
+                    >
                       {actionBusy === 'resume' ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{actionBusy === 'resume' ? '提交中' : '提交反馈并继续'}
                     </button>
                   </section>
                 ) : waitingForApproval ? (
                   <section className="workflow-action-card approval">
                     <div><ShieldCheck size={18} /><div><strong>{waitingRequest?.title || currentStepDefinition?.title || '等待审批'}</strong><span>{approvalDescription(currentStepDefinition, runDetail.run, waitingRequest)}</span>{waitingRequest?.risk_level ? <small>{riskLevelLabel(waitingRequest.risk_level)}风险</small> : null}{waitingRequest?.schema ? <details className="workflow-interaction-schema"><summary>查看提交格式</summary><pre>{JSON.stringify(waitingRequest.schema, null, 2)}</pre></details> : null}</div></div>
+                    {/* 先给事实再给按钮：没依据的批准等于盲签。
+                        条目来自已有数据（产物、步骤状态、委派分支），没有数据就整块不渲染。 */}
+                    {approvalEvidence && approvalEvidence.items.length ? (
+                      <div className="workflow-approval-evidence" role="group" aria-label="审批依据">
+                        {approvalEvidence.items.map((item, index) => (
+                          <div className={`workflow-approval-evidence-row ${item.tone}`} key={`${item.group}-${index}`}>
+                            <span>{item.group === 'change' ? '变更' : item.group === 'verify' ? '验证' : '结论'}</span>
+                            <div><strong>{item.title}</strong>{item.detail ? <small>{item.detail}</small> : null}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     <div className="workflow-run-actions">
                       <button type="button" className="btn btn-primary" disabled={Boolean(actionBusy)} onClick={() => void performRunAction(runDetail.run.run_id, 'approve', () => onApprove(runDetail.run.run_id, runDetail.run.current_step_id))}>{actionBusy === 'approve' ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{actionBusy === 'approve' ? '处理中' : '批准并继续'}</button>
                       <button type="button" className="btn" disabled={Boolean(actionBusy)} onClick={() => void performRunAction(runDetail.run.run_id, 'reject', () => onReject(runDetail.run.run_id, runDetail.run.current_step_id))}>拒绝</button>

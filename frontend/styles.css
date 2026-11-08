@@ -373,6 +373,40 @@
 .workflow-action-card strong { font-size: 12px; }
 .workflow-action-card span { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 .workflow-action-card small { color: var(--text-subtle); font-size: 10px; line-height: 1.45; }
+/* 审批依据：审批是「用户替系统承担风险」，卡片必须先给事实再给按钮。
+   分组顺序固定为 变更 → 验证 → 结论，读者按因果链理解。 */
+.workflow-approval-evidence { display: grid; gap: 1px; margin-top: var(--space-2); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--border); }
+.workflow-approval-evidence-row { min-width: 0; display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--space-2); padding: var(--space-2) 10px; background: var(--surface); }
+.workflow-approval-evidence-row > span { color: var(--text-subtle); font-size: var(--fs-meta); }
+.workflow-approval-evidence-row > div { min-width: 0; display: grid; gap: 2px; }
+.workflow-approval-evidence-row strong { color: var(--text); font-size: var(--fs-meta); font-weight: 600; }
+.workflow-approval-evidence-row small { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; overflow-wrap: anywhere; white-space: normal; }
+.workflow-approval-evidence-row.success strong { color: var(--success-strong); }
+.workflow-approval-evidence-row.danger strong { color: var(--danger); }
+.workflow-approval-evidence-row.warning strong { color: var(--warning-strong); }
+/* 窄窗下标签列收窄，值独占整行——避免长错误信息被压成一条缝。 */
+@media (max-width: 560px) {
+  .workflow-approval-evidence-row { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
+
+/* 结构化反馈表单：字段竖排，标签在上值在下。
+   与审批依据同一条窄窗规则：标签列不抢宽度，值独占整行。 */
+.workflow-interaction-form { display: grid; gap: var(--space-2); }
+.workflow-interaction-field { min-width: 0; display: grid; gap: 3px; }
+.workflow-interaction-field > span { color: var(--text); font-size: var(--fs-meta); font-weight: 600; }
+.workflow-interaction-field > span b { color: var(--danger); font-weight: 600; }
+.workflow-interaction-field > input[type="text"],
+.workflow-interaction-field > input[type="number"],
+.workflow-interaction-field > select,
+.workflow-interaction-field > textarea {
+  min-height: var(--control-h-sm); width: 100%; padding: 5px 8px;
+  border: 1px solid var(--control-border); border-radius: var(--radius-sm);
+  color: var(--text); background: var(--surface); font: inherit; font-size: var(--fs-meta);
+}
+.workflow-interaction-field > textarea { min-height: 72px; resize: vertical; line-height: 1.5; }
+.workflow-interaction-field > input[type="checkbox"] { width: 16px; height: 16px; justify-self: start; }
+.workflow-interaction-field > small { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; white-space: normal; }
+
 .workflow-interaction-schema { margin-top: 3px; }
 .workflow-interaction-schema summary { color: var(--primary); cursor: pointer; font-size: 10px; }
 .workflow-interaction-schema pre { max-height: 160px; margin: 5px 0 0; padding: var(--space-2); overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-muted); font: 10px/1.45 Consolas, monospace; white-space: pre-wrap; }
@@ -1724,33 +1758,132 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-center-state-icon.is-spinning svg { animation: spin 1s linear infinite; }
 .task-center-row-main { min-width: 0; display: grid; gap: var(--space-1); }
 .task-center-row-title { min-width: 0; display: flex; align-items: center; gap: var(--space-2); }
-.task-center-row-title strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.task-center-status { flex: 0 0 auto; padding: 2px 6px; border-radius: var(--radius-sm); font-size: 9px; font-weight: 600; }
+.task-center-row-title strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
+/* 这一行的四个胶囊（角色 / 委派 / 来源 / 状态）必须等高：同一行里高矮不齐
+   会让眼睛把「有边框的那个」误当成更重要。统一 1px 边框 + 同一内边距。 */
+.task-center-status { flex: 0 0 auto; padding: 2px 7px; border: 1px solid transparent; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.5; }
 .task-center-status.running { color: var(--primary-hover); background: var(--primary-soft); }
 .task-center-status.pending { color: #a16207; background: #fef3c7; }
 .task-center-status.success { color: #15803d; background: #dcfce7; }
 .task-center-status.danger { color: #b91c1c; background: #fee2e2; }
 .task-center-status.neutral { color: #475569; background: #f1f5f9; }
-.task-center-source { flex: 0 0 auto; padding: 2px 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-subtle); background: var(--surface-muted); font-size: 9px; font-weight: 500; }
-/* 角色徽标：实心底色区分于描边的来源徽标——来源是「任务从哪来」，角色是「谁在做」，两者不同层。 */
-.task-center-role { flex: 0 0 auto; padding: 2px 6px; border-radius: var(--radius-sm); color: #4338ca; background: #eef2ff; font-size: 9px; font-weight: 600; }
-.task-center-row.is-live .task-center-role { color: #3730a3; background: #e0e7ff; }
+.task-center-source { flex: 0 0 auto; padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-subtle); background: var(--surface-muted); font-size: 11px; font-weight: 500; line-height: 1.5; }
+/* 角色徽标：与来源徽标区分——来源是「任务从哪来」，角色是「谁在做」，两者不同层。
+   左侧小圆点是角色的身份标记，和协作链路里的节点用同一套色，读者能把两处对上。 */
+.task-center-role {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px 2px 6px; border: 1px solid var(--primary-border); border-radius: 999px;
+  color: var(--primary-strong); background: var(--surface);
+  font-size: 11px; font-weight: 600; line-height: 1.5;
+}
+.task-center-role::before {
+  content: ""; width: 5px; height: 5px; flex: 0 0 auto; border-radius: 50%;
+  background: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft);
+}
+.task-center-row.is-live .task-center-role { border-color: transparent; background: var(--primary-soft); }
+.task-center-row.is-live .task-center-role::before { animation: role-pulse 2s ease-out infinite; }
+@keyframes role-pulse {
+  0% { box-shadow: 0 0 0 2px var(--primary-soft); }
+  70% { box-shadow: 0 0 0 5px rgba(31, 78, 121, 0); }
+  100% { box-shadow: 0 0 0 2px var(--primary-soft); }
+}
 /* 委派与重做必须一眼分开：委派是团队分工，重做是返工，混用同一个颜色会误导判断。 */
-.task-center-parent { flex: 0 0 auto; padding: 2px 6px; border: 1px dashed transparent; border-radius: var(--radius-sm); font-size: 9px; font-weight: 600; }
+.task-center-parent { flex: 0 0 auto; padding: 2px 7px; border: 1px dashed transparent; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.5; }
 .task-center-parent.delegate { color: #0369a1; border-color: #bae6fd; background: #f0f9ff; }
 .task-center-parent.retry { color: #a16207; border-color: #fde68a; background: #fffbeb; }
-.task-center-team { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+/* 协作规模：数字用等宽，三项之间用极细分隔线而不是圆点，读起来像一个计量条。 */
+.task-center-team {
+  display: inline-flex; align-items: center; gap: 0;
+  color: var(--text-muted); font-size: var(--fs-meta); font-variant-numeric: tabular-nums;
+}
+.task-center-team > span { padding: 0 6px; }
+.task-center-team > span:first-child { padding-left: 0; }
+.task-center-team > span + span { border-left: 1px solid var(--border); }
+.task-center-team b { font-weight: 650; color: var(--text); }
+.task-center-team .is-live b { color: var(--primary); }
+.task-center-team .is-live { color: var(--primary-hover); }
+
+/* ── 角色协作链路 ───────────────────────────────────────────────────────────
+   一条带节点的连线，不是「徽标 → 箭头 → 徽标」。
+   · 节点是角色，连线是推进顺序；
+   · 连线的样式编码进度：已完成是实线，进行中是流动渐变，未开始是虚线；
+   · 节点本身用状态色，所以「现在卡在谁身上」和「走到哪一步了」同时可读。
+   这样一条链路同时回答两件事：谁参与、进行到哪。 */
+.task-center-role-chain {
+  --chain-done: var(--success);
+  --chain-live: var(--primary);
+  --chain-idle: var(--border-strong);
+  position: relative; min-width: 0;
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 0; padding: 2px 0 2px 1px;
+}
+.task-center-role-step {
+  position: relative; display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 12px 3px 0; color: var(--text-subtle);
+  font-size: var(--fs-meta); font-weight: 550; line-height: 1.5; white-space: nowrap;
+}
+/* 连接线画在节点之间：从上一个节点拉到这一个，第一个节点前没有线。 */
+.task-center-role-step + .task-center-role-step::before {
+  content: ""; width: 16px; height: 2px; margin-right: 5px; border-radius: 1px;
+  background: repeating-linear-gradient(90deg, var(--chain-idle) 0 3px, transparent 3px 6px);
+}
+/* 上一个节点已完成 → 到它的这段线是实线。 */
+.task-center-role-step.is-success + .task-center-role-step::before { background: var(--chain-done); }
+/* 等待审批时，到下一个节点的线也停在「未开始」的虚线——不能画成已推进。 */
+.task-center-role-step.is-waiting + .task-center-role-step::before,
+.task-center-role-step.is-danger + .task-center-role-step::before { background: repeating-linear-gradient(90deg, var(--chain-idle) 0 3px, transparent 3px 6px); }
+/* 上一个节点正在进行 → 这段线用流动渐变表示「正在推进」。 */
+.task-center-role-step.is-running + .task-center-role-step::before {
+  background: linear-gradient(90deg, var(--chain-live) 0%, var(--chain-live) 35%, var(--chain-idle) 35%, var(--chain-idle) 100%);
+  background-size: 200% 100%;
+  animation: chain-flow 1.8s linear infinite;
+}
+@keyframes chain-flow {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+.task-center-role-dot {
+  width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%;
+  border: 1.5px solid var(--chain-idle); background: var(--surface);
+}
+.task-center-role-step.is-success .task-center-role-dot { border-color: var(--chain-done); background: var(--chain-done); }
+.task-center-role-step.is-running .task-center-role-dot {
+  border-color: var(--chain-live); background: var(--chain-live);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+/* 等待审批：节点用琥珀色 + 呼吸，这是唯一需要「人来推一把」的状态，
+   必须和「还没轮到」的虚线空心点区分开。 */
+.task-center-role-step.is-waiting .task-center-role-dot {
+  border-color: var(--warning); background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-soft);
+  animation: role-pulse-wait 2s ease-out infinite;
+}
+@keyframes role-pulse-wait {
+  0% { box-shadow: 0 0 0 3px var(--warning-soft); }
+  70% { box-shadow: 0 0 0 6px rgba(180, 83, 9, 0); }
+  100% { box-shadow: 0 0 0 3px var(--warning-soft); }
+}
+.task-center-role-step.is-danger .task-center-role-dot { border-color: var(--danger); background: var(--danger); }
+.task-center-role-step.is-pending .task-center-role-dot { border-style: dashed; }
+.task-center-role-step.is-success { color: var(--text-muted); }
+.task-center-role-step.is-running { color: var(--primary-strong); font-weight: 650; }
+.task-center-role-step.is-waiting { color: var(--warning-strong); font-weight: 650; }
+.task-center-role-step.is-danger { color: var(--danger-strong); font-weight: 650; }
+.task-center-role-step.is-last { padding-right: 2px; }
+.task-center-role-name { line-height: 1.5; }
 /* 子运行展开：父行只报计数，明细收在这里。用 details 而不是受控组件，
    是因为展开状态不需要跨刷新保留，也不值得为它引入一次额外渲染。 */
 .task-center-children { min-width: 0; }
-.task-center-children > summary { display: inline-flex; align-items: center; gap: 4px; color: var(--primary); font-size: 9px; font-weight: 600; cursor: pointer; list-style: none; }
+.task-center-children > summary { display: inline-flex; align-items: center; gap: 4px; color: var(--primary); font-size: var(--fs-meta); font-weight: 600; cursor: pointer; list-style: none; }
 .task-center-children > summary::-webkit-details-marker { display: none; }
 .task-center-children > summary::before { content: "▸"; font-size: 8px; line-height: 1; }
 .task-center-children[open] > summary::before { content: "▾"; }
-.task-center-children-list { display: grid; gap: 3px; margin-top: 5px; padding-left: 10px; border-left: 1px solid var(--border); }
-.task-center-child { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: var(--text-subtle); font-size: 9px; }
+/* 子运行列表用左侧细导轨挂起：它从属于父行，不是和父行平级的第二批记录。 */
+.task-center-children-list { display: grid; gap: 2px; margin-top: 6px; padding: 2px 0 2px 10px; border-left: 2px solid var(--border); }
+.task-center-child { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 3px 6px; border-radius: var(--radius-sm); color: var(--text-subtle); font-size: var(--fs-meta); }
+.task-center-child:hover { background: var(--surface-muted); }
 .task-center-child code { font-family: Consolas, monospace; }
-.task-center-child-kind { padding: 1px 5px; border: 1px dashed transparent; border-radius: 3px; font-weight: 600; }
+.task-center-child-kind { padding: 1px 6px; border: 1px dashed transparent; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .task-center-child-kind.delegate { color: #0369a1; border-color: #bae6fd; background: #f0f9ff; }
 .task-center-child-kind.retry { color: #a16207; border-color: #fde68a; background: #fffbeb; }
 .task-center-child-role { color: var(--text-muted); font-weight: 600; }
@@ -1758,28 +1891,24 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-center-child-status.success { color: #15803d; }
 .task-center-child-status.danger { color: #b91c1c; }
 .task-center-child-error { min-width: 0; flex: 1; overflow: hidden; color: #b91c1c; text-overflow: ellipsis; white-space: nowrap; }
-/* 角色协作链路：把「谁 → 谁 → 谁」画成一条线。每个节点用状态色，
-   所以读者一眼能看出现在卡在哪个角色，而不是只看整条任务的粗状态。 */
-.task-center-role-chain { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
-.task-center-role-step { display: inline-flex; align-items: center; gap: 2px; }
-.task-center-role-arrow { color: #cbd5e1; font-size: 9px; line-height: 1; }
-.task-center-role-node { padding: 1px 6px; border-radius: var(--radius-sm); color: var(--text-muted); background: var(--surface-muted); font-size: 9px; font-weight: 600; white-space: nowrap; }
-.task-center-role-node.running { color: var(--primary-hover); background: var(--primary-soft); }
-.task-center-role-node.pending { color: #a16207; background: #fef3c7; }
-.task-center-role-node.success { color: #15803d; background: #dcfce7; }
-.task-center-role-node.danger { color: #b91c1c; background: #fee2e2; }
 .task-center-filter-stack { min-width: 0; display: grid; gap: var(--space-1); }
 .task-center-filters.sources button { min-height: 25px; font-size: 9px; }
 .task-center-row-action { flex: 0 0 auto; margin: 0; padding: 0; border: 0; color: var(--primary); background: transparent; font: inherit; font-size: 9px; font-weight: 600; cursor: pointer; }
 .task-center-row-action:hover { color: var(--primary-strong); text-decoration: underline; }
-.task-center-row-meta { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); color: var(--text-subtle); font-size: 9px; }
+/* 行内操作按后果着色：批准是推进（主色），取消与拒绝是终止（危险色）。
+   三者都是文字按钮，避免在一行 meta 里塞三个实心按钮抢走标题的注意力。 */
+.task-center-row-action.is-primary { color: var(--primary); }
+.task-center-row-action.is-danger { color: var(--danger); }
+.task-center-row-action.is-danger:hover { color: var(--danger-strong); }
+.task-center-row-action:disabled { opacity: .6; cursor: default; text-decoration: none; }
+.task-center-row-meta { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); color: var(--text-subtle); font-size: var(--fs-meta); }
 .task-center-row-meta code { max-width: 260px; overflow: hidden; font-family: Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .task-center-row-meta time, .task-center-row-meta span { white-space: nowrap; }
-.task-center-row p { margin: 0; overflow: hidden; color: var(--text-muted); font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.task-center-row p { margin: 0; overflow: hidden; color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
 .task-center-row p.error { color: #b91c1c; }
 .task-center-progress { height: 4px; overflow: hidden; border-radius: 999px; background: #e2e8f0; }
 .task-center-progress span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width .2s ease; }
-.task-center-progress-label { min-width: 36px; color: var(--primary); font-size: 10px; font-weight: 600; text-align: right; }
+.task-center-progress-label { min-width: 36px; color: var(--primary); font-size: var(--fs-meta); font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; }
 .task-center-result-icon { margin-top: 2px; }
 .task-center-result-icon.success { color: var(--success-strong); }
 .task-center-result-icon.danger { color: var(--danger); }

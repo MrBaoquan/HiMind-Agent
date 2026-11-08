@@ -138,6 +138,13 @@ const ROLE_LABELS: Record<string, string> = {
   'software.verifier': '测试',
   'software.reviewer': '代码审查',
   'software.delivery': '交付',
+  // UI 打磨团队
+  'ui.auditor': '信息架构审查',
+  'ui.craft': '工艺审查',
+  'ui.a11y': '无障碍审查',
+  'ui.polisher': '打磨实现',
+  'ui.verifier': '验证',
+  'ui.guard': '守门',
 };
 
 export function roleLabel(roleId: string | null | undefined) {
@@ -193,6 +200,27 @@ export function teamSummary(team: unknown): TeamSummary | null {
     running: pick('running'),
   };
   return summary.delegated || summary.retries || summary.running ? summary : null;
+}
+
+/**
+ * 角色链路节点的视觉状态。
+ *
+ * 比 `taskStatusTone` 多一档 `waiting`：`tone` 把等待归到 neutral（因为它要复用
+ * 徽标配色），但链路上「等审批」和「还没轮到」是两个完全不同的信息——
+ * 前者要人去推一把，后者只是还没开始，不能画成同一个灰点。
+ */
+export type ChainState = 'success' | 'running' | 'waiting' | 'danger' | 'pending';
+
+export function chainState(status: string): ChainState {
+  if (TASK_COMPLETED_STATUSES.has(status)) return 'success';
+  // 台账原始词表用 succeeded；投影层会归一成 completed，但链路也可能直接吃原始值。
+  if (status === 'succeeded') return 'success';
+  if (status === 'failed' || status === 'canceled') return 'danger';
+  if (status === 'waiting') return 'waiting';
+  if (status === 'pending') return 'pending';
+  if (TASK_ACTIVE_STATUSES.has(status)) return 'running';
+  // 认不出时落到 pending 而不是 running —— 宁可显示「还没轮到」，也不谎报「正在跑」。
+  return 'pending';
 }
 
 export type RoleChip = { id: string; label: string; status: string };
