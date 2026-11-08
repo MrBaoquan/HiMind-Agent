@@ -1364,16 +1364,29 @@ fn execute_workflow_with(
     let stdout = process::join_output(stdout);
     let stderr = process::join_output(stderr);
     if !status.success() {
-        let detail = if stderr.trim().is_empty() {
-            stdout
+        // 以前只拼 stderr（空则回落到 stdout）。两者都为空时错误就变成
+        // "DSH workflow runtime failed: " —— 排查时完全无信息可用。
+        // 现在总是带上退出码，并在两个流都空时明确说明，而不是留一句空话。
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
         } else {
-            stderr
+            String::new()
         };
-        return Err(format!(
-            "DSH workflow runtime failed: {}",
-            process::summarize_output(detail.trim(), OUTPUT_CAPTURE_LIMIT)
-        )
-        .into());
+        let exit = status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string());
+        let summarized = process::summarize_output(&detail, OUTPUT_CAPTURE_LIMIT);
+        let message = if summarized.trim().is_empty() {
+            format!(
+                "DSH workflow runtime failed (exit {exit}) with no output on stdout or stderr"
+            )
+        } else {
+            format!("DSH workflow runtime failed (exit {exit}): {summarized}")
+        };
+        return Err(message.into());
     }
     Ok(WorkflowRuntimeOutcome {
         text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
