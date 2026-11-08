@@ -1087,8 +1087,9 @@ fn configured_gateway_endpoint(options: &Options) -> String {
 
 fn adapter_projection_schema(target: &str) -> String {
     // 适配器投影规则变化时提升这里，让已有绑定进入待更新，而不是静默沿用旧文件布局。
-    // Codex v2 引入模型级推理档位；旧绑定必须重建 himind-models.json。
-    let schema_version = if target.trim() == "codex" { 2 } else { 1 };
+    // Codex v2 引入模型级推理档位；v3 收紧档位枚举（移除 max/ultra，它们会让
+    // 0.150 的目录解析器整份失败）。旧绑定的 himind-models.json 必须重建。
+    let schema_version = if target.trim() == "codex" { 3 } else { 1 };
     format!("{}:{schema_version}", target.trim())
 }
 
@@ -3671,12 +3672,18 @@ fn codex_reasoning_contract(
         .cloned()
         .unwrap_or(fallback);
     efforts = crate::api::ai::normalize_reasoning_efforts(&efforts);
-    // Ignore future/unknown levels instead of making the whole Codex catalog
-    // unusable on an older client build.
+    // 只保留 Codex 目录解析器**认识的**档位。
+    //
+    // 这里曾经把 `max` / `ultra` 一并放行，理由是「服务目录可能声明了更新的档位」。
+    // 但 Codex 对 `supported_reasoning_levels[].effort` 是严格枚举：0.150.1 只接受
+    // none/minimal/low/medium/high/xhigh，遇到 `max` 会整份目录解析失败、客户端起不来
+    // （表现为 `unknown variant max`）。一个档位换来整份目录不可用，代价完全不对等。
+    //
+    // 上游若声明了更高的档位，降级到 `xhigh` 表达「最高推理」，而不是让目录失效。
     efforts.retain(|effort| {
         matches!(
             effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
         )
     });
     if efforts.is_empty() {
@@ -10812,6 +10819,8 @@ mod tests {
                 .and_then(Value::as_str),
             Some("medium")
         );
+        // 上游声明了 max，但 Codex 目录解析器只认到 xhigh；写进去会让整份目录失效，
+        // 所以契约把它滤掉，保留 xhigh 作为「最高推理」。
         assert_eq!(
             models[0]["supported_reasoning_levels"]
                 .as_array()
@@ -10819,7 +10828,7 @@ mod tests {
                 .iter()
                 .filter_map(|level| level.get("effort").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["low", "medium", "high", "xhigh"]
         );
         assert_eq!(
             models[1]
@@ -11295,7 +11304,7 @@ command = "uvx.exe"
 
     #[test]
     fn codex_projection_schema_forces_catalog_rebuild() {
-        assert_eq!(super::adapter_projection_schema("codex"), "codex:2");
+        assert_eq!(super::adapter_projection_schema("codex"), "codex:3");
         assert_eq!(super::adapter_projection_schema("claude"), "claude:1");
     }
 
