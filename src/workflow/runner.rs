@@ -3503,7 +3503,12 @@ mod tests {
         let runner = WorkflowRunner::with_ledger(ledger("delegate-kind"));
         let package = package();
         let parent = runner
-            .start("agent-1", &package, "request-parent", &serde_json::json!({}))
+            .start(
+                "agent-1",
+                &package,
+                "request-parent",
+                &serde_json::json!({}),
+            )
             .unwrap();
         let delegated = runner
             .start_delegated(

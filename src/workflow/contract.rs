@@ -196,7 +196,10 @@ fn collect_roles(package: &WorkflowPackage) -> Value {
         for step in steps {
             let role = step.role_id.trim();
             if !role.is_empty() {
-                roles.entry(role.to_string()).or_default().push(step.id.clone());
+                roles
+                    .entry(role.to_string())
+                    .or_default()
+                    .push(step.id.clone());
             }
             if let Some(loop_config) = step.loop_config.as_ref() {
                 walk(&loop_config.steps, roles);
@@ -316,7 +319,10 @@ mod tests {
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "platform_delivery")));
         // 这个包没有声明角色：dry-run 要给出空清单，而不是凭空造一个角色出来。
-        assert_eq!(report["coverage"]["roles"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            report["coverage"]["roles"].as_array().map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]
@@ -349,9 +355,8 @@ mod tests {
     fn role_fixture_package_declares_a_full_software_team() {
         // 这个 fixture 就是「一个任务分给多个角色」的最小完整样例：
         // 解析、校验、dry-run 全都要通过，否则示例会变成一个跑不起来的文档。
-        let source = include_str!(
-            "../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"
-        );
+        let source =
+            include_str!("../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json");
         let mut package: super::super::WorkflowPackage = serde_json::from_str(source).unwrap();
         package.validate().unwrap();
         package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();

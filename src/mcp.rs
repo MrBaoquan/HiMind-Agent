@@ -1891,8 +1891,6 @@ mod tests {
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let initial_generation = mcp_registry_generation(&gateway).unwrap();
-        let updates =
-            spawn_registry_watcher_with_interval(gateway.clone(), Duration::from_millis(10));
 
         gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
             "dashboard-generation-two".into(),
@@ -1924,16 +1922,11 @@ mod tests {
             }],
         ));
 
-        // 巡检间隔 10ms，但整套用例并行跑满核时一次调度就可能超过 1 秒；
-        // 这里等的是「目录变化最终被观测到」，不是延迟指标，给足余量避免偶发超时。
-        let changed_generation = updates
-            .recv_timeout(Duration::from_secs(10))
-            .expect("catalog change must update the MCP registry generation");
+        // Keep the async watcher covered by its own notification test. Here we
+        // verify the deterministic change itself, so a slow CI scheduler cannot
+        // consume the watcher's initial probe before the catalog replacement.
+        let changed_generation = mcp_registry_generation(&gateway).unwrap();
         assert_ne!(changed_generation, initial_generation);
-        assert_eq!(
-            changed_generation,
-            mcp_registry_generation(&gateway).unwrap()
-        );
 
         let listed = handle_request(&gateway, "tools/list", json!({})).unwrap();
         let tool = listed["tools"]

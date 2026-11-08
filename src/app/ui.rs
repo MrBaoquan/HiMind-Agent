@@ -29,6 +29,48 @@ use crate::approval::manager::ApprovalManager;
 use crate::store::types::LocalWorkerStatus;
 use crate::Options;
 
+/// Owns the DSH process until the session is handed over to the session map.
+///
+/// Startup has several failure points that run after the child is spawned
+/// (page verification, rail preparation, capability probing). Each of them used
+/// to `return Err` and leave the Runtime host running: those orphans kept their
+/// loopback ports, MCP bridges and `DSH_HOME` locks for the life of the Agent.
+/// Termination now follows ownership instead of being repeated at every exit.
+struct BuiltinAiChild(Option<Child>);
+
+impl BuiltinAiChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Hand the process to the session map; the guard then stops touching it.
+    fn into_child(mut self) -> Child {
+        self.0.take().expect("child taken once")
+    }
+}
+
+impl std::ops::Deref for BuiltinAiChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.0.as_ref().expect("child taken once")
+    }
+}
+
+impl std::ops::DerefMut for BuiltinAiChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child taken once")
+    }
+}
+
+impl Drop for BuiltinAiChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            crate::runtime::process::terminate_process_tree(&mut child);
+        }
+    }
+}
+
 struct BuiltinAiSession {
     child: Child,
     home: PathBuf,
@@ -1719,12 +1761,12 @@ fn start_builtin_ai_session_inner(
         command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     }
     crate::runtime::process::configure_hidden_process(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("无法启动 HiMind AI：{error}"))?;
+    let mut child = BuiltinAiChild::new(
+        command
+            .spawn()
+            .map_err(|error| format!("无法启动 HiMind AI：{error}"))?,
+    );
     let Some(stdout) = child.stdout.take() else {
-        crate::runtime::process::terminate_process_tree(&mut child);
-        let _ = child.wait();
         return Err("HiMind AI 没有返回启动输出".to_string());
     };
     let stderr = child.stderr.take();
@@ -1756,8 +1798,6 @@ fn start_builtin_ai_session_inner(
             break url;
         }
         if Instant::now() >= deadline {
-            crate::runtime::process::terminate_process_tree(&mut child);
-            let _ = child.wait();
             return Err(builtin_ai_startup_error(
                 &format!(
                     "HiMind AI 启动超时（等待 {} 秒），请检查运行时状态",
@@ -1780,12 +1820,7 @@ fn start_builtin_ai_session_inner(
         crate::app::builtin_ai_gateway::RuntimeCapabilities::conservative(),
     );
     let origin_key = launch.home.to_string_lossy().to_string();
-    let mut proxy =
-        BuiltinAiProxy::start(&url, Some(observer), Some(&origin_key)).map_err(|error| {
-            crate::runtime::process::terminate_process_tree(&mut child);
-            let _ = child.wait();
-            error
-        })?;
+    let mut proxy = BuiltinAiProxy::start(&url, Some(observer), Some(&origin_key))?;
     // Browser verification and rail preparation are independent once the
     // proxy is listening. Run them together so project entries do not pay two
     // serial round trips before the iframe is allowed to load.
@@ -1810,8 +1845,6 @@ fn start_builtin_ai_session_inner(
     });
     if let Err(error) = verify_result {
         proxy.stop();
-        crate::runtime::process::terminate_process_tree(&mut child);
-        let _ = child.wait();
         // 页面验证失败的原因几乎都在 Runtime 的启动输出里（例如不受信的会话
         // 目录联接会让会话持久化插件起不来、Web 入口回 502）。只报一句「认证
         // 失败」等于把证据丢掉，所以这里和启动超时一样带上 Runtime 诊断。
@@ -1830,6 +1863,11 @@ fn start_builtin_ai_session_inner(
     if let Err(error) = rail_result {
         append_builtin_ai_diagnostic(&diagnostics, &error);
     }
+    // Provider 目录不再经 Settings API 写入。DSH 会把 `llm-pi-ai` 的 settings
+    // 写入回落到 profile patch，而这次会话的 `--patch` overlay 优先级更高，
+    // 写回校验必然判「被 overlay 覆盖」并抛错（config-editor 的行为），
+    // 从而把一个本该无关紧要的目录同步放大成会话启动失败。
+    // 目录本身已随 overlay 下发，会话内换模型只需要 `session/selectModel`。
     if launch.service_source == "custom" {
         // 本机路由模式的两条行（`llm-pi-ai` / `agent-default-model`）由本次会话
         // 的 overlay 拥有：DSH 的 settings 编辑接口会把「被 home patch 或命令行
@@ -1881,7 +1919,7 @@ fn start_builtin_ai_session_inner(
         ),
     );
     Ok(BuiltinAiSession {
-        child,
+        child: child.into_child(),
         home: launch.home.clone(),
         workspace: launch.workspace.clone(),
         focus_workspace,
@@ -2080,19 +2118,18 @@ pub(crate) fn sync_builtin_ai_models(
     })
 }
 
-/// Apply a local AI service switch to every running DSH host without restarting
-/// it. The stable router resolves the new upstream; this call only points the
-/// current Session at the corresponding catalog alias.
+/// Point every running DSH Session at the alias of the newly selected local
+/// service.
 ///
-/// The provider row itself stays owned by the per-session overlay (see
-/// `render_himind_agent_overlay`): DSH refuses settings writes for a namespace a
-/// home patch or `--patch` overlay overrides, and asking for one turned a normal
-/// service switch into an error the caller had to surface. Because that overlay
-/// carries the whole local alias catalog at launch, switching service or model
-/// needs no write at all — only a catalog that grew since launch does, and that
-/// one is picked up when the Session next starts.
-fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<(), String> {
-    let controls = {
+/// The whole alias catalog travels with the per-session `--patch` overlay,
+/// which outranks DSH's profile patch. Writing the catalog back through the
+/// Settings API is therefore impossible: DSH verifies the write by recomposing
+/// the layers, sees the overlay win, and rejects it. A service switch only has
+/// to move the Session's selected model — and only an alias the running
+/// Session was never launched with forces a restart. The returned flag tells
+/// the UI to drop its now-dead iframe.
+fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<bool, String> {
+    let plan = {
         let sessions = builtin_ai_sessions()
             .lock()
             .map_err(|_| "HiMind AI 会话状态不可用".to_string())?;
@@ -2101,42 +2138,67 @@ fn sync_builtin_ai_local_catalog(activate_default: bool) -> Result<(), String> {
             .map(|session| (session.proxy.control(), session.workspace.clone()))
             .collect::<Vec<_>>()
     };
-    if controls.is_empty() {
-        return Ok(());
+    if plan.is_empty() || !activate_default {
+        return Ok(false);
     }
     let model_alias = crate::app::builtin_ai_router::active_model_alias()?;
-    if !activate_default {
-        crate::approval::manager::append_event_log(
-            "info",
-            &format!(
-                "本机模型目录已更新；{} 个运行中的 HiMind AI 会话会在下次启动时看到新增的服务与模型",
-                controls.len()
-            ),
-        );
-        return Ok(());
-    }
-    let mut failures = Vec::new();
-    for (control, workspace) in controls {
-        if let Err(error) = control.select_latest_session_model(&workspace, &model_alias) {
-            failures.push(error);
+    for (control, workspace) in plan {
+        if control
+            .select_latest_session_model(&workspace, &model_alias)
+            .is_err()
+        {
+            // 新别名不在这个会话启动时的目录里，只能换进程重新读 overlay。
+            stop_builtin_ai_process();
+            return Ok(true);
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "部分 DSH 会话未能切换到新的本机模型（进程保持运行）：{}",
-            failures.join("；")
-        ))
-    }
+    Ok(false)
 }
 
-pub(crate) fn refresh_builtin_ai_local_catalog() -> Result<(), String> {
-    sync_builtin_ai_local_catalog(false)
+/// 目录随 overlay 下发，运行中的会话读不到新目录；返回会话是否因此被停掉。
+pub(crate) fn refresh_builtin_ai_local_catalog() -> Result<bool, String> {
+    restart_builtin_ai_sessions_if_catalog_changed()
 }
 
-pub(crate) fn activate_builtin_ai_local_service() -> Result<(), String> {
+/// 切换对话默认服务，返回会话是否因此被重启。
+pub(crate) fn activate_builtin_ai_local_service() -> Result<bool, String> {
     sync_builtin_ai_local_catalog(true)
+}
+
+/// 本机服务的模型目录变了（改了服务、增删了服务）以后，让已经启动的会话换成
+/// 能读到新目录的进程。
+///
+/// overlay 在启动时就固定了 `llm-pi-ai`，DSH 又拒绝把 settings 写入落到被
+/// overlay 覆盖的层，所以进程内没有第二条路：宁可在用户还停在设置页时先停掉
+/// 会话，也不要让下一次对话撞上「模型不可用」。会话按需重建，这里不预热，
+/// 用户下次进入 HiMind AI 时用新目录启动。
+pub(crate) fn restart_builtin_ai_sessions_if_catalog_changed() -> Result<bool, String> {
+    let expected = crate::app::builtin_ai_router::model_catalog()?
+        .into_iter()
+        .map(|route| route.alias)
+        .collect::<HashSet<String>>();
+    let stale = {
+        let sessions = builtin_ai_sessions()
+            .lock()
+            .map_err(|_| "HiMind AI 会话状态不可用".to_string())?;
+        if sessions.is_empty() {
+            return Ok(false);
+        }
+        sessions.values().any(|session| {
+            session
+                .model_sync
+                .launched_models()
+                .into_iter()
+                .filter(|alias| alias.starts_with("himind:"))
+                .collect::<HashSet<String>>()
+                != expected
+        })
+    };
+    if !stale {
+        return Ok(false);
+    }
+    stop_builtin_ai_process();
+    Ok(true)
 }
 
 pub(crate) fn plugin_view_window_label(plugin_id: &str, view_id: &str) -> String {

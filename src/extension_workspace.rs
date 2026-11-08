@@ -68,6 +68,9 @@ pub(crate) struct DiscoveredExtension {
     pub kind: String,
     pub id: String,
     pub path: PathBuf,
+    /// 该扩展所属聚合仓库根目录。多工作区下，项目登记必须知道扩展来自
+    /// 哪个工作区，才能保留不同工作区里的同名扩展。
+    pub workspace_root: PathBuf,
     pub source_repository: String,
     pub source_default_branch: String,
     pub source_subdirectory: String,
@@ -92,6 +95,8 @@ fn binding_schema_version() -> u32 {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Catalog {
+    #[serde(default = "default_catalog_schema_version")]
+    schema_version: u32,
     #[serde(default)]
     repository: String,
     #[serde(default)]
@@ -106,6 +111,22 @@ struct CatalogExtension {
     kind: String,
     id: String,
     path: String,
+    #[serde(default)]
+    ownership: Option<String>,
+    #[serde(default)]
+    consumer_ids: Vec<String>,
+    #[serde(default)]
+    reuse_scope: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<String>,
+    #[serde(default)]
+    disable_safe: Option<bool>,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+fn default_catalog_schema_version() -> u32 {
+    1
 }
 
 pub(crate) fn settings() -> ExtensionWorkspaceSettings {
@@ -477,31 +498,78 @@ pub(crate) fn is_agent_managed_path(path: &Path) -> bool {
 }
 
 pub(crate) fn discover() -> Vec<DiscoveredExtension> {
-    let Some(root) = configured_root() else {
-        return Vec::new();
-    };
-    let Ok(catalog) = read_catalog(&root) else {
-        return Vec::new();
-    };
-    catalog
-        .extensions
-        .into_iter()
-        .filter_map(|item| {
-            let manifest_name = catalog_manifest(&item.kind)?;
-            let path = safe_child_path(&root, &item.path).ok()?;
+    let mut discovered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in workspace_roots() {
+        let Ok(catalog) = read_catalog(&root) else {
+            // 一个登记目录暂时没有有效清单，不应阻断其他工作区。
+            continue;
+        };
+        for item in catalog.extensions {
+            let Some(manifest_name) = catalog_manifest(&item.kind) else {
+                continue;
+            };
+            let Ok(path) = safe_child_path(&root, &item.path) else {
+                continue;
+            };
             if !path.join(manifest_name).is_file() {
-                return None;
+                continue;
             }
-            Some(DiscoveredExtension {
+            let project_key = format!(
+                "{}:{}:{}",
+                display_path(&root).to_ascii_lowercase(),
+                item.kind,
+                item.id
+            );
+            if !seen.insert(project_key) {
+                continue;
+            }
+            discovered.push(DiscoveredExtension {
                 kind: item.kind,
                 id: item.id,
                 path,
+                workspace_root: root.clone(),
                 source_repository: catalog.repository.clone(),
                 source_default_branch: catalog.default_branch.clone(),
                 source_subdirectory: item.path.replace('\\', "/"),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    discovered
+}
+
+/// 所有需要参与项目发现的聚合仓库根目录。
+///
+/// 多工作区登记表是用户维护的权威列表；binding 记录来自真实会话，legacy
+/// `extension-workspace.json` 继续作为兼容入口保留。这里取并集而不是取第一个，
+/// 否则切换当前工作区会让另一个工作区的项目从开发页消失。
+fn workspace_roots() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.extend(read_registry().roots.into_iter().map(PathBuf::from));
+    candidates.extend(read_bindings().roots.into_iter().map(PathBuf::from));
+    if let Ok(content) = fs::read_to_string(config_path()) {
+        if let Ok(config) = serde_json::from_str::<WorkspaceConfig>(&content) {
+            candidates.push(PathBuf::from(config.root));
+        }
+    }
+    if let Some(root) = env::var_os("HIMIND_EXTENSIONS_ROOT") {
+        candidates.push(PathBuf::from(root));
+    }
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for candidate in candidates {
+        let Ok(path) = candidate.canonicalize() else {
+            continue;
+        };
+        if !path.is_dir() || is_agent_managed_path(&path) {
+            continue;
+        }
+        let key = display_path(&path).replace('\\', "/").to_ascii_lowercase();
+        if seen.insert(key) {
+            roots.push(path);
+        }
+    }
+    roots
 }
 
 pub(crate) fn metadata_for_path(path: &Path) -> Option<(String, String, String)> {
@@ -565,6 +633,13 @@ fn read_catalog(root: &Path) -> Result<Catalog, Box<dyn std::error::Error>> {
         .map_err(|error| format!("扩展工作区缺少 extensions.json: {error}"))?;
     let catalog = serde_json::from_str::<Catalog>(&content)
         .map_err(|error| format!("extensions.json 格式无效: {error}"))?;
+    if !matches!(catalog.schema_version, 1 | 2) {
+        return Err(format!(
+            "extensions.json schema_version 不支持: {}（支持 1 或 2）",
+            catalog.schema_version
+        )
+        .into());
+    }
     if catalog.repository.trim().is_empty() || catalog.default_branch.trim().is_empty() {
         return Err("extensions.json 缺少 repository 或 default_branch".into());
     }
@@ -598,8 +673,62 @@ fn read_catalog(root: &Path) -> Result<Catalog, Box<dyn std::error::Error>> {
         if manifest_id.as_deref() != Some(item.id.trim()) {
             return Err(format!("扩展清单 ID 与 manifest 不一致: {}", item.path).into());
         }
+        if catalog.schema_version >= 2 {
+            validate_catalog_extension_v2(item)?;
+        }
     }
     Ok(catalog)
+}
+
+fn validate_catalog_extension_v2(
+    item: &CatalogExtension,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ownership = item.ownership.as_deref().unwrap_or_default().trim();
+    if !matches!(ownership, "application" | "agent" | "extension") {
+        return Err(format!(
+            "extensions.json v2 条目 {} 的 ownership 必须是 application/agent/extension",
+            item.id
+        )
+        .into());
+    }
+    if item.consumer_ids.iter().all(|id| id.trim().is_empty()) {
+        return Err(format!("extensions.json v2 条目 {} 缺少 consumer_ids", item.id).into());
+    }
+    let reuse_scope = item.reuse_scope.as_deref().unwrap_or_default().trim();
+    if !matches!(reuse_scope, "application" | "agent" | "ecosystem") {
+        return Err(format!("extensions.json v2 条目 {} 的 reuse_scope 无效", item.id).into());
+    }
+    let lifecycle = item.lifecycle.as_deref().unwrap_or_default().trim();
+    if !matches!(lifecycle, "app_locked" | "independently_versioned") {
+        return Err(format!("extensions.json v2 条目 {} 的 lifecycle 无效", item.id).into());
+    }
+    if item.disable_safe.is_none() {
+        return Err(format!("extensions.json v2 条目 {} 缺少 disable_safe", item.id).into());
+    }
+    if item.owner.as_deref().unwrap_or_default().trim().is_empty() {
+        return Err(format!("extensions.json v2 条目 {} 缺少 owner", item.id).into());
+    }
+    if ownership == "extension" {
+        if item.consumer_ids.len() < 2 {
+            return Err(format!("扩展 {} 至少需要两个独立消费者", item.id).into());
+        }
+        if reuse_scope != "ecosystem" || lifecycle != "independently_versioned" {
+            return Err(
+                format!("扩展 {} 必须可独立版本化并具有 ecosystem 复用范围", item.id).into(),
+            );
+        }
+        if item.disable_safe != Some(true) {
+            return Err(format!("扩展 {} 必须 disable_safe=true", item.id).into());
+        }
+    }
+    if ownership == "application" && (reuse_scope != "application" || lifecycle != "app_locked") {
+        return Err(format!(
+            "应用条目 {} 必须 app_locked 且仅在 application 范围复用",
+            item.id
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn safe_child_path(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -975,6 +1104,77 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 多工作区发现必须扫描全部登记目录，即使 legacy 当前目录只指向其中一个。
+    /// 同名扩展来自不同工作区时也必须各自保留，不能按扩展 ID 去重。
+    #[test]
+    fn discovers_all_registered_workspaces_and_keeps_duplicate_ids() {
+        let _lock = env_lock();
+        let root = unique_root("himind-extension-multi-workspace");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        for workspace in [&workspace_a, &workspace_b] {
+            let plugin = workspace.join("plugins/shared");
+            fs::create_dir_all(&plugin).unwrap();
+            fs::write(plugin.join("plugin.json"), r#"{"id":"com.test.shared"}"#).unwrap();
+            fs::write(
+                workspace.join(CATALOG_FILE),
+                format!(
+                    r#"{{"repository":"https://github.com/example/{}","default_branch":"main","extensions":[{{"type":"plugin","id":"com.test.shared","path":"plugins/shared"}}]}}"#,
+                    workspace.file_name().unwrap().to_string_lossy()
+                ),
+            )
+            .unwrap();
+        }
+        let profile = root.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        let workspace_file = profile.join("extension-workspace.json");
+        let registry_file = profile.join("extension-workspaces.json");
+        let broken = root.join("workspace-broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(
+            broken.join(CATALOG_FILE),
+            r#"{"repository":"https://github.com/example/broken","default_branch":"main","extensions":[{"type":"plugin","id":"com.test.missing","path":"plugins/missing"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &workspace_file,
+            format!(r#"{{"root":"{}"}}"#, workspace_a.display()),
+        )
+        .unwrap();
+        fs::write(
+            &registry_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": REGISTRY_SCHEMA_VERSION,
+                "roots": [
+                    workspace_a.display().to_string(),
+                    workspace_b.display().to_string(),
+                    broken.display().to_string(),
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _workspace_file = EnvGuard::set("HIMIND_EXTENSIONS_WORKSPACE_FILE", &workspace_file);
+        let _registry_file = EnvGuard::set("HIMIND_EXTENSIONS_REGISTRY_FILE", &registry_file);
+        let _binding_file = EnvGuard::set(
+            "HIMIND_EXTENSIONS_BINDING_FILE",
+            profile.join("extension-workspace-binding.json"),
+        );
+        let _root = EnvGuard::clear("HIMIND_EXTENSIONS_ROOT");
+
+        let discovered = discover();
+        assert_eq!(discovered.len(), 2, "两个工作区的同名扩展都应被发现");
+        assert!(discovered.iter().all(|item| item.id == "com.test.shared"));
+        let roots = discovered
+            .iter()
+            .map(|item| item.workspace_root.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&workspace_a.canonicalize().unwrap()));
+        assert!(roots.contains(&workspace_b.canonicalize().unwrap()));
+
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn rejects_paths_outside_workspace() {
         let root = env::temp_dir().join(format!(
@@ -1159,5 +1359,51 @@ mod tests {
         let agent_home = crate::store::paths::agent_home();
         assert!(bind(&agent_home).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn v2_catalog_gate_requires_real_extension_evidence() {
+        let application = CatalogExtension {
+            kind: "plugin".to_string(),
+            id: "com.test.app".to_string(),
+            path: "plugins/app".to_string(),
+            ownership: Some("application".to_string()),
+            consumer_ids: vec!["com.test.feature".to_string()],
+            reuse_scope: Some("application".to_string()),
+            lifecycle: Some("app_locked".to_string()),
+            disable_safe: Some(true),
+            owner: Some("test".to_string()),
+        };
+        assert!(validate_catalog_extension_v2(&application).is_ok());
+
+        let mut extension = CatalogExtension {
+            ownership: Some("extension".to_string()),
+            consumer_ids: vec!["app.one".to_string(), "app.two".to_string()],
+            reuse_scope: Some("ecosystem".to_string()),
+            lifecycle: Some("independently_versioned".to_string()),
+            disable_safe: Some(true),
+            ..application
+        };
+        assert!(validate_catalog_extension_v2(&extension).is_ok());
+
+        extension.consumer_ids = vec!["app.one".to_string()];
+        let error = validate_catalog_extension_v2(&extension).unwrap_err();
+        assert!(error.to_string().contains("至少需要两个独立消费者"));
+    }
+
+    #[test]
+    fn v2_catalog_gate_rejects_missing_metadata() {
+        let extension = CatalogExtension {
+            kind: "skill".to_string(),
+            id: "com.test.skill".to_string(),
+            path: "skills/test".to_string(),
+            ownership: None,
+            consumer_ids: Vec::new(),
+            reuse_scope: None,
+            lifecycle: None,
+            disable_safe: None,
+            owner: None,
+        };
+        let error = validate_catalog_extension_v2(&extension).unwrap_err();
+        assert!(error.to_string().contains("ownership"));
     }
 }

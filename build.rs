@@ -63,6 +63,12 @@ fn write_embedded_extension_key() {
 fn write_embedded_build() {
     println!("cargo:rerun-if-env-changed=HIMIND_BUILD_CHANNEL");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    // `.git/HEAD` usually contains the stable text `ref: refs/heads/main`.
+    // Watching only that file misses a fast-forward: the branch ref changes,
+    // while HEAD itself does not. The embedded build marker would then keep
+    // advertising the pre-merge commit for every incremental build.
+    println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is required"));
     let channel = std::env::var("HIMIND_BUILD_CHANNEL")
         .ok()

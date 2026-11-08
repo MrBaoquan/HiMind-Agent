@@ -31,6 +31,14 @@ pub(crate) const DEFAULT_GATEWAY_CLIENT_IDS: &[&str] = &[
     "zcode",
 ];
 
+/// 工具历史降级文本的固定前缀。
+///
+/// 历史工具调用被降级成纯文本时，这段文本会作为对话内容回灌给模型。它必须读起来
+/// 是「别人转述的一条记录」，而不能是助手自己会说的话，否则模型会照着续写，客户端
+/// 就把这段转述当成最终答复（工具永远不执行）。同一前缀也用于把已经落进历史里的
+/// 旧格式（`Earlier the assistant used ...`）识别出来重写。
+pub(crate) const TOOL_HISTORY_PREFIX: &str = "[tool-transcript] ";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilitySupport {
@@ -968,6 +976,51 @@ fn builtin_providers() -> Vec<ProviderCapability> {
             x,
             sample(s, s),
         ),
+        // Verified 2026-11-07 by direct probe against opencode.ai/zen/go/v1:
+        // structured function_call / function_call_output history, namespace
+        // tools, tool_choice, sampling, max_output_tokens and both tool-result
+        // and user images all round-trip (200, and the model actually emitted
+        // the nested namespace call). `web_search` is the exception: the tool
+        // definition is echoed back but the model reports it as unavailable, so
+        // it stays unsupported and gets removed.
+        provider(
+            "opencode_zen_responses",
+            "OpenCode Zen Responses",
+            &[OpenaiResponses],
+            ProviderFingerprint {
+                host_suffixes: vec!["opencode.ai".to_string()],
+                path_prefixes: vec!["/zen/go/v1".to_string()],
+            },
+            ModelDiscovery::Native,
+            s,
+            u,
+            s,
+            s,
+            u,
+            s,
+            s,
+            sample(s, s),
+        ),
+        // Same upstream on its Chat entry point: tool-call history, tool_choice,
+        // sampling and images are accepted there too.
+        provider(
+            "opencode_zen_chat",
+            "OpenCode Zen Chat",
+            &[OpenaiChat],
+            ProviderFingerprint {
+                host_suffixes: vec!["opencode.ai".to_string()],
+                path_prefixes: vec!["/zen/go/v1".to_string()],
+            },
+            ModelDiscovery::Native,
+            s,
+            u,
+            s,
+            u,
+            u,
+            s,
+            s,
+            sample(s, s),
+        ),
         provider(
             "openai_responses_limited",
             "OpenAI Responses limited",
@@ -1151,6 +1204,8 @@ fn normalize_responses_request(
     provider: &ProviderCapability,
     changes: &mut Vec<NormalizationChange>,
 ) -> Result<(), CompatibilityNormalizationError> {
+    use serde_json::json;
+
     if let Some(input) = request
         .get_mut("input")
         .and_then(serde_json::Value::as_array_mut)
@@ -1189,17 +1244,72 @@ fn normalize_responses_request(
                 changes,
                 CompatibilityFeature::FunctionCallHistory,
                 NormalizationAction::Translate,
-                "已将历史中的伪工具调用文本改为普通说明，避免模型继续模仿",
+                "已将历史中的伪工具调用文本改为第三方转述记录，避免模型继续模仿",
             );
         }
 
-        if !provider.function_call_history.is_supported() && project_responses_tool_history(input) {
-            record_change(
-                changes,
-                CompatibilityFeature::FunctionCallHistory,
-                NormalizationAction::Degrade,
-                "已将 Responses 工具调用历史投影为只读上下文块",
-            );
+        if !provider.function_call_history.is_supported() {
+            // 降级文本必须同时满足两点，否则会重新制造“模型把工具调用写成正文”的故障：
+            //   1. 不能长得像助手会说的话。旧实现写成 “Earlier the assistant used
+            //      the {name} tool.”，是助手的口吻，模型读到自己历史里的这句话就
+            //      会原样续写，客户端把它当成最终答复，工具永远不执行。
+            //   2. 不能长得像工具调用语法。`[工具调用 name] {...}` 这种伪语法
+            //      同样会被模型照抄（见 neutralize_legacy_tool_call_marker 的修复）。
+            // 因此统一由调用方（user）以“转录记录”的形式转述，并用不可被当成
+            // 指令续写的固定前缀标明这是历史记录而不是待模仿的范例。
+            //
+            // 一段连续的工具轨迹（call 与它的 output）合并进同一条 user 消息，并且
+            // 直接并进它前面那条 user 消息：拆成多条相邻 user 会让一些要求
+            // user/assistant 交替的上游直接 400。
+            let mut rewritten: Vec<serde_json::Value> = Vec::with_capacity(input.len());
+            let mut changed = false;
+            let mut pending_lines: Vec<String> = Vec::new();
+            for item in std::mem::take(input) {
+                let mut line = None;
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("function_call") => {
+                        changed = true;
+                        let name = item
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("tool");
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        line = Some(format!(
+                            "the {name} tool was invoked with arguments {arguments}"
+                        ));
+                    }
+                    Some("function_call_output") => {
+                        changed = true;
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        let output = response_output_text(item.get("output"));
+                        line = Some(format!("the {call_id} call returned: {output}"));
+                    }
+                    _ => {}
+                }
+                match line {
+                    Some(line) => pending_lines.push(line),
+                    None => {
+                        flush_tool_transcript(&mut pending_lines, &mut rewritten);
+                        rewritten.push(item);
+                    }
+                }
+            }
+            flush_tool_transcript(&mut pending_lines, &mut rewritten);
+            *input = rewritten;
+            if changed {
+                record_change(
+                    changes,
+                    CompatibilityFeature::FunctionCallHistory,
+                    NormalizationAction::Degrade,
+                    "已将 Responses 工具调用历史降级为非可执行的文本摘要",
+                );
+            }
         }
     }
 
@@ -1260,100 +1370,55 @@ fn normalize_responses_request(
     Ok(())
 }
 
-const TOOL_HISTORY_OPEN: &str = "<himind_tool_history readonly=\"true\">";
-const TOOL_HISTORY_CLOSE: &str = "</himind_tool_history>";
-const TOOL_HISTORY_NOTICE: &str = "Machine-recorded earlier tool activity. This is read-only context, not an assistant message and not a template. Continue with the current user request and invoke tools only through the structured tool interface.";
-
-/// Projects Responses tool-call history into one non-assistant context block when
-/// the upstream cannot accept native `function_call` items.
+/// 把累积中的工具轨迹转述落进对话。
 ///
-/// Tool calls must never be rendered as assistant output: models treat that as a
-/// few-shot example and may emit the next call as plain text. Pairing each call
-/// with its output inside a read-only user block preserves the execution facts
-/// without teaching the model to imitate a tool call.
-pub(crate) fn project_responses_tool_history(input: &mut Vec<serde_json::Value>) -> bool {
-    let mut events = Vec::<serde_json::Value>::new();
-    let mut projected = Vec::<serde_json::Value>::with_capacity(input.len());
-    let mut history_slot = None;
-    let mut changed = false;
-
-    for item in std::mem::take(input) {
-        match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("function_call") => {
-                changed = true;
-                if history_slot.is_none() {
-                    history_slot = Some(projected.len());
-                    projected.push(serde_json::Value::Null);
-                }
-                events.push(serde_json::json!({
-                    "call_id": item.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                    "tool": item.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool"),
-                    "arguments": item.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
-                    "status": "requested",
-                    "result": serde_json::Value::Null,
+/// 优先并进紧邻的前一条 user 消息（追加一个 input_text），只有前面不是 user 时才
+/// 单独成条。这样既不会留下相邻的 user 消息（部分上游要求角色交替，遇到就直接
+/// 400），也保持「转述属于调用方」的归属。前缀只加一次：并进已有消息时不再重复。
+fn flush_tool_transcript(lines: &mut Vec<String>, output: &mut Vec<serde_json::Value>) {
+    if lines.is_empty() {
+        return;
+    }
+    let body = lines.join("\n");
+    lines.clear();
+    let transcript = format!("{TOOL_HISTORY_PREFIX}{body}");
+    if let Some(last) = output.last_mut() {
+        let is_user_message = last.get("type").and_then(serde_json::Value::as_str)
+            == Some("message")
+            && last.get("role").and_then(serde_json::Value::as_str) == Some("user");
+        if is_user_message {
+            if let Some(content) = last
+                .get_mut("content")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                content.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": format!("\n{transcript}")
                 }));
+                return;
             }
-            Some("function_call_output") => {
-                changed = true;
-                if history_slot.is_none() {
-                    history_slot = Some(projected.len());
-                    projected.push(serde_json::Value::Null);
-                }
-                let call_id = item
-                    .get("call_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                let output = response_output_text(item.get("output"));
-                let event_index = events.iter().rposition(|event| {
-                    event.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
-                        && event.get("status").and_then(serde_json::Value::as_str)
-                            == Some("requested")
-                });
-                if let Some(event_index) = event_index {
-                    events[event_index]["status"] = serde_json::json!("completed");
-                    events[event_index]["result"] = serde_json::Value::String(output);
-                } else {
-                    events.push(serde_json::json!({
-                        "call_id": call_id,
-                        "tool": "unknown",
-                        "arguments": serde_json::Value::Null,
-                        "status": "completed_without_call",
-                        "result": output,
-                    }));
-                }
-            }
-            _ => projected.push(item),
         }
     }
-
-    if changed {
-        let history_json = serde_json::to_string(&serde_json::json!({ "events": events }))
-            .unwrap_or_else(|_| "{\"events\":[]}".to_string());
-        let history = serde_json::json!({
-            "type": "message",
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": format!("{TOOL_HISTORY_OPEN}\n{TOOL_HISTORY_NOTICE}\n{history_json}\n{TOOL_HISTORY_CLOSE}"),
-            }]
-        });
-        if let Some(index) = history_slot {
-            projected[index] = history;
-        } else {
-            projected.push(history);
-        }
-    }
-
-    *input = projected;
-    changed
+    output.push(serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": transcript}]
+    }));
 }
 
-/// Older compatibility revisions rendered structured function calls as
-/// assistant text, including the legacy `[工具调用 name] {...}` marker and the
-/// later `Earlier the assistant used ...` prose. Models copied those markers and
-/// clients treated the result as a completed answer. Rewrite the marker into a
-/// neutral note so existing sessions stop supplying an imitation template.
+/// 把历史里几代「伪工具调用」文本收敛成不会被模型续写的转述记录。
+///
+/// 兼容层先后产出过两种会被模型照抄的写法：
+/// - `[工具调用 name] {...}`：伪装成工具调用语法，模型直接当正文回吐；
+/// - `Earlier the assistant used the {name} tool. Arguments: {...}`：用了助手的
+///   口吻，模型读到自己历史里的这句话就接着往下写，客户端把这段伪叙述当成
+///   最终答复，工具永远不执行（codex 会话里反复出现的正是这一句）。
+///
+/// 两者都重写成 `[tool-transcript] ...`：既不是工具调用语法，也不是助手会说的话，
+/// 而是一条明确的第三方转述。已经是该前缀的文本保持原样，重复调用是幂等的。
 fn neutralize_legacy_tool_call_marker(item: &mut serde_json::Value) -> bool {
+    // 只处理助手自己的历史文本：模型照抄的是它自己说过的话，改写用户原话既无必要
+    // 也有误伤真实用户输入的风险。
     if item.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
         return false;
     }
@@ -1365,7 +1430,8 @@ fn neutralize_legacy_tool_call_marker(item: &mut serde_json::Value) -> bool {
     };
     let mut changed = false;
     for part in content {
-        if part.get("type").and_then(serde_json::Value::as_str) != Some("output_text") {
+        let kind = part.get("type").and_then(serde_json::Value::as_str);
+        if kind != Some("output_text") && kind != Some("input_text") {
             continue;
         }
         let Some(text) = part
@@ -1375,18 +1441,65 @@ fn neutralize_legacy_tool_call_marker(item: &mut serde_json::Value) -> bool {
         else {
             continue;
         };
-        let marker = text
-            .find("[工具调用 ")
-            .or_else(|| text.find("Earlier the assistant used the "))
-            .or_else(|| text.find("Earlier the assistant attempted to call the "));
-        let Some(marker) = marker else {
-            continue;
-        };
-        let neutral = "Historical tool activity was omitted by the compatibility layer because the original structured event was unavailable. The call was not executed.";
-        part["text"] = serde_json::Value::String(format!("{}{neutral}", &text[..marker]));
-        changed = true;
+        if let Some(rewritten) = rewrite_pseudo_tool_call_text(&text) {
+            part["text"] = serde_json::Value::String(rewritten);
+            changed = true;
+        }
     }
     changed
+}
+
+/// 单段文本的伪工具调用重写；不含旧格式时返回 `None`。
+fn rewrite_pseudo_tool_call_text(text: &str) -> Option<String> {
+    // 已经是新格式：幂等返回，避免同一段文本被反复改写。
+    if text.contains(TOOL_HISTORY_PREFIX) {
+        return None;
+    }
+    // 旧格式：`[工具调用 name] arguments`
+    if let Some(marker) = text.find("[工具调用 ") {
+        let detail = &text[marker + "[工具调用 ".len()..];
+        let (name, arguments) = detail
+            .split_once("] ")
+            .map(|(name, arguments)| (name.trim(), arguments))
+            .unwrap_or((detail.trim(), ""));
+        return Some(format!(
+            "{}{TOOL_HISTORY_PREFIX}the {name} tool was invoked with arguments {arguments}",
+            &text[..marker]
+        ));
+    }
+    // 次旧格式：`Earlier the assistant used the X tool. Arguments: {...}`
+    // 以及 `Earlier the assistant attempted to call the X tool, but the call was
+    // not executed. Arguments: {...}`。
+    for (lead, marker) in [
+        ("Earlier the assistant used the ", " tool."),
+        ("Earlier the assistant attempted to call the ", " tool,"),
+    ] {
+        let Some(start) = text.find(lead) else {
+            continue;
+        };
+        let rest = &text[start + lead.len()..];
+        let Some((name, tail)) = rest.split_once(marker) else {
+            continue;
+        };
+        let name = name.trim();
+        let arguments = tail
+            .split_once("Arguments: ")
+            .map(|(_, arguments)| arguments.trim())
+            .unwrap_or_default();
+        let rewritten = if arguments.is_empty() {
+            format!(
+                "{}{TOOL_HISTORY_PREFIX}the {name} tool was invoked",
+                &text[..start]
+            )
+        } else {
+            format!(
+                "{}{TOOL_HISTORY_PREFIX}the {name} tool was invoked with arguments {arguments}",
+                &text[..start]
+            )
+        };
+        return Some(rewritten);
+    }
+    None
 }
 
 fn degrade_response_tool_output_media(
@@ -1720,6 +1833,8 @@ mod tests {
             "openai_responses_strict",
             "vectide_responses",
             "vectide_anthropic",
+            "opencode_zen_responses",
+            "opencode_zen_chat",
             "openai_responses_limited",
             "volcengine_agent_plan",
             UNKNOWN_PROVIDER_ID,
@@ -1936,7 +2051,8 @@ mod tests {
         .unwrap();
         let serialized = normalized.request.to_string();
         assert!(!serialized.contains("[工具调用"));
-        assert!(serialized.contains("call was not executed"));
+        assert!(!serialized.contains("Earlier the assistant"));
+        assert!(serialized.contains("the shell tool was invoked with arguments"));
         assert!(normalized
             .changes
             .iter()
@@ -1945,18 +2061,49 @@ mod tests {
     }
 
     #[test]
-    fn legacy_prose_tool_call_is_neutralized_for_existing_sessions() {
+    fn opencode_zen_keeps_structured_tool_history() {
         let matrix = CapabilityMatrixV1::builtin();
-        let client = matrix.client("claude-desktop").unwrap();
-        let provider = matrix.provider("openai_responses_limited").unwrap();
+        let provider = matrix.resolve_provider(
+            "https://opencode.ai/zen/go/v1",
+            &AIServiceProtocol::OpenaiResponses,
+        );
+        assert_eq!(provider.id, "opencode_zen_responses");
+        // Provider 自身能力：2026-11-07 实测，结构化工具历史、namespace 工具、
+        // tool_choice、采样、工具结果图片和用户图片都能往返；只有 web_search 是空壳
+        // （定义会被回显，但模型明确说不存在这个工具）。
+        assert!(provider.function_call_history.is_supported());
+        assert!(provider.namespace_tools.is_supported());
+        assert!(provider.tool_choice.is_supported());
+        assert!(provider.sampling.temperature.is_supported());
+        assert!(provider.tool_result.image.is_supported());
+        assert!(provider.user_input_image.is_supported());
+        assert!(!provider.web_search_tool.is_supported());
+
+        // 组合决策按客户端 ∩ Provider 取交集，且 unknown 从不按支持处理：
+        // - codex 自己把采样参数标成不支持 → 仍要降级；
+        // - codex 的工具结果图片能力是 unknown → 仍按未知处理，继续降级为文本占位
+        //   （这是三态设计的保守约束，不是 Provider 的问题）。
+        // 关键收益是：工具调用历史与 namespace 工具不再被降级成文本。
+        let unsupported = matrix.unsupported_features("codex", &provider.id);
+        assert!(!unsupported.contains(&CompatibilityFeature::FunctionCallHistory));
+        assert!(!unsupported.contains(&CompatibilityFeature::NamespaceTools));
+        assert!(!unsupported.contains(&CompatibilityFeature::UserInputImage));
+        assert!(unsupported.contains(&CompatibilityFeature::WebSearchTool));
+        assert!(unsupported.contains(&CompatibilityFeature::SamplingTemperature));
+        assert!(unsupported.contains(&CompatibilityFeature::ToolResultImage));
+
+        // 工具历史是本次修复的关键：它必须真的以结构化形式寄出。
+        let client = matrix.client("codex").unwrap();
         let request = serde_json::json!({
-            "model": "claude-himind-test[1m]",
+            "model": "deepseek-v4.1-flash",
+            "tools": [
+                {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "mcp__cua", "tools": []}
+            ],
             "input": [
-                {"type": "message", "role": "assistant", "content": [{
-                    "type": "output_text",
-                    "text": "准备执行。\n\nEarlier the assistant used the Bash tool. Arguments: {\"command\":\"deploy\"}"
-                }]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
+                {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}", "call_id": "c1"},
+                {"type": "function_call_output", "call_id": "c1", "output": "/home/user"}
             ]
         });
         let normalized = normalize_provider_request(
@@ -1967,30 +2114,44 @@ mod tests {
             None,
         )
         .unwrap();
-        let serialized = normalized.request.to_string();
-        assert!(!serialized.contains("Earlier the assistant used the Bash tool"));
-        assert!(!serialized.contains("deploy"));
-        assert!(serialized.contains("call was not executed"));
-        assert!(normalized.changes.iter().any(|change| {
-            change.feature == "function_call_history"
-                && change.action == NormalizationAction::Translate
-        }));
+        assert!(
+            normalized
+                .changes
+                .iter()
+                .all(|change| change.feature != "function_call_history"),
+            "structured tool history must not be degraded: {:?}",
+            normalized.changes
+        );
+        assert_eq!(normalized.request["input"][1]["type"], "function_call");
+        assert_eq!(
+            normalized.request["input"][2]["type"],
+            "function_call_output"
+        );
+        assert_eq!(normalized.request["tools"].as_array().unwrap().len(), 2);
+
+        let chat = matrix.resolve_provider(
+            "https://opencode.ai/zen/go/v1",
+            &AIServiceProtocol::OpenaiChat,
+        );
+        assert_eq!(chat.id, "opencode_zen_chat");
     }
 
+    /// 回归：降级工具历史时绝不能留下助手口吻的句子。
+    ///
+    /// 旧实现把历史 function_call 写成 `Earlier the assistant used the X tool.`，
+    /// 模型读到自己历史里的这句话就把 tool call 写成正文，客户端当成最终答复，
+    /// 工具永远不执行（codex 会话里反复出现的正是这一句）。
     #[test]
-    fn limited_responses_projects_tool_history_without_assistant_templates() {
+    fn degraded_tool_history_is_never_shaped_like_assistant_speech() {
         let matrix = CapabilityMatrixV1::builtin();
-        let client = matrix.client("claude-desktop").unwrap();
+        let client = matrix.client("codex").unwrap();
         let provider = matrix.provider("openai_responses_limited").unwrap();
         let request = serde_json::json!({
-            "model": "claude-himind-test[1m]",
+            "model": "model-a",
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "开始"}]},
-                {"type": "function_call", "call_id": "call-1", "name": "Bash", "arguments": "{\"command\":\"pwd\"}"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "F:\\workspace"},
-                {"type": "function_call", "call_id": "call-2", "name": "Read", "arguments": "{\"path\":\"a.txt\"}"},
-                {"type": "function_call_output", "call_id": "call-2", "output": "file body"},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "跑一下"}]},
+                {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}", "call_id": "c1"},
+                {"type": "function_call_output", "call_id": "c1", "output": "/home/user"}
             ]
         });
         let normalized = normalize_provider_request(
@@ -2001,22 +2162,67 @@ mod tests {
             None,
         )
         .unwrap();
-        let input = normalized.request["input"].as_array().unwrap();
-        assert_eq!(input.len(), 3);
-        assert_eq!(input[1]["role"], "user");
-        let history = input[1]["content"][0]["text"].as_str().unwrap();
-        assert!(history.starts_with(TOOL_HISTORY_OPEN));
-        assert!(history.contains("call-1"));
-        assert!(history.contains("workspace"));
-        assert!(history.contains("call-2"));
-        assert!(history.contains("file body"));
         let serialized = normalized.request.to_string();
-        assert!(!serialized.contains("Earlier the assistant used"));
-        assert!(!serialized.contains("Result from the earlier"));
-        assert!(normalized.changes.iter().any(|change| {
-            change.feature == "function_call_history"
-                && change.action == NormalizationAction::Degrade
-        }));
+        // 不许出现助手第一人称/第三人口吻，也不许出现工具调用语法。
+        for banned in [
+            "Earlier the assistant",
+            "[工具调用",
+            "[历史工具调用",
+            "The assistant used",
+        ] {
+            assert!(
+                !serialized.contains(banned),
+                "degraded history must not contain {banned:?}: {serialized}"
+            );
+        }
+        // 也不允许降级后的文本挂在 assistant 角色上。
+        let input = normalized.request["input"].as_array().unwrap();
+        for item in input.iter() {
+            if item["type"] == "function_call" || item["type"] == "function_call_output" {
+                panic!("raw tool history survived degradation: {item}");
+            }
+            assert_ne!(
+                item["role"], "assistant",
+                "degraded tool transcript must be attributed to the caller: {item}"
+            );
+        }
+        assert!(serialized.contains(TOOL_HISTORY_PREFIX.trim_end()));
+        // 轨迹必须并进前面那条 user 消息（而不是新起一条）：相邻 user 会让要求
+        // 角色交替的上游直接 400。
+        assert_eq!(
+            input.len(),
+            1,
+            "tool transcript should merge into the existing user turn: {input:?}"
+        );
+        assert_eq!(input[0]["role"], "user");
+        let parts = input[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "transcript must be appended as one part");
+        assert_eq!(parts[0]["text"], "跑一下");
+        let transcript = parts[1]["text"].as_str().unwrap();
+        assert!(transcript.contains(TOOL_HISTORY_PREFIX));
+        assert!(transcript.contains("pwd"));
+        assert!(transcript.contains("/home/user"));
+        // 前缀只出现一次，不重复。
+        assert_eq!(transcript.matches(TOOL_HISTORY_PREFIX).count(), 1);
+    }
+
+    /// 已经落进历史里的旧格式必须在寄出前被改写，且改写是幂等的。
+    #[test]
+    fn legacy_assistant_voiced_tool_text_is_rewritten_and_idempotent() {
+        let legacy =
+            "Earlier the assistant used the exec_command tool. Arguments: {\"cmd\":\"Get-Date\"}";
+        let rewritten = rewrite_pseudo_tool_call_text(legacy).unwrap();
+        assert!(!rewritten.contains("Earlier the assistant"));
+        assert!(rewritten.starts_with(TOOL_HISTORY_PREFIX));
+        assert!(rewritten.contains("exec_command"));
+        assert!(rewritten.contains("Get-Date"));
+        // 幂等：再次处理不再变化。
+        assert!(rewrite_pseudo_tool_call_text(&rewritten).is_none());
+
+        let attempted = "Earlier the assistant attempted to call the shell tool, but the call was not executed. Arguments: {\"a\":1}";
+        let rewritten = rewrite_pseudo_tool_call_text(attempted).unwrap();
+        assert!(!rewritten.contains("Earlier the assistant"));
+        assert!(rewritten.contains("{\"a\":1}"));
     }
 
     #[test]

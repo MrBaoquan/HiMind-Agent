@@ -246,6 +246,8 @@ struct CatalogState {
     refresh_in_flight: bool,
     etag: String,
     snapshot: Option<DashboardCatalogSnapshot>,
+    #[cfg(test)]
+    test_pinned: bool,
 }
 
 #[derive(Clone)]
@@ -310,6 +312,13 @@ impl DashboardCatalogProvider {
     pub(crate) fn snapshot(&self) -> Option<DashboardCatalogSnapshot> {
         if !crate::app::control_plane_provider::available(&self.options) {
             return None;
+        }
+        #[cfg(test)]
+        {
+            let state = self.state.lock().ok()?;
+            if state.test_pinned {
+                return state.snapshot.clone();
+            }
         }
         let should_refresh = self
             .state
@@ -405,6 +414,8 @@ impl DashboardCatalogProvider {
                 refresh_in_flight: false,
                 etag: snapshot.generation.clone(),
                 snapshot: Some(snapshot),
+                #[cfg(test)]
+                test_pinned: true,
             })),
         }
     }
@@ -417,6 +428,10 @@ impl DashboardCatalogProvider {
         state.refresh_in_flight = false;
         state.etag = snapshot.generation.clone();
         state.snapshot = Some(snapshot);
+        #[cfg(test)]
+        {
+            state.test_pinned = true;
+        }
     }
 }
 

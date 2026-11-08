@@ -11,37 +11,88 @@
     "top_p": 0.9,
     "tool_choice": "auto",
     "tools": [
-      {"type": "function", "name": "read", "parameters": {"type": "object"}},
-      {"type": "namespace", "name": "mcp__cua", "tools": []},
-      {"type": "web_search"}
+      {
+        "type": "function",
+        "name": "read",
+        "parameters": {
+          "type": "object"
+        }
+      },
+      {
+        "type": "namespace",
+        "name": "mcp__cua",
+        "tools": []
+      },
+      {
+        "type": "web_search"
+      }
     ],
     "input": [
-      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "读取截图"}]},
-      {"type": "function_call", "call_id": "call-1", "name": "execute", "arguments": "{}"},
-      {"type": "function_call_output", "call_id": "call-1", "output": [
-        {"type": "input_text", "text": "screenshot"},
-        {"type": "input_image", "image_url": "data:image/jpeg;base64,AAAA"},
-        {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,AAAA"}
-      ]}
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "读取截图"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "execute",
+        "arguments": "{}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "screenshot"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/jpeg;base64,AAAA"
+          },
+          {
+            "type": "input_file",
+            "filename": "report.pdf",
+            "file_data": "data:application/pdf;base64,AAAA"
+          }
+        ]
+      }
     ]
   },
   "expect": {
-    "lengths": {"/tools": 1, "/input": 2},
+    "lengths": {
+      "/tools": 1,
+      "/input": 1
+    },
     "paths": {
       "/tools/0/type": "function",
-      "/input/1/type": "message",
-      "/input/1/role": "user",
-      "/input/1/content/0/type": "input_text"
+      "/input/0/type": "message",
+      "/input/0/role": "user"
     },
-    "absent_paths": ["/temperature", "/top_p"],
+    "absent_paths": [
+      "/input/1",
+      "/temperature",
+      "/top_p"
+    ],
     "forbidden_substrings": [
       "input_image",
       "input_file",
       "data:image",
       "data:application/pdf",
-      "Earlier the assistant used",
-      "Result from the earlier"
+      "Earlier the assistant"
     ],
-    "changes_include": ["tool_result_image", "tool_result_file", "function_call_history", "sampling_temperature", "sampling_top_p"]
+    "changes_include": [
+      "tool_result_image",
+      "tool_result_file",
+      "function_call_history",
+      "sampling_temperature",
+      "sampling_top_p"
+    ]
   }
 }

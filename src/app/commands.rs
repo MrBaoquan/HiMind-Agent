@@ -3174,11 +3174,12 @@ fn current_chat_selection() -> Option<(String, String)> {
     Some((service.id, model?))
 }
 
-/// 对话路由变了以后，把新模型目录推给已经启动的 DSH 会话。
+/// 对话路由变了以后，把已经启动的 DSH 会话切到新模型。
 ///
 /// 与旧 `set_active_ai_service` 的语义一致，但比较单位是「服务 + 模型」：
-/// 只要 DSH 该用的别名变了，就要重新激活默认模型（`activate_…` 内部同时刷新
-/// 目录并选中新模型）；清空主选则停掉本机路由，让 DSH 回到原生配置。
+/// 只要 DSH 该用的别名变了，就要重新选中模型（目录本身随 overlay 下发，
+/// 没有需要刷新的设置项）；新别名不在运行中会话的目录里时会话会被停掉，
+/// 界面据此丢弃旧 iframe；清空主选则同样停掉会话，让 DSH 回到原生配置。
 fn sync_chat_route(
     app: &AppHandle,
     state: &State<'_, AgentState>,
@@ -3188,29 +3189,35 @@ fn sync_chat_route(
     if current == previous {
         return;
     }
-    match current.as_ref() {
+    let restarted = match current.as_ref() {
         None => {
             crate::app::ui::stop_builtin_ai_process();
             state
                 .approval_manager
                 .add_log("info", "已取消 HiMind AI 本机默认服务，恢复 DSH 原生设置");
+            true
         }
         Some(_) => {
-            if let Err(error) = crate::app::ui::activate_builtin_ai_local_service() {
-                state.approval_manager.add_log("warn", &error);
-            }
+            let restarted = match crate::app::ui::activate_builtin_ai_local_service() {
+                Ok(restarted) => restarted,
+                Err(error) => {
+                    state.approval_manager.add_log("warn", &error);
+                    false
+                }
+            };
             state
                 .approval_manager
                 .add_log("info", "已将本机模型服务设为 HiMind AI 对话默认服务");
+            restarted
         }
-    }
+    };
     let _ = app.emit(
         "himind:ai-service-changed",
         json!({
             "reason": "active_service_changed",
             "service_id": current.as_ref().map(|(id, _)| id.clone()).unwrap_or_default(),
             "model": current.as_ref().map(|(_, model)| model.clone()).unwrap_or_default(),
-            "restart_required": current.is_none(),
+            "restart_required": restarted,
         }),
     );
 }
@@ -3543,23 +3550,28 @@ pub(crate) fn save_ai_service(
         }),
     );
     let active_service_id = crate::store::ai_services::active_id().map_err(|e| e.to_string())?;
-    if active_service_id.is_some() {
-        let sync_result = if active_service_id.as_deref() == Some(service.id.as_str()) {
-            crate::app::ui::activate_builtin_ai_local_service()
-        } else {
-            crate::app::ui::refresh_builtin_ai_local_catalog()
-        };
-        if let Err(error) = sync_result {
-            state.approval_manager.add_log("warn", &error);
+    let mut restarted = false;
+    // 目录随 overlay 下发，运行中的进程改不了它：只要目录变了（新增 / 修改 /
+    // 删除任意服务）就必须换进程，否则下一次对话会拿着进程里那份旧目录去解析
+    // 新别名。会话按需重建，这里只停掉旧的。
+    match crate::app::ui::restart_builtin_ai_sessions_if_catalog_changed() {
+        Ok(did_restart) => {
+            restarted = did_restart;
+            if did_restart {
+                state
+                    .approval_manager
+                    .add_log("info", "模型目录已变化，HiMind AI 会话将按新目录重新启动");
+            }
         }
+        Err(error) => state.approval_manager.add_log("warn", &error),
     }
-    if active_service_id.as_deref() == Some(service.id.as_str()) {
+    if restarted || active_service_id.as_deref() == Some(service.id.as_str()) {
         let _ = app.emit(
             "himind:ai-service-changed",
             json!({
                 "reason": "active_service_edited",
                 "service_id": service.id.clone(),
-                "restart_required": false,
+                "restart_required": restarted,
             }),
         );
     }
@@ -3628,8 +3640,24 @@ pub(crate) fn remove_ai_service(
                 }),
             );
         } else {
-            if let Err(error) = crate::app::ui::refresh_builtin_ai_local_catalog() {
-                state.approval_manager.add_log("warn", &error);
+            // 目录少了一个别名，运行中的会话仍可用（它没在用这个服务），
+            // 但下次对话前必须换进程才能读到新目录。
+            let restarted = match crate::app::ui::refresh_builtin_ai_local_catalog() {
+                Ok(restarted) => restarted,
+                Err(error) => {
+                    state.approval_manager.add_log("warn", &error);
+                    false
+                }
+            };
+            if restarted {
+                let _ = app.emit(
+                    "himind:ai-service-changed",
+                    json!({
+                        "reason": "ai_service_removed",
+                        "service_id": id.clone(),
+                        "restart_required": true,
+                    }),
+                );
             }
         }
         state
@@ -7167,6 +7195,7 @@ pub(crate) fn invoke_development_plugin(
         &capability_id,
         input,
         trusted_dashboard_url,
+        &[],
     );
     let duration_ms = started.elapsed().as_millis() as u64;
     Ok(match result {
