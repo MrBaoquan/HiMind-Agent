@@ -36,7 +36,9 @@ pub(crate) fn execute_runtime_step(
         .map(|role| role.prompt.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or(runtime.prompt.trim());
-    let provider = resolve_provider(provider_name)?;
+    // auto 的含义是「挑一个能干这活的本机 Runtime」——干不了的就不该成为候选。
+    // 传 tool_policy 进去，让 none 约束参与候选筛选，而不是先挑中再报错。
+    let provider = resolve_provider(provider_name, tool_policy)?;
     enforce_runtime_network_policy(&provider, runtime.allow_network)?;
     let disable_tools = enforce_runtime_tool_policy(&provider, tool_policy)?;
     let workspace = resolve_workspace(&runtime.workspace_path, input)?;
@@ -220,24 +222,38 @@ fn validate_runtime_output(
     .into())
 }
 
-fn resolve_provider(provider: &str) -> Result<String, Box<dyn Error>> {
+fn resolve_provider(provider: &str, tool_policy: &str) -> Result<String, Box<dyn Error>> {
     let provider = provider.trim();
-    if provider == "auto" {
-        if std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1") {
-            return Ok("himind.fixture".to_string());
-        }
-        if codex::probe().status == "ready" {
-            return Ok("personal.codex".to_string());
-        }
-        if copilot::probe().status == "ready" {
-            return Ok("personal.github-copilot".to_string());
-        }
-        if crate::runtime::deepseek_harness::probe().status == "ready" {
-            return Ok("himind.builtin".to_string());
-        }
-        return Err("no local AI Runtime Provider is available for runtime step".into());
+    if provider != "auto" {
+        return Ok(provider.to_string());
     }
-    Ok(provider.to_string())
+    // 步骤要求不挂工具时，只有能强制这一点的 Runtime 才是候选。
+    // 否则会出现「auto 挑中 codex，运行到一半报 cannot enforce tool_policy=none」——
+    // 那是最难排查的一类失败：预检说能动、真跑才炸。
+    let require_no_tools = tool_policy.trim() == "none";
+    let candidate_ok = |name: &str| !require_no_tools || super::runtime_supports_tool_none(name);
+
+    if std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1")
+        && candidate_ok("himind.fixture")
+    {
+        return Ok("himind.fixture".to_string());
+    }
+    if candidate_ok("personal.codex") && codex::probe().status == "ready" {
+        return Ok("personal.codex".to_string());
+    }
+    if candidate_ok("personal.github-copilot") && copilot::probe().status == "ready" {
+        return Ok("personal.github-copilot".to_string());
+    }
+    if candidate_ok("himind.builtin") && crate::runtime::deepseek_harness::probe().status == "ready" {
+        return Ok("himind.builtin".to_string());
+    }
+    if require_no_tools {
+        return Err(
+            "no local Runtime can enforce tool_policy=none for an auto step; set provider to himind.builtin"
+                .into(),
+        );
+    }
+    Err("no local AI Runtime Provider is available for runtime step".into())
 }
 
 fn enforce_runtime_network_policy(
@@ -262,13 +278,17 @@ fn enforce_runtime_network_policy(
 fn enforce_runtime_tool_policy(provider: &str, tool_policy: &str) -> Result<bool, Box<dyn Error>> {
     match tool_policy.trim() {
         "" | "default" => Ok(false),
-        "none" => match provider {
-            "himind.builtin" | "himind.fixture" => Ok(true),
-            other => Err(format!(
-                "workflow runtime provider {other} cannot enforce tool_policy=none; use a Runtime that can mount the step without model-facing tools"
-            )
-            .into()),
-        },
+        "none" => {
+            // 与预检共用同一份判据：预检说能跑、运行期才拒绝，是最难排查的一类失败。
+            if super::runtime_supports_tool_none(provider) {
+                Ok(true)
+            } else {
+                Err(format!(
+                    "workflow runtime provider {provider} cannot enforce tool_policy=none; use a Runtime that can mount the step without model-facing tools"
+                )
+                .into())
+            }
+        }
         other => Err(format!("unsupported workflow runtime tool_policy: {other}").into()),
     }
 }
@@ -791,6 +811,31 @@ mod tests {
         assert_eq!(state["iteration"], 2);
         assert!(output.contains("fixture_iteration"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 关键回归：auto + tool_policy=none 必须挑到能执行它的 Runtime，
+    /// 而不是先挑中 codex 再在运行期报 cannot enforce。
+    #[test]
+    fn auto_never_resolves_to_a_runtime_that_cannot_enforce_tool_none() {
+        // fixture 模式是唯一可确定的环境；它本来就支持 none，理应被选中。
+        std::env::set_var("HIMIND_WORKFLOW_RUNTIME_FIXTURE", "1");
+        let resolved = resolve_provider("auto", "none").unwrap();
+        assert!(
+            super::super::runtime_supports_tool_none(&resolved),
+            "auto 为 none 步骤挑出的 provider 必须支持 none，实际：{resolved}"
+        );
+        // 非 none 的步骤不受影响：fixture 优先仍然是既有行为。
+        assert_eq!(resolve_provider("auto", "default").unwrap(), "himind.fixture");
+        std::env::remove_var("HIMIND_WORKFLOW_RUNTIME_FIXTURE");
+    }
+
+    #[test]
+    fn explicit_provider_is_never_rewritten_by_tool_policy() {
+        // 显式声明不改写：用户写了 personal.codex，就该报错而不是悄悄换成 builtin。
+        assert_eq!(
+            resolve_provider("personal.codex", "none").unwrap(),
+            "personal.codex"
+        );
     }
 
     #[test]

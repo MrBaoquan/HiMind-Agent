@@ -1,14 +1,14 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.software-delivery",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "distribution_targets": [
     "workbench",
     "github"
   ],
   "name": "软件交付（多角色）",
   "description": "从需求分析到 PR 准备的多角色交付流程：分析、实现、测试修复循环、代码审查、人工批准后交付。",
-  "release_notes": "1.1.0：测试与审查改为并行委派，各起独立子运行；新增 min_succeeded 汇总规则。",
+  "release_notes": "1.1.0：测试与审查改为并行委派，各起独立子运行；新增 min_succeeded 汇总规则。 1.1.1：tool_policy=none 的步骤固定到 himind.builtin——auto 可能解析到不支持的 Runtime。",
   "min_agent_version": "0.3.90",
   "local_requirements": {
     "platform": "windows",
@@ -160,7 +160,7 @@
             "title": "代码审查",
             "role_id": "software.reviewer",
             "runtime": {
-              "provider": "auto",
+              "provider": "himind.builtin",
               "prompt": "审查本次改动。只依据代码与测试结果判断，不采信实现方的描述。列出问题与建议。",
               "tool_policy": "none",
               "timeout_seconds": 1800
@@ -180,7 +180,7 @@
       "role_id": "software.delivery",
       "risk_level": "local_write",
       "runtime": {
-        "provider": "auto",
+        "provider": "himind.builtin",
         "prompt": "整理变更摘要、验证证据（测试结果）与回滚说明，形成 PR 描述草稿。不要创建 PR。",
         "tool_policy": "none",
         "timeout_seconds": 900

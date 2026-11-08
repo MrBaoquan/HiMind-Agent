@@ -178,6 +178,23 @@ pub(crate) fn capability_is_usable(
         || capability.dashboard_provider
 }
 
+/// 哪些 Runtime 能真正执行 `tool_policy = "none"`。
+///
+/// 判据只能来自 Runtime 自身的能力，不能靠「名字看起来像内建的」。目前只有
+/// 内核自带的两个 Runtime 能在不挂载模型可见工具的前提下跑一步：
+/// - `himind.builtin`：由 Agent 直接控制进程与工具挂载；
+/// - `himind.fixture`：测试替身，本来就不挂工具。
+///
+/// 其余 Provider（personal.codex / personal.github-copilot / ACP）由外部 CLI 掌管
+/// 工具面，Agent 只能提要求、不能强制，所以拒绝而不是静默降级——
+/// 「审查角色读不到实现过程」是这个策略存在的唯一理由，做不到就不该假装做到。
+pub(crate) const TOOL_NONE_CAPABLE_RUNTIMES: &[&str] = &["himind.builtin", "himind.fixture"];
+
+/// 这个 Runtime 能否执行 `tool_policy = "none"`。
+pub(crate) fn runtime_supports_tool_none(provider: &str) -> bool {
+    TOOL_NONE_CAPABLE_RUNTIMES.contains(&provider.trim())
+}
+
 pub(crate) fn workflow_approval_id(run_id: &str, step_id: &str) -> String {
     format!("workflow:{}:{}", run_id.trim(), step_id.trim())
 }

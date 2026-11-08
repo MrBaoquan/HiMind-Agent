@@ -1,14 +1,14 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.ui-craft-team",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "distribution_targets": [
     "workbench",
     "github"
   ],
   "name": "UI 专业打磨团队",
   "description": "三路并行审查（信息架构 / 工艺 / 无障碍），人工勾选整改项后进入打磨循环，守门角色验收。",
-  "release_notes": "1.0.2：审查结果写入界面审查台账，跨运行可追踪已修/未修。",
+  "release_notes": "1.0.2：审查结果写入界面审查台账，跨运行可追踪已修/未修。 1.0.3：tool_policy=none 的步骤固定到 himind.builtin——auto 可能解析到不支持的 Runtime。",
   "min_agent_version": "0.3.90",
   "local_requirements": {
     "platform": "windows",
@@ -246,7 +246,7 @@
             "role_id": "ui.guard",
             "risk_level": "read_only",
             "runtime": {
-              "provider": "auto",
+              "provider": "himind.builtin",
               "prompt": "依据代码 diff 与验证结果判断本次打磨是否达标：已确认的问题清单是否全部处理、检查是否全部通过、有无引入新问题。只输出 JSON：{\"passed\": true|false, \"reasons\": [...], \"remaining\": [...]}。不采信实现方的自述。\n\n若本轮确认某些问题已修，调用 engineering.ui-audit.mark-fixed 标明（ids 用台账 id）。只标你实际验证过的：审查范围缩小导致的漏报不代表修好了。",
               "tool_policy": "none",
               "timeout_seconds": 900

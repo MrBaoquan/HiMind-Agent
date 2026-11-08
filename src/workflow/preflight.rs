@@ -404,6 +404,9 @@ pub(crate) fn preflight(
 
     let runtime_reports = workflow_runtime_reports_for(package);
     let runtimes = evaluate_runtime_preflight(package, &runtime_reports, &mut diagnostics);
+    // tool_policy 与 provider 的兼容性单独一关：它不属于「Runtime 装没装」，
+    // 而是「装了的 Runtime 能不能满足这个步骤的约束」。
+    validate_tool_policy_support(package, &runtime_reports, &mut diagnostics);
 
     let dashboard_available = available_capabilities
         .iter()
@@ -1133,6 +1136,118 @@ fn runtime_requirements(
     (explicit, auto)
 }
 
+/// 收集所有声明了 `tool_policy = "none"` 的步骤及其 provider 声明。
+///
+/// 返回 `(step_id, provider)`；provider 可能是 `auto`，那正是最危险的一种，
+/// 因为 auto 可能解析到不支持 none 的 Runtime。
+fn tool_none_steps(steps: &[super::WorkflowStep]) -> Vec<(String, String)> {
+    fn walk(steps: &[super::WorkflowStep], out: &mut Vec<(String, String)>) {
+        for step in steps {
+            if let Some(runtime) = step.runtime.as_ref() {
+                if runtime.tool_policy.trim() == "none" {
+                    out.push((
+                        step.id.clone(),
+                        runtime.provider.trim().to_string(),
+                    ));
+                }
+            }
+            if let Some(loop_config) = step.loop_config.as_ref() {
+                walk(&loop_config.steps, out);
+            }
+            // 委派分支自带 runtime 与 tool_policy，必须一并检查：
+            // 审查角色恰恰是最常声明 none 的那一类。
+            if let Some(delegate) = step.delegate.as_ref() {
+                for branch in &delegate.branches {
+                    if let Some(runtime) = branch.runtime.as_ref() {
+                        if runtime.tool_policy.trim() == "none" {
+                            out.push((
+                                format!("{}:{}", step.id, branch.id),
+                                runtime.provider.trim().to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(steps, &mut out);
+    out
+}
+
+/// `tool_policy = "none"` 的步骤必须解析到能执行它的 Runtime。
+///
+/// 这条检查以前不存在，导致 doctor 报 ready、运行时才失败：
+/// `personal.codex cannot enforce tool_policy=none`。预检与运行期必须共用同一份
+/// 判据（[`super::runtime_supports_tool_none`]），否则「预检说可用、运行期调不到」
+/// 就会重演。
+fn validate_tool_policy_support(
+    package: &super::WorkflowPackage,
+    runtime_reports: &[RuntimeInstallationReport],
+    diagnostics: &mut Vec<WorkflowDiagnostic>,
+) {
+    for (step_id, provider) in tool_none_steps(&package.steps) {
+        if provider.is_empty() || provider == "auto" {
+            // auto 会按 codex → copilot → builtin 的顺序解析，没有一个能被证明
+            // 支持 none。这是「可能在某台机器上必然失败」，按 blocker 报而不是 warning：
+            // 用户需要在启动前就知道，而不是跑到一半才发现。
+            let capable = package
+                .supported_runtimes
+                .iter()
+                .filter(|runtime| super::runtime_supports_tool_none(runtime))
+                .cloned()
+                .collect::<Vec<_>>();
+            if capable.is_empty() {
+                push_blocker(
+                    diagnostics,
+                    "runtime.tool_policy_unsupported",
+                    "runtime",
+                    format!(
+                        "workflow step {step_id} declares tool_policy=none but provider is auto, and no supported runtime can enforce it"
+                    ),
+                    "把该步骤的 provider 改成 himind.builtin，或在 supported_runtimes 中声明一个支持 none 的 Runtime。",
+                    true,
+                );
+            } else {
+                push_warning(
+                    diagnostics,
+                    "runtime.tool_policy_auto",
+                    "runtime",
+                    format!(
+                        "workflow step {step_id} declares tool_policy=none with provider=auto; auto may resolve to a runtime that cannot enforce it"
+                    ),
+                    format!(
+                        "把 provider 固定为 {}，避免 auto 解析到不支持 none 的 Runtime。",
+                        capable.join(" / ")
+                    ),
+                    true,
+                );
+            }
+            continue;
+        }
+        if super::runtime_supports_tool_none(&provider) {
+            continue;
+        }
+        // provider 明确声明了，但它做不到：只有在该 provider 确实可用时报错，
+        // 否则「没装」的报错会盖住真实原因。
+        let available = runtime_reports
+            .iter()
+            .any(|report| report.provider == provider && report.status == "ready");
+        if available {
+            push_blocker(
+                diagnostics,
+                "runtime.tool_policy_unsupported",
+                "runtime",
+                format!(
+                    "workflow step {step_id} declares tool_policy=none but runtime {provider} cannot enforce it"
+                ),
+                "把该步骤的 provider 改成 himind.builtin，或去掉 tool_policy=none 并接受该步骤可以使用工具。",
+                true,
+            );
+        }
+    }
+}
+
 fn runtime_requires_network_isolation(steps: &[super::WorkflowStep]) -> bool {
     steps.iter().any(|step| {
         step.runtime
@@ -1569,6 +1684,113 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    /// tool_policy=none 与 provider 的兼容性：三种情况各一条断言。
+    #[test]
+    fn tool_policy_none_is_checked_against_the_resolved_runtime() {
+        use crate::agent_core_contracts::RuntimeEventType; // 保持与模块其他用例一致的 import 风格
+        let _ = RuntimeEventType::Progress;
+
+        // 1) 显式声明 builtin + none：合法，不产生诊断。
+        let mut ok = package(Vec::new());
+        ok.steps.clear();
+        ok.steps.push(step_with_policy("STEP", "himind.builtin", "none"));
+        let mut diagnostics = Vec::new();
+        validate_tool_policy_support(&ok, &[], &mut diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "builtin 支持 none，不该报诊断：{diagnostics:?}"
+        );
+
+        // 2) 显式声明 codex + none 且 codex 可用：blocker。
+        let mut bad = package(Vec::new());
+        bad.steps.clear();
+        bad.steps.push(step_with_policy("STEP", "personal.codex", "none"));
+        let available = vec![runtime_report("personal.codex", "ready")];
+        let mut diagnostics = Vec::new();
+        validate_tool_policy_support(&bad, &available, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, "blocker");
+        assert!(
+            diagnostics[0].message.contains("cannot enforce"),
+            "诊断必须点明原因：{}",
+            diagnostics[0].message
+        );
+
+        // 3) 委派分支声明 none：必须被扫到（审查角色正是在分支里）。
+        let mut delegated = package(Vec::new());
+        delegated.steps.clear();
+        delegated.steps.push(delegate_with_branch_policy("GATE", "BRANCH", "personal.codex", "none"));
+        let mut diagnostics = Vec::new();
+        validate_tool_policy_support(&delegated, &available, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "委派分支的 tool_policy 必须纳入检查，否则 doctor 又会漏报"
+        );
+        assert!(diagnostics[0].message.contains("GATE:BRANCH"));
+    }
+
+    fn step_with_policy(id: &str, provider: &str, tool_policy: &str) -> crate::workflow::WorkflowStep {
+        crate::workflow::WorkflowStep {
+            id: id.to_string(),
+            title: id.to_string(),
+            kind: "runtime".to_string(),
+            capability_id: String::new(),
+            runtime: Some(serde_json::from_value(serde_json::json!({
+                "provider": provider,
+                "prompt": "do it",
+                "tool_policy": tool_policy
+            })).unwrap()),
+            delegate: None,
+            loop_config: None,
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "sync".to_string(),
+            role_id: String::new(),
+            risk_level: "read_only".to_string(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn delegate_with_branch_policy(
+        step_id: &str,
+        branch_id: &str,
+        provider: &str,
+        tool_policy: &str,
+    ) -> crate::workflow::WorkflowStep {
+        let branch = serde_json::json!({
+            "id": branch_id,
+            "title": branch_id,
+            "runtime": { "provider": provider, "prompt": "do it", "tool_policy": tool_policy }
+        });
+        crate::workflow::WorkflowStep {
+            id: step_id.to_string(),
+            title: step_id.to_string(),
+            kind: "delegate".to_string(),
+            capability_id: String::new(),
+            runtime: None,
+            delegate: Some(Box::new(serde_json::from_value(serde_json::json!({
+                "min_succeeded": 1,
+                "branches": [branch]
+            })).unwrap())),
+            loop_config: None,
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "long_running".to_string(),
+            role_id: String::new(),
+            risk_level: "read_only".to_string(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        }
+    }
 
     fn package(required_tools: Vec<&str>) -> WorkflowPackage {
         WorkflowPackage {
