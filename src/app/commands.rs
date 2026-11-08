@@ -8043,6 +8043,62 @@ pub(crate) fn cancel_workflow_run(run_id: String) -> Result<serde_json::Value, S
     serde_json::to_value(run).map_err(|error| error.to_string())
 }
 
+/// 重置指定步骤及其下游，让它们重新执行。
+#[tauri::command]
+pub(crate) fn retry_workflow_step(
+    run_id: String,
+    step_id: String,
+) -> Result<serde_json::Value, String> {
+    let runner =
+        crate::workflow::WorkflowRunner::open_default().map_err(|error| error.to_string())?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()
+        .map_err(|error| error.to_string())?;
+    let run = ledger
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let run = runner
+        .retry_step(run, &step_id)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(run).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn pause_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
+    let runner =
+        crate::workflow::WorkflowRunner::open_default().map_err(|error| error.to_string())?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()
+        .map_err(|error| error.to_string())?;
+    let run = ledger
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let run = runner.pause(run).map_err(|error| error.to_string())?;
+    serde_json::to_value(run).map_err(|error| error.to_string())
+}
+
+/// 恢复被用户暂停的运行。
+///
+/// 与 `resume_workflow_run` 分开：那个走「带反馈继续」，会重新进入调度；
+/// 这个只是把 `pause_kind` 清掉并重新入队，等待调度器接手。
+#[tauri::command]
+pub(crate) fn resume_paused_workflow_run(
+    run_id: String,
+) -> Result<serde_json::Value, String> {
+    let runner =
+        crate::workflow::WorkflowRunner::open_default().map_err(|error| error.to_string())?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()
+        .map_err(|error| error.to_string())?;
+    let run = ledger
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let run = runner
+        .resume_from_pause(run)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(run).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub(crate) async fn resume_workflow_run(
     state: State<'_, AgentState>,
@@ -8837,6 +8893,127 @@ fn workflow_interaction_request(
     }))
 }
 
+/// 按条件列出本机运行，供 `workflow.run.list` 与运行历史页共用。
+///
+/// 刻意返回**摘要**而不是完整快照：事件与证据可能几十 KB，
+/// 让调用方先列表再按需取详情，是列表类接口的基本纪律。
+pub(crate) fn list_workflow_runs(
+    workflow_id: &str,
+    status: &str,
+    since: &str,
+    limit: usize,
+    include_children: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let workflow_id = workflow_id.trim();
+    let status = status.trim();
+    // since 既接受 unix 秒，也接受 ISO 时间；两种写法在真实调用里都出现过。
+    let since_epoch = parse_since(since);
+    let mut items = Vec::new();
+    for run in ledger.list_runs(500)? {
+        if run.source != crate::agent_core_contracts::InteractionSource::Workflow {
+            continue;
+        }
+        if !include_children && !run.parent_run_id.trim().is_empty() {
+            continue;
+        }
+        if !status.is_empty() && run_status_key(&run.status) != status {
+            continue;
+        }
+        let created = run.created_at.parse::<i64>().unwrap_or_default();
+        if since_epoch > 0 && created > 0 && created < since_epoch {
+            continue;
+        }
+        let interaction = ledger.get_interaction(&run.interaction_id)?;
+        let workflow = interaction
+            .as_ref()
+            .and_then(|interaction| interaction.business_context.get("workflow"));
+        let package_id = workflow
+            .and_then(|workflow| workflow.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !workflow_id.is_empty() && package_id != workflow_id {
+            continue;
+        }
+        let package_version = workflow
+            .and_then(|workflow| workflow.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let current = run
+            .steps
+            .iter()
+            .find(|step| step.step_id == run.current_step_id);
+        let role_id = current
+            .map(|step| step.role_id.trim().to_string())
+            .unwrap_or_default();
+        items.push(json!({
+            "run_id": run.run_id,
+            "workflow_id": package_id,
+            "workflow_version": package_version,
+            "status": run_status_key(&run.status),
+            "parent_run_id": run.parent_run_id,
+            "parent_kind": if run.parent_run_id.trim().is_empty() {
+                ""
+            } else if run.parent_kind.is_delegation() {
+                "delegate"
+            } else {
+                "retry"
+            },
+            "current_step_id": run.current_step_id,
+            "current_step_title": current.map(|step| step.title.clone()).unwrap_or_default(),
+            "role_id": role_id,
+            "error": run.error,
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+            "artifact_count": run.artifacts.len(),
+        }));
+        if items.len() >= limit {
+            break;
+        }
+    }
+    items.sort_by(|left, right| {
+        let l = left.get("created_at").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let r = right.get("created_at").and_then(serde_json::Value::as_str).unwrap_or_default();
+        r.cmp(l)
+    });
+    let total = items.len();
+    Ok(json!({
+        "runs": items,
+        "total": total,
+        "include_children": include_children,
+    }))
+}
+
+/// 与 `local_activity` 同一套状态词表，避免两个接口对同一个运行说两种状态。
+fn run_status_key(status: &crate::agent_core_contracts::LocalRunStatus) -> &'static str {
+    use crate::agent_core_contracts::LocalRunStatus as S;
+    match status {
+        S::Queued => "queued",
+        S::Running => "running",
+        S::Waiting => "waiting",
+        S::Succeeded => "succeeded",
+        S::Failed => "failed",
+        S::Canceled => "canceled",
+    }
+}
+
+fn parse_since(value: &str) -> i64 {
+    let value = value.trim();
+    if value.is_empty() {
+        return 0;
+    }
+    if let Ok(seconds) = value.parse::<i64>() {
+        return seconds;
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.timestamp())
+        .unwrap_or(0)
+}
+
 pub(crate) fn workflow_run_snapshot(
     run_id: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -8867,6 +9044,9 @@ pub(crate) fn workflow_run_snapshot(
             }))
         })
         .transpose()?;
+    // 结构化证据按步骤归拢后一并给出：前端不必再从事件流里自己拼。
+    let evidence = crate::workflow::collect_step_evidence(run_id, &ledger)
+        .unwrap_or_default();
     Ok(json!({
         "run": run,
         "interaction": interaction,
@@ -8874,6 +9054,7 @@ pub(crate) fn workflow_run_snapshot(
         "projections": projections,
         "interaction_request": workflow_interaction_request(&run, &events),
         "workflow": workflow,
+        "step_evidence": evidence,
     }))
 }
 
@@ -8903,6 +9084,30 @@ fn workflow_run_verification(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn run_status_keys_stay_in_one_vocabulary() {
+        use crate::agent_core_contracts::LocalRunStatus as S;
+        // 与 local_activity 的词表一致：两个接口对同一条运行不能各说一套。
+        assert_eq!(run_status_key(&S::Queued), "queued");
+        assert_eq!(run_status_key(&S::Running), "running");
+        assert_eq!(run_status_key(&S::Waiting), "waiting");
+        assert_eq!(run_status_key(&S::Succeeded), "succeeded");
+        assert_eq!(run_status_key(&S::Failed), "failed");
+        assert_eq!(run_status_key(&S::Canceled), "canceled");
+    }
+
+    #[test]
+    fn since_accepts_unix_seconds_and_iso_time() {
+        // 两种写法在真实调用里都出现过：CLI 传秒，客户端传 ISO。
+        assert_eq!(parse_since("1794000000"), 1_794_000_000);
+        assert_eq!(parse_since(""), 0);
+        assert!(parse_since("2026-11-07T00:00:00Z") > 1_700_000_000);
+        // 无法解析时退回 0（不过滤），而不是把整个列表清空。
+        assert_eq!(parse_since("not-a-time"), 0);
+    }
+
     use super::{
         dedupe_workflow_catalog, extension_activation_receipts_for_profile,
         present_builtin_ai_start_error, validate_credential_fields,

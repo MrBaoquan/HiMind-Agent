@@ -523,6 +523,14 @@ fn handle_request_with_session(
         "resources/list" => {
             let facts = mcp_capability_facts(gateway)?;
             let mut result = crate::skill::mcp_resources_json(VERSION, &facts)?;
+            // 把近期运行作为可读资源暴露出去：AI 客户端跨会话找不到任务，
+            // 是因为它们没有 run_id；有了资源 URI 就能先列再读。
+            if let Some(items) = result.get_mut("resources").and_then(Value::as_array_mut) {
+                for run in recent_run_resources(12) {
+                    items.push(run);
+                }
+                items.push(audit_ledger_resource());
+            }
             result["_meta"] =
                 json!({ "himind": { "registryGeneration": mcp_registry_generation(gateway)? } });
             Ok(result)
@@ -532,18 +540,46 @@ fn handle_request_with_session(
         // Returning the empty, well-formed result keeps discovery compatible
         // without pretending that Agent-owned files are MCP resources.
         "resources/templates/list" => Ok(json!({
-            "resourceTemplates": [{
-                "uriTemplate": "himind://skill/{skill_id}/{path}",
-                "name": "Skill 附属资料",
-                "description": "读取已就绪 Skill Manifest 声明的附属资料。",
-                "mimeType": "text/plain"
-            }]
+            "resourceTemplates": [
+                {
+                    "uriTemplate": "himind://skill/{skill_id}/{path}",
+                    "name": "Skill 附属资料",
+                    "description": "读取已就绪 Skill Manifest 声明的附属资料。",
+                    "mimeType": "text/plain"
+                },
+                {
+                    "uriTemplate": "himind://run/{run_id}",
+                    "name": "Workflow 运行详情",
+                    "description": "读取一条运行的状态、步骤、事件与结构化证据。",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uriTemplate": "himind://ui-audit-ledger",
+                    "name": "界面审查台账",
+                    "description": "跨运行的界面问题清单：id、状态、复现位置。",
+                    "mimeType": "application/json"
+                }
+            ]
         })),
         "resources/read" => {
             let uri = params
                 .get("uri")
                 .and_then(Value::as_str)
                 .ok_or("MCP resource URI is required")?;
+            // 运行资源走自己的读取路径，不混进 Skill 资料那套校验。
+            if let Some(run_id) = uri.strip_prefix("himind://run/") {
+                return read_run_resource(run_id);
+            }
+            if uri.trim() == "himind://ui-audit-ledger" {
+                let summary = crate::ui_audit_ledger::summary()?;
+                return Ok(json!({
+                    "contents": [{
+                        "uri": "himind://ui-audit-ledger",
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string(&summary)?,
+                    }]
+                }));
+            }
             let facts = mcp_capability_facts(gateway)?;
             crate::skill::mcp_resource_read(uri, VERSION, &facts)
         }
@@ -1984,16 +2020,24 @@ mod tests {
         assert!(resources["_meta"]["himind"]["registryGeneration"]
             .as_str()
             .is_some());
+        // 现在有两类模板：Skill 附属资料与 Workflow 运行详情。
+        // 断言从「完全相等」改成「包含」：新增资源不该让这条用例天天改。
+        let templates =
+            handle_request(&gateway, "resources/templates/list", json!({})).unwrap();
+        let items = templates["resourceTemplates"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["uriTemplate"] == "himind://skill/{skill_id}/{path}"));
+        assert!(
+            items.iter().any(|item| item["uriTemplate"] == "himind://run/{run_id}"),
+            "运行资源模板必须暴露：客户端靠它发现可读的运行"
+        );
+        assert!(
+            items.iter().any(|item| item["uriTemplate"] == "himind://ui-audit-ledger"),
+            "审查台账必须暴露：它是跨运行追踪的唯一入口"
+        );
         assert_eq!(
-            handle_request(&gateway, "resources/templates/list", json!({})).unwrap(),
-            json!({
-                "resourceTemplates": [{
-                    "uriTemplate": "himind://skill/{skill_id}/{path}",
-                    "name": "Skill 附属资料",
-                    "description": "读取已就绪 Skill Manifest 声明的附属资料。",
-                    "mimeType": "text/plain"
-                }]
-            })
+            items.len(),
+            3,
+            "模板数量变化必须是有意的，不能顺手加一个没人用的"
         );
         let prompts = handle_request(&gateway, "prompts/list", json!({})).unwrap();
         assert!(prompts["prompts"].is_array());
@@ -2300,4 +2344,72 @@ mod tests {
             assert_eq!(tool["annotations"]["availability"], "control_plane");
         }
     }
+}
+
+/// 近期运行的 MCP 资源条目。
+///
+/// 只暴露最近 12 条：客户端列资源时会一次性拿到全部条目，太多了会挤占上下文，
+/// 而跨会话真正需要的通常就是「我刚才让它做的那件事」。
+/// 审查台账的 MCP 资源：客户端可以直接读「还有哪些问题没修」。
+fn audit_ledger_resource() -> Value {
+    json!({
+        "uri": "himind://ui-audit-ledger",
+        "name": "界面审查台账",
+        "description": "跨运行的界面问题清单：id、状态、复现位置。",
+        "mimeType": "application/json",
+    })
+}
+
+fn recent_run_resources(limit: usize) -> Vec<Value> {
+    let Ok(ledger) = crate::store::local_runs::LocalRunLedger::open_default() else {
+        return Vec::new();
+    };
+    let Ok(runs) = ledger.list_runs(limit.saturating_mul(3)) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for run in runs {
+        if run.source != crate::agent_core_contracts::InteractionSource::Workflow {
+            continue;
+        }
+        // 子运行（委派/重试）不单独暴露：它们在父运行的详情里看得到，
+        // 单独列出来会让列表被同一次任务刷屏。
+        if !run.parent_run_id.trim().is_empty() {
+            continue;
+        }
+        let current = run
+            .steps
+            .iter()
+            .find(|step| step.step_id == run.current_step_id);
+        let title = current
+            .map(|step| step.title.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| run.run_id.clone());
+        items.push(json!({
+            "uri": format!("himind://run/{}", run.run_id),
+            "name": title,
+            "description": format!("{:?} · {} 步", run.status, run.steps.len()),
+            "mimeType": "application/json",
+        }));
+        if items.len() >= limit {
+            break;
+        }
+    }
+    items
+}
+
+/// 读取一条运行资源：与 `workflow.run.get` 同一份快照，保证两个入口说法一致。
+fn read_run_resource(run_id: &str) -> Result<Value, Box<dyn Error>> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err("run resource URI is missing run_id".into());
+    }
+    let snapshot = crate::app::commands::workflow_run_snapshot(run_id)?;
+    Ok(json!({
+        "contents": [{
+            "uri": format!("himind://run/{run_id}"),
+            "mimeType": "application/json",
+            "text": serde_json::to_string(&snapshot)?,
+        }]
+    }))
 }

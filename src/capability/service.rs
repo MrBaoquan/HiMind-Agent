@@ -98,6 +98,10 @@ enum CapabilityHandler {
     WorkflowCatalogDescribe,
     WorkflowRunStart,
     WorkflowRunGet,
+    WorkflowRunList,
+    UiAuditLedgerRecord,
+    UiAuditLedgerMarkFixed,
+    UiAuditLedgerSummary,
     ScheduleList,
     ScheduleSet,
     ScheduleDelete,
@@ -2093,6 +2097,83 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkflowRunGet,
             ),
             registration(
+                "workflow.run.list",
+                "列出 Workflow Run",
+                "按 Workflow、状态与时间列出本机运行记录，默认最近 7 天、未归档、最多 50 条。返回运行摘要，不含事件与证据全文——那些用 workflow.run.get 取。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workflow_id": { "type": "string" },
+                        "status": {
+                            "type": "string",
+                            "enum": ["queued", "running", "waiting", "succeeded", "failed", "canceled"]
+                        },
+                        "since": { "type": "string", "description": "ISO 时间或 unix 秒；默认 7 天前" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                        "include_children": { "type": "boolean", "description": "是否包含委派/重试产生的子运行" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowRunList,
+            ),
+            registration(
+                "engineering.ui-audit.record",
+                "登记界面审查发现",
+                "把一次审查发现的问题写入界面审查台账。同一条问题（类别+位置+标题相同）不会重复插入，只刷新最近确认时间。返回新增与复用计数。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "category": { "type": "string", "enum": ["ia", "craft", "a11y", "misc"] },
+                                    "title": { "type": "string", "minLength": 1 },
+                                    "location": { "type": "string" },
+                                    "detail": { "type": "string" }
+                                },
+                                "required": ["title"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["run_id", "findings"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::UiAuditLedgerRecord,
+            ),
+            registration(
+                "engineering.ui-audit.mark-fixed",
+                "标记界面问题已修",
+                "按台账 id 把问题标为已修。只接受显式 id：不根据「本轮没再报」自动关闭，因为范围缩小也会漏报。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "ids": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 }
+                        }
+                    },
+                    "required": ["run_id", "ids"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::UiAuditLedgerMarkFixed,
+            ),
+            registration(
+                "engineering.ui-audit.summary",
+                "界面审查台账汇总",
+                "返回台账按状态与类别计数，以及仍待处理的问题清单。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::UiAuditLedgerSummary,
+            ),
+            registration(
                 "workflow.run.feedback",
                 "提交 Workflow 反馈",
                 "向等待反馈的 Development Loop 提交用户反馈，并在后台继续执行。",
@@ -3748,6 +3829,85 @@ impl CapabilityGateway {
                     .ok_or("workflow.run.get requires run_id")?;
                 crate::app::commands::workflow_run_snapshot(run_id)
             }
+            CapabilityHandler::WorkflowRunList => {
+                let workflow_id = input
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                let status_filter = input
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                let limit = input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 200) as usize;
+                let include_children = input
+                    .get("include_children")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let since = input
+                    .get("since")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        // 默认窗口 7 天：跨会话的 AI 客户端只关心近期任务，
+                        // 全量历史会挤占它的上下文预算。
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|value| value.as_secs())
+                            .unwrap_or_default();
+                        now.saturating_sub(7 * 24 * 3600).to_string()
+                    });
+                crate::app::commands::list_workflow_runs(
+                    workflow_id,
+                    status_filter,
+                    &since,
+                    limit,
+                    include_children,
+                )
+            }
+            CapabilityHandler::UiAuditLedgerRecord => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("engineering.ui-audit.record requires run_id")?;
+                let findings = input
+                    .get("findings")
+                    .and_then(Value::as_array)
+                    .ok_or("engineering.ui-audit.record requires findings array")?;
+                crate::ui_audit_ledger::record_findings(run_id, findings)
+            }
+            CapabilityHandler::UiAuditLedgerMarkFixed => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("engineering.ui-audit.mark-fixed requires run_id")?;
+                let ids = input
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .ok_or("engineering.ui-audit.mark-fixed requires ids array")?;
+                crate::ui_audit_ledger::mark_fixed(run_id, &ids)
+            }
+            CapabilityHandler::UiAuditLedgerSummary => crate::ui_audit_ledger::summary(),
             CapabilityHandler::WorkflowRunFeedback => {
                 let run_id = input
                     .get("run_id")

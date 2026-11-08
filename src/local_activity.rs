@@ -315,6 +315,22 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             "updated_at": iso_from_epoch(&run.updated_at),
             "artifact_count": run.artifacts.len(),
             "workflow_run_id": run.run_id,
+            // 行内审批需要知道停在哪一步：approve/reject 都按 step_id 定位。
+            "current_step_id": run.current_step_id,
+            // 失败步骤用于行内重试：只给第一个失败步骤，重试它会连带重置下游。
+            "failed_step_id": run
+                .steps
+                .iter()
+                .find(|step| step.status == LocalStepStatus::Failed)
+                .map(|step| step.step_id.clone())
+                .unwrap_or_default(),
+            "pause_kind": match run.pause_kind {
+                crate::agent_core_contracts::RunPauseKind::User => "user",
+                crate::agent_core_contracts::RunPauseKind::Approval => "approval",
+                crate::agent_core_contracts::RunPauseKind::Feedback => "feedback",
+                crate::agent_core_contracts::RunPauseKind::External => "external",
+                crate::agent_core_contracts::RunPauseKind::None => "",
+            },
             "role_id": role_id,
             "roles": roles,
             "parent_run_id": run.parent_run_id,
@@ -376,6 +392,9 @@ fn skill_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             "updated_at": if finished.trim().is_empty() { iso_from_epoch(&record.started_at) } else { finished },
             "artifact_count": if record.output_path.trim().is_empty() { 0 } else { 1 },
             "workflow_run_id": "",
+            "current_step_id": "",
+            "failed_step_id": "",
+            "pause_kind": "",
             // 技能运行没有角色和父子关系：字段保持在，值为空，前端据此不渲染协作区。
             "role_id": "",
             "roles": Vec::<Value>::new(),

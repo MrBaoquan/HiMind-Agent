@@ -70,6 +70,7 @@ mod skill_run;
 mod store;
 mod svn;
 mod upload;
+mod ui_audit_ledger;
 mod worker;
 #[allow(dead_code)]
 mod workflow;
