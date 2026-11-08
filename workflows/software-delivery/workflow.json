@@ -1,14 +1,14 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.software-delivery",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "distribution_targets": [
     "workbench",
     "github"
   ],
   "name": "软件交付（多角色）",
   "description": "从需求分析到 PR 准备的多角色交付流程：分析、实现、测试修复循环、代码审查、人工批准后交付。",
-  "release_notes": "首个版本：五个执行角色分工，测试失败自动修复最多三轮，审查与创建 PR 各有独立闸门。",
+  "release_notes": "1.1.0：测试与审查改为并行委派，各起独立子运行；新增 min_succeeded 汇总规则。",
   "min_agent_version": "0.3.90",
   "local_requirements": {
     "platform": "windows",
@@ -38,7 +38,7 @@
   "exits": [
     {
       "id": "reviewed",
-      "at_step": "REVIEW",
+      "at_step": "QUALITY-GATE",
       "label": "审查通过",
       "produces": [
         "review-report"
@@ -135,56 +135,41 @@
       ]
     },
     {
-      "id": "VERIFY",
-      "title": "测试与自动修复",
-      "kind": "loop",
+      "id": "QUALITY-GATE",
+      "title": "测试与审查（并行）",
+      "kind": "delegate",
       "execution_mode": "long_running",
-      "role_id": "software.verifier",
+      "role_id": "",
       "risk_level": "local_write",
-      "loop": {
-        "max_iterations": 3,
-        "pause_for_feedback": true,
-        "exit_when": {
-          "operator": "equals",
-          "path": "loops.VERIFY.latest.passed",
-          "value": true
-        },
-        "steps": [
+      "delegate": {
+        "min_succeeded": 2,
+        "branches": [
           {
-            "id": "VERIFY-RUN",
-            "title": "运行测试并对失败做修复",
-            "kind": "runtime",
-            "execution_mode": "long_running",
+            "id": "TEST",
+            "title": "运行测试并修复失败",
             "role_id": "software.verifier",
-            "risk_level": "local_write",
             "runtime": {
               "provider": "auto",
-              "prompt": "运行测试。全部通过则输出 passed=true；失败则定位根因并修复，再重跑。不要为了让测试通过而改断言。",
+              "prompt": "运行测试。全部通过则输出 passed=true；失败则定位根因并修复后重跑，最多三轮。不要为了让测试通过而改断言。",
               "tool_policy": "default",
               "timeout_seconds": 3600
+            }
+          },
+          {
+            "id": "AUDIT",
+            "title": "代码审查",
+            "role_id": "software.reviewer",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "审查本次改动。只依据代码与测试结果判断，不采信实现方的描述。列出问题与建议。",
+              "tool_policy": "none",
+              "timeout_seconds": 1800
             }
           }
         ]
       },
       "depends_on": [
         "IMPLEMENT"
-      ]
-    },
-    {
-      "id": "REVIEW",
-      "title": "代码审查",
-      "kind": "runtime",
-      "execution_mode": "long_running",
-      "role_id": "software.reviewer",
-      "risk_level": "read_only",
-      "runtime": {
-        "provider": "auto",
-        "prompt": "审查本次改动。只依据代码与测试结果判断，不要采信实现方的描述。列出问题与建议。",
-        "tool_policy": "none",
-        "timeout_seconds": 1800
-      },
-      "depends_on": [
-        "VERIFY"
       ]
     },
     {
@@ -201,7 +186,7 @@
         "timeout_seconds": 900
       },
       "depends_on": [
-        "REVIEW"
+        "QUALITY-GATE"
       ]
     },
     {

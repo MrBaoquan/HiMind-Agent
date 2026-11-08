@@ -1,0 +1,72 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "UI 专业打磨团队",
+  "sections": [
+    {
+      "id": "workspace",
+      "title": "工作区",
+      "fields": [
+        {
+          "id": "workspace_root",
+          "label": "代码仓库",
+          "type": "text",
+          "required": true,
+          "picker": "directory",
+          "placeholder": "选择要审查的仓库目录",
+          "hint": "审查与打磨都在这个目录里进行。",
+          "span": "full"
+        }
+      ]
+    },
+    {
+      "id": "scope",
+      "title": "审查范围",
+      "fields": [
+        {
+          "id": "target_area",
+          "label": "重点区域",
+          "type": "textarea",
+          "placeholder": "例如：设置窗口的 AI 连接页；或留空由审查员自行圈定",
+          "hint": "留空时由信息架构审查员先产出范围清单，经你确认后再继续。",
+          "span": "full"
+        },
+        {
+          "id": "viewports",
+          "label": "要复验的视口",
+          "type": "list",
+          "default": [
+            "1024",
+            "768",
+            "560",
+            "400"
+          ],
+          "hint": "每行一个宽度（CSS px），用于窄窗复验。"
+        }
+      ]
+    },
+    {
+      "id": "limits",
+      "title": "轮次与判据",
+      "fields": [
+        {
+          "id": "max_rounds",
+          "label": "最多打磨轮次",
+          "type": "number",
+          "default": 3,
+          "hint": "3 到 6 之间。超过 3 轮说明问题反复出现，值得看看审查标准是不是没写清。",
+          "override": {
+            "stepId": "POLISH-LOOP",
+            "key": "max_iterations"
+          }
+        },
+        {
+          "id": "repo_scoped_pages",
+          "label": "限定页面（留空为全仓）",
+          "type": "list",
+          "placeholder": "例如：\nsettings\nworkflows"
+        }
+      ]
+    }
+  ],
+  "actions": []
+}

@@ -1,0 +1,289 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.ui-craft-team",
+  "version": "1.0.2",
+  "distribution_targets": [
+    "workbench",
+    "github"
+  ],
+  "name": "UI 专业打磨团队",
+  "description": "三路并行审查（信息架构 / 工艺 / 无障碍），人工勾选整改项后进入打磨循环，守门角色验收。",
+  "release_notes": "1.0.2：审查结果写入界面审查台账，跨运行可追踪已修/未修。",
+  "min_agent_version": "0.3.90",
+  "local_requirements": {
+    "platform": "windows",
+    "required_tools": []
+  },
+  "execution_policy": "segmented",
+  "entrypoints": [
+    {
+      "id": "full",
+      "at_step": "SCOPE",
+      "label": "完整流程（审查后打磨）",
+      "requires": [
+        "workspace"
+      ]
+    },
+    {
+      "id": "audit",
+      "at_step": "AUDIT",
+      "label": "只审查，不改代码",
+      "requires": [
+        "workspace"
+      ]
+    }
+  ],
+  "default_entrypoint": "full",
+  "exits": [
+    {
+      "id": "audited",
+      "at_step": "AUDIT",
+      "label": "审查完成",
+      "produces": [
+        "audit-report"
+      ]
+    },
+    {
+      "id": "delivered",
+      "at_step": "DELIVER",
+      "label": "打磨已交付"
+    }
+  ],
+  "default_exitpoint": "delivered",
+  "capabilities": [],
+  "roles": {
+    "ui.auditor": {
+      "label": "信息架构审查",
+      "brief": "你是信息架构审查员。只评价导航层级、页面结构、任务流是否顺畅、命名与文案是否准确。不评价视觉细节，不改代码。每条问题必须给出：位置、现象、为什么是问题、建议怎么改。",
+      "tool_policy": "none"
+    },
+    "ui.craft": {
+      "label": "工艺审查",
+      "brief": "你是界面工艺审查员。只评价间距、圆角、描边、阴影分层、字阶与字距、数字对齐、命中区大小、过渡范围。每条问题必须给出改前改后的具体数值，不接受「再精致一点」这类意见。",
+      "tool_policy": "none"
+    },
+    "ui.a11y": {
+      "label": "无障碍审查",
+      "brief": "你是无障碍审查员。检查对比度、键盘可达性、焦点可见性、读屏语义、命中区。对照 WCAG 2.2 AA 给出条款依据。",
+      "tool_policy": "none"
+    },
+    "ui.polisher": {
+      "label": "打磨实现",
+      "brief": "你是实现角色。只按已确认的问题清单改代码，不做清单外的重构。每条整改完成后说明改了哪个文件、改前改后的值。",
+      "tool_policy": "default"
+    },
+    "ui.verifier": {
+      "label": "验证",
+      "brief": "你是验证角色。运行真实检查命令并读取真实输出。必须原样贴出执行的命令与退出码，不得转述或推测结果。检查失败就如实报告，不要修改断言来迁就实现。",
+      "tool_policy": "default"
+    },
+    "ui.guard": {
+      "label": "守门",
+      "brief": "你是验收角色。只依据代码 diff 与验证结果判断本次打磨是否达标，不采信实现方的自述。判断标准：已确认的问题清单是否全部处理、检查是否全部通过、有无引入新问题。输出 passed: true/false 与理由。",
+      "tool_policy": "none"
+    }
+  },
+  "dependencies": {
+    "skills": [],
+    "plugins": [],
+    "connectors": [],
+    "runtimes": []
+  },
+  "steps": [
+    {
+      "id": "SCOPE",
+      "title": "圈定审查范围",
+      "kind": "runtime",
+      "execution_mode": "sync",
+      "role_id": "ui.auditor",
+      "risk_level": "read_only",
+      "runtime": {
+        "provider": "auto",
+        "prompt": "阅读工作区，列出这次要审查的页面与组件范围：涉及哪些文件、覆盖哪些界面状态（空态/加载/错误/窄窗）。不要开始评价，只输出范围清单。",
+        "tool_policy": "default",
+        "timeout_seconds": 900
+      },
+      "input": {}
+    },
+    {
+      "id": "CONFIRM-SCOPE",
+      "title": "确认审查范围",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": [
+        "SCOPE"
+      ]
+    },
+    {
+      "id": "AUDIT",
+      "title": "三路并行审查",
+      "kind": "delegate",
+      "execution_mode": "long_running",
+      "risk_level": "read_only",
+      "delegate": {
+        "min_succeeded": 3,
+        "branches": [
+          {
+            "id": "IA",
+            "title": "信息架构审查",
+            "role_id": "ui.auditor",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "按已确认的范围审查信息架构：导航层级是否清晰、页面结构是否合理、任务流有无断点、命名与文案是否准确。输出问题清单，每条含位置/现象/原因/建议。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "tool_policy": "default",
+              "timeout_seconds": 1800
+            }
+          },
+          {
+            "id": "CRAFT",
+            "title": "工艺审查",
+            "role_id": "ui.craft",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "按已确认的范围审查界面工艺：间距是否成阶梯、圆角与描边是否一致、阴影是否分层、字阶与字距、数字对齐、命中区是否够大、过渡时长是否统一。每条给出改前改后的具体数值。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "tool_policy": "default",
+              "timeout_seconds": 1800
+            }
+          },
+          {
+            "id": "A11Y",
+            "title": "无障碍审查",
+            "role_id": "ui.a11y",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "按已确认的范围审查无障碍：对比度、键盘可达性与焦点顺序、焦点可见性、读屏语义、命中区尺寸。对照 WCAG 2.2 AA 给出条款依据。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "tool_policy": "default",
+              "timeout_seconds": 1800
+            }
+          }
+        ]
+      },
+      "depends_on": [
+        "CONFIRM-SCOPE"
+      ]
+    },
+    {
+      "id": "CONFIRM-FIXES",
+      "title": "选择要整改的问题",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": [
+        "AUDIT"
+      ]
+    },
+    {
+      "id": "POLISH-LOOP",
+      "title": "打磨与验收循环",
+      "kind": "loop",
+      "execution_mode": "long_running",
+      "risk_level": "local_write",
+      "loop": {
+        "max_iterations": 3,
+        "pause_for_feedback": true,
+        "exit_when": {
+          "operator": "equals",
+          "path": "loops.POLISH-LOOP.latest.passed",
+          "value": true
+        },
+        "steps": [
+          {
+            "id": "POLISH",
+            "title": "按清单打磨",
+            "kind": "runtime",
+            "execution_mode": "long_running",
+            "role_id": "ui.polisher",
+            "risk_level": "local_write",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "按已确认的问题清单逐条整改。不做清单外的重构。每条整改后记录：改了哪个文件、改前改后的值。",
+              "tool_policy": "default",
+              "timeout_seconds": 3600
+            }
+          },
+          {
+            "id": "VERIFY",
+            "title": "真实验证",
+            "kind": "delegate",
+            "execution_mode": "long_running",
+            "risk_level": "read_only",
+            "delegate": {
+              "min_succeeded": 2,
+              "branches": [
+                {
+                  "id": "CHECKS",
+                  "title": "跑界面自检",
+                  "role_id": "ui.verifier",
+                  "runtime": {
+                    "provider": "auto",
+                    "prompt": "在 frontend 目录运行 npm run check:ui 与 npm run build。原样贴出执行的命令、退出码与失败项。不要修改断言来让检查通过。",
+                    "tool_policy": "default",
+                    "timeout_seconds": 1800
+                  }
+                },
+                {
+                  "id": "LAYOUT",
+                  "title": "窄窗与排版复验",
+                  "role_id": "ui.verifier",
+                  "runtime": {
+                    "provider": "auto",
+                    "prompt": "复验窄窗与排版：运行 npm run check:text-layout 与 npm run check:design-tokens，报告对比度与溢出结论。原样贴出命令与输出。",
+                    "tool_policy": "default",
+                    "timeout_seconds": 1800
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": "GATE",
+            "title": "守门判定",
+            "kind": "runtime",
+            "execution_mode": "sync",
+            "role_id": "ui.guard",
+            "risk_level": "read_only",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "依据代码 diff 与验证结果判断本次打磨是否达标：已确认的问题清单是否全部处理、检查是否全部通过、有无引入新问题。只输出 JSON：{\"passed\": true|false, \"reasons\": [...], \"remaining\": [...]}。不采信实现方的自述。\n\n若本轮确认某些问题已修，调用 engineering.ui-audit.mark-fixed 标明（ids 用台账 id）。只标你实际验证过的：审查范围缩小导致的漏报不代表修好了。",
+              "tool_policy": "none",
+              "timeout_seconds": 900
+            }
+          }
+        ],
+        "max_iterations_limit": 6
+      },
+      "depends_on": [
+        "CONFIRM-FIXES"
+      ]
+    },
+    {
+      "id": "DELIVER",
+      "title": "确认交付",
+      "kind": "manual",
+      "execution_mode": "sync",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": [
+        "POLISH-LOOP"
+      ]
+    }
+  ],
+  "artifacts": [],
+  "ui": {
+    "mode": "declarative",
+    "surfaces": [
+      "agent",
+      "dashboard"
+    ],
+    "entry": "ui/workflow-view.json"
+  },
+  "supported_runtimes": [
+    "himind.builtin",
+    "personal.codex",
+    "personal.github-copilot"
+  ],
+  "created_at": "2026-11-07T00:00:00Z"
+}
