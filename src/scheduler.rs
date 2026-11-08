@@ -1153,6 +1153,7 @@ mod tests {
             runtime_provider: "himind.builtin".to_string(),
             workspace_ref: "F:/workspace".to_string(),
             current_step_id: String::new(),
+            pause_kind: crate::agent_core_contracts::RunPauseKind::None,
             completion_mode: "partial".to_string(),
             execution_plan: Some(LocalRunExecutionPlan {
                 workflow_id: workflow_id.to_string(),

@@ -1372,6 +1372,7 @@ mod tests {
             runtime_provider: "himind.builtin".to_string(),
             workspace_ref: "F:/workspace".to_string(),
             current_step_id: "step-1".to_string(),
+            pause_kind: crate::agent_core_contracts::RunPauseKind::None,
             completion_mode: "full".to_string(),
             execution_plan: None,
             steps: vec![LocalRunStep {

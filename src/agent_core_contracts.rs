@@ -165,6 +165,31 @@ pub(crate) enum LocalStepStatus {
     Skipped,
 }
 
+/// 运行为什么停下来。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunPauseKind {
+    /// 没停，或旧台账未记录。
+    #[default]
+    None,
+    /// 用户主动暂停。
+    User,
+    /// 等待人工审批。
+    Approval,
+    /// 等待用户对循环给出反馈。
+    Feedback,
+    /// 等待外部系统状态。
+    External,
+}
+
+impl RunPauseKind {
+    /// 只有用户主动暂停才允许通过 resume 直接继续；
+    /// 其余三种要各自的入口（批准、提交反馈、外部信号）。
+    pub(crate) fn is_user_pause(self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
 /// 子运行为什么挂在父运行下面。
 ///
 /// 二者都写 `parent_run_id`，但统计口径不同：重做算返工，委派算分工。
@@ -317,6 +342,12 @@ pub(crate) struct LocalRun {
     pub workspace_ref: String,
     #[serde(default)]
     pub current_step_id: String,
+    /// 停下来的原因。只在 `status == Waiting` 时有意义。
+    ///
+    /// 为什么不新增状态枚举值：旧台账里的状态是 `waiting`，新增变体会让反序列化失败、
+    /// 已有记录全读不出来。`Waiting` 本来就表示「停住等人」，只是以前没说等谁。
+    #[serde(default)]
+    pub pause_kind: RunPauseKind,
     #[serde(default = "default_full_completion_mode")]
     pub completion_mode: String,
     #[serde(default)]
@@ -672,6 +703,7 @@ mod tests {
             include_str!("../workflows/wechat-experience-upload/workflow.json"),
             include_str!("../workflows/engine-build/workflow.json"),
             include_str!("../workflows/software-delivery/workflow.json"),
+            include_str!("../workflows/ui-craft-team/workflow.json"),
         ] {
             let fixture: Value = serde_json::from_str(source).unwrap();
             assert!(

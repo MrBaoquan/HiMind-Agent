@@ -12,7 +12,8 @@ use super::{WorkflowPackage, WorkflowStep};
 use crate::agent_core_contracts::{
     InteractionEnvelope, InteractionPrincipal, InteractionSource, InteractionTransport,
     LocalApprovalStatus, LocalRun, LocalRunApproval, LocalRunArtifact, LocalRunExecutionPlan,
-    LocalRunParentKind, LocalRunStatus, LocalRunStep, LocalRunUsage, LocalStepStatus, RuntimeEvent,
+    LocalRunParentKind, LocalRunStatus, LocalRunStep, LocalRunUsage, LocalStepStatus, RunPauseKind,
+    RuntimeEvent,
     RuntimeEventType, INTERACTION_ENVELOPE_SCHEMA_VERSION, LOCAL_RUN_SCHEMA_VERSION,
     RUNTIME_EVENT_SCHEMA_VERSION,
 };
@@ -25,7 +26,23 @@ pub(crate) trait WorkflowStepExecutor {
         step: &WorkflowStep,
         input: &Value,
     ) -> Result<WorkflowStepExecution, Box<dyn Error>>;
+
+    /// 能否被多个线程同时调用。
+    ///
+    /// 委派分支要真并发就必须让执行器跨线程使用。默认返回 `None`——既有执行器
+    /// （含测试里的 `RefCell` 实现）不受影响，委派退回顺序执行；只有声明了自己
+    /// 可以共享的实现才会真正并行。
+    fn as_shared(&self) -> Option<&dyn SharedStepExecutor> {
+        None
+    }
 }
+
+/// 可在线程间共享的执行器。
+///
+/// 用独立 trait 而不是给 `WorkflowStepExecutor` 加 `Send + Sync` 约束：
+/// 那会让所有既有实现（尤其是测试里带 `RefCell` 的）一起编译失败，
+/// 而它们本来就不需要并发。
+pub(crate) trait SharedStepExecutor: WorkflowStepExecutor + Send + Sync {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct WorkflowArtifactOutput {
@@ -91,6 +108,34 @@ pub(crate) struct WorkflowRunVerification {
     pub commit_sha: String,
     pub tree_digest: String,
     pub artifacts: Vec<WorkflowArtifactVerification>,
+}
+
+
+/// 一条委派分支的执行结果。
+struct DelegateBranchResult {
+    status: LocalRunStatus,
+    /// 失败描述；成功时为空串。
+    failure: String,
+    /// 汇总进父步骤输出的分支记录。
+    json: Value,
+    artifacts: Vec<LocalRunArtifact>,
+}
+
+impl DelegateBranchResult {
+    fn failed(branch: &super::WorkflowDelegateBranch, failure: String) -> Self {
+        Self {
+            status: LocalRunStatus::Failed,
+            failure,
+            json: serde_json::json!({
+                "branch_id": branch.id,
+                "role_id": branch.role_id,
+                "run_id": String::new(),
+                "status": LocalRunStatus::Failed,
+                "output": Value::Null,
+            }),
+            artifacts: Vec::new(),
+        }
+    }
 }
 
 enum WorkflowStepOutcome {
@@ -335,6 +380,7 @@ impl WorkflowRunner {
                 .unwrap_or_default()
                 .to_string(),
             current_step_id: String::new(),
+            pause_kind: crate::agent_core_contracts::RunPauseKind::None,
             completion_mode,
             execution_plan: Some(execution_plan),
             steps: package
@@ -586,6 +632,11 @@ impl WorkflowRunner {
                 if current.status == LocalRunStatus::Canceled {
                     return Ok(outcome(current, String::new(), completed_steps));
                 }
+                // 用户暂停：在步骤边界停住，不再推进。内存在 run 与台账可能不一致
+                // （暂停是另一个调用写进去的），所以以台账为准。
+                if current.pause_kind.is_user_pause() {
+                    return Ok(outcome(current, String::new(), completed_steps));
+                }
             }
             self.resume_feedback_loop(package, &mut run)?;
             if execution_plan_exit_reached(&run) {
@@ -616,6 +667,7 @@ impl WorkflowRunner {
                     }
                 }
                 run.current_step_id.clear();
+                run.pause_kind = super::super::agent_core_contracts::RunPauseKind::None;
                 run.updated_at = timestamp();
                 self.persist_run(&mut run)?;
                 return Ok(outcome(run, String::new(), completed_steps));
@@ -656,6 +708,7 @@ impl WorkflowRunner {
                     run_step.status = LocalStepStatus::Waiting;
                 }
                 run.status = LocalRunStatus::Waiting;
+                run.pause_kind = super::super::agent_core_contracts::RunPauseKind::Approval;
                 run.current_step_id = step.id.clone();
                 run.updated_at = timestamp();
                 self.persist_run(&mut run)?;
@@ -687,7 +740,27 @@ impl WorkflowRunner {
                 Value::Object(serde_json::Map::new()),
             )?;
 
-            let result = if let Some(loop_config) = step.loop_config.as_ref() {
+            // 步骤输入在成功分支之外的脱敏快照：结构化证据要记录「这一步看到了什么」。
+            // 只保留键名与长度，不落具体值——输入里可能有凭据句柄与业务数据。
+            let mut step_input_snapshot = Value::Null;
+            let result = if let Some(delegate) = step.delegate.as_ref() {
+                self.execute_delegate_step(
+                    package,
+                    &run,
+                    workflow_input,
+                    executor,
+                    step,
+                    delegate,
+                    &|| {
+                        self.ledger
+                            .get_run(&run.run_id)
+                            .map(|current| {
+                                current.is_some_and(|c| c.status == LocalRunStatus::Canceled)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+            } else if let Some(loop_config) = step.loop_config.as_ref() {
                 self.execute_loop_step(
                     package,
                     &run,
@@ -712,6 +785,7 @@ impl WorkflowRunner {
                     &condition_context,
                     step,
                 )?;
+                step_input_snapshot = summarize_step_input(&step_input);
                 executor
                     .execute(package, step, &step_input)
                     .map(WorkflowStepOutcome::Execution)
@@ -733,6 +807,7 @@ impl WorkflowRunner {
                     run_step.status = LocalStepStatus::Waiting;
                     run_step.finished_at = timestamp();
                     run.status = LocalRunStatus::Waiting;
+                    run.pause_kind = super::super::agent_core_contracts::RunPauseKind::Feedback;
                     run.current_step_id = step.id.clone();
                     run.updated_at = timestamp();
                     self.persist_run(&mut run)?;
@@ -819,6 +894,15 @@ impl WorkflowRunner {
                             "output_recorded": !execution.output.is_null(),
                             "output": execution.output,
                             "artifact_ids": run.artifacts.iter().map(|artifact| &artifact.artifact_id).collect::<Vec<_>>(),
+                            // 结构化证据：回答「谁依据什么做了什么判断」，
+                            // 不依赖各 Runtime 互不相同的原始对话格式。
+                            "evidence": serde_json::json!({
+                                "role_id": step.role_id,
+                                "capability_id": step.capability_id,
+                                "runtime_provider": run_step_provider(&run.run_id, step, &self.ledger),
+                                "inputs": step_input_snapshot,
+                                "artifact_ids": run.artifacts.iter().map(|artifact| &artifact.artifact_id).collect::<Vec<_>>(),
+                            }),
                         }),
                     )?;
                 }
@@ -1287,6 +1371,527 @@ impl WorkflowRunner {
             step.id, loop_config.max_iterations
         )
         .into())
+    }
+
+    /// 把一个步骤拆成多条并行子运行，各跑一条分支。
+    ///
+    /// 与 loop 的区别在语义和统计：
+    /// - loop 反复执行**同一组步骤**，子运行是「重做」，计入 `rework_runs`；
+    /// - delegate 把工作分给**不同角色**，子运行是「分工」，计入 `delegated_runs`。
+    ///
+    /// 每个分支起一条独立子运行（`start_delegated`），父运行收集各分支结果后继续推进。
+    /// 只要达到 `min_succeeded` 就算这一步成功；未达标时整步失败并带上各分支的错误。
+    fn execute_delegate_step(
+        &self,
+        package: &WorkflowPackage,
+        parent_run: &LocalRun,
+        workflow_input: &Value,
+        executor: &dyn WorkflowStepExecutor,
+        step: &WorkflowStep,
+        delegate: &super::WorkflowDelegate,
+        is_canceled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
+        // 执行器若能跨线程共享就真并发跑，否则退回顺序执行。
+        // 「声明式地可以并发」而不是「一律并发」：测试里的执行器带 RefCell，并发会编译不过。
+        match executor.as_shared() {
+            Some(shared) => self.execute_delegate_branches_parallel(
+                shared,
+                parent_run,
+                package,
+                step,
+                delegate,
+                workflow_input,
+                is_canceled,
+            ),
+            None => self.execute_delegate_branches_sequential(
+                executor,
+                parent_run,
+                package,
+                step,
+                delegate,
+                workflow_input,
+                is_canceled,
+            ),
+        }
+    }
+
+    /// 顺序执行各分支：既有执行器（含测试）走这条路径。
+    #[allow(clippy::too_many_arguments)]
+    fn execute_delegate_branches_sequential(
+        &self,
+        executor: &dyn WorkflowStepExecutor,
+        parent_run: &LocalRun,
+        package: &WorkflowPackage,
+        step: &WorkflowStep,
+        delegate: &super::WorkflowDelegate,
+        workflow_input: &Value,
+        _is_canceled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
+        let mut results = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut failures = Vec::new();
+        let mut succeeded = 0u32;
+
+        for branch in &delegate.branches {
+            let (child_package, child_run) =
+                self.prepare_delegate_branch(package, parent_run, step, branch, workflow_input)?;
+            let outcome = if child_run.status.is_terminal() {
+                WorkflowRunOutcome {
+                    run: child_run,
+                    blocked_step_id: String::new(),
+                    completed_steps: Vec::new(),
+                }
+            } else {
+                self.run_ready_internal(
+                    &child_package,
+                    child_run,
+                    workflow_input,
+                    executor,
+                    false,
+                    None,
+                )?
+            };
+            let collected = self.collect_delegate_branch(branch, outcome.run)?;
+            for artifact in &collected.artifacts {
+                merge_artifact(&mut artifacts, artifact.clone());
+            }
+            if collected.status == LocalRunStatus::Succeeded {
+                succeeded = succeeded.saturating_add(1);
+            } else {
+                failures.push(collected.failure.clone());
+            }
+            results.push(collected.json);
+        }
+        self.finish_delegate_step(parent_run, step, delegate, results, artifacts, succeeded, failures)
+    }
+
+    /// 真并发执行各分支。
+    ///
+    /// 每条分支在独立线程里跑自己的子运行；线程之间不共享可变状态——
+    /// 子运行的状态都写在台账（SQLite）里，靠它同步，而不是靠内存里的锁。
+    #[allow(clippy::too_many_arguments)]
+    fn execute_delegate_branches_parallel(
+        &self,
+        executor: &dyn SharedStepExecutor,
+        parent_run: &LocalRun,
+        package: &WorkflowPackage,
+        step: &WorkflowStep,
+        delegate: &super::WorkflowDelegate,
+        workflow_input: &Value,
+        is_canceled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
+        // 先把子运行都起好，再一起跑：这样界面上能同时看到所有分支处于「进行中」，
+        // 而不是一条一条冒出来。
+        let mut prepared = Vec::new();
+        for branch in &delegate.branches {
+            prepared.push((
+                branch,
+                self.prepare_delegate_branch(package, parent_run, step, branch, workflow_input)?,
+            ));
+        }
+
+        let collected = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (branch, (child_package, child_run)) in prepared {
+                let runner = self.clone_for_thread();
+                let shared = executor;
+                let input = workflow_input.clone();
+                handles.push((
+                    branch,
+                    scope.spawn(move || {
+                        // 线程之间只传 String：Box<dyn Error> 不是 Send，
+                        // 跨线程搬运会编译失败，也没必要。
+                        if is_canceled() {
+                            return Err(format!(
+                                "delegate branch {} cancelled before start",
+                                branch.id
+                            ));
+                        }
+                        let outcome = if child_run.status.is_terminal() {
+                            WorkflowRunOutcome {
+                                run: child_run,
+                                blocked_step_id: String::new(),
+                                completed_steps: Vec::new(),
+                            }
+                        } else {
+                            runner
+                                .run_ready_internal(
+                                    &child_package,
+                                    child_run,
+                                    &input,
+                                    shared,
+                                    false,
+                                    None,
+                                )
+                                .map_err(|error| error.to_string())?
+                        };
+                        runner
+                            .collect_delegate_branch(branch, outcome.run)
+                            .map_err(|error| error.to_string())
+                    }),
+                ));
+            }
+            let mut collected = Vec::new();
+            for (branch, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(item)) => collected.push(item),
+                    Ok(Err(error)) => collected.push(DelegateBranchResult::failed(
+                        branch,
+                        format!("{}: {error}", branch.id),
+                    )),
+                    Err(_) => collected.push(DelegateBranchResult::failed(
+                        branch,
+                        format!("{}: branch thread panicked", branch.id),
+                    )),
+                }
+            }
+            Ok::<_, Box<dyn Error>>(collected)
+        })?;
+
+        let mut results = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut failures = Vec::new();
+        let mut succeeded = 0u32;
+        for item in collected {
+            if item.status == LocalRunStatus::Succeeded {
+                succeeded = succeeded.saturating_add(1);
+            } else {
+                failures.push(item.failure.clone());
+            }
+            for artifact in &item.artifacts {
+                merge_artifact(&mut artifacts, artifact.clone());
+            }
+            results.push(item.json);
+        }
+        self.finish_delegate_step(parent_run, step, delegate, results, artifacts, succeeded, failures)
+    }
+
+    /// 线程里要用 runner，但 `&self` 不能跨线程；台账本身是「路径 + 超时」的句柄，克隆即可。
+    fn clone_for_thread(&self) -> Self {
+        Self {
+            ledger: self.ledger.clone(),
+        }
+    }
+
+    /// 起一条委派子运行（幂等：同一分支重跑时复用已有 run）。
+    fn prepare_delegate_branch(
+        &self,
+        package: &WorkflowPackage,
+        parent_run: &LocalRun,
+        step: &WorkflowStep,
+        branch: &super::WorkflowDelegateBranch,
+        workflow_input: &Value,
+    ) -> Result<(WorkflowPackage, LocalRun), Box<dyn Error>> {
+        // 父运行 id 已带 `workflow_run_` 前缀，直接拼会得到
+        // `workflow_run_workflow_run_…`。剥掉一层再拼，子运行 id 才可读且可定位。
+        let parent_suffix = parent_run
+            .run_id
+            .strip_prefix("workflow_run_")
+            .unwrap_or(&parent_run.run_id);
+        let request_id = run_suffix(&format!(
+            "{parent_suffix}_delegate_{}_{}",
+            step.id, branch.id
+        ));
+        let child_run_id = format!("workflow_run_{request_id}");
+        // 分支的 runtime 必须自带：子运行要能独立执行，不继承父步骤配置。
+        let runtime = branch
+            .runtime
+            .as_ref()
+            .ok_or_else(|| format!("delegate branch {} is missing runtime", branch.id))?;
+        let branch_step = WorkflowStep {
+            id: branch.id.clone(),
+            title: branch.title.clone(),
+            kind: "runtime".to_string(),
+            capability_id: String::new(),
+            runtime: Some(runtime.clone()),
+            delegate: None,
+            loop_config: None,
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: branch.input.clone(),
+            execution_mode: "long_running".to_string(),
+            risk_level: "local_write".to_string(),
+            role_id: branch.role_id.clone(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        };
+        let child_package = WorkflowPackage {
+            steps: vec![branch_step],
+            candidate: None,
+            execution_policy: "strict".to_string(),
+            entrypoints: Vec::new(),
+            default_entrypoint: String::new(),
+            default_exitpoint: String::new(),
+            exits: Vec::new(),
+            ..package.clone()
+        };
+        let child_run = match self.ledger.get_run(&child_run_id)? {
+            Some(existing) => existing,
+            None => self.start_delegated(
+                "local-agent",
+                &child_package,
+                &request_id,
+                workflow_input,
+                &parent_run.run_id,
+            )?,
+        };
+        Ok((child_package, child_run))
+    }
+
+    /// 收一条分支的结果：成功时取它的步骤输出，失败时带上错误。
+    fn collect_delegate_branch(
+        &self,
+        branch: &super::WorkflowDelegateBranch,
+        run: LocalRun,
+    ) -> Result<DelegateBranchResult, Box<dyn Error>> {
+        let status = run.status.clone();
+        let output = if status == LocalRunStatus::Succeeded {
+            delegate_branch_output(&run, &self.ledger)?
+        } else {
+            Value::Null
+        };
+        let failure = if status == LocalRunStatus::Succeeded {
+            String::new()
+        } else if run.error.trim().is_empty() {
+            format!("{}: {status:?}", branch.id)
+        } else {
+            format!("{}: {}", branch.id, run.error)
+        };
+        Ok(DelegateBranchResult {
+            status: status.clone(),
+            failure,
+            json: serde_json::json!({
+                "branch_id": branch.id,
+                "role_id": branch.role_id,
+                "run_id": run.run_id,
+                "status": status,
+                "output": output,
+            }),
+            artifacts: run.artifacts,
+        })
+    }
+
+    /// 校验分支结果并把整步收成一次执行产出。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_delegate_step(
+        &self,
+        parent_run: &LocalRun,
+        step: &WorkflowStep,
+        delegate: &super::WorkflowDelegate,
+        results: Vec<Value>,
+        artifacts: Vec<LocalRunArtifact>,
+        succeeded: u32,
+        failures: Vec<String>,
+    ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
+        let required = if delegate.min_succeeded == 0 {
+            delegate.branches.len() as u32
+        } else {
+            delegate.min_succeeded
+        };
+        self.append_event(
+            parent_run,
+            step,
+            RuntimeEventType::Progress,
+            serde_json::json!({
+                "delegate_id": step.id,
+                "branches": delegate.branches.len(),
+                "succeeded": succeeded,
+                "required": required,
+            }),
+        )?;
+        if succeeded < required {
+            return Err(format!(
+                "workflow delegate {} needs {} successful branch(es) but got {}: {}",
+                step.id,
+                required,
+                succeeded,
+                failures.join("; ")
+            )
+            .into());
+        }
+        Ok(WorkflowStepOutcome::Execution(WorkflowStepExecution {
+            output: serde_json::json!({
+                "delegate_id": step.id,
+                "branches": results,
+                "succeeded": succeeded,
+            }),
+            artifacts: artifacts
+                .into_iter()
+                .map(local_artifact_to_output)
+                .collect(),
+            usage: None,
+        }))
+    }
+
+    /// 用户主动暂停。
+    ///
+    /// 语义边界：只在**步骤边界**生效，不打断正在执行的步骤——打断需要 kill
+    /// Runtime 进程，成本高且中途状态不可控。所以暂停只是把运行标成
+    /// `Waiting + pause_kind=User`，下一个步骤开始前由 `run_ready` 提前返回。
+    pub(crate) fn pause(&self, mut run: LocalRun) -> Result<LocalRun, Box<dyn Error>> {
+        if run.status.is_terminal() {
+            return Err(format!("workflow run already finished: {}", run.run_id).into());
+        }
+        if run.status == LocalRunStatus::Waiting && !run.pause_kind.is_user_pause() {
+            return Err(format!(
+                "workflow run is waiting for {:?}, not paused by user: {}",
+                run.pause_kind, run.run_id
+            )
+            .into());
+        }
+        run.status = LocalRunStatus::Waiting;
+        run.pause_kind = RunPauseKind::User;
+        run.updated_at = timestamp();
+        self.persist_run(&mut run)?;
+        self.append_run_event(
+            &run,
+            RuntimeEventType::Progress,
+            serde_json::json!({ "paused_by": "user" }),
+        )?;
+        Ok(run)
+    }
+
+    /// 恢复一个被用户暂停的运行。
+    ///
+    /// 只接受 `pause_kind = User`：等审批、等反馈、等外部信号的运行各有自己的
+    /// 恢复入口，用 resume 绕过它们等于跳过了本该发生的确认。
+    pub(crate) fn resume_from_pause(&self, mut run: LocalRun) -> Result<LocalRun, Box<dyn Error>> {
+        if run.status != LocalRunStatus::Waiting || !run.pause_kind.is_user_pause() {
+            return Err(format!(
+                "workflow run is not paused by user: {}",
+                run.run_id
+            )
+            .into());
+        }
+        run.status = LocalRunStatus::Queued;
+        run.pause_kind = RunPauseKind::None;
+        run.updated_at = timestamp();
+        self.persist_run(&mut run)?;
+        self.append_run_event(
+            &run,
+            RuntimeEventType::Progress,
+            serde_json::json!({ "resumed_by": "user" }),
+        )?;
+        Ok(run)
+    }
+
+    /// 不带步骤的运行级事件（暂停/恢复这类不归属任何步骤的动作）。
+    fn append_run_event(
+        &self,
+        run: &LocalRun,
+        event_type: RuntimeEventType,
+        payload: Value,
+    ) -> Result<(), Box<dyn Error>> {
+        let sequence = self.ledger.next_runtime_sequence(&run.run_id)?;
+        self.ledger.append_event(&RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION.to_string(),
+            event_id: format!("{}:run:{sequence}", run.run_id),
+            run_id: run.run_id.clone(),
+            step_id: String::new(),
+            capability_id: String::new(),
+            sequence,
+            occurred_at: timestamp(),
+            provider: run.runtime_provider.clone(),
+            event_type,
+            payload,
+        })?;
+        Ok(())
+    }
+
+    /// 重置一个步骤，让它和它的下游重新执行。
+    ///
+    /// 只重置目标步骤 + 沿 `depends_on` 反向传播到的下游：
+    /// - 已经成功、且与目标无依赖关系的分支不动（重跑它会浪费已完成的工作）；
+    /// - 目标步骤的审批记录一并清除（改了输入就该重新确认）；
+    /// - 已终结的运行不能被重试，必须先重新入队（否则台账里会出现
+    ///   「成功过又被改成排队」这种自相矛盾的记录）。
+    pub(crate) fn retry_step(
+        &self,
+        mut run: LocalRun,
+        step_id: &str,
+    ) -> Result<LocalRun, Box<dyn Error>> {
+        let step_id = step_id.trim();
+        if step_id.is_empty() {
+            return Err("retry_step requires a step id".into());
+        }
+        if !run.steps.iter().any(|step| step.step_id == step_id) {
+            return Err(format!("workflow run has no step: {step_id}").into());
+        }
+        // 运行还在跑的时候重置步骤会和执行线程打架：让用户先暂停或取消。
+        if run.status == LocalRunStatus::Running {
+            return Err(format!(
+                "cannot retry a step while the run is executing: {}",
+                run.run_id
+            )
+            .into());
+        }
+
+        // 用包的依赖图算「需要重置的集合」。
+        //
+        // 包读不到时（已被卸载/版本已换）保守退化：重置目标步骤**及其之后的所有步骤**。
+        // 不能只重置目标——那会留下「输入已变、下游却还是旧状态」的不一致组合，
+        // 下游会拿着过期的上游输出继续跑。多重置几步是可接受的代价，不一致不是。
+        let (targets, degraded) = match self.load_package_for_run(&run) {
+            Ok(package) => (downstream_chain(&package.steps, step_id), false),
+            Err(_) => {
+                let mut from_target = std::collections::BTreeSet::new();
+                let mut seen_target = false;
+                for step in &run.steps {
+                    if step.step_id == step_id {
+                        seen_target = true;
+                    }
+                    if seen_target {
+                        from_target.insert(step.step_id.clone());
+                    }
+                }
+                (from_target, true)
+            }
+        };
+
+        let mut reset = 0u32;
+        for step in run.steps.iter_mut() {
+            if !targets.contains(&step.step_id) {
+                continue;
+            }
+            step.status = LocalStepStatus::Pending;
+            step.started_at = String::new();
+            step.finished_at = String::new();
+            step.error = String::new();
+            step.attempt = 0;
+            reset += 1;
+        }
+        // 目标步骤与下游的审批记录作废：输入变了，之前的批准不再适用。
+        run.approvals
+            .retain(|approval| !targets.iter().any(|id| approval.approval_id.ends_with(id)));
+        run.error.clear();
+        run.pause_kind = RunPauseKind::None;
+        run.status = LocalRunStatus::Queued;
+        run.current_step_id.clear();
+        run.updated_at = timestamp();
+        self.persist_run(&mut run)?;
+        self.append_run_event(
+            &run,
+            RuntimeEventType::Progress,
+            serde_json::json!({
+                "retry_from": step_id,
+                "reset_steps": targets.iter().cloned().collect::<Vec<_>>(),
+                "reset_count": reset,
+                // 包已不可读时用的是保守策略：重置目标之后的所有步骤。
+                "degraded": degraded,
+            }),
+        )?;
+        Ok(run)
+    }
+
+    /// 读回运行对应的包；包缺失或已卸载时返回错误，由调用方退化处理。
+    fn load_package_for_run(&self, run: &LocalRun) -> Result<WorkflowPackage, Box<dyn Error>> {
+        let interaction = self
+            .ledger
+            .get_interaction(&run.interaction_id)?
+            .ok_or("workflow run interaction is missing")?;
+        crate::workflow::WorkflowStore::open_default()?.load_for_run_interaction(&interaction)
     }
 
     pub(crate) fn reject_step(
@@ -1862,6 +2467,127 @@ fn merge_artifact(artifacts: &mut Vec<LocalRunArtifact>, artifact: LocalRunArtif
     }
 }
 
+/// 步骤输入的脱敏快照。
+///
+/// 目的不是完整留档，而是回答「这一步看到了什么」。凭据句柄、业务数据这类值
+/// 不能落盘，所以只记键名、类型和规模——足以判断「它有没有拿到上游产物」，
+/// 又不会把敏感内容写进台账。
+fn summarize_step_input(input: &Value) -> Value {
+    fn shape(value: &Value, depth: usize) -> Value {
+        // 三层足够回答「这一步拿到了什么结构」；再深就与具体业务强耦合了。
+        if depth > 3 {
+            return Value::String("<nested>".to_string());
+        }
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), shape(value, depth + 1)))
+                    .collect(),
+            ),
+            Value::Array(items) => serde_json::json!({ "array_len": items.len() }),
+            Value::String(text) => serde_json::json!({ "string_len": text.chars().count() }),
+            Value::Number(number) => serde_json::json!({ "number": number.is_i64() }),
+            Value::Bool(_) => serde_json::json!("boolean"),
+            Value::Null => Value::Null,
+        }
+    }
+    let mut summarized = shape(input, 0);
+    // workflow_context 里的 steps 是上游输出，体积最大且已在别处留痕，只报键名。
+    if let Some(context) = summarized
+        .get_mut("workflow_context")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(steps) = context.get_mut("steps").and_then(Value::as_object_mut) {
+            for (_, value) in steps.iter_mut() {
+                *value = Value::String("<upstream_output>".to_string());
+            }
+        }
+    }
+    summarized
+}
+
+/// 步骤实际用的 Runtime：执行器可能回填（例如 auto 解析成 codex），优先取回填值。
+fn run_step_provider(run_id: &str, step: &WorkflowStep, ledger: &LocalRunLedger) -> String {
+    ledger
+        .get_run(run_id)
+        .ok()
+        .flatten()
+        .and_then(|run| {
+            run.steps
+                .iter()
+                .find(|item| item.step_id == step.id)
+                .map(|item| item.runtime_provider.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            step.runtime
+                .as_ref()
+                .map(|runtime| runtime.provider.clone())
+                .unwrap_or_default()
+        })
+}
+
+/// 从台账里读出某条运行的结构化证据（按步骤归拢）。
+///
+/// 证据写在 `tool_completed` 事件的 payload 里；这个函数把它抽成
+/// 「step_id → evidence」的映射，供运行详情与审查台账直接消费。
+pub(crate) fn collect_step_evidence(
+    run_id: &str,
+    ledger: &LocalRunLedger,
+) -> Result<serde_json::Map<String, Value>, Box<dyn Error>> {
+    let mut collected = serde_json::Map::new();
+    for event in ledger.list_events(run_id)? {
+        if event.event_type != RuntimeEventType::ToolCompleted {
+            continue;
+        }
+        if let Some(evidence) = event.payload.get("evidence") {
+            collected.insert(event.step_id, evidence.clone());
+        }
+    }
+    Ok(collected)
+}
+
+
+/// 目标步骤 + 所有依赖它的下游（传递闭包）。
+///
+/// 依赖方向是「下游 `depends_on` 上游」，所以要反着找：谁依赖了 target。
+fn downstream_chain(
+    steps: &[WorkflowStep],
+    target: &str,
+) -> std::collections::BTreeSet<String> {
+    fn collect(steps: &[WorkflowStep], out: &mut std::collections::BTreeMap<String, Vec<String>>) {
+        for step in steps {
+            out.entry(step.id.clone())
+                .or_default()
+                .extend(step.depends_on.iter().cloned());
+            if let Some(loop_config) = step.loop_config.as_ref() {
+                collect(&loop_config.steps, out);
+            }
+        }
+    }
+    let mut deps = std::collections::BTreeMap::new();
+    collect(steps, &mut deps);
+
+    let mut result = std::collections::BTreeSet::new();
+    result.insert(target.to_string());
+    // 反复扫到不再增长：图很小（步骤数 < 100），传递闭包直接迭代即可。
+    loop {
+        let before = result.len();
+        for (step_id, dependencies) in &deps {
+            if result.contains(step_id) {
+                continue;
+            }
+            if dependencies.iter().any(|dependency| result.contains(dependency)) {
+                result.insert(step_id.clone());
+            }
+        }
+        if result.len() == before {
+            break;
+        }
+    }
+    result
+}
+
 fn loop_iteration_output(run: &LocalRun, ledger: &LocalRunLedger) -> Result<Value, Box<dyn Error>> {
     let mut steps = serde_json::Map::new();
     for event in ledger.list_events(&run.run_id)? {
@@ -1877,6 +2603,27 @@ fn loop_iteration_output(run: &LocalRun, ledger: &LocalRunLedger) -> Result<Valu
         "status": run.status,
         "steps": steps,
         "artifacts": run.artifacts,
+    }))
+}
+
+/// 汇总一条被委派子运行的产出。
+///
+/// 与 loop 的 `loop_iteration_output` 同一口径：只取 ToolCompleted 事件里的输出，
+/// 不把子运行的完整事件流塞进父步骤输出。
+fn delegate_branch_output(run: &LocalRun, ledger: &LocalRunLedger) -> Result<Value, Box<dyn Error>> {
+    let mut steps = serde_json::Map::new();
+    for event in ledger.list_events(&run.run_id)? {
+        if event.event_type != RuntimeEventType::ToolCompleted {
+            continue;
+        }
+        if let Some(output) = event.payload.get("output") {
+            steps.insert(event.step_id, output.clone());
+        }
+    }
+    Ok(serde_json::json!({
+        "run_id": run.run_id,
+        "status": run.status,
+        "steps": steps,
     }))
 }
 
@@ -2348,6 +3095,7 @@ mod tests {
                     capability_id: "test.first".to_string(),
                     runtime: None,
                     loop_config: None,
+                    delegate: None,
                     when: None,
                     fail_when: None,
                     candidate_action: String::new(),
@@ -2366,6 +3114,7 @@ mod tests {
                     capability_id: "test.second".to_string(),
                     runtime: None,
                     loop_config: None,
+                    delegate: None,
                     when: None,
                     fail_when: None,
                     candidate_action: String::new(),
@@ -2384,6 +3133,7 @@ mod tests {
                     capability_id: String::new(),
                     runtime: None,
                     loop_config: None,
+                    delegate: None,
                     when: None,
                     fail_when: None,
                     candidate_action: String::new(),
@@ -2922,6 +3672,7 @@ mod tests {
                 capability_id: "test.first".to_string(),
                 runtime: None,
                 loop_config: None,
+                delegate: None,
                 when: None,
                 fail_when: None,
                 candidate_action: String::new(),
@@ -2940,6 +3691,7 @@ mod tests {
                 capability_id: "test.second".to_string(),
                 runtime: None,
                 loop_config: None,
+                delegate: None,
                 when: None,
                 fail_when: None,
                 candidate_action: String::new(),
@@ -3117,6 +3869,7 @@ mod tests {
             capability_id: "test.first".to_string(),
             runtime: None,
             loop_config: None,
+            delegate: None,
             when: None,
             fail_when: Some(super::super::WorkflowCondition {
                 operator: "equals".to_string(),
@@ -3423,6 +4176,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// 输入快照只留形状，不留值。
+    #[test]
+    fn step_input_snapshot_keeps_shape_without_values() {
+        let input = serde_json::json!({
+            "workspace_root": "F:/secret-project",
+            "api_key_handle": "cred-123",
+            "viewports": ["1024", "768"],
+            "workflow_context": {
+                "steps": { "IMPLEMENT": { "diff": "very long output" } },
+                "input": { "note": "x" }
+            }
+        });
+        let snapshot = summarize_step_input(&input);
+
+        // 字符串只报长度，不落内容。
+        assert_eq!(snapshot["workspace_root"]["string_len"], 17);
+        assert_eq!(snapshot["api_key_handle"]["string_len"], 8);
+        // 数组只报元素个数。
+        assert_eq!(snapshot["viewports"]["array_len"], 2);
+        // 上游输出被替换成占位符：体积最大且已在别处留痕。
+        assert_eq!(
+            snapshot["workflow_context"]["steps"]["IMPLEMENT"],
+            serde_json::json!("<upstream_output>")
+        );
+        // 其余结构保留键名，便于回答「这一步拿到了什么」。
+        assert_eq!(snapshot["workflow_context"]["input"]["note"]["string_len"], 1);
+
+        let text = snapshot.to_string();
+        assert!(!text.contains("secret-project"), "不得泄漏路径值");
+        assert!(!text.contains("cred-123"), "不得泄漏凭据句柄值");
+        assert!(!text.contains("very long output"), "不得把上游输出再存一遍");
+    }
+
+    /// 证据落盘后能按步骤读回来。
+    #[test]
+    fn step_evidence_is_recorded_and_collectable() {
+        let ledger = ledger("evidence-collect");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.steps[0].role_id = "software.analyst".to_string();
+        let executor = RecordingExecutor::default();
+        let run = runner
+            .start("agent-1", &workflow, "evidence-run", &serde_json::json!({ "workspace_root": "F:/x" }))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&workflow, run, &serde_json::json!({ "workspace_root": "F:/x" }), &executor)
+            .unwrap();
+        assert_eq!(outcome.blocked_step_id, "APPROVE");
+
+        let evidence = collect_step_evidence(&outcome.run.run_id, &ledger).unwrap();
+        let first = evidence.get("STEP-1").expect("已完成的步骤必须有证据");
+        assert_eq!(first["role_id"], "software.analyst");
+        assert_eq!(first["capability_id"], "test.first");
+        assert!(first["inputs"].is_object(), "证据必须带输入形状");
+        // 未完成的步骤不应伪造证据。
+        assert!(!evidence.contains_key("APPROVE"), "等待中的步骤没有完成事件");
+    }
+
     #[test]
     fn loop_executes_child_runs_until_exit_condition() {
         struct LoopExecutor {
@@ -3457,8 +4270,10 @@ mod tests {
             kind: "loop".to_string(),
             capability_id: String::new(),
             runtime: None,
+            delegate: None,
             loop_config: Some(Box::new(super::super::WorkflowLoop {
                 max_iterations: 4,
+                max_iterations_limit: 0,
                 pause_for_feedback: true,
                 continue_when: Some(super::super::WorkflowCondition {
                     operator: "not_equals".to_string(),
@@ -3479,6 +4294,7 @@ mod tests {
                     capability_id: "test.body".to_string(),
                     runtime: None,
                     loop_config: None,
+                    delegate: None,
                     when: None,
                     fail_when: None,
                     candidate_action: String::new(),
@@ -3546,4 +4362,325 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(child_runs.len(), 2);
     }
+    fn delegate_step(package: &WorkflowPackage, branch_count: usize, min_succeeded: u32) -> WorkflowStep {
+        let branches = (0..branch_count)
+            .map(|i| super::super::WorkflowDelegateBranch {
+                id: format!("BRANCH-{i}"),
+                title: format!("Branch {i}"),
+                role_id: format!("software.role{i}"),
+                runtime: Some(serde_json::from_value(serde_json::json!({
+                    "provider": "himind.fixture",
+                    "prompt": "do the branch work"
+                })).unwrap()),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        WorkflowStep {
+            id: "FANOUT".to_string(),
+            title: "Fan out".to_string(),
+            kind: "delegate".to_string(),
+            capability_id: String::new(),
+            runtime: None,
+            delegate: Some(Box::new(super::super::WorkflowDelegate {
+                branches,
+                min_succeeded,
+            })),
+            loop_config: None,
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "long_running".to_string(),
+            risk_level: "local_write".to_string(),
+            role_id: String::new(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn delegate_step_creates_one_child_run_per_branch() {
+        let ledger = ledger("delegate-fanout");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.supported_runtimes = vec!["himind.fixture".to_string()];
+        workflow.steps = vec![delegate_step(&workflow, 2, 2)];
+
+        struct OkExecutor;
+        impl WorkflowStepExecutor for OkExecutor {
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                _step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                Ok(WorkflowStepExecution::output(serde_json::json!({"ok": true})))
+            }
+        }
+
+        let run = runner
+            .start("agent-1", &workflow, "delegate-run", &serde_json::json!({}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&workflow, run, &serde_json::json!({}), &OkExecutor)
+            .unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
+
+        // 两个分支各起一条独立子运行，都挂在父运行下且标为委派。
+        let all = ledger.list_runs(50).unwrap();
+        let children: Vec<_> = all
+            .iter()
+            .filter(|r| r.parent_run_id == outcome.run.run_id)
+            .collect();
+        assert_eq!(children.len(), 2, "each branch must produce one child run");
+        for child in &children {
+            assert_eq!(child.parent_kind, LocalRunParentKind::Delegate);
+            assert_eq!(child.status, LocalRunStatus::Succeeded);
+        }
+        // 子运行的角色来自分支自己的 role_id，不继承父步骤。
+        let roles: Vec<&str> = children
+            .iter()
+            .flat_map(|r| r.steps.iter().map(|s| s.role_id.as_str()))
+            .collect();
+        assert!(roles.contains(&"software.role0"));
+        assert!(roles.contains(&"software.role1"));
+    }
+
+    /// 并发验证：两个分支的执行区间必须重叠，而不是一前一后。
+    /// 用两个挡板让分支互相等待——顺序执行会死锁，并发执行能通过。
+    #[test]
+    fn delegate_branches_run_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        struct BarrierExecutor {
+            barrier: Barrier,
+            started: AtomicUsize,
+        }
+        // 只有标记为 shared 的执行器才会走并发路径。
+        impl super::super::SharedStepExecutor for BarrierExecutor {}
+        impl WorkflowStepExecutor for BarrierExecutor {
+            fn as_shared(&self) -> Option<&dyn super::super::SharedStepExecutor> {
+                Some(self)
+            }
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                _step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                // 两个分支都到达这里才放行：串行执行会在此永久阻塞（测试超时即失败）。
+                self.barrier.wait();
+                Ok(WorkflowStepExecution::output(serde_json::json!({"ok": true})))
+            }
+        }
+
+        let ledger = ledger("delegate-concurrent");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.supported_runtimes = vec!["himind.fixture".to_string()];
+        workflow.steps = vec![delegate_step(&workflow, 2, 2)];
+
+        let executor = BarrierExecutor {
+            barrier: Barrier::new(2),
+            started: AtomicUsize::new(0),
+        };
+        let run = runner
+            .start("agent-1", &workflow, "delegate-concurrent", &serde_json::json!({}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&workflow, run, &serde_json::json!({}), &executor)
+            .unwrap();
+
+        assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
+        // 两个分支都真正进入过执行器 —— 说明它们是并发运行的。
+        assert_eq!(executor.started.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_resets_target_and_downstream_only() {
+        let mut pkg: WorkflowPackage = package();
+        // STEP-1 → STEP-2 → APPROVE 是一条链；再造一条与它们无关的旁支。
+        pkg.steps.push(WorkflowStep {
+            id: "SIDE".to_string(),
+            title: "Side".to_string(),
+            kind: "capability".to_string(),
+            capability_id: "test.first".to_string(),
+            runtime: None,
+            delegate: None,
+            loop_config: None,
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "sync".to_string(),
+            role_id: String::new(),
+            risk_level: "read_only".to_string(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        });
+
+        let chain = downstream_chain(&pkg.steps, "STEP-2");
+        // STEP-2 与它的下游 APPROVE 要被重置。
+        assert!(chain.contains("STEP-2"));
+        assert!(chain.contains("APPROVE"));
+        // 上游 STEP-1 已经成功，不该重跑。
+        assert!(!chain.contains("STEP-1"), "重试不得回滚上游");
+        // 无关旁支不动。
+        assert!(!chain.contains("SIDE"), "无关分支不得被牵连");
+    }
+
+    #[test]
+    fn retry_step_clears_approvals_and_requeues() {
+        let ledger = ledger("retry-step");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let package = package();
+        let executor = RecordingExecutor::default();
+        let run = runner
+            .start("agent-1", &package, "retry-run", &serde_json::json!({}))
+            .unwrap();
+        let blocked = runner
+            .run_ready(&package, run, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(blocked.blocked_step_id, "APPROVE");
+
+        let retried = runner.retry_step(blocked.run.clone(), "STEP-2").unwrap();
+        assert_eq!(retried.status, LocalRunStatus::Queued);
+        assert_eq!(retried.pause_kind, RunPauseKind::None);
+        let step2 = retried.steps.iter().find(|s| s.step_id == "STEP-2").unwrap();
+        assert_eq!(step2.status, LocalStepStatus::Pending);
+        assert_eq!(step2.attempt, 0, "重试要把尝试次数归零");
+        assert!(step2.started_at.is_empty());
+        // 下游 APPROVE 也重置，且它的审批记录作废。
+        let approve = retried.steps.iter().find(|s| s.step_id == "APPROVE").unwrap();
+        assert_eq!(approve.status, LocalStepStatus::Pending);
+        assert!(
+            retried.approvals.iter().all(|a| !a.approval_id.ends_with("APPROVE")),
+            "重试下游必须作废对应的审批"
+        );
+        // 上游 STEP-1 保持成功。
+        let step1 = retried.steps.iter().find(|s| s.step_id == "STEP-1").unwrap();
+        assert_eq!(step1.status, LocalStepStatus::Succeeded);
+    }
+
+    #[test]
+    fn retry_rejects_running_and_unknown_steps() {
+        let ledger = ledger("retry-guard");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let package = package();
+        let mut run = runner
+            .start("agent-1", &package, "retry-guard", &serde_json::json!({}))
+            .unwrap();
+        run.status = LocalRunStatus::Running;
+        assert!(runner.retry_step(run.clone(), "STEP-1").is_err(), "运行中不得重试单步");
+        run.status = LocalRunStatus::Queued;
+        assert!(runner.retry_step(run, "NOPE").is_err(), "未知步骤必须报错");
+    }
+
+    #[test]
+    fn paused_run_stops_advancing_until_resumed() {
+        let ledger = ledger("pause-resume");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let package = package();
+        let executor = RecordingExecutor::default();
+        let run = runner
+            .start("agent-1", &package, "pause-run", &serde_json::json!({}))
+            .unwrap();
+
+        // 暂停后推进：必须原地不动，且不执行任何步骤。
+        let paused = runner.pause(run).unwrap();
+        assert_eq!(paused.status, LocalRunStatus::Waiting);
+        assert_eq!(paused.pause_kind, RunPauseKind::User);
+        let blocked = runner
+            .run_ready(&package, paused.clone(), &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(blocked.run.status, LocalRunStatus::Waiting);
+        assert!(executor.steps.borrow().is_empty(), "暂停期间不得执行任何步骤");
+
+        // 恢复后从下一个步骤继续，行为与从未暂停一致。
+        let resumed = runner.resume_from_pause(blocked.run).unwrap();
+        assert_eq!(resumed.status, LocalRunStatus::Queued);
+        assert_eq!(resumed.pause_kind, RunPauseKind::None);
+        let outcome = runner
+            .run_ready(&package, resumed, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(outcome.blocked_step_id, "APPROVE");
+        assert_eq!(executor.steps.borrow().as_slice(), &["STEP-1", "STEP-2"]);
+    }
+
+    #[test]
+    fn resume_does_not_bypass_approval_or_feedback_waits() {
+        let ledger = ledger("pause-guard");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let package = package();
+        let executor = RecordingExecutor::default();
+        let run = runner
+            .start("agent-1", &package, "guard-run", &serde_json::json!({}))
+            .unwrap();
+        let blocked = runner
+            .run_ready(&package, run, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(blocked.blocked_step_id, "APPROVE");
+        assert_eq!(
+            blocked.run.pause_kind,
+            RunPauseKind::Approval,
+            "等审批的运行必须标注 pause_kind=Approval"
+        );
+        // 用 resume 绕过审批必须被拒绝：那等于跳过了本该发生的确认。
+        let error = runner.resume_from_pause(blocked.run.clone()).unwrap_err();
+        assert!(error.to_string().contains("not paused by user"), "实际：{error}");
+    }
+
+    #[test]
+    fn delegate_step_fails_when_too_few_branches_succeed() {
+        let ledger = ledger("delegate-fail");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.supported_runtimes = vec!["himind.fixture".to_string()];
+        workflow.steps = vec![delegate_step(&workflow, 2, 2)];
+
+        // 第一个分支成功、第二个失败：要求两个都成功时整步失败。
+        struct HalfExecutor {
+            calls: std::cell::RefCell<u32>,
+        }
+        impl WorkflowStepExecutor for HalfExecutor {
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                let mut calls = self.calls.borrow_mut();
+                *calls += 1;
+                if step.id == "BRANCH-1" {
+                    return Err("branch failed".into());
+                }
+                Ok(WorkflowStepExecution::output(Value::Null))
+            }
+        }
+
+        let run = runner
+            .start("agent-1", &workflow, "delegate-fail", &serde_json::json!({}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(
+                &workflow,
+                run,
+                &serde_json::json!({}),
+                &HalfExecutor { calls: std::cell::RefCell::new(0) },
+            )
+            .unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Failed);
+        assert!(outcome.run.error.contains("needs 2 successful branch"));
+    }
+
 }

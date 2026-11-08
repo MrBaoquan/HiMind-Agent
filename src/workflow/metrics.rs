@@ -211,6 +211,7 @@ mod tests {
             runtime_provider: "test".to_string(),
             workspace_ref: String::new(),
             current_step_id: String::new(),
+            pause_kind: crate::agent_core_contracts::RunPauseKind::None,
             completion_mode: "full".to_string(),
             execution_plan: None,
             steps: vec![LocalRunStep {

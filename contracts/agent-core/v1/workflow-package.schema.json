@@ -163,12 +163,50 @@
         }
       }
     },
+    "delegate": {
+      "description": "把一步拆成多条并行子运行，各跑一条分支。与 loop 的区别是语义：loop 是同一步重做（算返工），delegate 是分给不同角色做（算分工）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branches"],
+      "properties": {
+        "branches": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/delegate_branch" }
+        },
+        "min_succeeded": {
+          "description": "至少几个分支成功才算这一步成功；0 表示全部分支都要成功。",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8
+        }
+      }
+    },
+    "delegate_branch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "runtime"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "role_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]*$" },
+        "runtime": { "$ref": "#/$defs/runtime_step" },
+        "input": { "type": "object" }
+      }
+    },
     "loop": {
       "type": "object",
       "additionalProperties": false,
       "required": ["max_iterations", "steps"],
       "properties": {
         "max_iterations": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "max_iterations_limit": {
+          "description": "轮数硬上限，由包作者声明；留 0 表示等于 max_iterations。执行时可在 [max_iterations, limit] 内调整。",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20
+        },
         "pause_for_feedback": { "type": "boolean" },
         "continue_when": { "$ref": "#/$defs/condition" },
         "exit_when": { "$ref": "#/$defs/condition" },
@@ -187,11 +225,12 @@
         "id": { "type": "string", "minLength": 1 },
         "title": { "type": "string", "minLength": 1 },
         "kind": {
-          "enum": ["capability", "runtime", "manual", "loop", "provider_defined"]
+          "enum": ["capability", "runtime", "manual", "loop", "delegate", "provider_defined"]
         },
         "capability_id": { "type": "string" },
         "runtime": { "$ref": "#/$defs/runtime_step" },
         "loop": { "$ref": "#/$defs/loop" },
+        "delegate": { "$ref": "#/$defs/delegate" },
         "when": { "$ref": "#/$defs/condition" },
         "fail_when": { "$ref": "#/$defs/condition" },
         "candidate_action": { "enum": ["", "freeze", "require"] },

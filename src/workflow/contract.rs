@@ -201,6 +201,15 @@ fn collect_roles(package: &WorkflowPackage) -> Value {
             if let Some(loop_config) = step.loop_config.as_ref() {
                 walk(&loop_config.steps, roles);
             }
+            // 委派分支的角色也要进清单：用户看到的「这个任务由谁协作」必须含分支。
+            if let Some(delegate) = step.delegate.as_ref() {
+                for branch in &delegate.branches {
+                    let role = branch.role_id.trim();
+                    if !role.is_empty() {
+                        roles.entry(role.to_string()).or_default().push(branch.id.clone());
+                    }
+                }
+            }
         }
     }
     let mut roles = std::collections::BTreeMap::<String, Vec<String>>::new();
@@ -258,6 +267,12 @@ fn find_step<'a>(steps: &'a [WorkflowStep], step_id: &str) -> Option<&'a Workflo
         if let Some(loop_config) = step.loop_config.as_ref() {
             if let Some(found) = find_step(&loop_config.steps, step_id) {
                 return Some(found);
+            }
+        }
+        // 委派分支的 id 也可能作为 role 的 step_ids 出现（角色清单里记的是 branch.id）。
+        if let Some(delegate) = step.delegate.as_ref() {
+            if delegate.branches.iter().any(|branch| branch.id == step_id) {
+                return Some(step);
             }
         }
     }

@@ -1084,6 +1084,7 @@ fn evaluate_connector_credentials(
 fn step_has_executor(step: &super::WorkflowStep) -> bool {
     step.runtime.is_some()
         || step.loop_config.is_some()
+        || step.delegate.is_some()
         || !step.capability_id.trim().is_empty()
         || step.approval_required
         || matches!(step.kind.trim(), "manual" | "provider_defined")
@@ -1109,6 +1110,20 @@ fn runtime_requirements(
             if let Some(loop_config) = step.loop_config.as_ref() {
                 walk(&loop_config.steps, explicit, auto);
             }
+            // 委派分支自带 runtime：不把它们算进来，预检就会漏判「这个包需要哪些 Runtime」。
+            if let Some(delegate) = step.delegate.as_ref() {
+                for branch in &delegate.branches {
+                    let Some(runtime) = branch.runtime.as_ref() else {
+                        continue;
+                    };
+                    let provider = runtime.provider.trim();
+                    if provider == "auto" {
+                        *auto = true;
+                    } else if !provider.is_empty() {
+                        explicit.insert(provider.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -1127,6 +1142,14 @@ fn runtime_requires_network_isolation(steps: &[super::WorkflowStep]) -> bool {
                 .loop_config
                 .as_ref()
                 .is_some_and(|loop_config| runtime_requires_network_isolation(&loop_config.steps))
+            || step.delegate.as_ref().is_some_and(|delegate| {
+                delegate.branches.iter().any(|branch| {
+                    branch
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.allow_network == Some(false))
+                })
+            })
     })
 }
 
@@ -1577,6 +1600,7 @@ mod tests {
                 capability_id: "system.health".to_string(),
                 runtime: None,
                 loop_config: None,
+                delegate: None,
                 when: None,
                 fail_when: None,
                 candidate_action: String::new(),

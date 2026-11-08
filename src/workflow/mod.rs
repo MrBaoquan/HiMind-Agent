@@ -61,8 +61,9 @@ pub(crate) use presets::{
 };
 #[allow(unused_imports)]
 pub(crate) use runner::{
-    verify_run, WorkflowArtifactOutput, WorkflowArtifactVerification, WorkflowRunOutcome,
-    WorkflowRunVerification, WorkflowRunner, WorkflowStepExecution, WorkflowStepExecutor,
+    collect_step_evidence, verify_run, SharedStepExecutor, WorkflowArtifactOutput,
+    WorkflowArtifactVerification, WorkflowRunOutcome, WorkflowRunVerification, WorkflowRunner,
+    WorkflowStepExecution, WorkflowStepExecutor,
 };
 pub(crate) use runtime::execute_runtime_step;
 pub(crate) use store::{InstalledWorkflow, WorkflowStore};
@@ -126,10 +127,13 @@ pub(crate) fn apply_execution_overrides(
             let loop_config = step.loop_config.as_mut().ok_or_else(|| {
                 format!("execution override max_iterations requires a loop step: {step_id}")
             })?;
-            if rounds > loop_config.max_iterations {
+            // 可调范围是 `[1, iteration_limit]`，不是「只能降」。
+            // 包作者用 `max_iterations_limit` 声明成本边界；没声明的老包上限即默认值，
+            // 所以行为与以前完全一致。
+            let limit = loop_config.iteration_limit();
+            if rounds > limit {
                 return Err(format!(
-                    "execution override can only lower max_iterations on {step_id} ({} -> {rounds})",
-                    loop_config.max_iterations
+                    "execution override max_iterations exceeds the declared limit on {step_id} (limit {limit}, requested {rounds})"
                 )
                 .into());
             }
@@ -394,6 +398,12 @@ pub(crate) struct WorkflowStep {
     pub runtime: Option<WorkflowRuntimeStep>,
     #[serde(default, rename = "loop")]
     pub loop_config: Option<Box<WorkflowLoop>>,
+    /// 把这一步拆成多个并行子任务，各起一条子运行。
+    ///
+    /// 与 `loop` 的区别是语义：loop 是「同一步重做」，delegate 是「分给不同角色做」。
+    /// 两者都产生子运行，但统计口径不同（返工 vs 分工），所以是独立的步骤配置。
+    #[serde(default)]
+    pub delegate: Option<Box<WorkflowDelegate>>,
     #[serde(default)]
     pub when: Option<WorkflowCondition>,
     #[serde(default)]
@@ -484,9 +494,48 @@ pub(crate) struct WorkflowRole {
     pub tool_policy: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowDelegate {
+    /// 分出去的子任务。每个分支起一条**独立子运行**，挂在父运行下。
+    pub branches: Vec<WorkflowDelegateBranch>,
+    /// 至少要有几个分支成功，这一步才算成功。
+    ///
+    /// 留 0 表示「全部分支都要成功」；显式写 1 就是「任一成功即可」。
+    /// 审查与测试并行时通常要全部成功，所以默认从严。
+    #[serde(default)]
+    pub min_succeeded: u32,
+}
+
+/// 一条被委派出去的子任务。
+///
+/// 分支自带 role_id 与 runtime：它要能独立执行，不能依赖父步骤的配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WorkflowLoop {    pub max_iterations: u32,
+pub(crate) struct WorkflowDelegateBranch {
+    pub id: String,
+    pub title: String,
+    /// 执行这一分支的角色。留空表示不指定角色，但委派语义仍然成立。
+    #[serde(default)]
+    pub role_id: String,
+    #[serde(default)]
+    pub runtime: Option<WorkflowRuntimeStep>,
+    #[serde(default = "default_object")]
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowLoop {
+    /// 默认轮数。执行时若没有覆盖就用它。
+    pub max_iterations: u32,
+    /// 轮数硬上限，由包作者声明。
+    ///
+    /// 与 `max_iterations` 分离是必要的：如果只有默认值，它同时也是天花板，
+    /// 用户就永远无法把「这次多打磨两轮」表达出来。留 0 表示等于 `max_iterations`
+    /// （老包不必改），这样既有包的行为完全不变。
+    #[serde(default)]
+    pub max_iterations_limit: u32,
     #[serde(default)]
     pub pause_for_feedback: bool,
     #[serde(default)]
@@ -494,6 +543,20 @@ pub(crate) struct WorkflowLoop {    pub max_iterations: u32,
     #[serde(default)]
     pub exit_when: Option<WorkflowCondition>,
     pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowLoop {
+    /// 生效的轮数上限。
+    ///
+    /// `max_iterations_limit` 留 0 时退回 `max_iterations`——这正是旧包的行为，
+    /// 因此不必迁移既有工作流。
+    pub(crate) fn iteration_limit(&self) -> u32 {
+        if self.max_iterations_limit == 0 {
+            self.max_iterations
+        } else {
+            self.max_iterations_limit.max(self.max_iterations)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -659,6 +722,21 @@ struct WorkflowViewFieldDefinition {
     // span 控制栅格占位：full 表示整行，其它值按单列处理。
     #[serde(default)]
     span: String,
+    /// 该字段不是步骤输入，而是一条运行期覆盖（如循环轮数）。
+    ///
+    /// 声明后前端把值写进 `execution_overrides`，而不是步骤输入——
+    /// 否则「这次跑几轮」会被当成业务参数传给模型。
+    #[serde(default, rename = "override")]
+    override_target: Option<WorkflowViewFieldOverride>,
+}
+
+/// 视图字段指向的运行期覆盖目标。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowViewFieldOverride {
+    #[serde(rename = "stepId")]
+    step_id: String,
+    key: String,
 }
 
 impl WorkflowPackage {
@@ -1388,7 +1466,28 @@ fn validate_step_scope(
                         step.id
                     ));
                 }
+                if step.delegate.is_some() {
+                    return Err(format!(
+                        "workflow loop step {} cannot declare delegate",
+                        step.id
+                    ));
+                }
                 validate_loop_step(step, global_step_ids, depth + 1)?;
+            }
+            "delegate" => {
+                if !step.capability_id.trim().is_empty() || step.runtime.is_some() {
+                    return Err(format!(
+                        "workflow delegate step {} cannot declare capability_id or runtime",
+                        step.id
+                    ));
+                }
+                if step.loop_config.is_some() {
+                    return Err(format!(
+                        "workflow delegate step {} cannot declare loop",
+                        step.id
+                    ));
+                }
+                validate_delegate_step(step, depth)?;
             }
             "manual" | "provider_defined" => {
                 if !step.capability_id.trim().is_empty() {
@@ -1443,6 +1542,7 @@ fn normalized_step_kind(step: &WorkflowStep) -> Result<&'static str, String> {
             "capability" => Ok("capability"),
             "runtime" => Ok("runtime"),
             "loop" => Ok("loop"),
+            "delegate" => Ok("delegate"),
             "manual" => Ok("manual"),
             "provider_defined" => Ok("provider_defined"),
             value => Err(format!(
@@ -1450,6 +1550,9 @@ fn normalized_step_kind(step: &WorkflowStep) -> Result<&'static str, String> {
                 step.id
             )),
         };
+    }
+    if step.delegate.is_some() {
+        return Ok("delegate");
     }
     if step.loop_config.is_some() {
         return Ok("loop");
@@ -1559,6 +1662,16 @@ fn validate_loop_step(
             step.id
         ));
     }
+    // 上限同样限制在 1..=20，且不得小于默认值——否则「默认轮数」跑不满自己声明的上限，
+    // 用户看到的两个数字会自相矛盾。
+    if loop_config.max_iterations_limit != 0
+        && !(loop_config.max_iterations..=20).contains(&loop_config.max_iterations_limit)
+    {
+        return Err(format!(
+            "workflow loop step {} max_iterations_limit must be between max_iterations and 20",
+            step.id
+        ));
+    }
     if loop_config.continue_when.is_none() && loop_config.exit_when.is_none() {
         return Err(format!(
             "workflow loop step {} requires continue_when or exit_when",
@@ -1588,6 +1701,92 @@ fn validate_loop_step(
         ));
     }
     validate_step_scope(&loop_config.steps, global_step_ids, depth)
+}
+
+/// 委派步骤的校验。
+///
+/// 与 loop 的差别：loop 是一组步骤反复执行，delegate 是一组**独立分支**各起一条子运行。
+/// 分支必须自带 id/title 和独立 runtime，否则子运行起不来；分支内不允许再嵌套委派或审批，
+/// 避免出现「子运行里还要再请示父运行」的循环依赖。
+fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), String> {
+    let delegate = step
+        .delegate
+        .as_ref()
+        .ok_or_else(|| format!("workflow delegate step {} requires delegate", step.id))?;
+    if depth > 4 {
+        return Err("workflow delegate nesting exceeds 4 levels".to_string());
+    }
+    if delegate.branches.len() < 2 {
+        return Err(format!(
+            "workflow delegate step {} requires at least two branches; a single branch is just a step",
+            step.id
+        ));
+    }
+    if delegate.branches.len() > 8 {
+        return Err(format!(
+            "workflow delegate step {} cannot fan out to more than 8 branches",
+            step.id
+        ));
+    }
+    let mut ids = HashSet::new();
+    for branch in &delegate.branches {
+        validate_workflow_id(&branch.id)
+            .map_err(|error| format!("workflow delegate branch {}: {error}", branch.id))?;
+        if !ids.insert(branch.id.as_str()) {
+            return Err(format!(
+                "duplicate workflow delegate branch id: {}",
+                branch.id
+            ));
+        }
+        if branch.title.trim().is_empty() {
+            return Err(format!(
+                "workflow delegate branch {} title is required",
+                branch.id
+            ));
+        }
+        let runtime = branch.runtime.as_ref().ok_or_else(|| {
+            format!(
+                "workflow delegate branch {} requires runtime; a branch must be runnable on its own",
+                branch.id
+            )
+        })?;
+        if runtime.provider.trim().is_empty() {
+            return Err(format!(
+                "workflow delegate branch {} runtime provider is required",
+                branch.id
+            ));
+        }
+        if runtime.prompt.trim().is_empty() {
+            return Err(format!(
+                "workflow delegate branch {} runtime prompt is required",
+                branch.id
+            ));
+        }
+        if !matches!(runtime.tool_policy.trim(), "" | "default" | "none") {
+            return Err(format!(
+                "workflow delegate branch {} tool_policy must be default or none",
+                branch.id
+            ));
+        }
+        if !branch.role_id.trim().is_empty() {
+            validate_workflow_id(branch.role_id.trim()).map_err(|error| {
+                format!("workflow delegate branch {} role_id: {error}", branch.id)
+            })?;
+        }
+        if !branch.input.is_object() {
+            return Err(format!(
+                "workflow delegate branch {} input must be an object",
+                branch.id
+            ));
+        }
+    }
+    if delegate.min_succeeded as usize > delegate.branches.len() {
+        return Err(format!(
+            "workflow delegate step {} min_succeeded exceeds branch count",
+            step.id
+        ));
+    }
+    Ok(())
 }
 
 fn step_scope_requires_approval(step: &WorkflowStep) -> bool {
@@ -2192,6 +2391,7 @@ mod tests {
         step.capability_id.clear();
         step.loop_config = Some(Box::new(WorkflowLoop {
             max_iterations: 4,
+            max_iterations_limit: 0,
             pause_for_feedback: false,
             continue_when: Some(WorkflowCondition {
                 operator: "not_equals".to_string(),
@@ -2212,6 +2412,7 @@ mod tests {
                 capability_id: String::new(),
                 runtime: None,
                 loop_config: None,
+                delegate: None,
                 when: None,
                 fail_when: None,
                 candidate_action: String::new(),
@@ -2238,6 +2439,7 @@ mod tests {
         step.capability_id.clear();
         step.loop_config = Some(Box::new(WorkflowLoop {
             max_iterations: 4,
+            max_iterations_limit: 0,
             pause_for_feedback: false,
             continue_when: None,
             exit_when: None,
@@ -2248,6 +2450,7 @@ mod tests {
                 capability_id: String::new(),
                 runtime: None,
                 loop_config: None,
+                delegate: None,
                 when: None,
                 fail_when: None,
                 candidate_action: String::new(),
@@ -2335,19 +2538,48 @@ mod tests {
         assert!(error.to_string().contains("cannot remove the approval gate"));
     }
 
+    /// 覆盖测试自带一个最小包：直接依赖某个已发布包的形状，会让「包改了」误伤
+    /// 「覆盖逻辑坏了」这两件事分不开。
+    fn loop_override_package(rounds: u32) -> WorkflowPackage {
+        let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.override-loop",
+            "version": "1.0.0",
+            "name": "Override Loop",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "steps": [{
+                "id": "VERIFY",
+                "title": "Verify",
+                "kind": "loop",
+                "execution_mode": "long_running",
+                "risk_level": "local_write",
+                "loop": {
+                    "max_iterations": rounds,
+                    "exit_when": { "operator": "equals", "path": "loops.VERIFY.latest.passed", "value": true },
+                    "steps": [{
+                        "id": "BODY",
+                        "title": "Body",
+                        "kind": "capability",
+                        "capability_id": "test.body",
+                        "execution_mode": "sync",
+                        "risk_level": "read_only"
+                    }]
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" },
+            "capabilities": ["test.body"]
+        }))
+        .unwrap();
+        package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+        package.validate().unwrap();
+        package
+    }
+
     #[test]
     fn execution_override_can_lower_loop_rounds_but_not_raise_them() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
-            .join("software-delivery");
-        let package = load_from_directory(&root).unwrap();
-        let declared = package
-            .steps
-            .iter()
-            .find(|s| s.id == "VERIFY")
-            .and_then(|s| s.loop_config.as_ref())
-            .unwrap()
-            .max_iterations;
+        let package = loop_override_package(3);
 
         let lowered = apply_execution_overrides(
             &package,
@@ -2369,10 +2601,135 @@ mod tests {
         assert!(apply_execution_overrides(
             &package,
             &serde_json::json!({
-                "execution_overrides": { "VERIFY": { "max_iterations": declared + 5 } }
+                "execution_overrides": { "VERIFY": { "max_iterations": 8 } }
             }),
         )
         .is_err());
+    }
+
+    /// 带显式上限的循环包：默认 3 轮，允许上调到 6。
+    fn loop_override_package_with_limit(default: u32, limit: u32) -> WorkflowPackage {
+        let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.override-loop-limit",
+            "version": "1.0.0",
+            "name": "Override Loop Limit",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "steps": [{
+                "id": "VERIFY",
+                "title": "Verify",
+                "kind": "loop",
+                "execution_mode": "long_running",
+                "risk_level": "local_write",
+                "loop": {
+                    "max_iterations": default,
+                    "max_iterations_limit": limit,
+                    "exit_when": { "operator": "equals", "path": "loops.VERIFY.latest.passed", "value": true },
+                    "steps": [{
+                        "id": "BODY",
+                        "title": "Body",
+                        "kind": "capability",
+                        "capability_id": "test.body",
+                        "execution_mode": "sync",
+                        "risk_level": "read_only"
+                    }]
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" },
+            "capabilities": ["test.body"]
+        }))
+        .unwrap();
+        package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+        package.validate().unwrap();
+        package
+    }
+
+    #[test]
+    fn execution_override_can_raise_rounds_up_to_the_declared_limit() {
+        let package = loop_override_package_with_limit(3, 6);
+        // 上调：默认 3，上限 6，用户可以要求 5。
+        let raised = apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "VERIFY": { "max_iterations": 5 } } }),
+        )
+        .unwrap();
+        let rounds = raised
+            .steps
+            .iter()
+            .find(|s| s.id == "VERIFY")
+            .and_then(|s| s.loop_config.as_ref())
+            .unwrap()
+            .max_iterations;
+        assert_eq!(rounds, 5, "默认值与上限分离后，必须能上调");
+    }
+
+    #[test]
+    fn execution_override_rejects_rounds_above_the_declared_limit() {
+        let package = loop_override_package_with_limit(3, 6);
+        let error = apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "VERIFY": { "max_iterations": 7 } } }),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the declared limit"),
+            "超限必须给出明确原因，实际：{error}"
+        );
+    }
+
+    #[test]
+    fn legacy_loop_without_limit_keeps_lowering_only() {
+        // 老包没有 max_iterations_limit：上限等于默认值，行为与改动前一致。
+        let package = loop_override_package(3);
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "VERIFY": { "max_iterations": 4 } } }),
+        )
+        .is_err(), "老包不能上调轮数");
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({ "execution_overrides": { "VERIFY": { "max_iterations": 2 } } }),
+        )
+        .is_ok(), "老包仍可下调轮数");
+    }
+
+    #[test]
+    fn loop_limit_must_not_be_below_default() {
+        let error = serde_json::from_value::<WorkflowPackage>(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.bad-limit",
+            "version": "1.0.0",
+            "name": "Bad Limit",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "steps": [{
+                "id": "VERIFY",
+                "title": "Verify",
+                "kind": "loop",
+                "execution_mode": "long_running",
+                "risk_level": "local_write",
+                "loop": {
+                    "max_iterations": 5,
+                    "max_iterations_limit": 2,
+                    "exit_when": { "operator": "equals", "path": "x", "value": true },
+                    "steps": [{
+                        "id": "BODY",
+                        "title": "Body",
+                        "kind": "capability",
+                        "capability_id": "test.body",
+                        "execution_mode": "sync",
+                        "risk_level": "read_only"
+                    }]
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        let err = error.validate().unwrap_err();
+        assert!(err.contains("max_iterations_limit"), "上限低于默认值时必须拒绝：{err}");
     }
 
     #[test]

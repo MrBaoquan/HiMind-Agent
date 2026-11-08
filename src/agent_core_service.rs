@@ -81,6 +81,7 @@ impl AgentCoreRunRecorder {
             runtime_provider: "himind.agent".to_string(),
             workspace_ref: context.workspace_ref.clone(),
             current_step_id: step_id.clone(),
+            pause_kind: crate::agent_core_contracts::RunPauseKind::None,
             completion_mode: "full".to_string(),
             execution_plan: None,
             steps: vec![LocalRunStep {

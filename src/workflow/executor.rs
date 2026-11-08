@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::error::Error;
 
-use super::{WorkflowPackage, WorkflowStep, WorkflowStepExecution, WorkflowStepExecutor};
+use super::{SharedStepExecutor, WorkflowPackage, WorkflowStep, WorkflowStepExecution, WorkflowStepExecutor};
 use crate::agent_core_contracts::{LocalRunStatus, LocalRunUsage};
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::InvocationContext;
@@ -54,6 +54,11 @@ impl WorkflowGatewayExecutor {
 }
 
 impl WorkflowStepExecutor for WorkflowGatewayExecutor {
+    /// 网关/台账/上下文都是可克隆的句柄，允许多个委派分支并发调用。
+    fn as_shared(&self) -> Option<&dyn SharedStepExecutor> {
+        Some(self)
+    }
+
     fn execute(
         &self,
         package: &WorkflowPackage,
@@ -360,6 +365,7 @@ mod tests {
             capability_id: "test.capability".to_string(),
             runtime: None,
             loop_config: None,
+            delegate: None,
             when: None,
             fail_when: None,
             candidate_action: String::new(),
@@ -431,3 +437,5 @@ mod tests {
         assert_eq!(redacted["nested"]["token"], "[redacted]");
     }
 }
+
+impl SharedStepExecutor for WorkflowGatewayExecutor {}
