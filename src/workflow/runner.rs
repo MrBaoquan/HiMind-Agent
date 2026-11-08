@@ -1250,6 +1250,8 @@ impl WorkflowRunner {
             exits: Vec::new(),
             ..package.clone()
         };
+        // 子包是 strict 的单步骤包，不该继承父运行的入口/出口选择。
+        let child_input = without_execution_selection(workflow_input);
         let start_iteration = u32::try_from(history.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -1277,7 +1279,7 @@ impl WorkflowRunner {
                     "local-agent",
                     &child_package,
                     &request_id,
-                    workflow_input,
+                    &child_input,
                     &parent_run.run_id,
                 )?
             };
@@ -1633,7 +1635,8 @@ impl WorkflowRunner {
                 "local-agent",
                 &child_package,
                 &request_id,
-                workflow_input,
+                // 同 loop：strict 单步骤子包不继承父运行的入口/出口选择。
+                &without_execution_selection(workflow_input),
                 &parent_run.run_id,
             )?,
         };
@@ -2586,6 +2589,32 @@ fn downstream_chain(
         }
     }
     result
+}
+
+/// 子运行用的输入：剥掉父运行的入口/出口选择。
+///
+/// 为什么必须剥：loop 与 delegate 会造一个 `execution_policy: "strict"` 的单步骤子包，
+/// 但把父运行的完整 input 原样传下去。而 segmented 父包的 input 里带着
+/// `execution: { entrypoint, exitpoint }`，strict 子包一看到它就拒绝启动
+/// （"strict workflow does not allow selecting entrypoint or exitpoint"）。
+///
+/// 结果是：任何 segmented 包只要用户选了非默认入口，内部的 loop 或 delegate 必然失败。
+/// 子包只有一个步骤、没有入口出口可言，这类选择对它是噪声，应当剥掉。
+fn without_execution_selection(input: &Value) -> Value {
+    let mut value = input.clone();
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    object.remove("execution");
+    object.remove("entrypoint");
+    object.remove("exitpoint");
+    if let Some(context) = object
+        .get_mut("workflow_context")
+        .and_then(Value::as_object_mut)
+    {
+        context.remove("execution");
+    }
+    value
 }
 
 fn loop_iteration_output(run: &LocalRun, ledger: &LocalRunLedger) -> Result<Value, Box<dyn Error>> {
@@ -4239,6 +4268,136 @@ mod tests {
         assert!(first["inputs"].is_object(), "证据必须带输入形状");
         // 未完成的步骤不应伪造证据。
         assert!(!evidence.contains_key("APPROVE"), "等待中的步骤没有完成事件");
+    }
+
+    /// segmented 包选了非默认入口时，内部的 loop 不能因为继承入口选择而拒绝启动。
+    ///
+    /// 回归背景：子包被强制改成 strict，但 input 里还带着
+    /// `execution: { entrypoint, exitpoint }`，strict 子包一看到就报
+    /// "strict workflow does not allow selecting entrypoint or exitpoint"。
+    #[test]
+    fn segmented_entrypoint_does_not_break_inner_loop() {
+        struct OkExecutor;
+        impl WorkflowStepExecutor for OkExecutor {
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                _step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                Ok(WorkflowStepExecution::output(serde_json::json!({"passed": true})))
+            }
+        }
+
+        let ledger = ledger("segmented-entry-loop");
+        let runner = WorkflowRunner::with_ledger(ledger);
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.execution_policy = "segmented".to_string();
+        workflow.entrypoints = vec![super::super::WorkflowEndpoint {
+            id: "alt".to_string(),
+            at_step: "DEV-LOOP".to_string(),
+            label: "Alternative".to_string(),
+            requires: Vec::new(),
+            produces: Vec::new(),
+        }];
+        workflow.default_entrypoint = "alt".to_string();
+        workflow.exits = vec![super::super::WorkflowEndpoint {
+            id: "done".to_string(),
+            at_step: "DEV-LOOP".to_string(),
+            label: "Done".to_string(),
+            requires: Vec::new(),
+            produces: Vec::new(),
+        }];
+        workflow.default_exitpoint = "done".to_string();
+        workflow.steps = vec![WorkflowStep {
+            id: "DEV-LOOP".to_string(),
+            title: "Loop".to_string(),
+            kind: "loop".to_string(),
+            capability_id: String::new(),
+            runtime: None,
+            delegate: None,
+            loop_config: Some(Box::new(super::super::WorkflowLoop {
+                max_iterations: 2,
+                max_iterations_limit: 0,
+                pause_for_feedback: false,
+                continue_when: None,
+                exit_when: Some(super::super::WorkflowCondition {
+                    operator: "equals".to_string(),
+                    path: "loops.DEV-LOOP.latest.steps.BODY.passed".to_string(),
+                    value: serde_json::json!(true),
+                    conditions: Vec::new(),
+                }),
+                steps: vec![WorkflowStep {
+                    id: "BODY".to_string(),
+                    title: "Body".to_string(),
+                    kind: "capability".to_string(),
+                    capability_id: "test.body".to_string(),
+                    runtime: None,
+                    delegate: None,
+                    loop_config: None,
+                    when: None,
+                    fail_when: None,
+                    candidate_action: String::new(),
+                    input: serde_json::json!({}),
+                    execution_mode: "sync".to_string(),
+                    role_id: String::new(),
+                    risk_level: "read_only".to_string(),
+                    approval_required: false,
+                    on_failure: String::new(),
+                    depends_on: Vec::new(),
+                }],
+            })),
+            when: None,
+            fail_when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "long_running".to_string(),
+            role_id: String::new(),
+            risk_level: "local_write".to_string(),
+            approval_required: false,
+            on_failure: String::new(),
+            depends_on: Vec::new(),
+        }];
+
+        // 用户选了非默认入口：这正是触发 bug 的输入形态。
+        let input = serde_json::json!({
+            "execution": { "entrypoint": "alt", "exitpoint": "done" },
+        });
+        let run = runner
+            .start("agent-1", &workflow, "segmented-loop", &input)
+            .unwrap();
+        let outcome = runner.run_ready(&workflow, run, &input, &OkExecutor).unwrap();
+        assert_eq!(
+            outcome.run.status,
+            LocalRunStatus::Succeeded,
+            "segmented 入口下的 loop 不该被 strict 子包拒绝：{}",
+            outcome.run.error
+        );
+    }
+
+    #[test]
+    fn execution_selection_is_stripped_from_child_input() {
+        let input = serde_json::json!({
+            "workspace_root": "F:/x",
+            "execution": { "entrypoint": "audit", "exitpoint": "audited" },
+            "entrypoint": "audit",
+            "exitpoint": "audited",
+            "workflow_context": {
+                "execution": { "entrypoint": "audit" },
+                "input": { "keep": "me" }
+            }
+        });
+        let stripped = without_execution_selection(&input);
+        assert_eq!(stripped["workspace_root"], "F:/x");
+        assert!(stripped.get("execution").is_none());
+        assert!(stripped.get("entrypoint").is_none());
+        assert!(stripped.get("exitpoint").is_none());
+        // workflow_context 里的同类字段也要剥，否则会被 build_execution_plan 再次读到。
+        assert!(stripped["workflow_context"].get("execution").is_none());
+        // 其它业务输入必须原样保留。
+        assert_eq!(stripped["workflow_context"]["input"]["keep"], "me");
     }
 
     #[test]

@@ -1,0 +1,110 @@
+{
+  "schema_version": "ui_review_profile.v1",
+  "name": "HiMind Agent 前端",
+  "workspace_root": ".",
+  "frontend_root": "frontend",
+  "design_system": {
+    "stylesheet": "frontend/styles.css",
+    "tokens": "frontend/styles.css#:root",
+    "token_count": 70
+  },
+  "checks": [
+    {
+      "id": "ui",
+      "command": "npm run check:ui",
+      "cwd": "frontend",
+      "covers": [
+        "全部 30 项既有自检"
+      ]
+    },
+    {
+      "id": "layout",
+      "command": "npm run check:text-layout",
+      "cwd": "frontend",
+      "covers": [
+        "窄窗、截断、溢出"
+      ]
+    },
+    {
+      "id": "tokens",
+      "command": "npm run check:design-tokens",
+      "cwd": "frontend",
+      "covers": [
+        "对比度、字阶、令牌完整性"
+      ]
+    },
+    {
+      "id": "copy",
+      "command": "npm run check:copy",
+      "cwd": "frontend",
+      "covers": [
+        "文案长度与用词"
+      ]
+    },
+    {
+      "id": "build",
+      "command": "npx tsc --noEmit && npx vite build",
+      "cwd": "frontend",
+      "covers": [
+        "类型与可构建性"
+      ]
+    }
+  ],
+  "viewports": [
+    1024,
+    768,
+    560,
+    400
+  ],
+  "judgement": {
+    "typography": {
+      "rule": "元信息不小于 --fs-meta(12px)，正文不小于 --fs-body(13px)，标题不小于 --fs-title(14px)",
+      "source": "check-design-tokens 的 metaSize/bodySize/titleSize 断言",
+      "note": "Task Center 曾出现 9px 徽标与 11px 标题，低于该下限"
+    },
+    "contrast": {
+      "rule": "正文 ≥4.5:1，控件边框 ≥3:1，弱化文字在其实际背景上 ≥4.5:1",
+      "source": "check-design-tokens 的 expectContrast 断言"
+    },
+    "tokens_only": {
+      "rule": "颜色、圆角、间距、阴影只能引用 --* 令牌，不得写新字面量",
+      "source": "check-design-tokens 缺令牌即失败",
+      "exception": "一次性装饰色（如角色链节点底色）允许字面量，但必须在样式注释里说明用途"
+    },
+    "hit_target": {
+      "rule": "可点击元素命中区 ≥24×24 CSS px",
+      "source": "check-design-tokens 对 .text-action / .market-update-action 的断言"
+    },
+    "motion": {
+      "rule": "所有动画必须在 prefers-reduced-motion: reduce 下被降级",
+      "source": "check-design-tokens 强制要求该 media query 存在"
+    },
+    "narrow_window": {
+      "rule": "400 / 560 / 768 / 1024 四档均不得出现横向溢出",
+      "source": "check:text-layout 的 4300 条规则"
+    },
+    "empty_state": {
+      "rule": "无数据时整块不渲染，不留「暂无」占位",
+      "source": "docs/multi-agent-maturity-roadmap.md 与审批依据实现"
+    },
+    "copy_budget": {
+      "rule": "页头说明 ≤20 汉字，设置项 ≤24，空态 ≤40，单条硬上限 60",
+      "source": "frontend/scripts/check-copy.mts 的 BUDGET"
+    }
+  },
+  "known_debt": [
+    "全量 check:copy 会因 28–39 字文案 29 条超阈值而失败；该阈值是增长天花板，不是硬错误",
+    "check:ui 里 30 个脚本，新增页面容易漏接",
+    "深色主题未实现，color-scheme 固定 light"
+  ],
+  "focus_areas": [
+    "frontend/src/pages/TaskCenterPage.tsx",
+    "frontend/src/pages/WorkflowsPage.tsx",
+    "frontend/src/pages/taskView.ts",
+    "frontend/src/pages/approvalEvidence.ts",
+    "frontend/src/pages/interactionForm.ts",
+    "frontend/src/components/WorkflowProcessRail.tsx",
+    "frontend/styles.css"
+  ],
+  "note": "本文件是版本受控的审查判据。放在 docs/ 而不是 .himind/ 是因为它属于项目文档：需要可 diff、可评审、可分享；.himind/ 只存 agent 运行期状态（已被 gitignore）。"
+}
