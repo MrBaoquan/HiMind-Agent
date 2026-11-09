@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, CheckCircle2, Clock3, Plus, ShieldCheck } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState } from '../components/Common';
-import { agentApi, type MissionCreateInput, type MissionEvent, type MissionSnapshot, type MissionView } from '../services/agentApi';
+import { agentApi, type MissionCreateInput, type MissionEvent, type MissionExecutionOption, type MissionSnapshot, type MissionTaskSpec, type MissionView } from '../services/agentApi';
 import { formatError } from '../types';
 import {
   eventLabel,
@@ -156,6 +156,65 @@ function CreateMissionDialog({ onClose, onCreated }: { onClose: () => void; onCr
   );
 }
 
+function TaskExecutionEditor({ mission, task, options, onSaved }: {
+  mission: MissionView;
+  task: MissionTaskSpec;
+  options: MissionExecutionOption[];
+  onSaved: (mission: MissionView) => void;
+}) {
+  const [executor, setExecutor] = useState(task.execution.executor);
+  const [model, setModel] = useState(task.execution.model);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const selected = options.find(option => option.executor === executor);
+  const models = selected?.models ?? [];
+
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    setError('');
+    try {
+      const updated = await agentApi.updateMissionTaskExecution(
+        mission.mission_id,
+        task.id,
+        mission.plan_sha256,
+        { executor, model, role_id: task.execution.role_id },
+      );
+      onSaved(updated);
+    } catch (cause) {
+      setError(formatError(cause, '执行绑定更新失败'));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mission-execution-editor">
+      <label><span>执行器</span>
+        <select value={executor} onChange={event => {
+          const next = options.find(option => option.executor === event.target.value);
+          setExecutor(event.target.value);
+          setModel(next?.models[0]?.alias ?? '');
+        }}>
+          {options.map(option => <option key={option.executor} value={option.executor} disabled={!option.available}>
+            {option.label}{option.available ? '' : `（${option.reason || '不可用'}）`}
+          </option>)}
+        </select>
+      </label>
+      <label><span>模型</span>
+        <select value={model} onChange={event => setModel(event.target.value)}>
+          <option value="">Runtime 当前模型</option>
+          {models.map(option => <option key={option.alias} value={option.alias}>{option.label}</option>)}
+        </select>
+      </label>
+      <button type="button" className="btn" disabled={saving || !executor} onClick={() => void save()}>
+        {saving ? <BusyIndicator size={14} /> : null}{saving ? '保存中' : '保存绑定'}
+      </button>
+      {error ? <small className="error">{error}</small> : null}
+    </div>
+  );
+}
+
 function MissionDetail({ missionId, onBack, onRefresh }: { missionId: string; onBack: () => void; onRefresh: () => Promise<void> }) {
   const [mission, setMission] = useState<MissionView | null>(null);
   const [events, setEvents] = useState<MissionEvent[]>([]);
@@ -166,6 +225,7 @@ function MissionDetail({ missionId, onBack, onRefresh }: { missionId: string; on
   const [dispatching, setDispatching] = useState(false);
   const [planning, setPlanning] = useState(false);
   const [followingUp, setFollowingUp] = useState(false);
+  const [executionOptions, setExecutionOptions] = useState<MissionExecutionOption[]>([]);
 
   const poll = useCallback(async (reset = false) => {
     try {
@@ -178,6 +238,10 @@ function MissionDetail({ missionId, onBack, onRefresh }: { missionId: string; on
       setError(formatError(cause, '团队任务详情读取失败'));
     }
   }, [missionId]);
+
+  useEffect(() => {
+    void agentApi.listMissionExecutionOptions().then(setExecutionOptions).catch(cause => setError(formatError(cause, '执行器目录读取失败')));
+  }, []);
 
   useEffect(() => {
     cursorRef.current = 0; setEvents([]); void poll(true);
@@ -263,7 +327,7 @@ function MissionDetail({ missionId, onBack, onRefresh }: { missionId: string; on
       {error ? <p className="error" role="alert">{error}</p> : null}
       <div className="mission-detail-grid">
         <section className="mission-detail-panel"><div className="mission-detail-panel-head"><h3>计划与确认</h3><span>r{mission.plan_revision || 0}</span></div>{mission.plan_summary ? <p>{mission.plan_summary}</p> : <p className="muted">还没有执行计划，确认前不会派发写任务。</p>}{mission.status === 'draft' ? <button type="button" className="btn" disabled={planning} onClick={() => void generatePlan()}>{planning ? <BusyIndicator size={14} /> : <ShieldCheck size={14} />}{planning ? '协调中' : '生成执行计划'}</button> : null}{mission.confirmation ? <div className="mission-confirmation"><strong>已确认</strong><small>{mission.confirmation.confirmed_by} · {mission.confirmation.approved_paths.join('、')}</small><code title={mission.confirmation.plan_sha256}>{mission.confirmation.plan_sha256.slice(0, 16)}…</code></div> : mission.plan_sha256 ? <div className="mission-confirmation is-pending"><strong>等待确认</strong><small>计划摘要 {mission.plan_sha256.slice(0, 16)}…</small></div> : null}{mission.status === 'awaiting_confirmation' && mission.plan_sha256 ? <button type="button" className="btn btn-primary" disabled={confirming} onClick={() => void confirmPlan()}>{confirming ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{confirming ? '确认中' : '确认计划并允许派发'}</button> : null}</section>
-        <section className="mission-detail-panel"><div className="mission-detail-panel-head"><h3>{mission.status === 'awaiting_confirmation' ? '待确认任务' : '任务派发'}</h3><span>{(mission.status === 'awaiting_confirmation' ? mission.proposed_tasks : mission.tasks.map(task => task.spec)).length} 项</span></div>{mission.status === 'awaiting_confirmation' && mission.proposed_tasks.length ? <div className="mission-task-list">{mission.proposed_tasks.map(task => <div className="mission-task-row task-proposed" key={task.id}><span className="mission-task-status">待确认</span><div><strong>{task.title}</strong><small>{task.execution.role_id || '未指定角色'} · {task.execution.executor}{task.execution.model ? ` · ${task.execution.model}` : ''}</small>{task.depends_on.length ? <em>依赖：{task.depends_on.join('、')}</em> : null}{task.write_paths.length ? <em>写入：{task.write_paths.join('、')}</em> : null}{task.acceptance_criteria.length ? <em>验收：{task.acceptance_criteria.join('；')}</em> : null}</div></div>)}</div> : mission.tasks.length ? <div className="mission-task-list">{mission.tasks.map(task => <div className={`mission-task-row task-${task.status}`} key={task.spec.id}><span className="mission-task-status">{MISSION_TASK_STATUS_LABELS[task.status]}</span><div><strong>{task.spec.title}</strong><small>{task.spec.execution.role_id || '未指定角色'} · {task.spec.execution.executor}{task.spec.execution.model ? ` · ${task.spec.execution.model}` : ''}</small>{task.spec.depends_on.length ? <em>依赖：{task.spec.depends_on.map(id => taskTitle(mission, id)).join('、')}</em> : null}{task.status === 'failed' ? <em>验收未通过，等待跟进任务</em> : null}</div></div>)}</div> : <p className="muted">确认计划后会在这里出现实际任务；空计划不会派发 Agent。</p>}{mission.status === 'active' && mission.tasks.some(task => task.status === 'failed') ? <button type="button" className="btn" disabled={followingUp} onClick={() => void generateFollowUp()}>{followingUp ? <BusyIndicator size={14} /> : <Activity size={14} />}{followingUp ? '协调中' : '生成跟进任务'}</button> : null}</section>
+        <section className="mission-detail-panel"><div className="mission-detail-panel-head"><h3>{mission.status === 'awaiting_confirmation' ? '待确认任务' : '任务派发'}</h3><span>{(mission.status === 'awaiting_confirmation' ? mission.proposed_tasks : mission.tasks.map(task => task.spec)).length} 项</span></div>{mission.status === 'awaiting_confirmation' && mission.proposed_tasks.length ? <div className="mission-task-list">{mission.proposed_tasks.map(task => <div className="mission-task-row task-proposed" key={task.id}><span className="mission-task-status">待确认</span><div><strong>{task.title}</strong><small>{task.execution.role_id || '未指定角色'} · {task.execution.executor}{task.execution.model ? ` · ${task.execution.model}` : ''}</small><TaskExecutionEditor mission={mission!} task={task} options={executionOptions} onSaved={next => { setMission(next); void poll(true); void onRefresh(); }} />{task.depends_on.length ? <em>依赖：{task.depends_on.join('、')}</em> : null}{task.write_paths.length ? <em>写入：{task.write_paths.join('、')}</em> : null}{task.acceptance_criteria.length ? <em>验收：{task.acceptance_criteria.join('；')}</em> : null}</div></div>)}</div> : mission.tasks.length ? <div className="mission-task-list">{mission.tasks.map(task => <div className={`mission-task-row task-${task.status}`} key={task.spec.id}><span className="mission-task-status">{MISSION_TASK_STATUS_LABELS[task.status]}</span><div><strong>{task.spec.title}</strong><small>{task.spec.execution.role_id || '未指定角色'} · {task.spec.execution.executor}{task.spec.execution.model ? ` · ${task.spec.execution.model}` : ''}</small>{task.spec.depends_on.length ? <em>依赖：{task.spec.depends_on.map(id => taskTitle(mission, id)).join('、')}</em> : null}{task.status === 'failed' ? <em>验收未通过，等待跟进任务</em> : null}</div></div>)}</div> : <p className="muted">确认计划后会在这里出现实际任务；空计划不会派发 Agent。</p>}{mission.status === 'active' && mission.tasks.some(task => task.status === 'failed') ? <button type="button" className="btn" disabled={followingUp} onClick={() => void generateFollowUp()}>{followingUp ? <BusyIndicator size={14} /> : <Activity size={14} />}{followingUp ? '协调中' : '生成跟进任务'}</button> : null}</section>
       </div>
       <section className="mission-detail-panel mission-timeline-panel"><div className="mission-detail-panel-head"><div><h3>执行过程</h3><small>{progressDisclosure(mission, events)}</small></div><span className="mission-timeline-actions">{mission.status === 'active' && mission.tasks.some(task => task.status === 'ready') ? <button type="button" className="btn btn-primary" disabled={dispatching} onClick={() => void dispatchNext()}>{dispatching ? <BusyIndicator size={14} /> : <Plus size={14} />}{dispatching ? '执行中' : '派发下一个任务'}</button> : null}<button type="button" className="btn" onClick={() => { setBusy(true); void poll(true).finally(() => setBusy(false)); }}>{busy ? <BusyIndicator size={14} /> : <Clock3 size={14} />}刷新</button></span></div>{events.length ? <ol className="mission-timeline">{events.map(event => <li key={event.event_id}><span className={`mission-timeline-dot type-${event.event_type}`} aria-hidden="true" /><div><strong>{eventLabel(event)}{event.task_id ? ` · ${taskTitle(mission, event.task_id)}` : ''}</strong><p>{event.summary}</p><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleString()}</time></div></li>)}</ol> : <p className="muted">暂无细粒度执行事件，只显示任务状态。</p>}</section>
       <div className="mission-detail-foot"><span>确认哈希 {mission.plan_sha256 ? `${mission.plan_sha256.slice(0, 12)}…` : '尚未生成'}</span><span>{mission.budget ? `预算 ${mission.budget.max_rounds} 轮 / ${mission.budget.max_minutes} 分钟 / ${mission.budget.max_repair_attempts} 次返工` : '预算待计划生成'}</span></div>

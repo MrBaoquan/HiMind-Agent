@@ -180,6 +180,9 @@ pub(crate) struct MissionTaskView {
     pub spec: MissionTaskSpec,
     pub status: TaskStatus,
     pub attempt_run_id: String,
+    /// Verification run admitted by the host before execution. Results from any
+    /// other run id are rejected, preventing caller self-certification.
+    pub verification_run_id: String,
     pub verification_passed: Option<bool>,
     pub evidence_refs: Vec<String>,
 }

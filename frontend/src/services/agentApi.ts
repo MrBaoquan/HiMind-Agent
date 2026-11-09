@@ -219,6 +219,14 @@ export type MissionWorkspace = {
     write_scope: string[];
 };
 
+export type MissionExecutionOption = {
+    executor: string;
+    label: string;
+    available: boolean;
+    reason: string;
+    models: Array<{ alias: string; label: string }>;
+};
+
 export type MissionCreateInput = {
     title: string;
     objective: string;
@@ -3473,6 +3481,9 @@ export const agentApi = {
     setAgentMode: (mode: AgentModeSettings['mode']) => invoke<AgentModeSettings>('set_agent_mode', { mode }),
     taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
     localActivity: (limit = 60) => invoke<AgentActivityItem[]>('list_local_activity', { limit }),
+    listMissionExecutionOptions: () => invoke<MissionExecutionOption[]>('list_mission_execution_options'),
+    updateMissionTaskExecution: (missionId: string, taskId: string, expectedPlanSha256: string, execution: MissionTaskSpec['execution']) =>
+        invoke<MissionView>('update_mission_task_execution', { missionId, taskId, expectedPlanSha256, execution }),
     createMission: (input: MissionCreateInput) => invoke<MissionView>('create_mission', { input }),
     listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
     getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),

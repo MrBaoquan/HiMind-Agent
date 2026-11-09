@@ -564,6 +564,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::mission_commands::confirm_mission_plan,
             super::mission_commands::add_mission_follow_up_tasks,
             super::mission_commands::get_mission_snapshot,
+            super::mission_commands::list_mission_execution_options,
+            super::mission_commands::update_mission_task_execution,
             super::mission_dispatch::dispatch_next_mission_task,
             super::mission_commands::generate_mission_plan,
             super::mission_commands::generate_mission_follow_up,

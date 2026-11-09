@@ -72,12 +72,7 @@ pub(crate) fn dispatch_next(
     let Some(task) = store.next_ready_task(mission_id)? else {
         return Ok(json!({"dispatched": false, "reason": "no ready task"}));
     };
-    if task.execution.executor != "himind.builtin" {
-        return Err(format!(
-            "MVP dispatch currently supports himind.builtin, got {}",
-            task.execution.executor
-        ).into());
-    }
+    validate_execution_binding(&task)?;
     let task_id = task.id.clone();
     let has_required_checks = !task.required_checks.is_empty();
     let has_acceptance = !task.acceptance_criteria.is_empty();
@@ -206,6 +201,33 @@ fn verification_events_output(run_id: &str) -> Result<Option<Value>, Box<dyn Err
     }))
 }
 
+fn validate_execution_binding(task: &MissionTaskSpec) -> Result<(), Box<dyn Error>> {
+    let executor = task.execution.executor.trim();
+    let model = task.execution.model.trim();
+    let supported = matches!(executor, "himind.builtin" | "personal.codex" | "personal.github-copilot")
+        || crate::runtime::acp::is_provider(executor);
+    if !supported {
+        return Err(format!("mission task {} uses unsupported executor: {executor}", task.id).into());
+    }
+    if !model.is_empty() {
+        crate::workflow::validate_model_alias(model)
+            .map_err(|error| format!("mission task {} model binding: {error}", task.id))?;
+        crate::workflow::model_alias_matches_provider(executor, model)
+            .map_err(|error| format!("mission task {} model binding: {error}", task.id))?;
+    }
+    Ok(())
+}
+
+fn role_entry(task: &MissionTaskSpec) -> Value {
+    json!({
+        "label": task.execution.role_id,
+        "brief": format!("你是专家团队中的 {}。只负责当前任务，不扩大范围，不自行宣布最终通过。", task.execution.role_id),
+        "runtime_provider": task.execution.executor,
+        "model": task.execution.model,
+        "tool_policy": "default",
+    })
+}
+
 fn task_package(
     mission_id: &str,
     mission_title: &str,
@@ -228,7 +250,8 @@ fn task_package(
         "name": mission_title,
         "description": "Mission task attempt",
         "min_agent_version": "0.3.90",
-        "supported_runtimes": ["himind.builtin"],
+        "supported_runtimes": [task.execution.executor.clone()],
+        "roles": { task.execution.role_id.clone(): role_entry(task) },
         "steps": [{
             "id": task.id,
             "title": task.title,

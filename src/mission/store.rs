@@ -235,6 +235,81 @@ impl MissionStore {
         self.get(mission_id)
     }
 
+    /// Changes one task's executor/model/role before confirmation. The whole
+    /// proposal is re-hashed and the old confirmation is cleared, so a binding
+    /// change can never reuse an earlier approval.
+    pub(crate) fn update_task_execution(
+        &self,
+        mission_id: &str,
+        task_id: &str,
+        expected_plan_sha256: &str,
+        execution: &crate::mission::ExecutionBinding,
+    ) -> Result<MissionView, Box<dyn Error>> {
+        require_sha256(expected_plan_sha256)?;
+        let (mission, mut proposal) = self.get_with_plan(mission_id)?;
+        if mission.status != MissionStatus::AwaitingConfirmation {
+            return Err("task execution can only be changed before plan confirmation".into());
+        }
+        if mission.plan_sha256 != expected_plan_sha256 {
+            return Err("plan changed while editing execution binding; reload first".into());
+        }
+        let task = proposal
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task is not in the proposed plan: {task_id}"))?;
+        crate::workflow::validate_model_alias(&execution.model)
+            .map_err(|error| format!("task execution model: {error}"))?;
+        crate::workflow::model_alias_matches_provider(&execution.executor, &execution.model)
+            .map_err(|error| format!("task execution binding: {error}"))?;
+        task.execution = execution.clone();
+        validate_proposal(&proposal)?;
+        validate_relative_task_paths(&proposal.tasks)?;
+        let plan_sha256 = plan_hash(
+            &mission.mission_id,
+            &mission.workspace.root,
+            &mission.acceptance_criteria,
+            &proposal,
+        )?;
+        let revision = mission.plan_revision.saturating_add(1);
+        let now = now_stamp();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE mission_runs SET plan_revision = ?2, plan_sha256 = ?3,
+                plan_json = ?4, confirmation_json = NULL, updated_at = ?5
+             WHERE mission_id = ?1 AND status = ?6 AND plan_sha256 = ?7",
+            params![
+                mission_id,
+                revision as i64,
+                plan_sha256,
+                serde_json::to_string(&proposal)?,
+                now,
+                MissionStatus::AwaitingConfirmation.as_str(),
+                expected_plan_sha256,
+            ],
+        )?;
+        if changed != 1 {
+            return Err("plan changed concurrently; reload before editing".into());
+        }
+        append_event_tx(
+            &transaction,
+            mission_id,
+            "task_execution_updated",
+            task_id,
+            format!("计划 r{revision} 已更新任务执行绑定，等待重新确认"),
+            serde_json::json!({
+                "plan_sha256": plan_sha256,
+                "executor": execution.executor,
+                "model": execution.model,
+                "role_id": execution.role_id,
+            }),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.get(mission_id)
+    }
+
     pub(crate) fn add_follow_up_tasks(
         &self,
         mission_id: &str,
@@ -544,8 +619,9 @@ impl MissionStore {
             return Err("verification must use a different run from the implementation attempt".into());
         }
         transaction.execute(
-            "UPDATE mission_tasks SET updated_at = ?3 WHERE mission_id = ?1 AND task_id = ?2",
-            params![mission_id, task_id, now],
+            "UPDATE mission_tasks SET verification_run_id = ?3, updated_at = ?4
+             WHERE mission_id = ?1 AND task_id = ?2",
+            params![mission_id, task_id, run_id, now],
         )?;
         append_event_tx(
             &transaction, mission_id, "verification_started", task_id,
@@ -578,10 +654,11 @@ impl MissionStore {
         let now = now_stamp();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (status, bound_run): (String, String) = transaction.query_row(
-            "SELECT status, attempt_run_id FROM mission_tasks WHERE mission_id = ?1 AND task_id = ?2",
+        let (status, bound_run, bound_verification_run): (String, String, String) = transaction.query_row(
+            "SELECT status, attempt_run_id, verification_run_id
+             FROM mission_tasks WHERE mission_id = ?1 AND task_id = ?2",
             params![mission_id, task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         if status != TaskStatus::AwaitingVerification.as_str() {
             return Err(format!("task {task_id} is not awaiting verification").into());
@@ -589,6 +666,13 @@ impl MissionStore {
         if bound_run != implementation_run_id {
             return Err(format!(
                 "verification evidence is bound to implementation run {bound_run}, not {implementation_run_id}"
+            ).into());
+        }
+        if bound_verification_run.trim().is_empty()
+            || bound_verification_run != verification_run_id
+        {
+            return Err(format!(
+                "verification run {verification_run_id} was not admitted by the host for task {task_id}"
             ).into());
         }
         transaction.execute(
@@ -659,9 +743,69 @@ impl MissionStore {
         Ok(connection)
     }
 
+    pub(crate) fn budget_exhaustion_reason(
+        &self,
+        mission: &MissionView,
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        let Some(budget) = mission.budget.as_ref() else { return Ok(None); };
+        let Some(confirmation) = mission.confirmation.as_ref() else { return Ok(None); };
+        let connection = self.connection()?;
+        let rounds: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'task_dispatched'",
+            params![mission.mission_id],
+            |row| row.get(0),
+        )?;
+        let repairs: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM mission_tasks WHERE mission_id = ?1 AND json_extract(spec_json, '$.repair_of') <> ''",
+            params![mission.mission_id],
+            |row| row.get(0),
+        )?;
+        let confirmed_at = chrono::DateTime::parse_from_rfc3339(&confirmation.confirmed_at)
+            .map_err(|error| format!("invalid confirmation timestamp: {error}"))?;
+        let elapsed_minutes = Utc::now()
+            .signed_duration_since(confirmed_at.with_timezone(&Utc))
+            .num_minutes()
+            .max(0) as u64;
+        if rounds >= budget.max_rounds as i64 {
+            return Ok(Some(format!("达到轮次上限：已派发 {rounds}/{} 轮", budget.max_rounds)));
+        }
+        if elapsed_minutes >= budget.max_minutes as u64 {
+            return Ok(Some(format!("达到时限上限：已运行 {elapsed_minutes}/{} 分钟", budget.max_minutes)));
+        }
+        if repairs >= budget.max_repair_attempts as i64 {
+            return Ok(Some(format!("达到返工上限：{repairs}/{} 次", budget.max_repair_attempts)));
+        }
+        Ok(None)
+    }
+
+    fn record_budget_exhausted(&self, mission_id: &str, reason: &str) -> Result<(), Box<dyn Error>> {
+        let now = now_stamp();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'budget_exhausted'",
+            params![mission_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE mission_runs SET status = ?2, updated_at = ?3 WHERE mission_id = ?1",
+            params![mission_id, MissionStatus::Waiting.as_str(), now],
+        )?;
+        if already == 0 {
+            append_event_tx(&transaction, mission_id, "budget_exhausted", "", reason,
+                serde_json::json!({"reason": reason}), &now)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn next_ready_task(&self, mission_id: &str) -> Result<Option<MissionTaskSpec>, Box<dyn Error>> {
         let mission = self.get(mission_id)?;
         if mission.status != MissionStatus::Active {
+            return Ok(None);
+        }
+        if let Some(reason) = self.budget_exhaustion_reason(&mission)? {
+            self.record_budget_exhausted(mission_id, &reason)?;
             return Ok(None);
         }
         Ok(mission.tasks.into_iter()
@@ -692,9 +836,12 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
             mission_id TEXT NOT NULL REFERENCES mission_runs(mission_id) ON DELETE CASCADE,
             task_id TEXT NOT NULL, position INTEGER NOT NULL, status TEXT NOT NULL,
             spec_json TEXT NOT NULL, attempt_run_id TEXT NOT NULL DEFAULT '',
+            verification_run_id TEXT NOT NULL DEFAULT '',
             verification_passed INTEGER, evidence_json TEXT NOT NULL DEFAULT '[]',
             updated_at TEXT NOT NULL, PRIMARY KEY(mission_id, task_id)
          );
+         CREATE INDEX IF NOT EXISTS idx_mission_tasks_status
+            ON mission_tasks(mission_id, status);
          CREATE TABLE IF NOT EXISTS mission_events(
             mission_id TEXT NOT NULL REFERENCES mission_runs(mission_id) ON DELETE CASCADE,
             sequence INTEGER NOT NULL, event_id TEXT NOT NULL, event_type TEXT NOT NULL,
@@ -705,6 +852,20 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
          CREATE TABLE IF NOT EXISTS mission_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
          INSERT OR IGNORE INTO mission_meta(key, value) VALUES ('event_sequence', '0');",
     )?;
+    let has_verification_run = {
+        let mut statement = connection.prepare("PRAGMA table_info(mission_tasks)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.iter().any(|column| column == "verification_run_id")
+    };
+    if !has_verification_run {
+        connection.execute(
+            "ALTER TABLE mission_tasks
+             ADD COLUMN verification_run_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -726,18 +887,18 @@ fn load_mission(connection: &Connection, mission_id: &str) -> Result<Option<Miss
     let Some((id, title, objective, status, workspace, acceptance, revision, hash, plan_json, confirmation, budget, created, updated)) = row else { return Ok(None); };
     let proposal = serde_json::from_str::<MissionPlanProposal>(&plan_json).ok();
     let mut statement = connection.prepare(
-        "SELECT status, spec_json, attempt_run_id, verification_passed, evidence_json
+        "SELECT status, spec_json, attempt_run_id, verification_run_id, verification_passed, evidence_json
          FROM mission_tasks WHERE mission_id = ?1 ORDER BY position ASC",
     )?;
     let tasks = statement.query_map(params![id], |row| Ok((
         row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-        row.get::<_, Option<i64>>(3)?, row.get::<_, String>(4)?,
+        row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, String>(5)?,
     )))?
     .map(|row| {
-        let (status, spec, run_id, verified, evidence) = row?;
+        let (status, spec, run_id, verification_run_id, verified, evidence) = row?;
         Ok(MissionTaskView {
             spec: serde_json::from_str(&spec)?, status: TaskStatus::parse(&status)?,
-            attempt_run_id: run_id, verification_passed: verified.map(|value| value != 0),
+            attempt_run_id: run_id, verification_run_id, verification_passed: verified.map(|value| value != 0),
             evidence_refs: serde_json::from_str(&evidence)?,
         })
     }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -997,6 +1158,29 @@ mod tests {
     }
 
     #[test]
+    fn execution_binding_change_invalidates_plan_hash() {
+        let store = store("execution-binding");
+        let created = store.create(&create_input()).unwrap();
+        let planned = store.propose_plan(&created.mission_id, &proposal()).unwrap();
+        let execution = crate::mission::ExecutionBinding {
+            executor: "himind.builtin".to_string(),
+            model: "himind:service:model".to_string(),
+            role_id: "ui.reviewer".to_string(),
+        };
+        let updated = store.update_task_execution(
+            &created.mission_id,
+            "fix",
+            &planned.plan_sha256,
+            &execution,
+        ).unwrap();
+        assert_eq!(updated.status, MissionStatus::AwaitingConfirmation);
+        assert!(updated.confirmation.is_none());
+        assert_ne!(updated.plan_sha256, planned.plan_sha256);
+        assert_eq!(updated.proposed_tasks[0].execution, execution);
+    }
+
+
+    #[test]
     fn implementation_cannot_pass_without_independent_verification() {
         let store = store("verification");
         let created = confirmed_single_task(&store, "verification");
@@ -1008,6 +1192,7 @@ mod tests {
             &["local-run:run-impl".to_string()], "").unwrap_err().to_string().contains("cannot come"));
         assert!(store.record_verification_result(&created.mission_id, "fix", "run-impl", "run-verify", true,
             &[], "").unwrap_err().to_string().contains("evidence"));
+        store.begin_verification_attempt(&created.mission_id, "fix", "run-verify").unwrap();
         let completed = store.record_verification_result(&created.mission_id, "fix", "run-impl", "run-verify", true,
             &["local-run:run-impl".to_string(), "local-run:run-verify".to_string()], "").unwrap();
         assert_eq!(completed.status, MissionStatus::Completed);
@@ -1026,6 +1211,20 @@ mod tests {
     }
 
     #[test]
+    fn verification_rejects_unadmitted_run() {
+        let store = store("unadmitted-verification");
+        let created = confirmed_single_task(&store, "unadmitted");
+        store.begin_task_attempt(&created.mission_id, "fix", "run-impl").unwrap();
+        store.await_task_verification(&created.mission_id, "fix", "run-impl", "送验").unwrap();
+        let error = store.record_verification_result(
+            &created.mission_id, "fix", "run-impl", "run-forged", true,
+            &["local-run:run-forged".to_string()], "",
+        ).unwrap_err();
+        assert!(error.to_string().contains("not admitted"), "{error}");
+        assert_eq!(store.get(&created.mission_id).unwrap().tasks[0].status, TaskStatus::AwaitingVerification);
+    }
+
+    #[test]
     fn verification_rejects_stale_implementation_run() {
         let store = store("stale-verification");
         let created = confirmed_single_task(&store, "stale");
@@ -1036,6 +1235,54 @@ mod tests {
             &["local-run:run-verify".to_string()], "").unwrap_err();
         assert!(error.to_string().contains("bound to implementation run"));
         assert_eq!(store.get(&created.mission_id).unwrap().tasks[0].status, TaskStatus::AwaitingVerification);
+    }
+
+    #[test]
+    fn dispatch_budget_is_persisted_and_terminal() {
+        let store = store("dispatch-budget");
+        let created = store.create(&create_input()).unwrap();
+        let mut plan = proposal();
+        plan.tasks.truncate(1);
+        plan.budget.max_rounds = 1;
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        store.confirm_plan(
+            &created.mission_id,
+            &planned.plan_sha256,
+            &["fix".to_string()],
+            &["frontend/src".to_string()],
+            "test-user",
+        ).unwrap();
+        assert!(store.next_ready_task(&created.mission_id).unwrap().is_some());
+        store.begin_task_attempt(&created.mission_id, "fix", "run-impl").unwrap();
+        store.complete_task_attempt(&created.mission_id, "fix", "run-impl", false, &[], "failed").unwrap();
+        assert!(store.next_ready_task(&created.mission_id).unwrap().is_none());
+        let mission = store.get(&created.mission_id).unwrap();
+        assert_eq!(mission.status, MissionStatus::Waiting);
+        assert!(store.snapshot(&created.mission_id, 0).unwrap().events
+            .iter().any(|event| event.event_type == "budget_exhausted"));
+    }
+
+    #[test]
+    fn repair_budget_counts_follow_up_tasks() {
+        let store = store("repair-budget");
+        let created = store.create(&create_input()).unwrap();
+        let mut plan = proposal();
+        plan.tasks.truncate(1);
+        plan.budget.max_repair_attempts = 1;
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        store.confirm_plan(
+            &created.mission_id,
+            &planned.plan_sha256,
+            &["fix".to_string()],
+            &["frontend/src".to_string()],
+            "test-user",
+        ).unwrap();
+        let mut follow_up = task("repair");
+        follow_up.repair_of = "fix".to_string();
+        let updated = store.add_follow_up_tasks(&created.mission_id, &[follow_up], "返工").unwrap();
+        assert_eq!(updated.status, MissionStatus::Active);
+        assert!(store.next_ready_task(&created.mission_id).unwrap().is_none());
+        assert_eq!(store.get(&created.mission_id).unwrap().status, MissionStatus::Waiting);
     }
 
     #[test]

@@ -9,6 +9,102 @@ use crate::mission::{
     MissionTaskSpec, MissionView,
 };
 
+#[derive(serde::Serialize)]
+pub(crate) struct MissionExecutionOption {
+    pub executor: String,
+    pub label: String,
+    pub available: bool,
+    pub reason: String,
+    pub models: Vec<MissionModelOption>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct MissionModelOption {
+    pub alias: String,
+    pub label: String,
+}
+
+#[tauri::command]
+pub(crate) async fn list_mission_execution_options() -> Result<Vec<MissionExecutionOption>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut options = vec![MissionExecutionOption {
+            executor: "himind.builtin".to_string(),
+            label: "HiMind built-in Runtime".to_string(),
+            available: true,
+            reason: String::new(),
+            models: crate::app::builtin_ai_router::model_catalog()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|route| MissionModelOption {
+                    alias: route.alias,
+                    label: route.display_name,
+                })
+                .collect(),
+        }];
+        for (executor, label, ready) in [
+            ("personal.codex", "Codex CLI", crate::runtime::codex::probe().status == "ready"),
+            ("personal.github-copilot", "GitHub Copilot CLI", crate::runtime::copilot::probe().status == "ready"),
+        ] {
+            options.push(MissionExecutionOption {
+                executor: executor.to_string(),
+                label: label.to_string(),
+                available: ready,
+                reason: if ready { String::new() } else { "local CLI unavailable".to_string() },
+                models: Vec::new(),
+            });
+        }
+        let reports = crate::runtime::acp::probe_installations()
+            .into_iter()
+            .map(|report| (report.provider.clone(), report))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for profile in crate::store::acp_profiles::list().map_err(|error| error.to_string())? {
+            if !profile.enabled {
+                continue;
+            }
+            let report = reports.get(&profile.provider_id);
+            let available = report.is_some_and(|report| report.status == "ready");
+            options.push(MissionExecutionOption {
+                executor: profile.provider_id,
+                label: profile.display_name,
+                available,
+                reason: if available {
+                    String::new()
+                } else {
+                    report.map(|report| format!("{:?}", report.capabilities))
+                        .unwrap_or_else(|| "ACP profile 未通过运行时探测".to_string())
+                },
+                models: Vec::new(),
+            });
+        }
+        Ok(options)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn update_mission_task_execution(
+    mission_id: String,
+    task_id: String,
+    expected_plan_sha256: String,
+    execution: crate::mission::ExecutionBinding,
+) -> Result<MissionView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        MissionStore::open_default()
+            .and_then(|store| {
+                store.update_task_execution(
+                    &mission_id,
+                    &task_id,
+                    &expected_plan_sha256,
+                    &execution,
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub(crate) async fn create_mission(input: MissionCreateInput) -> Result<MissionView, String> {
     tauri::async_runtime::spawn_blocking(move || {

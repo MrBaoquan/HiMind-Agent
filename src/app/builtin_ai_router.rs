@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const CLIENT_ID: &str = "himind-ai";
 pub(crate) const PROVIDER_ID: &str = "himind-local-ai";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ModelRoute {
     pub alias: String,
     pub display_name: String,
