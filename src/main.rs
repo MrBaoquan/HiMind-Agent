@@ -59,6 +59,7 @@ mod mcp_ipc;
 #[cfg(windows)]
 mod mcp_pipe;
 mod mcp_service;
+mod mission;
 mod path_guard;
 mod plugin_authoring;
 mod remote;
@@ -287,6 +288,11 @@ fn main() {
     } else if let Some(arguments) = schedule_cli_arguments() {
         if let Err(error) = run_schedule_cli(&options, &arguments) {
             eprintln!("schedule command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = mission_cli_arguments() {
+        if let Err(error) = run_mission_cli(&options, &arguments) {
+            eprintln!("mission command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = runtime_cli_arguments() {
@@ -1130,6 +1136,67 @@ fn workflow_cli_arguments() -> Option<Vec<String>> {
 
 fn schedule_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("schedule")
+}
+
+fn mission_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("mission")
+}
+
+fn run_mission_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "list" => {
+            let store = mission::MissionStore::open_default()?;
+            let missions = store.list(100)?;
+            println!("{}", serde_json::to_string_pretty(&missions)?);
+        }
+        [action, input] if action == "create" => {
+            let payload: mission::MissionCreateInput = serde_json::from_str(
+                &std::fs::read_to_string(input).or_else(|_| Ok::<_, std::io::Error>(input.clone()))?,
+            )?;
+            let store = mission::MissionStore::open_default()?;
+            println!("{}", serde_json::to_string_pretty(&store.create(&payload)?)?);
+        }
+        [action, mission_id] if action == "snapshot" => {
+            let store = mission::MissionStore::open_default()?;
+            println!("{}", serde_json::to_string_pretty(&store.snapshot(mission_id, 0)?)?);
+        }
+        [action, mission_id, input] if action == "plan" => {
+            let payload: mission::MissionPlanProposal = serde_json::from_str(&std::fs::read_to_string(input)?)?;
+            let store = mission::MissionStore::open_default()?;
+            println!("{}", serde_json::to_string_pretty(&store.propose_plan(mission_id, &payload)?)?);
+        }
+        [action, mission_id] if action == "generate-plan" => {
+            let store = mission::MissionStore::open_default()?;
+            let mission = store.get(mission_id)?;
+            let prompt = mission::plan_prompt(&mission);
+            let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home(
+                options, &mission.workspace.root, &prompt, 240, true,
+                &format!("mission-plan-{}", mission_id), "PLAN", None,
+                crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+            )?;
+            let proposal = mission::parse_plan_json(&outcome.text)?;
+            println!("{}", serde_json::to_string_pretty(&store.propose_plan(mission_id, &proposal)?)?);
+        }
+        [action, mission_id, plan_sha256, task_ids, approved_paths] if action == "confirm" => {
+            let store = mission::MissionStore::open_default()?;
+            let task_ids = task_ids.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
+            let approved_paths = approved_paths.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&store.confirm_plan(
+                mission_id, plan_sha256, &task_ids, &approved_paths, "cli-user"
+            )?)?);
+        }
+        [action, mission_id] if action == "dispatch" => {
+            let gateway = CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(store::types::LocalWorkerStatus::default())),
+            );
+            println!("{}", serde_json::to_string_pretty(&app::mission_dispatch::dispatch_next(
+                &gateway, options, mission_id
+            )?)?);
+        }
+        _ => return Err("usage: himind-agent mission <list|create json|snapshot id|plan id proposal.json|generate-plan id|confirm id sha task_ids approved_paths|dispatch id>".into()),
+    }
+    Ok(())
 }
 
 /// 平台级定时任务的命令行入口，便于验收与排障。
