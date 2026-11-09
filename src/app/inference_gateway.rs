@@ -7,7 +7,7 @@
 //! P1 只做直通：入口协议与上游协议一致时原样转发。协议互译属 P2（见 0113）。
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -1467,6 +1467,15 @@ fn forward(
     } else {
         String::new()
     };
+    // Anthropic 入口直通上游时，上游 400 只会被记成 status + 字节数，
+    // 事后完全无法复盘。这里先按结构清点一次请求，失败日志直接带上它。
+    let anthropic_request_profile = if kind == "anthropic" {
+        serde_json::from_slice::<Value>(body)
+            .map(|request| describe_request_structure(&request))
+            .unwrap_or_else(|_| "invalid-json".to_string())
+    } else {
+        String::new()
+    };
     let normalized_responses = if kind == "openai-responses" {
         let request: Value = serde_json::from_slice(body)
             .map_err(|_| translate_error(stream, "Responses 请求体不是合法 JSON"))?;
@@ -1520,7 +1529,7 @@ fn forward(
         }
         None => serde_json::from_slice::<Value>(body).ok(),
     };
-    let outgoing_body = match compatibility_request {
+    let (outgoing_body, attempted_normalizations) = match compatibility_request {
         Some(request) => {
             let normalized = normalize_compatibility_request(
                 stream,
@@ -1528,10 +1537,11 @@ fn forward(
                 binding.protocol.as_str(),
                 request,
             )?;
-            serde_json::to_vec(&normalized)
-                .map_err(|error| media_normalize_error(stream, &error.to_string()))?
+            let body = serde_json::to_vec(&normalized.request)
+                .map_err(|error| media_normalize_error(stream, &error.to_string()))?;
+            (body, normalized.attempted)
         }
-        None => body.to_vec(),
+        None => (body.to_vec(), Vec::new()),
     };
     if kind != "models" {
         enforce_outbound_body_limit(stream, outgoing_body.len())?;
@@ -1653,12 +1663,13 @@ fn forward(
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
-                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={}",
+                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={} structure={}",
                 status.as_u16(),
                 head.path,
                 raw.len(),
                 header_names,
                 request_summary,
+                anthropic_request_profile,
             ),
         );
         if matches!(status.as_u16(), 400 | 422) {
@@ -1666,12 +1677,15 @@ fn forward(
                 serde_json::from_slice::<Value>(&outgoing_body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             if kind != "models" {
                 record_usage(
@@ -1820,8 +1834,10 @@ fn forward_translated(
             Ok(openai_body) => openai_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let openai_body = normalize_compatibility_request(stream, binding, "openai-chat", openai_body)?;
-    let openai_payload = openai_body.to_string();
+    let openai_normalized =
+        normalize_compatibility_request(stream, binding, "openai-chat", openai_body)?;
+    let attempted_normalizations = openai_normalized.attempted.clone();
+    let openai_payload = openai_normalized.request.to_string();
     enforce_outbound_body_limit(stream, openai_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let request = client
@@ -1847,12 +1863,15 @@ fn forward_translated(
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -1994,9 +2013,10 @@ fn forward_anthropic_responses_translated(
         Ok(body) => body,
         Err(error) => return Err(translate_error(stream, &error)),
     };
-    let responses_body =
+    let responses_normalized =
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
-    let payload = responses_body.to_string();
+    let attempted_normalizations = responses_normalized.attempted.clone();
+    let payload = responses_normalized.request.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let request_builder = client
@@ -2021,12 +2041,15 @@ fn forward_anthropic_responses_translated(
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2185,8 +2208,10 @@ fn forward_responses_translated(
             Ok(chat_body) => chat_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let chat_body = normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
-    let chat_payload = chat_body.to_string();
+    let chat_normalized =
+        normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
+    let attempted_normalizations = chat_normalized.attempted.clone();
+    let chat_payload = chat_normalized.request.to_string();
     enforce_outbound_body_limit(stream, chat_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let mut upstream_request = client
@@ -2211,12 +2236,15 @@ fn forward_responses_translated(
             let request = request.clone();
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2361,9 +2389,10 @@ fn forward_chat_responses_translated(
             Ok(body) => body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let responses_body =
+    let responses_normalized =
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
-    let payload = responses_body.to_string();
+    let attempted_normalizations = responses_normalized.attempted.clone();
+    let payload = responses_normalized.request.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let upstream_request = client
@@ -2388,12 +2417,15 @@ fn forward_chat_responses_translated(
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2550,6 +2582,10 @@ fn compatibility_normalize_error(
         attempted_normalizations: vec![crate::app::ai_compatibility::NormalizationAction::Reject],
         suggested_action: suggested_action.to_string(),
         safe_message: safe_message.clone(),
+        // 这一条是本地拒绝，没有上游响应；把拒绝理由放进 request_detail，
+        // 两个字段都保持非空，前端不必区分"缺字段"和"没有内容"。
+        upstream_detail: "local_reject=no_upstream_response".to_string(),
+        request_detail: format!("feature={}", error.feature.as_str()),
     };
     let payload = if binding.entry_protocol == "anthropic" {
         json!({
@@ -2583,12 +2619,15 @@ fn compatibility_normalize_error(
     GatewayError::Answered
 }
 
+/// 兼容矩阵规格化。除了改写后的请求，也把本次做过的动作一并交回：
+/// 上游随后返回 400 时，诊断里要写清"已经试着降级过什么"，否则用户会把
+/// 早已被降级的字段（比如工具结果图片）当成真正的诱因。
 fn normalize_compatibility_request(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     protocol: &str,
     request: Value,
-) -> Result<Value, GatewayError> {
+) -> Result<NormalizedOutbound, GatewayError> {
     let protocol = match crate::store::ai_services::AIServiceProtocol::parse(protocol) {
         Ok(protocol) => protocol,
         Err(error) => return Err(translate_error(stream, &error)),
@@ -2616,28 +2655,76 @@ fn normalize_compatibility_request(
             ),
         );
     }
-    Ok(normalized.request)
+    let attempted = normalized
+        .changes
+        .iter()
+        .map(|change| change.action)
+        .collect::<Vec<_>>();
+    Ok(NormalizedOutbound {
+        request: normalized.request,
+        attempted,
+    })
 }
+
+/// 规格化后的出站请求，连同已执行的兼容动作。
+struct NormalizedOutbound {
+    request: Value,
+    attempted: Vec<crate::app::ai_compatibility::NormalizationAction>,
+}
+
+/// 诊断要写清的三件事凑在一起：上游回了什么、发出去的请求长什么样、
+/// 兼容层已经改过什么。参数因此收进一个结构体，避免继续加字段就改签名。
+struct CompatibilityDiagnosticInput<'a> {
+    status: reqwest::StatusCode,
+    binding: &'a GatewayBinding,
+    client_protocol: &'a str,
+    request: &'a Value,
+    upstream_body: &'a [u8],
+    upstream_headers: &'a reqwest::header::HeaderMap,
+    attempted_normalizations: Vec<crate::app::ai_compatibility::NormalizationAction>,
+}
+
 fn write_upstream_compatibility_diagnostic(
     stream: &mut TcpStream,
-    status: reqwest::StatusCode,
-    binding: &GatewayBinding,
-    client_protocol: &str,
-    request: &Value,
-    upstream_body: &[u8],
-    upstream_headers: &reqwest::header::HeaderMap,
+    input: CompatibilityDiagnosticInput<'_>,
 ) -> Result<(), GatewayError> {
+    let CompatibilityDiagnosticInput {
+        status,
+        binding,
+        client_protocol,
+        request,
+        upstream_body,
+        upstream_headers,
+        attempted_normalizations,
+    } = input;
     let upstream_text = String::from_utf8_lossy(upstream_body);
     let request_id = upstream_request_id(upstream_headers, upstream_text.as_ref());
     let provider_protocol = crate::store::ai_services::AIServiceProtocol::parse(&binding.protocol)
         .unwrap_or(crate::store::ai_services::AIServiceProtocol::OpenaiChat);
     let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
     let provider = matrix.resolve_provider(&binding.base_url, &provider_protocol);
-    let unsupported_feature = infer_unsupported_feature(request, &upstream_text);
+    let unsupported_feature = infer_unsupported_feature_with_normalizations(
+        request,
+        &upstream_text,
+        &attempted_normalizations,
+    );
     let suggested_action = suggested_action_for_feature(&unsupported_feature);
+    // 上游 400 往往是泛化文案（"invalid request"），单看它定位不到字段。
+    // 因此把两侧的画像一起记下来：请求侧的字段/块类型清单与已执行的降级动作，
+    // 上游侧的错误骨架与原文摘要（凭据已脱敏）。两者都只记结构，不记用户内容。
+    let request_profile = describe_request_structure(request);
+    let attempted_profile = describe_attempted_normalizations(&attempted_normalizations);
+    let upstream_profile = summarize_upstream_error(&upstream_text);
     let safe_message = format!(
-        "{} 的请求与 Provider {} 不兼容（{}）。{}",
-        binding.client, provider.id, unsupported_feature, suggested_action
+        "{} 的请求与 Provider {} 不兼容（{}）。{} [诊断：client_request=[{}]；{}；已降级={}；request_id={}]",
+        binding.client,
+        provider.id,
+        unsupported_feature,
+        suggested_action,
+        request_profile,
+        upstream_profile,
+        attempted_profile,
+        request_id.as_deref().unwrap_or("none")
     );
     let diagnostic = crate::app::ai_compatibility::CompatibilityDiagnosticV1 {
         schema_version: crate::app::ai_compatibility::AI_COMPATIBILITY_SCHEMA_VERSION,
@@ -2648,9 +2735,11 @@ fn write_upstream_compatibility_diagnostic(
         unsupported_feature: unsupported_feature.clone(),
         upstream_status: status.as_u16(),
         request_id: request_id.clone(),
-        attempted_normalizations: Vec::new(),
+        attempted_normalizations: attempted_normalizations.clone(),
         suggested_action: suggested_action.to_string(),
         safe_message: safe_message.clone(),
+        upstream_detail: upstream_profile.clone(),
+        request_detail: request_profile.clone(),
     };
     crate::approval::manager::append_event_log(
         "warn",
@@ -2661,6 +2750,13 @@ fn write_upstream_compatibility_diagnostic(
             unsupported_feature,
             status.as_u16(),
             request_id.as_deref().unwrap_or("none")
+        ),
+    );
+    crate::approval::manager::append_event_log(
+        "warn",
+        &format!(
+            "本机网关兼容诊断明细：client_request=[{}] attempted=[{}] upstream=[{}]",
+            request_profile, attempted_profile, upstream_profile
         ),
     );
     let payload = if client_protocol == "anthropic" {
@@ -2694,6 +2790,344 @@ fn write_upstream_compatibility_diagnostic(
     let _ = stream.write_all(payload.as_bytes());
     let _ = stream.flush();
     Ok(())
+}
+
+/// 请求结构画像：只列字段名与内容块类型，不含任何用户文本。
+///
+/// 上游的 400 常常只说 "invalid request"，不从请求侧做一次结构清点，
+/// 事后就无从判断是哪个字段撞上了兼容边界。这里的输出是稳定的单行文本，
+/// 直接进事件日志与诊断文案，所以必须保证不携带凭据与正文。
+fn describe_request_structure(request: &Value) -> String {
+    let Some(object) = request.as_object() else {
+        return format!("not-an-object kind={}", json_kind(request));
+    };
+    let mut parts = Vec::new();
+    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    for key in keys {
+        let value = &object[key];
+        let entry = match key {
+            // 消息/输入是请求的主体，值得展开到内容块类型这一层。
+            "messages" | "input" => {
+                let Some(items) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let roles = items
+                    .iter()
+                    .filter_map(|item| item.get("role").and_then(Value::as_str))
+                    .fold(BTreeMap::<&str, usize>::new(), |mut acc, role| {
+                        *acc.entry(role).or_default() += 1;
+                        acc
+                    });
+                let role_text = roles
+                    .iter()
+                    .map(|(role, count)| format!("{role}:{count}"))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let mut blocks = Vec::new();
+                collect_content_block_types(items, &mut blocks);
+                format!(
+                    "{key}=[{} roles={}] blocks={{{}}}",
+                    items.len(),
+                    if role_text.is_empty() {
+                        "-".to_string()
+                    } else {
+                        role_text
+                    },
+                    blocks.join(",")
+                )
+            }
+            "tools" => {
+                let Some(tools) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let mut types = tools
+                    .iter()
+                    .map(|tool| {
+                        tool.get("type")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                // Anthropic 的 tool 定义不带 type 键，只有自定义工具。
+                                tool.get("name").and_then(Value::as_str).map(|_| "custom")
+                            })
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                types.sort_unstable();
+                types.dedup();
+                format!("{key}=[{} types={}]", tools.len(), types.join(","))
+            }
+            // 采样与开关类标量：值本身有价值（比如 thinking 的 type），也不敏感。
+            "temperature" | "top_p" | "top_k" | "max_tokens" | "stream" => {
+                format!("{key}={}", short_scalar(value))
+            }
+            "max_output_tokens" | "store" | "previous_response_id" | "truncation" => {
+                format!("{key}={}", short_scalar(value))
+            }
+            "tool_choice" => format!("{key}={}", describe_tool_choice(value)),
+            "system" => {
+                // Claude Code 的 system 是带 cache_control 的文本块数组，
+                // 版本差异正好集中在这里，值本身不能记，结构要记。
+                let Some(blocks) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let mut kinds = Vec::new();
+                let mut cached = 0usize;
+                for block in blocks {
+                    push_block_type(block.get("type"), &mut kinds);
+                    if block.get("cache_control").is_some() {
+                        cached += 1;
+                    }
+                }
+                format!(
+                    "{key}=[{} types={} cache_control={cached}]",
+                    blocks.len(),
+                    kinds.join(",")
+                )
+            }
+            "thinking" => format!(
+                "{key}={}",
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or(json_kind(value))
+            ),
+            "output_config" => {
+                let effort = value.get("effort").and_then(Value::as_str).unwrap_or("-");
+                format!("{key}=effort:{effort}")
+            }
+            // 其余对象/数组只报形状与大小，正文与键名列表都不展开。
+            _ => match value {
+                Value::Array(items) => format!("{key}=[{}({})]", items.len(), json_kind(value)),
+                Value::Object(fields) => {
+                    format!("{key}={{{}({})}}", fields.len(), json_kind(value))
+                }
+                _ => format!("{key}={}", short_scalar(value)),
+            },
+        };
+        parts.push(entry);
+    }
+    parts.join(" ")
+}
+
+/// 递归收集消息里的内容块类型，按出现顺序去重。
+fn collect_content_block_types(items: &[Value], out: &mut Vec<String>) {
+    for item in items {
+        push_block_type(item.get("type"), out);
+        let Some(content) = item.get("content") else {
+            continue;
+        };
+        match content {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    push_block_type(block.get("type"), out);
+                    // tool_result 的 content 里还套着一层块类型。
+                    if let Some(Value::Array(nested)) = block.get("content") {
+                        collect_content_block_types(nested, out);
+                    }
+                }
+            }
+            // 纯字符串内容没有 type 键，但语义上就是 text 块。
+            Value::String(_) => push_block_type(Some(&Value::from("text")), out),
+            _ => {}
+        }
+    }
+}
+
+fn push_block_type(kind: Option<&Value>, out: &mut Vec<String>) {
+    let Some(kind) = kind.and_then(Value::as_str) else {
+        return;
+    };
+    if !out.iter().any(|seen| seen == kind) {
+        out.push(kind.to_string());
+    }
+}
+
+/// 已执行的兼容动作：只写动作名与次数。用于回答"这个字段还可能是原因吗"。
+fn describe_attempted_normalizations(
+    attempted: &[crate::app::ai_compatibility::NormalizationAction],
+) -> String {
+    if attempted.is_empty() {
+        return "none".to_string();
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for action in attempted {
+        let label = match action {
+            crate::app::ai_compatibility::NormalizationAction::Native => "native",
+            crate::app::ai_compatibility::NormalizationAction::Translate => "translate",
+            crate::app::ai_compatibility::NormalizationAction::Degrade => "degrade",
+            crate::app::ai_compatibility::NormalizationAction::Reject => "reject",
+        };
+        *counts.entry(label.to_string()).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(label, count)| format!("{label}x{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn describe_tool_choice(value: &Value) -> String {
+    match value {
+        Value::String(mode) => mode.to_string(),
+        Value::Object(fields) => {
+            let kind = fields
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            let name = fields
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!(":{name}"))
+                .unwrap_or_default();
+            format!("{kind}{name}")
+        }
+        other => json_kind(other).to_string(),
+    }
+}
+
+fn short_scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) if text.len() <= 32 => text.clone(),
+        Value::String(text) => format!("<str:{}>", text.chars().count()),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// 上游错误画像：错误类型/错误码/错误字段 + 原文骨架。
+///
+/// 上游的 400 原文是定位这类问题的唯一一手证据，但直接整段落进日志既可能带
+/// 凭据，也可能很长。这里只保留"骨架"：URL 收敛成 `<url>`，标点与数字去掉、
+/// 连续空白压成一个空格，再按字符（不是字节）截断，避免切坏 UTF-8。
+const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 600;
+
+fn summarize_upstream_error(upstream_text: &str) -> String {
+    let value = serde_json::from_str::<Value>(upstream_text).ok();
+    let mut facts = Vec::new();
+    if let Some(value) = value.as_ref() {
+        for pointer in [
+            "/error/type",
+            "/error/code",
+            "/error/param",
+            "/error/message",
+            "/type",
+            "/code",
+            "/param",
+            "/message",
+            "/error",
+        ] {
+            let Some(field) = value.pointer(pointer) else {
+                continue;
+            };
+            let Some(text) = field.as_str() else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            facts.push(format!(
+                "{}={}",
+                pointer.trim_start_matches('/'),
+                excerpt(text, 200)
+            ));
+        }
+    }
+    let skeleton = upstream_skeleton(upstream_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+    let mut out = String::new();
+    if facts.is_empty() {
+        out.push_str("shape=none");
+    } else {
+        out.push_str(&facts.join(" "));
+    }
+    out.push_str(&format!(" excerpt=\"{skeleton}\""));
+    out
+}
+
+/// 把上游错误体压成可安全落盘的骨架：URL 去掉，连续标点/数字折叠，限长。
+fn upstream_skeleton(text: &str, limit: usize) -> String {
+    let redacted = crate::approval::manager::redact_message(text);
+    let mut skeleton = String::with_capacity(redacted.len().min(limit * 2));
+    let mut last_was_space = true;
+    for character in redacted.chars() {
+        let normalized = if character.is_whitespace() || is_skeleton_noise(character) {
+            ' '
+        } else {
+            character
+        };
+        if normalized == ' ' {
+            if !last_was_space {
+                skeleton.push(' ');
+            }
+            last_was_space = true;
+            continue;
+        }
+        last_was_space = false;
+        skeleton.push(normalized);
+        if skeleton.chars().count() >= limit {
+            skeleton.push('…');
+            break;
+        }
+    }
+    skeleton.trim().to_string()
+}
+
+/// 骨架里要抹掉的字符：标点、数字、URL 分隔符。留下的是"这个词出现了"的信息，
+/// 足以判断上游在抱怨哪个字段，又不至于把整段错误原文抄进日志。
+fn is_skeleton_noise(character: char) -> bool {
+    character.is_ascii_punctuation() || character.is_numeric()
+}
+
+fn excerpt(text: &str, limit: usize) -> String {
+    // 上游有时把整个请求头或凭据抄进错误 message，摘要必须先过脱敏再截断。
+    let redacted = crate::approval::manager::redact_message(text);
+    let trimmed = redacted.trim();
+    let mut out = String::new();
+    for character in trimmed.chars().take(limit) {
+        out.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if trimmed.chars().count() > limit {
+        out.push('…');
+    }
+    out
+}
+
+/// 判断上游 400 对应哪个能力缺口，并在证据不足时如实说明。
+///
+/// 先按请求内容与上游文案定位；都定不到时，把刚才已经做过的降级动作一并带出，
+/// 因为"图片已被降级"和"图片可能就是原因"是互斥的两种结论——旧实现会把早已
+/// 降级掉的字段又列进排查方向，等于把人往死路上引。
+fn infer_unsupported_feature_with_normalizations(
+    request: &Value,
+    upstream_text: &str,
+    attempted: &[crate::app::ai_compatibility::NormalizationAction],
+) -> String {
+    let feature = infer_unsupported_feature(request, upstream_text);
+    if feature != "request_format" || attempted.is_empty() {
+        return feature;
+    }
+    // 泛化 400 + 已有降级：明确标成"仍未定位"，避免与具体能力混淆。
+    "request_format（已降级字段已排除）".to_string()
 }
 
 fn infer_unsupported_feature(request: &Value, upstream_text: &str) -> String {
@@ -2785,8 +3219,10 @@ fn suggested_action_for_feature(feature: &str) -> &'static str {
         }
         "model" => "请从 /v1/models 中选择已登记的模型，不要在 Provider 间直接套用模型名。",
         "tool_protocol" => "请检查 tools/tool_choice/工具结果格式，或切换到兼容 Provider。",
+        // 上游只回了泛化 400，网关据此猜不出具体字段。此时不要给出"逐项移除"的
+        // 假指令：诊断里已经带了请求字段清单与错误原文摘要，让用户按那份证据定位。
         _ => {
-            "请逐项移除 tools、tool_choice、temperature、top_p 和图片后重试；仍失败时反馈参考编号。"
+            "上游只返回了泛化的 400，已记录请求字段清单与错误原文摘要；请按诊断明细定位具体字段，仍无法判断时反馈参考编号。"
         }
     }
 }
@@ -4204,6 +4640,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn anthropic_native_400_diagnostic_carries_request_structure() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let rejected = br#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid request"}}"#;
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                rejected.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(rejected);
+            let _ = stream.flush();
+        });
+
+        let token = "anthropic-native-diag-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "claude-desktop:custom:vectide:model-a".to_string(),
+                client: "claude-desktop".to_string(),
+                service: "custom:vectide".to_string(),
+                profile_id: String::new(),
+                entry_protocol: "anthropic".to_string(),
+                exposed_model: "model-a".to_string(),
+                models: vec!["model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                // 直通：入口 anthropic，上游 anthropic，正是出事的那条路。
+                protocol: "anthropic".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-secret".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "model-a",
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "SECRET-USER-TEXT"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "SECRET-TOOL-OUTPUT"}
+                    ]}
+                ]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let _ = client.write_all(head.as_bytes());
+        let _ = client.write_all(request_body.as_bytes());
+        let _ = client.flush();
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        gateway.stop();
+        upstream_thread.join().unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "response={response}"
+        );
+        // 上游只说了 "invalid request"，但诊断里必须能从请求结构定位到字段。
+        assert!(response.contains("messages=[3"), "{response}");
+        assert!(response.contains("tool_result"), "{response}");
+        assert!(response.contains("thinking=adaptive"), "{response}");
+        assert!(response.contains("output_config=effort:high"), "{response}");
+        assert!(
+            response.contains("error/type=invalid_request_error"),
+            "{response}"
+        );
+        // 结构化字段也要落到 diagnostic 里，便于前端直接展示而不是解析文案。
+        assert!(response.contains(r#""request_detail""#), "{response}");
+        assert!(response.contains(r#""upstream_detail""#), "{response}");
+        // 正文与凭据一律不得外泄。
+        assert!(!response.contains("SECRET-USER-TEXT"), "{response}");
+        assert!(!response.contains("SECRET-TOOL-OUTPUT"), "{response}");
+        assert!(!response.contains("upstream-secret"), "{response}");
+    }
+
+    #[test]
     fn anthropic_entry_translates_to_responses_upstream() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_address = upstream.local_addr().unwrap();
@@ -4364,6 +4894,139 @@ mod tests {
         );
     }
     #[test]
+    fn request_profile_lists_structure_without_content() {
+        let request = serde_json::json!({
+            "model": "deepseek-v4.1-flash-1017",
+            "max_tokens": 32000,
+            "stream": true,
+            "temperature": 0.3,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "system": [{"type": "text", "text": "TOP SECRET SYSTEM PROMPT", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "请检查这张截图 SECRET-USER-TEXT"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "SECRET-THOUGHT"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.png"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "SECRET-TOOL-OUTPUT"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}}
+                ]}]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"}
+        });
+        let profile = describe_request_structure(&request);
+        // 结构信息必须到位：块类型、角色计数、工具数量、采样参数。
+        // 角色计数走 BTreeMap，顺序按角色名排序，保证同一请求永远同一行。
+        assert!(
+            profile.contains("messages=[3 roles=assistant:1/user:2]"),
+            "{profile}"
+        );
+        for block in ["text", "thinking", "tool_use", "tool_result", "image"] {
+            assert!(profile.contains(block), "{profile} missing {block}");
+        }
+        assert!(profile.contains("tools=[1 types=custom]"), "{profile}");
+        assert!(profile.contains("tool_choice=auto"), "{profile}");
+        assert!(profile.contains("thinking=adaptive"), "{profile}");
+        assert!(profile.contains("output_config=effort:high"), "{profile}");
+        assert!(profile.contains("temperature=0.3"), "{profile}");
+        // system 的版本差异集中在块与 cache_control，形态要记，正文不记。
+        assert!(
+            profile.contains("system=[1 types=text cache_control=1]"),
+            "{profile}"
+        );
+        // 正文一个字都不能出现。
+        for secret in [
+            "SECRET-USER-TEXT",
+            "SECRET-TOOL-OUTPUT",
+            "SECRET-THOUGHT",
+            "TOP SECRET SYSTEM PROMPT",
+            "AAAA",
+        ] {
+            assert!(!profile.contains(secret), "{profile} leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn upstream_error_summary_keeps_shape_and_redacts_credentials() {
+        let summarised = summarize_upstream_error(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.1: unexpected field `cache_control`; Authorization: Bearer sk-secret-value\nrequest id: req_vt_abc123"}}"#,
+        );
+        assert!(
+            summarised.contains("error/type=invalid_request_error"),
+            "{summarised}"
+        );
+        assert!(summarised.contains("cache_control"), "{summarised}");
+        assert!(summarised.contains("excerpt="), "{summarised}");
+        assert!(!summarised.contains("sk-secret-value"), "{summarised}");
+    }
+
+    #[test]
+    fn upstream_skeleton_is_char_bounded_and_keeps_words() {
+        let long = "messages.3.content.0.type must be one of text image".repeat(20);
+        let skeleton = upstream_skeleton(&long, 80);
+        assert!(skeleton.chars().count() <= 81, "{skeleton}");
+        assert!(skeleton.contains("messages"), "{skeleton}");
+        assert!(skeleton.contains("one of"), "{skeleton}");
+        // 中文字符不能被按字节切断。
+        let chinese = upstream_skeleton("不支持该字段：缓存控制", 600);
+        assert!(chinese.contains("不支持该字段"), "{chinese}");
+    }
+
+    #[test]
+    fn generic_request_format_diagnostic_no_longer_gives_false_instruction() {
+        assert!(!suggested_action_for_feature("request_format").contains("逐项移除"));
+        assert!(suggested_action_for_feature("request_format").contains("参考编号"));
+    }
+
+    #[test]
+    fn already_degraded_features_are_not_relisted_as_cause() {
+        let request = serde_json::json!({
+            "model": "model-a",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        // 上游只回泛化 400，且本次已经做了降级：必须标明"仍未定位"，
+        // 而不是把 request_format 当成一个可以逐项排除的结论。
+        let feature = infer_unsupported_feature_with_normalizations(
+            &request,
+            r#"{"error":{"message":"invalid request"}}"#,
+            &[crate::app::ai_compatibility::NormalizationAction::Degrade],
+        );
+        assert!(feature.contains("request_format"), "{feature}");
+        assert!(feature.contains("已降级"), "{feature}");
+        // 没有降级动作时保持原样，避免把标签变得不可预测。
+        assert_eq!(
+            infer_unsupported_feature_with_normalizations(
+                &request,
+                r#"{"error":{"message":"invalid request"}}"#,
+                &[]
+            ),
+            "request_format"
+        );
+        // 能定位到具体能力时，降级动作不参与判断。
+        assert_eq!(
+            infer_unsupported_feature_with_normalizations(
+                &request,
+                r#"{"error":{"message":"tool_choice is unsupported"}}"#,
+                &[crate::app::ai_compatibility::NormalizationAction::Degrade]
+            ),
+            "tool_choice"
+        );
+        assert_eq!(
+            describe_attempted_normalizations(&[
+                crate::app::ai_compatibility::NormalizationAction::Degrade,
+                crate::app::ai_compatibility::NormalizationAction::Degrade,
+                crate::app::ai_compatibility::NormalizationAction::Translate,
+            ]),
+            "degradex2,translatex1"
+        );
+        assert_eq!(describe_attempted_normalizations(&[]), "none");
+    }
+
+    #[test]
     fn anthropic_tool_result_image_gets_specific_diagnostic_feature() {
         let request = serde_json::json!({
             "model": "model-a",
@@ -4449,7 +5112,15 @@ mod tests {
         assert!(response.contains(r#""unsupported_feature":"tool_choice""#));
         assert!(response.contains(r#""request_id":"req_vt_header_456""#));
         assert!(response.contains(r#""suggested_action""#));
-        assert!(!response.contains("sk-secret-value"));
+        // 泛化 400 也要把两侧画像带出来，否则用户手里没有任何可定位的证据。
+        assert!(response.contains("诊断："), "{response}");
+        assert!(
+            response.contains("request_id=req_vt_header_456"),
+            "{response}"
+        );
+        // 上游把 "Authorization: Bearer sk-secret-value" 写进了错误原文，
+        // 两个画像都必须先脱敏：响应体与日志里都不能出现它。
+        assert!(!response.contains("sk-secret-value"), "{response}");
         assert!(!response.contains("upstream-secret"));
         assert!(!response.contains("Bearer sk-"));
     }

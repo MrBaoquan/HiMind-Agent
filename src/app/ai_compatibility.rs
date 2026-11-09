@@ -333,6 +333,13 @@ pub(crate) struct CompatibilityDiagnosticV1 {
     pub attempted_normalizations: Vec<NormalizationAction>,
     pub suggested_action: String,
     pub safe_message: String,
+    /// 上游错误的结构化摘要（错误类型/码/字段 + 脱敏骨架）。
+    ///
+    /// 上游 400 常常只有一句 "invalid request"，没有它就无法复盘是哪一步
+    /// 撞上了兼容边界。默认空串，保持对旧诊断的向后兼容。
+    pub upstream_detail: String,
+    /// 出站请求的结构画像：字段名、内容块类型、采样参数，不含任何正文。
+    pub request_detail: String,
 }
 
 impl Default for CompatibilityDiagnosticV1 {
@@ -349,6 +356,8 @@ impl Default for CompatibilityDiagnosticV1 {
             attempted_normalizations: Vec::new(),
             suggested_action: "检查客户端、Provider 与模型组合是否在兼容矩阵中".to_string(),
             safe_message: "请求与 Provider 能力不兼容".to_string(),
+            upstream_detail: String::new(),
+            request_detail: String::new(),
         }
     }
 }
