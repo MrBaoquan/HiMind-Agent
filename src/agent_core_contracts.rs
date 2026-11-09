@@ -233,6 +233,12 @@ pub(crate) struct LocalRunStep {
     pub capability_id: String,
     #[serde(default)]
     pub runtime_provider: String,
+    /// 这一步实际使用的模型别名；空串表示没有调用模型或运行方未上报。
+    ///
+    /// 由 runner 从步骤输出里回填。之前只有 builtin 会在输出里带 model，
+    /// 导致运行详情对 Codex / Copilot / ACP 步骤一律显示「无模型信息」。
+    #[serde(default)]
+    pub model: String,
     /// 执行这一步的角色。留空表示工作流没有声明角色；旧台账读出来就是空串。
     #[serde(default)]
     pub role_id: String,

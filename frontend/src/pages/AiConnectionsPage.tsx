@@ -35,7 +35,7 @@ type AiConnectionsPageProps = {
   aiServiceTemplates: AIServiceTemplateListResult | null;
   gatewayStatus: InferenceGatewayStatus | null;
   gatewayProfiles: GatewayProfile[];
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) => Promise<void>;
   onSaveGatewayProfile: (input: GatewayProfileInput) => Promise<void>;
   onRemoveGatewayProfile: (id: string) => Promise<void>;
   gatewayBusy: boolean;

@@ -2956,8 +2956,10 @@ pub(crate) async fn stop_inference_gateway_and_unbind(
         let mut switched = Vec::new();
         let mut failures = Vec::new();
         for client in &clients {
+            // 「停网关并全部解绑」是用户显式发起的整体动作；这里记录直连风险，
+            // 但不再逐客户端二次确认，否则会导致网关永远停不下来。
             match crate::app::ai_provider_import::disable_gateway_binding(
-                &options, &user_id, client,
+                &options, &user_id, client, true,
             ) {
                 Ok(_) => switched.push(client.clone()),
                 Err(error) => {
@@ -3026,6 +3028,7 @@ pub(crate) async fn set_provider_binding_mode(
     mode: String,
     service: Option<String>,
     profile_id: Option<String>,
+    allow_direct_risk: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -3052,9 +3055,12 @@ pub(crate) async fn set_provider_binding_mode(
                     )
                 }
             }
-            "direct" => {
-                crate::app::ai_provider_import::disable_gateway_binding(&options, &user_id, &target)
-            }
+            "direct" => crate::app::ai_provider_import::disable_gateway_binding(
+                &options,
+                &user_id,
+                &target,
+                allow_direct_risk.unwrap_or(false),
+            ),
             other => return Err(format!("注入模式只支持 gateway 或 direct，收到：{other}")),
         }
         .map_err(|error| error.to_string())?;
@@ -8090,6 +8096,82 @@ pub(crate) fn retry_workflow_step(
         .retry_step(run, &step_id)
         .map_err(|error| error.to_string())?;
     serde_json::to_value(run).map_err(|error| error.to_string())
+}
+
+/// 读取通知通道配置（不含任何凭据）。
+#[tauri::command]
+pub(crate) fn list_notification_channels() -> Result<serde_json::Value, String> {
+    let items = crate::notification_channels::load().map_err(|error| error.to_string())?;
+    // 只回配置字段，不回 webhook 地址：地址在 credentials 里，界面不需要看到。
+    let safe = items
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "kind": item.kind,
+                "label": item.label,
+                "enabled": item.enabled,
+                "events": item.events,
+                "min_risk": item.min_risk,
+                "configured": !item.webhook_handle.trim().is_empty()
+                    && crate::notification_channels::has_webhook(&item.webhook_handle),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({ "channels": safe }))
+}
+
+/// 保存通知通道配置；`webhook` 有值时一并写入 DPAPI 凭据。
+#[tauri::command]
+pub(crate) fn save_notification_channel(
+    id: String,
+    kind: String,
+    label: Option<String>,
+    enabled: bool,
+    events: Vec<String>,
+    min_risk: Option<String>,
+    webhook: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("通知通道需要 id".to_string());
+    }
+    let supported = ["dingtalk", "feishu", "lark", "wecom", "slack", "discord", "generic"];
+    let kind = kind.trim().to_ascii_lowercase();
+    if !supported.contains(&kind.as_str()) {
+        return Err(format!("不支持的通知通道类型：{kind}"));
+    }
+    let handle = format!("cred://notification/{id}");
+    if let Some(webhook) = webhook.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        crate::notification_channels::set_webhook(&handle, webhook)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut items = crate::notification_channels::load().map_err(|error| error.to_string())?;
+    let record = crate::notification_channels::NotificationChannelConfig {
+        id: id.to_string(),
+        kind,
+        label: label.unwrap_or_default().trim().to_string(),
+        enabled,
+        webhook_handle: handle,
+        events,
+        min_risk: min_risk.unwrap_or_default().trim().to_string(),
+    };
+    items.retain(|item| item.id != record.id);
+    items.push(record);
+    crate::notification_channels::save(&items).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "saved": true, "id": id }))
+}
+
+#[tauri::command]
+pub(crate) fn delete_notification_channel(id: String) -> Result<serde_json::Value, String> {
+    let id = id.trim();
+    let mut items = crate::notification_channels::load().map_err(|error| error.to_string())?;
+    let before = items.len();
+    items.retain(|item| item.id != id);
+    crate::notification_channels::save(&items).map_err(|error| error.to_string())?;
+    // 顺手清掉凭据：删通道却留着 webhook 地址是没必要的暴露面。
+    let _ = crate::notification_channels::forget_webhook(&format!("cred://notification/{id}"));
+    Ok(serde_json::json!({ "removed": before != items.len(), "id": id }))
 }
 
 #[tauri::command]

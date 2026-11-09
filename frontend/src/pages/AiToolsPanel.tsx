@@ -44,7 +44,7 @@ type AiToolsPanelProps = {
   onRemoveAIClient: (target: string) => Promise<void>;
   /** 没有可用来源时，「模型」接线要给一条去「模型来源」的路，而不是只留一个禁用按钮。 */
   onOpenModelSources: () => void;
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) => Promise<void>;
   gatewayBusy: boolean;
   onRestartGateway: () => void;
   onStopGateway: () => void;
@@ -470,7 +470,7 @@ function ToolRow(props: {
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
   onOpenModelSources: () => void;
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) => Promise<void>;
   onSourceDraft: (value: string) => void;
   onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
   onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
@@ -520,15 +520,18 @@ function ToolRow(props: {
   }
 
   async function switchBindingMode(nextMode: 'gateway' | 'direct') {
-    if (nextMode === 'direct' && clientStatus?.warning) {
+    const directWarning = clientStatus?.direct_warning || clientStatus?.warning;
+    let allowDirectRisk = false;
+    if (nextMode === 'direct' && directWarning) {
       const accepted = await confirm({
         title: `改为直连 ${item.name}？`,
-        description: `${clientStatus.warning} 直连将绕过兼容规范化，可能再次触发 400。`,
+        description: `${directWarning} 直连将绕过兼容规范化，可能再次触发 400。`,
         confirmText: '仍然直连',
       });
       if (!accepted) return;
+      allowDirectRisk = true;
     }
-    await onRunRow(item.key, () => onSetBindingMode(item.key, nextMode));
+    await onRunRow(item.key, () => onSetBindingMode(item.key, nextMode, undefined, undefined, allowDirectRisk));
   }
   async function distributeSource() {
     if (!sourceDraft) return;
@@ -595,6 +598,7 @@ function ToolRow(props: {
                   </select>
                   <span className="muted">· {gatewayProfile?.profile_name ? `聚合：${gatewayProfile.profile_name}（${gatewayProfile.models.length} 个模型）` : gatewayMode ? '经本机网关' : '直连'}</span>
                   {!gatewayMode && clientStatus?.warning ? <span className="warning-text">{clientStatus.warning}</span> : null}
+                  {gatewayMode && clientStatus?.direct_warning ? <span className="warning-text">{clientStatus.direct_warning}</span> : null}
                 </> : <>
                   <span className="status-dot" />
                   <span className="muted">未分发</span>

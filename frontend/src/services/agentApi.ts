@@ -458,6 +458,10 @@ export type WorkflowLocalRun = {
         title: string;
         status: string;
         capability_id: string;
+        /** 这一步实际使用的 runtime provider；缺省表示未上报。 */
+        runtime_provider?: string;
+        /** 这一步实际使用的模型别名；空串表示没有调用模型。 */
+        model?: string;
         /** 执行角色；缺省表示没有声明角色。 */
         role_id?: string;
         attempt: number;
@@ -601,6 +605,29 @@ export type WorkflowInteractionKind = 'approval' | 'feedback' | 'form' | 'eviden
  * Workflow Runner 等待态的稳定 UI View Model。
  * 事实仍来自 Runtime Event；页面不再直接猜测 payload 字段。
  */
+/** 通知通道的展示视图：只含配置，不含 webhook 地址。 */
+export type NotificationChannelView = {
+  id: string;
+  kind: string;
+  label: string;
+  enabled: boolean;
+  events: string[];
+  min_risk: string;
+  /** webhook 是否已写入本机凭据。 */
+  configured: boolean;
+};
+
+export type NotificationChannelInput = {
+  id: string;
+  kind: string;
+  label?: string;
+  enabled: boolean;
+  events: string[];
+  min_risk?: string;
+  /** 只在需要写入/更新时传；留空表示不改已存的地址。 */
+  webhook?: string;
+};
+
 export type WorkflowInteractionRequest = {
     schema_version: 'interaction_request.v1' | string;
     id: string;
@@ -3038,6 +3065,9 @@ export type AIProviderImportStatus = {
     restart_required?: boolean;
     last_error?: string;
     warning?: string;
+    direct_warning?: string;
+    direct_risk_acknowledged_at?: string;
+    direct_risk_reason?: string;
 };
 
 export type AIProviderSyncPlan = {
@@ -3328,8 +3358,8 @@ export const agentApi = {
     restartInferenceGateway: () => invoke<InferenceGatewayStatus>('restart_inference_gateway'),
     setInferenceGatewayPort: (port: number) => invoke<InferenceGatewayStatus>('set_inference_gateway_port', { port }),
     stopInferenceGatewayAndUnbind: () => invoke<InferenceGatewayStopReport>('stop_inference_gateway_and_unbind'),
-    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) =>
-        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null, profileId: profileId ?? null }),
+    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) =>
+        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null, profileId: profileId ?? null, allowDirectRisk: allowDirectRisk ?? false }),
     startDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('start_dashboard_authorization'),
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
@@ -3493,6 +3523,9 @@ export const agentApi = {
     rejectWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('reject_workflow_step', { runId, stepId }),
     cancelWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('cancel_workflow_run', { runId }),
     pauseWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('pause_workflow_run', { runId }),
+    notificationChannels: () => invoke<{ channels: NotificationChannelView[] }>('list_notification_channels'),
+    saveNotificationChannel: (input: NotificationChannelInput) => invoke<{ saved: boolean; id: string }>('save_notification_channel', input),
+    deleteNotificationChannel: (id: string) => invoke<{ removed: boolean; id: string }>('delete_notification_channel', { id }),
     retryWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('retry_workflow_step', { runId, stepId }),
     resumePausedWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('resume_paused_workflow_run', { runId }),
     resumeWorkflowRun: (runId: string, feedback?: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId, feedback }),

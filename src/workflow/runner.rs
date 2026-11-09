@@ -400,6 +400,7 @@ impl WorkflowRunner {
                         step.capability_id.clone()
                     },
                     runtime_provider: interaction.runtime_hint.clone(),
+                    model: String::new(),
                     role_id: step.role_id.trim().to_string(),
                     attempt: 0,
                     started_at: String::new(),
@@ -835,6 +836,16 @@ impl WorkflowRunner {
                     {
                         run_step.runtime_provider = provider.to_string();
                     }
+                    // 实际使用的模型：所有 Runtime 都写在同一处，前端不必按 provider 分支。
+                    // 没有模型（确定性能力步骤）时保持空串，界面显示「未调用模型」。
+                    if let Some(model) = execution
+                        .output
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        run_step.model = model.to_string();
+                    }
                     if let Some(message) = step_failure(step, &condition_context, &execution)? {
                         if tolerates_failure(step) {
                             let message = degraded_failure_message(&message);
@@ -868,6 +879,8 @@ impl WorkflowRunner {
                             RuntimeEventType::Error,
                             serde_json::json!({"error": message}),
                         )?;
+                        // 运行失败也推出去：夜间定时任务挂掉时，没人守着界面。
+                        notify_run_failed(package, &run, step, &message);
                         return Ok(outcome(run, String::new(), completed_steps));
                     }
                     let artifacts = normalize_artifacts(
@@ -900,6 +913,7 @@ impl WorkflowRunner {
                                 "role_id": step.role_id,
                                 "capability_id": step.capability_id,
                                 "runtime_provider": run_step_provider(&run.run_id, step, &self.ledger),
+                                "model": execution.output.get("model").cloned().unwrap_or(Value::Null),
                                 "inputs": step_input_snapshot,
                                 "artifact_ids": run.artifacts.iter().map(|artifact| &artifact.artifact_id).collect::<Vec<_>>(),
                             }),
@@ -2617,6 +2631,33 @@ fn without_execution_selection(input: &Value) -> Value {
     value
 }
 
+/// 推送「运行失败」到外部通道。
+///
+/// 与审批推送同样的约束：独立线程、失败不上抛。运行已经失败了，
+/// 通知再抛错只会掩盖真正的失败原因。
+fn notify_run_failed(
+    package: &WorkflowPackage,
+    run: &LocalRun,
+    step: &WorkflowStep,
+    error: &str,
+) {
+    let run_id = run.run_id.clone();
+    let workflow_name = package.name.clone();
+    let step_title = step.title.clone();
+    let error = error.to_string();
+    let _ = std::thread::Builder::new()
+        .name("himind-notify".to_string())
+        .spawn(move || {
+            let note = crate::notification_channels::run_failed_notification(
+                &run_id,
+                &workflow_name,
+                &step_title,
+                &error,
+            );
+            crate::notification_channels::dispatch(&note);
+        });
+}
+
 fn loop_iteration_output(run: &LocalRun, ledger: &LocalRunLedger) -> Result<Value, Box<dyn Error>> {
     let mut steps = serde_json::Map::new();
     for event in ledger.list_events(&run.run_id)? {
@@ -3635,6 +3676,118 @@ mod tests {
         assert_eq!(outcome.run.status, LocalRunStatus::Canceled);
         assert_eq!(outcome.run.error, "canceled during workflow step");
         assert!(outcome.completed_steps.is_empty());
+    }
+
+    /// 步骤实际使用的模型必须落到 `LocalRunStep.model`：前端据此显示
+    /// 「这一步用了哪个模型」，不再只有 builtin 有模型信息。
+    #[test]
+    fn runner_records_the_model_each_step_actually_used() {
+        struct ModeledExecutor;
+        impl WorkflowStepExecutor for ModeledExecutor {
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                Ok(WorkflowStepExecution::output(serde_json::json!({
+                    "provider": if step.id == "STEP-1" { "himind.builtin" } else { "acp.claude" },
+                    "model": if step.id == "STEP-1" {
+                        "himind:svc-a:deepseek-chat"
+                    } else {
+                        "claude-sonnet-4-5"
+                    },
+                })))
+            }
+        }
+
+        let ledger = ledger("step-model-facts");
+        let runner = WorkflowRunner::with_ledger(ledger.clone());
+        let mut package = package();
+        package.artifacts.clear();
+        package.candidate = None;
+        package.execution_policy = "strict".to_string();
+        package.entrypoints.clear();
+        package.exits.clear();
+        package.default_entrypoint.clear();
+        package.default_exitpoint.clear();
+        package.steps = vec![
+            WorkflowStep {
+                id: "STEP-1".to_string(),
+                title: "Builtin".to_string(),
+                kind: "runtime".to_string(),
+                capability_id: String::new(),
+                runtime: Some(super::super::WorkflowRuntimeStep {
+                    provider: "himind.builtin".to_string(),
+                    prompt: "a".to_string(),
+                    workspace_path: String::new(),
+                    result_schema: String::new(),
+                    allow_network: None,
+                    input_artifacts: Vec::new(),
+                    tool_policy: String::new(),
+                    model: "himind:svc-a:deepseek-chat".to_string(),
+                    model_fallbacks: Vec::new(),
+                    timeout_seconds: 60,
+                }),
+                delegate: None,
+                loop_config: None,
+                when: None,
+                fail_when: None,
+                candidate_action: String::new(),
+                input: serde_json::json!({}),
+                execution_mode: "sync".to_string(),
+                role_id: String::new(),
+                risk_level: "local_write".to_string(),
+                approval_required: false,
+                on_failure: String::new(),
+                depends_on: Vec::new(),
+            },
+            WorkflowStep {
+                id: "STEP-2".to_string(),
+                title: "ACP".to_string(),
+                kind: "runtime".to_string(),
+                capability_id: String::new(),
+                runtime: Some(super::super::WorkflowRuntimeStep {
+                    provider: "acp.claude".to_string(),
+                    prompt: "b".to_string(),
+                    workspace_path: String::new(),
+                    result_schema: String::new(),
+                    allow_network: None,
+                    input_artifacts: Vec::new(),
+                    tool_policy: String::new(),
+                    model: "acp:claude:claude-sonnet-4-5".to_string(),
+                    model_fallbacks: Vec::new(),
+                    timeout_seconds: 60,
+                }),
+                delegate: None,
+                loop_config: None,
+                when: None,
+                fail_when: None,
+                candidate_action: String::new(),
+                input: serde_json::json!({}),
+                execution_mode: "sync".to_string(),
+                role_id: String::new(),
+                risk_level: "local_write".to_string(),
+                approval_required: false,
+                on_failure: String::new(),
+                depends_on: vec!["STEP-1".to_string()],
+            },
+        ];
+        package.supported_runtimes = vec!["himind.builtin".to_string(), "acp.claude".to_string()];
+
+        let run = runner
+            .start("agent-1", &package, "model-facts", &serde_json::json!({"workspace_root": "C:/w"}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&package, run, &serde_json::json!({"workspace_root": "C:/w"}), &ModeledExecutor)
+            .unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
+        let first = outcome.run.steps.iter().find(|s| s.step_id == "STEP-1").unwrap();
+        assert_eq!(first.model, "himind:svc-a:deepseek-chat");
+        assert_eq!(first.runtime_provider, "himind.builtin");
+        let second = outcome.run.steps.iter().find(|s| s.step_id == "STEP-2").unwrap();
+        assert_eq!(second.model, "claude-sonnet-4-5");
+        assert_eq!(second.runtime_provider, "acp.claude");
     }
 
     #[test]

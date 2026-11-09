@@ -359,7 +359,8 @@ function StartFields({ sections, values, errors, onChange, onPickDirectory, cont
                   </label>
                 );
               }
-              if (field.type === 'select') {
+              // runtime-provider / model 与 select 同形：都从 options 取值。
+              if (field.type === 'select' || field.type === 'runtime-provider' || field.type === 'model') {
                 return (
                   <label key={field.id} data-field-id={field.id} className={fieldClass}>
                     {label}

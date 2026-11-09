@@ -53,6 +53,42 @@
       ]
     },
     {
+      "id": "execution",
+      "title": "执行环境",
+      "fields": [
+        {
+          "id": "implement_provider",
+          "label": "打磨步骤的 AI 客户端",
+          "type": "runtime-provider",
+          "options": [
+            { "value": "inherit", "label": "按包声明（默认）" },
+            { "value": "himind.builtin", "label": "HiMind AI（内置）" },
+            { "value": "acp.claude", "label": "Claude Agent（ACP）" },
+            { "value": "acp.codex", "label": "Codex（ACP）" },
+            { "value": "acp.opencode", "label": "OpenCode（ACP）" }
+          ],
+          "hint": "只影响打磨步骤；审查与守门仍走内置引擎以保证隔离。",
+          "override": {
+            "stepId": "POLISH",
+            "key": "runtime_provider"
+          }
+        },
+        {
+          "id": "implement_model",
+          "label": "打磨步骤的模型",
+          "type": "model",
+          "options": [
+            { "value": "inherit", "label": "沿用客户端当前模型" }
+          ],
+          "hint": "himind:<服务id>:<模型> 或 acp:<客户端>:<模型>；选「沿用」表示不改。",
+          "override": {
+            "stepId": "POLISH",
+            "key": "model"
+          }
+        }
+      ]
+    },
+    {
       "id": "limits",
       "title": "轮次与判据",
       "fields": [

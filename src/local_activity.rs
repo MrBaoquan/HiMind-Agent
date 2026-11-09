@@ -489,6 +489,7 @@ mod tests {
             status,
             capability_id: String::new(),
             runtime_provider: String::new(),
+            model: String::new(),
             role_id: role.to_string(),
             attempt: 0,
             started_at: String::new(),

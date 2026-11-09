@@ -148,6 +148,61 @@ pub(crate) fn apply_execution_overrides(
             }
             step.on_failure = "fail".to_string();
         }
+        // 换 Runtime 只允许在主清单 + 可选清单内进行。
+        //
+        // 这是「不重新打包也能换外部 AI 客户端」的唯一入口：包作者用
+        // `optional_providers` 声明能接受的替代实现，用户启动时选其中一个。
+        // 白名单之外的 provider 一律拒绝——运行参数不能成为绕过包声明的后门。
+        if let Some(provider) = spec.get("runtime_provider").and_then(Value::as_str) {
+            let provider = provider.trim();
+            if provider.is_empty() {
+                return Err(format!(
+                    "execution override runtime_provider cannot be empty: {step_id}"
+                )
+                .into());
+            }
+            if !package.accepts_provider(provider) {
+                return Err(format!(
+                    "execution override runtime_provider is not declared by the package: {step_id} -> {provider}"
+                )
+                .into());
+            }
+            let runtime = step.runtime.as_mut().ok_or_else(|| {
+                format!(
+                    "execution override runtime_provider requires a runtime step: {step_id}"
+                )
+            })?;
+            // 换 provider 不能把「强制隔离」换成「做不到隔离」。
+            // 这条和预检的 tool_policy 检查是同一个约束，但必须在这里也拦一次：
+            // 用户可能在预检通过后才提交覆盖，而覆盖是启动路径上最后一处可写点。
+            if runtime.tool_policy.trim() == "none" && !runtime_supports_tool_none(provider) {
+                return Err(format!(
+                    "execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=none"
+                )
+                .into());
+            }
+            runtime.provider = provider.to_string();
+        }
+        // 换模型：与换 provider 同一道门。空串表示「清掉声明、回到 Runtime 默认」，
+        // 因此必须是显式 null/空串才生效，避免前端漏字段时误清。
+        if let Some(model) = spec.get("model").and_then(Value::as_str) {
+            let model = model.trim();
+            let runtime = step.runtime.as_mut().ok_or_else(|| {
+                format!("execution override model requires a runtime step: {step_id}")
+            })?;
+            if model.is_empty() {
+                runtime.model = String::new();
+                runtime.model_fallbacks.clear();
+            } else {
+                validate_model_alias(model)
+                    .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
+                model_alias_matches_provider(&runtime.provider, model)
+                    .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
+                runtime.model = model.to_string();
+                // 换了主模型，旧降级序列（可能属于另一命名空间）就不再成立。
+                runtime.model_fallbacks.clear();
+            }
+        }
     }
     // 覆盖后必须仍然是一个合法包：例如给 runtime 步骤加审批会撞上能力步骤的约束。
     patched.validate().map_err(std::io::Error::other)?;
@@ -197,6 +252,167 @@ pub(crate) fn runtime_supports_tool_none(provider: &str) -> bool {
 
 pub(crate) fn workflow_approval_id(run_id: &str, step_id: &str) -> String {
     format!("workflow:{}:{}", run_id.trim(), step_id.trim())
+}
+
+/// 模型别名的两种命名空间。
+///
+/// 别名必须带来源前缀：`deepseek-chat` 这个名字可能同时存在于两个服务账号下，
+/// 裸 id 无法决定走哪条路由。
+const MODEL_ALIAS_HIMIND_PREFIX: &str = "himind:";
+const MODEL_ALIAS_ACP_PREFIX: &str = "acp:";
+/// 透传给外部 CLI 的模型 id（`cli:codex:<id>` / `cli:github-copilot:<id>`）。
+///
+/// 与前两个命名空间的区别：`himind:` 与 `acp:` 都是**逻辑别名**，由平台解析；
+/// `cli:` 是**原样透传**，因为 Codex / Copilot 的模型 id 属于它们自己的协议，
+/// 平台不做映射，也无法校验是否存在。
+const MODEL_ALIAS_CLI_PREFIX: &str = "cli:";
+
+/// 这条模型别名是否语法合法。
+///
+/// 只校验形状，不校验「这个模型在这台机器上装没装」——后者是预检的事，
+/// 需要探测本机 AI 服务与 ACP profile，契约校验阶段拿不到。
+///
+/// 约束：
+/// - `himind:<service_id>:<model>`，两段都非空；
+/// - `acp:<provider>:<model>`，provider 可带 `acp.` 前缀也可不带（归一后比较）。
+pub(crate) fn validate_model_alias(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > 300 {
+        return Err(format!("model alias is too long: {} chars", value.len()));
+    }
+    if value.chars().any(char::is_control) || value.contains(char::is_whitespace) {
+        return Err(format!("model alias cannot contain whitespace or control chars: {value}"));
+    }
+    if let Some(rest) = value.strip_prefix(MODEL_ALIAS_HIMIND_PREFIX) {
+        let (service, model) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("himind model alias requires <service>:<model>: {value}"))?;
+        if service.trim().is_empty() || model.trim().is_empty() {
+            return Err(format!("himind model alias has an empty segment: {value}"));
+        }
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix(MODEL_ALIAS_ACP_PREFIX) {
+        let (provider, model) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("acp model alias requires <provider>:<model>: {value}"))?;
+        let provider = provider.trim().strip_prefix("acp.").unwrap_or(provider.trim());
+        if provider.is_empty() || model.trim().is_empty() {
+            return Err(format!("acp model alias has an empty segment: {value}"));
+        }
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix(MODEL_ALIAS_CLI_PREFIX) {
+        let (provider, model) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("cli model alias requires <provider>:<model>: {value}"))?;
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(format!("cli model alias has an empty segment: {value}"));
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "model alias must start with `himind:`, `acp:` or `cli:` (got {value}); a bare model id cannot decide the route"
+    ))
+}
+
+impl WorkflowPackage {
+    /// 这个包是否接受某个 Runtime：主清单与可选清单都算。
+    ///
+    /// 预检、运行期覆盖、角色/步骤校验必须共用这一条，否则会出现
+    /// 「声明在 optional_providers 里、预检也列出来了，运行时却说未声明」。
+    pub(crate) fn accepts_provider(&self, provider: &str) -> bool {
+        let provider = provider.trim();
+        !provider.is_empty()
+            && (self
+                .supported_runtimes
+                .iter()
+                .any(|item| item.trim() == provider)
+                || self
+                    .optional_providers
+                    .iter()
+                    .any(|item| item.trim() == provider))
+    }
+}
+
+/// 模型别名与某个具体 Provider 是否匹配。
+///
+/// `auto` 不接受任何声明模型：auto 的语义是「运行时自己挑一个能干的」，
+/// 它可能挑到不认这个命名空间的 Runtime，所以在契约阶段就拒绝，
+/// 让作者显式写出 provider。
+pub(crate) fn model_alias_matches_provider(provider: &str, alias: &str) -> Result<(), String> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(());
+    }
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err("declaring model requires an explicit runtime provider".to_string());
+    }
+    if provider == "auto" {
+        return Err(
+            "declaring model requires an explicit runtime provider, not `auto`".to_string(),
+        );
+    }
+    let namespace = model_alias_namespace(alias).ok_or_else(|| {
+        format!("model alias must start with `himind:`, `acp:` or `cli:` (got {alias})")
+    })?;
+    let provider_is_acp = provider == "acp.stdio" || provider.starts_with("acp.");
+    let provider_is_cli = matches!(provider, "personal.codex" | "personal.github-copilot");
+    match (namespace, provider_is_acp, provider_is_cli) {
+        ("himind", false, false) => Ok(()),
+        ("acp", true, false) => Ok(()),
+        ("cli", false, true) => {
+            // 透传命名空间还要核对「给谁用」：`cli:codex:` 不能喂给 Copilot。
+            let rest = alias.trim_start_matches(MODEL_ALIAS_CLI_PREFIX);
+            let target = rest.split_once(':').map(|(name, _)| name.trim()).unwrap_or_default();
+            if target.eq_ignore_ascii_case(cli_target_for_provider(provider)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "runtime {provider} cannot execute `cli:{target}:` model alias {alias}; the cli target must be {}",
+                    cli_target_for_provider(provider)
+                ))
+            }
+        }
+        ("himind", true, _) | ("himind", _, true) => Err(format!(
+            "runtime {provider} cannot execute `himind:` model alias {alias}; `himind:` aliases are only resolved by the built-in runtime"
+        )),
+        ("acp", _, _) => Err(format!(
+            "runtime {provider} cannot execute `acp:` model alias {alias}; `acp:` aliases belong to an ACP client"
+        )),
+        ("cli", _, _) => Err(format!(
+            "runtime {provider} cannot execute `cli:` model alias {alias}; `cli:` aliases are only forwarded to a local CLI runtime"
+        )),
+        _ => Err(format!("model alias has an unsupported namespace: {alias}")),
+    }
+}
+
+/// `cli:` 别名里的目标名与 provider 的稳定映射。
+fn cli_target_for_provider(provider: &str) -> &'static str {
+    match provider.trim() {
+        "personal.codex" => "codex",
+        "personal.github-copilot" => "github-copilot",
+        _ => "",
+    }
+}
+
+/// 别名归属哪个 Runtime 命名空间。
+pub(crate) fn model_alias_namespace(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    if value.starts_with(MODEL_ALIAS_HIMIND_PREFIX) {
+        return Some("himind");
+    }
+    if value.starts_with(MODEL_ALIAS_ACP_PREFIX) {
+        return Some("acp");
+    }
+    if value.starts_with(MODEL_ALIAS_CLI_PREFIX) {
+        return Some("cli");
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -481,6 +697,21 @@ pub(crate) struct WorkflowRuntimeStep {
     /// 不需要模型再调用文件工具。
     #[serde(default)]
     pub tool_policy: String,
+    /// 这一步用哪个模型。留空表示「沿用 Runtime 的当前配置」（历史行为）。
+    ///
+    /// 取值是**逻辑别名**而不是裸模型 id：
+    /// - `himind:<service_id>:<model>`：本机 AI 服务里的某个模型，由 Agent 内的
+    ///   推理网关按别名路由（见 `app::builtin_ai_router::model_alias`）。
+    /// - `acp:<provider>:<model>`：外部 ACP 客户端声明的模型，映射到该会话
+    ///   `config_options` 里 `category=model` 的可选值。
+    ///
+    /// 为什么不写裸 id：同名的 `deepseek-chat` 可能来自两个不同的服务账号，
+    /// 裸 id 在网关里无法区分；别名已经带上了来源。
+    #[serde(default)]
+    pub model: String,
+    /// 主模型不可用时的降级序列，按顺序尝试；全部不可用则 fail-closed。
+    #[serde(default)]
+    pub model_fallbacks: Vec<String>,
     #[serde(default)]
     pub timeout_seconds: u64,
 }
@@ -509,6 +740,12 @@ pub(crate) struct WorkflowRole {
     /// 只能依据显式注入的 Artifact（diff、测试报告）判断。
     #[serde(default)]
     pub tool_policy: String,
+    /// 覆盖步骤声明的模型别名。留空沿用步骤自己的。
+    ///
+    /// 与 `tool_policy` 正交：需要「隔离审查 + 轻模型」时，把 `tool_policy`
+    /// 设成 `none`（锁 builtin）同时在这里指定便宜的模型，不必二选一。
+    #[serde(default)]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -802,11 +1039,13 @@ impl WorkflowPackage {
                 ));
             }
             let provider = role.runtime_provider.trim();
-            if !provider.is_empty() && !self.supported_runtimes.iter().any(|item| item == provider) {
+            if !provider.is_empty() && !self.accepts_provider(provider) {
                 return Err(format!(
-                    "workflow role {role_id} runtime_provider is not declared in supported_runtimes: {provider}"
+                    "workflow role {role_id} runtime_provider is not declared in supported_runtimes or optional_providers: {provider}"
                 ));
             }
+            validate_model_alias(&role.model)
+                .map_err(|error| format!("workflow role {role_id} model: {error}"))?;
         }
         validate_dependency_refs("skill", &self.dependencies.skills)?;
         validate_dependency_refs("plugin", &self.dependencies.plugins)?;
@@ -826,7 +1065,7 @@ impl WorkflowPackage {
         let mut step_ids = HashSet::new();
         validate_step_scope(&self.steps, &mut step_ids, 0)?;
         validate_execution_contract(self, &step_ids)?;
-        validate_runtime_declarations(&self.steps, &self.supported_runtimes)?;
+        validate_runtime_declarations(self, &self.steps)?;
         for runtime in &self.dependencies.runtimes {
             if !self.supported_runtimes.contains(runtime) {
                 return Err(format!(
@@ -1272,13 +1511,20 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                     | "topic-groups"
                     | "json"
                     | "credential"
+                    // 运行环境 / 模型选择：与 select 同形，但语义上专指
+                    // 「这一步用哪个 Runtime / 哪个模型」。选项来自预检结果
+                    // 或包声明，值写进 execution_overrides 而不是步骤输入。
+                    | "runtime-provider"
+                    | "model"
             ) {
                 return Err(
                     format!("workflow view field {} type is invalid", definition.id).into(),
                 );
             }
-            if definition.field_type == "select"
-                && definition.options.is_empty()
+            if matches!(
+                definition.field_type.as_str(),
+                "select" | "runtime-provider" | "model"
+            ) && definition.options.is_empty()
                 && definition.option_source.is_none()
             {
                 return Err(format!(
@@ -1637,18 +1883,70 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
             step.id
         ));
     }
+    validate_model_alias(&runtime.model)
+        .map_err(|error| format!("workflow runtime step {} model: {error}", step.id))?;
+    // 声明了模型就必须写明确 provider：auto 可能解析到不认这个命名空间的 Runtime。
+    model_alias_matches_provider(&runtime.provider, &runtime.model)
+        .map_err(|error| format!("workflow runtime step {}: {error}", step.id))?;
+    for alias in &runtime.model_fallbacks {
+        model_alias_matches_provider(&runtime.provider, alias)
+            .map_err(|error| format!("workflow runtime step {}: {error}", step.id))?;
+    }
+    let mut seen_models = HashSet::new();
+    for alias in &runtime.model_fallbacks {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Err(format!(
+                "workflow runtime step {} model_fallbacks contains an empty alias",
+                step.id
+            ));
+        }
+        if !seen_models.insert(alias.to_string()) {
+            return Err(format!(
+                "workflow runtime step {} model_fallbacks contains a duplicate alias: {alias}",
+                step.id
+            ));
+        }
+        validate_model_alias(alias).map_err(|error| {
+            format!(
+                "workflow runtime step {} model_fallbacks: {error}",
+                step.id
+            )
+        })?;
+    }
+    // 降级序列必须与主模型同一命名空间：himind 别名换到 acp 客户端上去
+    // 没有意义，而且会让「主模型不可用」的判定变得不可预测。
+    if !runtime.model.trim().is_empty() {
+        let primary = model_alias_namespace(&runtime.model);
+        for alias in &runtime.model_fallbacks {
+            if model_alias_namespace(alias) != primary {
+                return Err(format!(
+                    "workflow runtime step {} model_fallbacks must stay in the same namespace as model",
+                    step.id
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
+/// 每个 Runtime 步骤的 provider 都必须在本包里声明过。
+///
+/// 「声明过」= `supported_runtimes`（本包主推）∪ `optional_providers`（本包接受、
+/// 由用户按需选择）。两侧必须同一判据：预检按这个集合生成候选，运行期覆盖也按
+/// 这个集合放行；只要有一处更严格，就会出现「预检说能换、运行时不认」。
 fn validate_runtime_declarations(
+    package: &WorkflowPackage,
     steps: &[WorkflowStep],
-    supported_runtimes: &[String],
 ) -> Result<(), String> {
-    fn walk(steps: &[WorkflowStep], supported_runtimes: &[String]) -> Result<(), String> {
+    fn walk(
+        package: &WorkflowPackage,
+        steps: &[WorkflowStep],
+    ) -> Result<(), String> {
         for step in steps {
             if let Some(runtime) = step.runtime.as_ref() {
                 let provider = runtime.provider.trim();
-                if provider != "auto" && !supported_runtimes.iter().any(|item| item == provider) {
+                if provider != "auto" && !package.accepts_provider(provider) {
                     return Err(format!(
                         "workflow runtime step {} uses undeclared provider {}",
                         step.id, provider
@@ -1656,12 +1954,26 @@ fn validate_runtime_declarations(
                 }
             }
             if let Some(loop_config) = step.loop_config.as_ref() {
-                walk(&loop_config.steps, supported_runtimes)?;
+                walk(package, &loop_config.steps)?;
+            }
+            if let Some(delegate) = step.delegate.as_ref() {
+                for branch in &delegate.branches {
+                    let Some(runtime) = branch.runtime.as_ref() else {
+                        continue;
+                    };
+                    let provider = runtime.provider.trim();
+                    if provider != "auto" && !package.accepts_provider(provider) {
+                        return Err(format!(
+                            "workflow delegate branch {} uses undeclared provider {}",
+                            branch.id, provider
+                        ));
+                    }
+                }
             }
         }
         Ok(())
     }
-    walk(steps, supported_runtimes)
+    walk(package, steps)
 }
 
 fn validate_loop_step(
@@ -1784,6 +2096,26 @@ fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), Strin
                 "workflow delegate branch {} tool_policy must be default or none",
                 branch.id
             ));
+        }
+        validate_model_alias(&runtime.model).map_err(|error| {
+            format!("workflow delegate branch {} model: {error}", branch.id)
+        })?;
+        model_alias_matches_provider(&runtime.provider, &runtime.model).map_err(|error| {
+            format!("workflow delegate branch {}: {error}", branch.id)
+        })?;
+        for alias in &runtime.model_fallbacks {
+            if alias.trim().is_empty() {
+                return Err(format!(
+                    "workflow delegate branch {} model_fallbacks contains an empty alias",
+                    branch.id
+                ));
+            }
+            validate_model_alias(alias).map_err(|error| {
+                format!(
+                    "workflow delegate branch {} model_fallbacks: {error}",
+                    branch.id
+                )
+            })?;
         }
         if !branch.role_id.trim().is_empty() {
             validate_workflow_id(branch.role_id.trim()).map_err(|error| {
@@ -2353,6 +2685,8 @@ mod tests {
             allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 1_800,
         });
         step.when = Some(WorkflowCondition {
@@ -2389,12 +2723,134 @@ mod tests {
             allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 86_401,
         });
         assert!(package
             .validate()
             .unwrap_err()
             .contains("timeout_seconds must not exceed 86400"));
+    }
+
+    /// 模型别名必须带命名空间：裸 id 无法决定走哪条路由，应当在契约阶段拒绝。
+    #[test]
+    fn model_alias_requires_a_namespace_prefix() {
+        assert!(validate_model_alias("").is_ok(), "留空表示沿用 Runtime 配置");
+        assert!(validate_model_alias("himind:svc-a:deepseek-chat").is_ok());
+        assert!(validate_model_alias("acp:claude:claude-sonnet-4-5").is_ok());
+        assert!(validate_model_alias("acp:acp.claude:claude-sonnet-4-5").is_ok());
+        assert_eq!(model_alias_namespace("himind:svc-a:x"), Some("himind"));
+        assert_eq!(model_alias_namespace("acp:claude:x"), Some("acp"));
+        assert_eq!(model_alias_namespace("deepseek-chat"), None);
+
+        let bare = validate_model_alias("deepseek-chat").unwrap_err();
+        assert!(bare.contains("himind:"), "{bare}");
+        assert!(validate_model_alias("himind:svc-a").is_err(), "缺 model 段");
+        assert!(validate_model_alias("himind::m").is_err(), "service 为空");
+        assert!(validate_model_alias("acp:claude:").is_err(), "model 为空");
+        assert!(validate_model_alias("himind:svc:a b").is_err(), "含空白");
+    }
+
+    /// 步骤声明了非法模型别名时整包校验必须失败，而不是留到运行时。
+    #[test]
+    fn rejects_runtime_step_with_invalid_model_alias() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let mut package = load_from_directory(&root).unwrap();
+        let step = &mut package.steps[0];
+        step.kind = "runtime".to_string();
+        step.capability_id.clear();
+        package
+            .supported_runtimes
+            .extend(["personal.codex".to_string(), "himind.builtin".to_string()]);
+        step.runtime = Some(WorkflowRuntimeStep {
+            provider: "personal.codex".to_string(),
+            prompt: "Do work.".to_string(),
+            workspace_path: "input.workspace_root".to_string(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            model: "deepseek-chat".to_string(),
+            model_fallbacks: Vec::new(),
+            timeout_seconds: 60,
+        });
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("model alias must start with"), "{error}");
+
+        // 换成合法别名后通过——但 `himind:` 别名只归内置 Runtime，所以 provider 一起换。
+        package.steps[0].runtime.as_mut().unwrap().provider = "himind.builtin".to_string();
+        package.steps[0].runtime.as_mut().unwrap().model = "himind:svc-a:deepseek-chat".to_string();
+        package.validate().unwrap();
+
+        // `himind:` 别名配外部 CLI 必须被拒绝：CLI 没有这条路由。
+        package.steps[0].runtime.as_mut().unwrap().provider = "personal.codex".to_string();
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("`himind:` aliases are only resolved"), "{error}");
+    }
+
+    /// 降级序列不能跨命名空间：himind 主模型降级到 acp 客户端没有语义。
+    ///
+    /// 现在的拒绝可能来自两处（provider 不认该命名空间 / 降级序列与主模型不同源），
+    /// 两者都是对的；这里只断言「被拒绝且指向 acp 别名」，不锁具体措辞。
+    #[test]
+    fn rejects_model_fallbacks_across_namespaces() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let mut package = load_from_directory(&root).unwrap();
+        let step = &mut package.steps[0];
+        step.kind = "runtime".to_string();
+        step.capability_id.clear();
+        package
+            .supported_runtimes
+            .extend(["personal.codex".to_string(), "himind.builtin".to_string()]);
+        // 主模型与 provider 匹配，只有降级序列跨了命名空间：
+        // provider 用内置，这样失败点唯一落在「降级序列与主模型不同源」上。
+        step.runtime = Some(WorkflowRuntimeStep {
+            provider: "himind.builtin".to_string(),
+            prompt: "Do work.".to_string(),
+            workspace_path: "input.workspace_root".to_string(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            model: "himind:svc-a:deepseek-chat".to_string(),
+            model_fallbacks: vec!["acp:claude:claude-sonnet-4-5".to_string()],
+            timeout_seconds: 60,
+        });
+        let error = package.validate().unwrap_err();
+        assert!(
+            error.contains("same namespace") || error.contains("acp:"),
+            "{error}"
+        );
+
+        // 主模型与降级序列同源、且 provider 认这个命名空间时通过。
+        // 注意：`himind:` 别名只归内置 Runtime，所以 provider 也要一起换。
+        let runtime = package.steps[0].runtime.as_mut().unwrap();
+        runtime.provider = "himind.builtin".to_string();
+        runtime.model_fallbacks = vec!["himind:svc-b:deepseek-reasoner".to_string()];
+        package.validate().unwrap_or_else(|error| {
+            panic!("合法的 himind 主模型 + 同源降级应通过，实际: {error}")
+        });
+    }
+
+    /// 角色上的模型别名同样受校验：它是步骤模型的覆盖来源。
+    #[test]
+    fn rejects_role_with_invalid_model_alias() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("ui-craft-team");
+        let mut package = load_from_directory(&root).unwrap();
+        let role = package
+            .roles
+            .get_mut("ui.guard")
+            .expect("shipped package declares ui.guard");
+        role.model = "claude-sonnet".to_string();
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("workflow role ui.guard model"), "{error}");
     }
 
     #[test]
@@ -2553,6 +3009,233 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cannot remove the approval gate"));
+    }
+
+    /// 运行期换 Runtime 只能在包声明过的 provider 内进行。
+    ///
+    /// 这是「不重新打包也能换外部 AI 客户端」的唯一入口；白名单之外必须拒绝，
+    /// 否则运行参数就成了绕过包声明的后门。
+    #[test]
+    fn runtime_provider_override_respects_declared_providers() {
+        let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.provider-override",
+            "version": "1.0.0",
+            "name": "Provider Override",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "supported_runtimes": ["himind.builtin"],
+            "optional_providers": ["acp.claude"],
+            "steps": [{
+                "id": "WORK",
+                "title": "Work",
+                "kind": "runtime",
+                "execution_mode": "sync",
+                "risk_level": "local_write",
+                "runtime": {
+                    "provider": "himind.builtin",
+                    "prompt": "do work",
+                    "tool_policy": "default"
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        package.validate().unwrap();
+        assert!(package.accepts_provider("himind.builtin"));
+        assert!(package.accepts_provider("acp.claude"), "可选清单也算接受");
+        assert!(!package.accepts_provider("acp.codex"));
+
+        // 主清单 -> 可选清单：允许。
+        let switched = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "runtime_provider": "acp.claude" } }
+            }),
+        )
+        .unwrap();
+        let step = switched.steps.iter().find(|s| s.id == "WORK").unwrap();
+        assert_eq!(step.runtime.as_ref().unwrap().provider, "acp.claude");
+
+        // 未声明的 provider：拒绝。
+        let error = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "runtime_provider": "acp.codex" } }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not declared by the package"), "{error}");
+
+        // 空值：拒绝（不能用来清空 provider）。
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "runtime_provider": "  " } }
+            }),
+        )
+        .is_err());
+
+        // 非 runtime 步骤：拒绝。
+        package.steps[0].kind = "manual".to_string();
+        package.steps[0].runtime = None;
+        package.steps[0].approval_required = true;
+        package.steps[0].risk_level = "R3".to_string();
+        let error = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "runtime_provider": "acp.claude" } }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires a runtime step"), "{error}");
+    }
+
+    /// 启动时换模型：同命名空间允许，跨命名空间或裸 id 拒绝；
+    /// 换 provider 后同步换模型也必须一致。
+    #[test]
+    fn model_override_follows_the_declared_provider_namespace() {
+        let package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.model-override",
+            "version": "1.0.0",
+            "name": "Model Override",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "supported_runtimes": ["himind.builtin"],
+            "optional_providers": ["acp.claude"],
+            "steps": [{
+                "id": "WORK",
+                "title": "Work",
+                "kind": "runtime",
+                "execution_mode": "sync",
+                "risk_level": "local_write",
+                "runtime": {
+                    "provider": "himind.builtin",
+                    "prompt": "do work",
+                    "model": "himind:svc-a:deepseek-chat",
+                    "model_fallbacks": ["himind:svc-a:deepseek-reasoner"]
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        package.validate().unwrap();
+
+        // 同命名空间换模型：允许，且旧降级序列被清掉（它属于旧主模型）。
+        let switched = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "model": "himind:svc-b:qwen-max" } }
+            }),
+        )
+        .unwrap();
+        let runtime = switched.steps[0].runtime.as_ref().unwrap();
+        assert_eq!(runtime.model, "himind:svc-b:qwen-max");
+        assert!(runtime.model_fallbacks.is_empty());
+
+        // 跨命名空间：拒绝。
+        let error = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "model": "acp:claude:claude-sonnet-4-5" } }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot execute `acp:`"), "{error}");
+
+        // 裸 id：拒绝。
+        assert!(apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "model": "deepseek-chat" } }
+            }),
+        )
+        .is_err());
+
+        // 先换 provider 再换模型：两个覆盖一起提交时按 provider 先行，合法。
+        let both = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": {
+                    "WORK": {
+                        "runtime_provider": "acp.claude",
+                        "model": "acp:claude:claude-sonnet-4-5"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let runtime = both.steps[0].runtime.as_ref().unwrap();
+        assert_eq!(runtime.provider, "acp.claude");
+        assert_eq!(runtime.model, "acp:claude:claude-sonnet-4-5");
+
+        // 空串表示回到 Runtime 默认：允许，且降级序列一起清空。
+        let cleared = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "model": "" } }
+            }),
+        )
+        .unwrap();
+        let runtime = cleared.steps[0].runtime.as_ref().unwrap();
+        assert!(runtime.model.is_empty());
+        assert!(runtime.model_fallbacks.is_empty());
+
+        // 非 runtime 步骤：拒绝。
+        let mut manual = package.clone();
+        manual.steps[0].kind = "manual".to_string();
+        manual.steps[0].runtime = None;
+        manual.steps[0].approval_required = true;
+        manual.steps[0].risk_level = "R3".to_string();
+        let error = apply_execution_overrides(
+            &manual,
+            &serde_json::json!({
+                "execution_overrides": { "WORK": { "model": "himind:svc-a:deepseek-chat" } }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires a runtime step"), "{error}");
+    }
+
+    /// 声明了 model 就必须写死 provider：auto 可能挑到不认这个命名空间的 Runtime。
+    #[test]
+    fn declaring_model_requires_an_explicit_provider() {
+        let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.model-needs-provider",
+            "version": "1.0.0",
+            "name": "Model Needs Provider",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "supported_runtimes": ["himind.builtin", "acp.claude"],
+            "steps": [{
+                "id": "WORK",
+                "title": "Work",
+                "kind": "runtime",
+                "execution_mode": "sync",
+                "risk_level": "local_write",
+                "runtime": {
+                    "provider": "auto",
+                    "prompt": "do work",
+                    "model": "himind:svc-a:deepseek-chat"
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("not `auto`"), "{error}");
+
+        package.steps[0].runtime.as_mut().unwrap().provider = "acp.claude".to_string();
+        let error = package.validate().unwrap_err();
+        assert!(error.contains("cannot execute `himind:`"), "{error}");
+
+        package.steps[0].runtime.as_mut().unwrap().provider = "himind.builtin".to_string();
+        package.validate().unwrap();
     }
 
     /// 覆盖测试自带一个最小包：直接依赖某个已发布包的形状，会让「包改了」误伤

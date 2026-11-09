@@ -786,6 +786,7 @@ pub(crate) struct AnthropicResponsesStream {
     model: String,
     message_started: bool,
     finished: bool,
+    failed: bool,
     next_index: u64,
     text_index: Option<u64>,
     tools: HashMap<String, ToolBlock>,
@@ -822,6 +823,7 @@ impl AnthropicResponsesStream {
             model,
             message_started: false,
             finished: false,
+            failed: false,
             next_index: 0,
             text_index: None,
             tools: HashMap::new(),
@@ -953,6 +955,7 @@ impl AnthropicResponsesStream {
                     json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
                 ));
                 self.finished = true;
+                self.failed = true;
                 events
             }
             _ => Vec::new(),
@@ -976,6 +979,10 @@ impl AnthropicResponsesStream {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         )
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
     }
 
     fn handle_output_item_added(&mut self, event: &Value) -> Vec<String> {
@@ -1629,5 +1636,17 @@ mod tests {
             output.contains(r#""stop_reason":"tool_use""#),
             "output={output}"
         );
+    }
+
+    #[test]
+    fn stream_failure_marks_failed_and_stops_lifecycle() {
+        let mut stream = AnthropicResponsesStream::new("alias".to_string());
+        let output = stream
+            .push_line(r#"data: {"type":"error","error":{"message":"上游失败"}}"#)
+            .concat();
+        assert!(stream.failed());
+        assert!(output.contains("event: error"), "output={output}");
+        assert!(!output.contains("event: message_stop"), "output={output}");
+        assert!(stream.finish().is_empty());
     }
 }

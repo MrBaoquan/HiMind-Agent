@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { NotificationChannelsPanel } from '../components/NotificationChannelsPanel';
 import { agentApi, type AgentBackupExportReport, type AgentBackupInspectReport, type AgentBackupRestoreReport, type AgentBackupScope, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type EngineInstallation, type GithubAccountStatus, type GithubAppAuthorization, type GithubAppInstallation, type LogItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe } from '../services/agentApi';
 import { Bell, BellOff, Bot, Check, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Github, Globe2, Inbox, KeyRound, Link2, LockKeyhole, LogIn, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, ScanSearch, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
@@ -860,6 +861,9 @@ export function SettingsPage({
                   <div className="approval-group-heading"><strong>怎么提醒我</strong><span>不影响审批中心和托盘中的待处理数量</span></div>
                   <ChoiceGroup className="approval-notification-options" label="审批提醒方式" value={settings.notification_mode || 'popup'} options={APPROVAL_NOTIFICATION_OPTIONS} onChange={onApprovalNotificationModeChange} />
                 </div>
+
+                {/* 本机提醒之外的外部通道：人不在电脑前时唯一能看到的途径。 */}
+                <NotificationChannelsPanel />
 
                 <div className="approval-settings-group approval-effective-group">
                   <div className="approval-group-heading"><strong>当前实际行为</strong><span>{exactRuleCount ? `另有 ${exactRuleCount} 条单项例外优先生效` : '没有额外的单项例外'}</span></div>

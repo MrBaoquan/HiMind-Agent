@@ -369,6 +369,7 @@ pub(crate) struct AnthropicStream {
     input_tokens: u64,
     output_tokens: u64,
     finished: bool,
+    failed: bool,
 }
 
 impl AnthropicStream {
@@ -383,11 +384,38 @@ impl AnthropicStream {
             input_tokens: 0,
             output_tokens: 0,
             finished: false,
+            failed: false,
         }
     }
 
     pub(crate) fn usage(&self) -> (u64, u64) {
         (self.input_tokens, self.output_tokens)
+    }
+
+    /// 上游流内错误已经作为 Anthropic `error` 事件写给客户端；调用方不能
+    /// 再用 HTTP 200 记成功用量。
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn fail_with(&mut self, payload: &Value) -> Vec<String> {
+        if self.failed {
+            return Vec::new();
+        }
+        self.failed = true;
+        self.finished = true;
+        let message = payload
+            .pointer("/error/message")
+            .or_else(|| payload.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Chat 上游流式生成失败");
+        vec![event(
+            "error",
+            json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": message },
+            }),
+        )]
     }
 
     /// 消费一行 OpenAI SSE，返回需要写给客户端的完整 Anthropic 事件块。
@@ -403,6 +431,15 @@ impl AnthropicStream {
             Ok(chunk) => chunk,
             Err(_) => return Vec::new(),
         };
+        // Chat 兼容上游的流内错误分片没有 choices。旧实现会把它当成空事件，
+        // 随后补一个正常的 message_delta/message_stop，客户端看到的是
+        // “模型什么都没说就结束了”。
+        if let Some(error) = chunk.get("error") {
+            return self.fail_with(error);
+        }
+        if chunk.get("type").and_then(Value::as_str) == Some("error") {
+            return self.fail_with(&chunk);
+        }
         let mut events = Vec::new();
         if !self.started {
             self.started = true;
@@ -742,5 +779,23 @@ mod tests {
         assert!(out.contains(r#""name":"read""#));
         assert!(out.contains(r#""partial_json":"{\"path\":"#));
         assert!(out.contains(r#""stop_reason":"tool_use""#));
+    }
+
+    #[test]
+    fn stream_error_chunk_emits_anthropic_error_without_message_stop() {
+        let mut stream = AnthropicStream::new("m".to_string());
+        let mut out = String::new();
+        out.push_str(
+            &stream
+                .push_line(
+                    r#"data: {"error":{"type":"invalid_request_error","message":"内容被拒绝"}}"#,
+                )
+                .join(""),
+        );
+        out.push_str(&stream.finish().join(""));
+        assert!(stream.failed());
+        assert!(out.contains("event: error"), "out={out}");
+        assert!(out.contains("\"message\":\"内容被拒绝\""), "out={out}");
+        assert!(!out.contains("event: message_stop"), "out={out}");
     }
 }

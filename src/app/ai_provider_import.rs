@@ -576,6 +576,11 @@ struct AIProviderImportBinding {
     restart_required: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     last_error: String,
+    /// 最近一次用户确认直连风险的时间与原文；治理审计用。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    direct_risk_acknowledged_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    direct_risk_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -639,6 +644,15 @@ pub(crate) struct AIProviderImportStatus {
     /// `detail` 只在未注册时渲染，已注册的告警需要一个独立通道才可见。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub warning: String,
+    /// 直连风险提示：无论当前是否已经直连都计算，供 UI 在「切到直连」前确认。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub direct_warning: String,
+    /// 最近一次确认直连风险的时间；为空表示从未确认过。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub direct_risk_acknowledged_at: String,
+    /// 确认时记录的风险原文，作为审计事实保留。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub direct_risk_reason: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1590,8 +1604,15 @@ fn direct_compatibility_warning(target: &str, service_source: &str) -> String {
     let unsupported = service_source
         .trim()
         .strip_prefix("custom:")
-        .and_then(|id| crate::store::ai_services::load_secret(id).ok())
-        .map(|(service, _)| {
+        .and_then(|id| {
+            // 风险只依赖端点与协议，不需要解密 API Key；状态页会被频繁刷新，
+            // 这里避免对每个客户端都跑一次 DPAPI。
+            crate::store::ai_services::list()
+                .ok()?
+                .into_iter()
+                .find(|service| service.id == id)
+        })
+        .map(|service| {
             // 告警要针对客户端实际走的那一族端点：多端点服务上，按主端点
             // 评估会把 Anthropic 客户端的风险算到 OpenAI 端点头上。
             let (base_url, protocol) = match required_protocol_family(target)
@@ -1620,6 +1641,23 @@ fn direct_compatibility_warning(target: &str, service_source: &str) -> String {
         client.display_name, risk
     )
 }
+
+/// 切回直连前的治理闸门：富工具客户端存在风险时，必须有显式确认才能继续。
+/// 返回值是风险原文，调用方在确认后把它写进绑定簿记作为审计事实。
+fn require_direct_risk_acknowledgement(
+    target: &str,
+    service_source: &str,
+    acknowledged: bool,
+) -> Result<String, String> {
+    let warning = direct_compatibility_warning(target, service_source);
+    if !warning.is_empty() && !acknowledged {
+        return Err(format!(
+            "直连风险未确认：{warning} 如果仍要直连，请确认风险后重试。"
+        ));
+    }
+    Ok(warning)
+}
+
 /// 本机网关地址：优先使用当前进程已启动的网关；命令行或诊断进程没有网关单例时，
 /// 回退到当前 profile 的持久化端口，并确认该端口确实由 HiMind 网关监听。
 fn local_gateway_url(options: &Options) -> Option<String> {
@@ -2234,6 +2272,7 @@ pub(crate) fn disable_gateway_binding(
     options: &Options,
     expected_user_id: &str,
     target: &str,
+    allow_direct_risk: bool,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let target = target.trim();
     let bindings = load_import_bindings(options);
@@ -2242,6 +2281,8 @@ pub(crate) fn disable_gateway_binding(
         .get(target)
         .map(|binding| binding.service.clone())
         .unwrap_or_else(|| "managed".to_string());
+    // 先过治理闸门，再动客户端配置：未确认的风险不能留下半切状态。
+    let direct_risk = require_direct_risk_acknowledgement(target, &service, allow_direct_risk)?;
     let result = import(
         options,
         expected_user_id,
@@ -2259,6 +2300,13 @@ pub(crate) fn disable_gateway_binding(
     if let Some(binding) = bindings.clients.get_mut(target) {
         binding.mode.clear();
         binding.gateway = None;
+        if direct_risk.is_empty() {
+            binding.direct_risk_acknowledged_at.clear();
+            binding.direct_risk_reason.clear();
+        } else {
+            binding.direct_risk_acknowledged_at = now_rfc3339();
+            binding.direct_risk_reason = direct_risk;
+        }
     }
     save_import_bindings(options, &bindings)?;
     Ok(result)
@@ -2464,18 +2512,22 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                         status.sync_reason_codes = desired.reason_codes;
                         status.restart_required = desired.restart_required;
                         status.last_error = binding.last_error.clone();
-                        if binding.mode != BINDING_MODE_GATEWAY {
-                            let warning = direct_compatibility_warning(
-                                status.target.as_str(),
-                                binding.service.as_str(),
-                            );
-                            if !warning.is_empty() {
-                                status.warning = if status.warning.is_empty() {
-                                    warning
-                                } else {
-                                    format!("{}；{}", status.warning, warning)
-                                };
-                            }
+                        // 直连风险无论当前模式都要计算：UI 在「切到直连」之前
+                        // 需要先看到它，不能等切换完才提示。
+                        let direct_warning = direct_compatibility_warning(
+                            status.target.as_str(),
+                            binding.service.as_str(),
+                        );
+                        status.direct_warning = direct_warning.clone();
+                        status.direct_risk_acknowledged_at =
+                            binding.direct_risk_acknowledged_at.clone();
+                        status.direct_risk_reason = binding.direct_risk_reason.clone();
+                        if binding.mode != BINDING_MODE_GATEWAY && !direct_warning.is_empty() {
+                            status.warning = if status.warning.is_empty() {
+                                direct_warning
+                            } else {
+                                format!("{}；{direct_warning}", status.warning)
+                            };
                         }
                         // 客户端自己不记时间时，用簿记时间兜底，UI 才能显示「最近同步」。
                         if status.synced_at.is_empty() {
@@ -13050,5 +13102,22 @@ command = "uvx.exe"
             let client = matrix.client(target).unwrap();
             assert!(client.default_gateway, "{target} must default to gateway");
         }
+    }
+
+    #[test]
+    fn direct_risk_requires_explicit_acknowledgement() {
+        let error = super::require_direct_risk_acknowledgement("codex", "managed", false)
+            .expect_err("rich-tool direct must require acknowledgement");
+        assert!(error.contains("直连风险未确认"), "{error}");
+        assert!(error.contains("富工具客户端"), "{error}");
+
+        let acknowledged = super::require_direct_risk_acknowledgement("codex", "managed", true)
+            .expect("acknowledged direct should pass");
+        assert!(!acknowledged.is_empty());
+
+        // 不在能力矩阵里的客户端没有可评估的直连风险，不应被闸门误伤。
+        let unknown = super::require_direct_risk_acknowledgement("not-a-client", "managed", false)
+            .expect("unknown client should not be gated");
+        assert!(unknown.is_empty());
     }
 }

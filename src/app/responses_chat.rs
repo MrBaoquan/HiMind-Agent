@@ -459,6 +459,7 @@ pub(crate) struct ResponsesStream {
     message_text: String,
     tool_items: Vec<ToolItem>,
     stop_reason: Option<String>,
+    failed: bool,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
@@ -483,6 +484,7 @@ impl ResponsesStream {
             message_text: String::new(),
             tool_items: Vec::new(),
             stop_reason: None,
+            failed: false,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
@@ -492,6 +494,35 @@ impl ResponsesStream {
 
     pub(crate) fn usage(&self) -> (u64, u64) {
         (self.input_tokens, self.output_tokens)
+    }
+
+    /// 上游流内错误已经把失败事件写给客户端；调用方不能再用 HTTP 200
+    /// 把它记成成功用量。
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn fail_with(&mut self, payload: &Value) -> Vec<String> {
+        if self.failed {
+            return Vec::new();
+        }
+        self.failed = true;
+        let message = payload
+            .pointer("/error/message")
+            .or_else(|| payload.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Chat 上游流式生成失败");
+        let code = payload
+            .pointer("/error/code")
+            .or_else(|| payload.pointer("/error/type"))
+            .and_then(Value::as_str)
+            .unwrap_or("upstream_error");
+        let mut response = response_envelope(&json!({}), &self.model, Vec::new(), "failed");
+        response["error"] = json!({ "code": code, "message": message });
+        vec![event(
+            "response.failed",
+            json!({ "type": "response.failed", "response": response }),
+        )]
     }
 
     pub(crate) fn cached_tokens(&self) -> u64 {
@@ -514,6 +545,15 @@ impl ResponsesStream {
             Ok(chunk) => chunk,
             Err(_) => return Vec::new(),
         };
+        // Chat 兼容上游可能在流内直接发 `{"error": ...}`（限流、内容拒绝、
+        // 上下文超限等）。旧实现只找 choices，遇到这种分片会当成空事件，
+        // 最后仍合成 response.completed，客户端以为模型正常答完了。
+        if let Some(error) = chunk.get("error") {
+            return self.fail_with(error);
+        }
+        if chunk.get("type").and_then(Value::as_str) == Some("error") {
+            return self.fail_with(&chunk);
+        }
         let mut events = Vec::new();
         if !self.created {
             self.created = true;
@@ -646,11 +686,20 @@ impl ResponsesStream {
         events
     }
 
-    /// 上游流结束：补齐 done 事件与 response.completed。
+    /// 上游流结束：补齐 done 事件与终结事件。
+    ///
+    /// 失败已经由 `response.failed` 收尾，不能再补一个 `response.completed`；
+    /// 长度截断要如实标记成 `response.incomplete`，否则客户端会把半截回答
+    /// 当成完整结果。
     pub(crate) fn finish(&mut self) -> Vec<String> {
-        if !self.created {
+        if self.failed || !self.created {
             return Vec::new();
         }
+        let incomplete_reason = match self.stop_reason.as_deref() {
+            Some("length") => Some("max_output_tokens"),
+            Some("content_filter") => Some("content_filter"),
+            _ => None,
+        };
         let mut events = Vec::new();
         let mut output = Vec::<Value>::new();
         if self.message_started {
@@ -692,10 +741,23 @@ impl ResponsesStream {
             "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
             "completion_tokens_details": { "reasoning_tokens": self.reasoning_tokens },
         }});
-        let response = response_envelope(&usage, &self.model, output, "completed");
+        let status = if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let mut response = response_envelope(&usage, &self.model, output, status);
+        if let Some(reason) = incomplete_reason {
+            response["incomplete_details"] = json!({ "reason": reason });
+        }
+        let event_name = if incomplete_reason.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         events.push(event(
-            "response.completed",
-            json!({ "type": "response.completed", "response": response }),
+            event_name,
+            json!({ "type": event_name, "response": response }),
         ));
         events
     }
@@ -958,6 +1020,54 @@ mod tests {
         let completed = out.find("event: response.completed").unwrap();
         assert!(created < added && added < delta && delta < completed);
         assert_eq!(stream.usage(), (5, 2));
+    }
+
+    #[test]
+    fn stream_error_chunk_emits_failed_without_completed() {
+        let mut stream = ResponsesStream::new("m".to_string());
+        let mut out = String::new();
+        out.push_str(
+            &stream
+                .push_line(r#"data: {"id":"c1","choices":[{"delta":{"content":"半"}}]}"#)
+                .concat(),
+        );
+        out.push_str(
+            &stream
+                .push_line(
+                    r#"data: {"error":{"type":"rate_limit_error","code":"429","message":"请求过快"}}"#,
+                )
+                .concat(),
+        );
+        // 失败之后上游可能还会补一个结束分片，客户端不能再收到 completed。
+        out.push_str(
+            &stream
+                .push_line(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+                .concat(),
+        );
+        out.push_str(&stream.finish().concat());
+        assert!(stream.failed());
+        assert!(out.contains("event: response.failed"), "out={out}");
+        assert!(!out.contains("event: response.completed"), "out={out}");
+        assert!(out.contains("\"message\":\"请求过快\""), "out={out}");
+    }
+
+    #[test]
+    fn stream_length_finish_emits_incomplete() {
+        let mut stream = ResponsesStream::new("m".to_string());
+        let mut out = String::new();
+        for line in [
+            r#"data: {"id":"c1","choices":[{"delta":{"content":"被截断"}}]}"#,
+            r#"data: {"id":"c1","choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ] {
+            out.push_str(&stream.push_line(line).concat());
+        }
+        out.push_str(&stream.finish().concat());
+        assert!(out.contains("event: response.incomplete"), "out={out}");
+        assert!(!out.contains("event: response.completed"), "out={out}");
+        assert!(
+            out.contains("\"reason\":\"max_output_tokens\""),
+            "out={out}"
+        );
     }
 
     #[test]

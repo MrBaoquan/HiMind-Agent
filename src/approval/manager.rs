@@ -395,6 +395,17 @@ impl ApprovalManager {
         };
         self.add_log("info", &format!("等待审批: {title} ({timeout_label})"));
 
+        // 推送到已配置的外部通道（钉钉/飞书等）。
+        //
+        // 必须在独立线程里做并立刻返回：投递是网络操作，最多等 8 秒；
+        // 放在这里同步调会把审批线程堵住，而通知失败绝不该影响审批本身。
+        spawn_notification(
+            id.clone(),
+            title.clone(),
+            description.clone(),
+            risk_level.unwrap_or_default().to_string(),
+        );
+
         self.wait_for_decision_with_cancel(&id, &title, timeout, rx, is_canceled)
     }
 
@@ -1321,6 +1332,30 @@ fn reset_identity_sensitive_rules(settings: &mut ApprovalSettings) {
 /// 给拿不到 `AgentState` 句柄的后台线程写一条事件日志（例如沙箱预热线程）。
 ///
 /// 与 [`ApprovalManager::add_log`] 共用同一份落盘格式与轮转，只是不进内存缓冲：
+/// 把审批请求推送到外部通知通道。
+///
+/// 单独起线程有三个理由：投递是网络操作、失败不能影响审批、
+/// 用户没配通道时开销为零（子线程里读配置为空就直接返回）。
+fn spawn_notification(
+    approval_id: String,
+    title: String,
+    description: String,
+    risk_level: String,
+) {
+    let risk = risk_level.clone();
+    let _ = std::thread::Builder::new()
+        .name("himind-notify".to_string())
+        .spawn(move || {
+            let note = crate::notification_channels::approval_notification(
+                &approval_id,
+                &title,
+                &description,
+                &risk,
+            );
+            crate::notification_channels::dispatch(&note);
+        });
+}
+
 /// 内存缓冲服务前端那个「日志」列表，是为用户能看到并跟着排查的事情准备的；
 /// 预热属于我们自己的准备工作，用户不需要在界面里读它。
 pub(crate) fn append_event_log(level: &str, message: &str) {

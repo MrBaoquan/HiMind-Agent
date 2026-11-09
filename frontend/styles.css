@@ -407,6 +407,47 @@
 .workflow-interaction-field > input[type="checkbox"] { width: 16px; height: 16px; justify-self: start; }
 .workflow-interaction-field > small { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; white-space: normal; }
 
+/* 外部通知通道：与审批设置同一张卡内的子分节。
+   列表行固定五列（图标/主信息/状态/编辑/删除），窄窗下主信息换行。 */
+.notification-channels-card { display: grid; gap: var(--space-2); }
+.notification-channels-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.notification-channels-heading > div { min-width: 0; display: grid; gap: 2px; }
+.notification-channels-heading strong { color: var(--text); font-size: var(--fs-body); font-weight: 600; }
+.notification-channels-heading span { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; }
+.notification-channels-loading,
+.notification-channels-empty { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) 0; color: var(--text-muted); font-size: var(--fs-meta); }
+.notification-channels-list { display: grid; gap: 1px; margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--border); list-style: none; }
+.notification-channel-row { min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr) max-content max-content max-content; align-items: center; gap: var(--space-2); padding: var(--space-2) 10px; background: var(--surface); }
+.notification-channel-row.is-disabled { background: var(--surface-muted); }
+.notification-channel-row > svg { color: var(--text-subtle); }
+.notification-channel-main { min-width: 0; display: grid; gap: 1px; }
+.notification-channel-main strong { color: var(--text); font-size: var(--fs-meta); font-weight: 600; }
+.notification-channel-main small { color: var(--text-muted); font-size: var(--fs-meta); overflow-wrap: anywhere; white-space: normal; }
+/* 缺凭据必须显眼：通道看起来是配好的、实际推不出去，是最难发现的一类故障。 */
+.notification-channel-warning { color: var(--danger) !important; }
+.notification-channel-state { padding: 1px 7px; border-radius: 999px; font-size: var(--fs-meta); font-weight: 600; }
+.notification-channel-state.on { color: var(--success-strong); background: var(--success-soft); }
+.notification-channel-state.off { color: var(--text-muted); background: var(--surface-muted); }
+.notification-channel-editor { display: grid; gap: var(--space-2); margin-top: var(--space-2); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-muted); }
+.notification-channel-field { min-width: 0; display: grid; gap: 3px; }
+.notification-channel-field > span { color: var(--text); font-size: var(--fs-meta); font-weight: 600; }
+.notification-channel-field > input[type="text"],
+.notification-channel-field > select {
+  min-height: var(--control-h-sm); width: 100%; padding: 5px 8px;
+  border: 1px solid var(--control-border); border-radius: var(--radius-sm);
+  color: var(--text); background: var(--surface); font: inherit; font-size: var(--fs-meta);
+}
+.notification-channel-field > small { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; white-space: normal; }
+.notification-channel-field.inline { display: flex; align-items: center; gap: var(--space-2); }
+.notification-channel-field.inline > span { font-weight: 500; }
+.notification-channel-events { display: flex; flex-wrap: wrap; gap: var(--space-3); }
+.notification-channel-events label { display: inline-flex; align-items: center; gap: 5px; color: var(--text); font-size: var(--fs-meta); }
+.notification-channel-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
+@media (max-width: 640px) {
+  .notification-channel-row { grid-template-columns: 16px minmax(0, 1fr) max-content; }
+  .notification-channel-row > .btn { grid-column: 2; justify-self: end; }
+}
+
 .workflow-interaction-schema { margin-top: 3px; }
 .workflow-interaction-schema summary { color: var(--primary); cursor: pointer; font-size: 10px; }
 .workflow-interaction-schema pre { max-height: 160px; margin: 5px 0 0; padding: var(--space-2); overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-muted); font: 10px/1.45 Consolas, monospace; white-space: pre-wrap; }

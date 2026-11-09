@@ -17,6 +17,23 @@ import { roleLabel } from '../pages/taskView.ts';
 
 export type WorkflowProcessNode = WorkflowGraphNode | RunTimelineStep;
 
+/**
+ * 这一步实际用了什么执行方与模型。
+ *
+ * 只对已执行过的运行步骤有意义：定义态（还没跑）没有事实可显示。
+ * model 缺失但 provider 存在时仍显示 provider——那恰好说明
+ * 「用了某个 Runtime 但没汇报模型」，比留空更能解释现象。
+ */
+export function workflowNodeModelFacts(node: WorkflowProcessNode): string {
+  // 定义态没有执行事实；只用类型判定，避免把图节点上同名的可选字段当成运行事实。
+  if (!('state' in node)) return '';
+  const provider = node.runtimeProvider || '';
+  const model = node.model || '';
+  if (!provider && !model) return '';
+  if (model && provider) return `${provider} · ${model}`;
+  return model || provider;
+}
+
 export function runStepStateLabel(state: RunStepState) {
   return ({
     done: '已完成',
@@ -79,6 +96,7 @@ export function WorkflowProcessRail({ nodes, mode, activities = [] }: {
         const latestActivity = nodeActivities[0];
         const showLatestActivity = Boolean(runStep && ['active', 'waiting', 'failed'].includes(runStep.state));
         const artifactCount = isRunStep(node) ? node.artifacts.length : node.producedArtifacts.length;
+        const modelFacts = isRunStep(node) ? workflowNodeModelFacts(node) : '';
         const style = { '--process-depth': Math.min(node.depth, 3) } as CSSProperties;
         return (
           <div
@@ -108,6 +126,7 @@ export function WorkflowProcessRail({ nodes, mode, activities = [] }: {
                   {[stepKindLabel(node.kind), roleLabel(node.roleId), runStep && runStep.durationSeconds > 0 ? `耗时 ${formatElapsedCn(runStep.durationSeconds)}` : '', runStep?.attempt && runStep.attempt > 1 ? `第 ${runStep.attempt} 次尝试` : ''].filter(Boolean).join(' · ')}
                 </small>
                 <span className="workflow-process-node-tags">
+                  {modelFacts ? <b title={runStep?.runtimeProvider || ''}>{modelFacts}</b> : null}
                   {node.condition ? <b><GitBranch size={11} />条件：{node.condition}</b> : null}
                   {node.loop ? <b><Repeat2 size={11} />最多 {node.loop.maxIterations} 轮{node.loop.pauseForFeedback ? ' · 每轮可反馈' : ''}</b> : null}
                   {node.delegate ? (

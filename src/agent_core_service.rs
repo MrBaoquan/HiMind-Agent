@@ -90,6 +90,7 @@ impl AgentCoreRunRecorder {
                 status: LocalStepStatus::Running,
                 capability_id: capability_id.to_string(),
                 runtime_provider: "himind.agent".to_string(),
+                model: String::new(),
                 role_id: String::new(),
                 attempt: 1,
                 started_at: now.clone(),

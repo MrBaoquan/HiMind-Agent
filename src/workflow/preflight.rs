@@ -1300,6 +1300,15 @@ fn evaluate_runtime_preflight(
 ) -> Vec<WorkflowRuntimePreflight> {
     let (explicit_runtimes, auto_runtime) = runtime_requirements(&package.steps);
     let requires_network_isolation = runtime_requires_network_isolation(&package.steps);
+    // 包声明「也接受」的 Runtime：它们进候选集供用户选择，但未就绪时不阻断运行。
+    // 一个包只要主 provider 可用就应该能跑，不能因为用户没装某个可选项而拒绝启动。
+    let optional_runtimes = package
+        .optional_providers
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut runtime_ids = if !package.dependencies.runtimes.is_empty() {
         package
             .dependencies
@@ -1317,6 +1326,7 @@ fn evaluate_runtime_preflight(
         std::collections::BTreeSet::new()
     };
     runtime_ids.extend(explicit_runtimes.iter().cloned());
+    runtime_ids.extend(optional_runtimes.iter().cloned());
     if auto_runtime {
         runtime_ids.extend(package.supported_runtimes.iter().cloned());
         runtime_ids.extend(
@@ -1352,6 +1362,15 @@ fn evaluate_runtime_preflight(
         .collect::<Vec<_>>();
 
     for runtime_id in &explicit_runtimes {
+        // 只声明为 optional 的 provider 未就绪不阻断：它本来就只是「可用则更好」。
+        if optional_runtimes.contains(runtime_id)
+            && !package
+                .supported_runtimes
+                .iter()
+                .any(|declared| declared == runtime_id)
+        {
+            continue;
+        }
         let report = runtime_reports
             .iter()
             .find(|report| report.provider == *runtime_id);
@@ -1962,6 +1981,8 @@ mod tests {
             allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 0,
         });
         let mut manual = package.steps[0].clone();
@@ -1986,6 +2007,8 @@ mod tests {
             allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 0,
         });
         package.steps[0].capability_id.clear();
@@ -2025,6 +2048,8 @@ mod tests {
             allow_network: Some(false),
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 0,
         });
         package.steps[0].capability_id.clear();
@@ -2052,6 +2077,56 @@ mod tests {
         }));
     }
 
+    /// 只声明为 optional 的 provider 未安装时不能阻断启动：
+    /// 一个包只要主 provider 可用就该能跑。
+    #[test]
+    fn optional_provider_not_ready_does_not_block_the_run() {
+        let mut package = package(Vec::new());
+        package.supported_runtimes = vec!["himind.builtin".to_string()];
+        package.optional_providers = vec!["acp.claude".to_string()];
+        package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
+            provider: "himind.builtin".to_string(),
+            prompt: "Implement.".to_string(),
+            workspace_path: String::new(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
+            timeout_seconds: 0,
+        });
+        package.steps[0].capability_id.clear();
+        package.steps[0].kind = "runtime".to_string();
+
+        let mut diagnostics = Vec::new();
+        let runtimes = evaluate_runtime_preflight(
+            &package,
+            &[
+                runtime_report("himind.builtin", "ready"),
+                // 可选客户端没装：status 不是 ready。
+                runtime_report("acp.claude", "unavailable"),
+            ],
+            &mut diagnostics,
+        );
+        // 可选项仍要出现在清单里（用户要知道它能选但没装）。
+        let optional = runtimes
+            .iter()
+            .find(|item| item.id == "acp.claude")
+            .expect("optional provider must be listed");
+        assert!(!optional.available);
+        // 但不得因此产生阻断项。
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == "blocker" && diagnostic.message.contains("acp.claude")
+            }),
+            "optional provider 不可用不应阻断：{diagnostics:?}"
+        );
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("himind.builtin cannot")));
+    }
+
     #[test]
     fn auto_runtime_accepts_any_available_candidate() {
         let mut package = package(Vec::new());
@@ -2067,6 +2142,8 @@ mod tests {
             allow_network: Some(false),
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 0,
         });
         package.steps[0].capability_id.clear();
@@ -2097,6 +2174,8 @@ mod tests {
             allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
+            model: String::new(),
+            model_fallbacks: Vec::new(),
             timeout_seconds: 0,
         });
         package.steps[0].capability_id.clear();

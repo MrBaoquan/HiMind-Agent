@@ -36,11 +36,22 @@ pub(crate) fn execute_runtime_step(
         .map(|role| role.prompt.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or(runtime.prompt.trim());
+    // 模型覆盖与 provider / tool_policy 同一优先级：角色优先于步骤。
+    // 两者都声明时角色说了算，否则会出现「角色把 provider 换到 builtin、模型却
+    // 还留在 acp 命名空间」这种谁也执行不了组合。
+    let model_alias = role
+        .map(|role| role.model.trim())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let value = runtime.model.trim();
+            (!value.is_empty()).then_some(value)
+        });
     // auto 的含义是「挑一个能干这活的本机 Runtime」——干不了的就不该成为候选。
     // 传 tool_policy 进去，让 none 约束参与候选筛选，而不是先挑中再报错。
     let provider = resolve_provider(provider_name, tool_policy)?;
     enforce_runtime_network_policy(&provider, runtime.allow_network)?;
     let disable_tools = enforce_runtime_tool_policy(&provider, tool_policy)?;
+    enforce_model_namespace(&provider, model_alias)?;
     let workspace = resolve_workspace(&runtime.workspace_path, input)?;
     // 声明了 input_artifacts 的步骤不从提示词里带上游输出：数据已经以文件路径
     // 注入 input_artifacts，提示词长度因此与 Artifact 体量无关。
@@ -80,9 +91,42 @@ pub(crate) fn execute_runtime_step(
     let mut runtime_facts: Option<(String, String, String)> = None;
     let mut acp_facts: Option<Value> = None;
     let output = match provider.as_str() {
-        "personal.codex" => execute_codex(&workspace, &prompt, timeout_seconds, is_canceled)?,
+        "personal.codex" => {
+            // `cli:codex:<id>` 里的 id 原样转给 Codex；没声明就沿用 Codex 自己的默认模型。
+            let cli_model = strip_cli_model_prefix(model_alias);
+            let text = execute_codex(
+                &workspace,
+                &prompt,
+                timeout_seconds,
+                cli_model,
+                is_canceled,
+            )?;
+            if let Some(model) = cli_model {
+                runtime_facts = Some((
+                    model.to_string(),
+                    "cli".to_string(),
+                    String::new(),
+                ));
+            }
+            text
+        }
         "personal.github-copilot" => {
-            execute_copilot(&workspace, &prompt, timeout_seconds, is_canceled)?
+            let cli_model = strip_cli_model_prefix(model_alias);
+            let text = execute_copilot(
+                &workspace,
+                &prompt,
+                timeout_seconds,
+                cli_model,
+                is_canceled,
+            )?;
+            if let Some(model) = cli_model {
+                runtime_facts = Some((
+                    model.to_string(),
+                    "cli".to_string(),
+                    String::new(),
+                ));
+            }
+            text
         }
         "himind.fixture" => fixture_runtime_output(&step.id, &workspace, input)?,
         "himind.builtin" => {
@@ -94,6 +138,8 @@ pub(crate) fn execute_runtime_step(
                 timeout_seconds,
                 disable_tools,
                 run_id,
+                step.id.as_str(),
+                model_alias,
                 is_canceled,
             )?;
             // 把“实际用了哪个模型/哪类服务”写进步骤输出，随运行事实一起留痕。
@@ -105,18 +151,31 @@ pub(crate) fn execute_runtime_step(
             outcome.text
         }
         provider if crate::runtime::acp::is_provider(provider) => {
+            // acp 别名形如 `acp:<provider>:<model>`，只把 model 段交给会话；
+            // provider 段必须与当前步骤的 provider 一致，否则是包写错了。
+            let acp_model = strip_acp_model_prefix(provider, model_alias)?;
             let execution = crate::runtime::acp::execute_workflow(
                 provider,
                 &workspace,
                 &prompt,
                 timeout_seconds,
                 run_id,
+                acp_model,
+                options,
                 is_canceled,
             )?;
             // ACP 步骤把真实会话事实留痕：工作台需要能回答“这一步由哪个 ACP 会话
             // 执行、真实 Agent 发起了多少次工具调用与权限请求”，否则链路不可审计。
+            if !execution.model.trim().is_empty() {
+                runtime_facts = Some((
+                    execution.model.clone(),
+                    "acp".to_string(),
+                    String::new(),
+                ));
+            }
             acp_facts = Some(json!({
                 "provider": provider,
+                "model": execution.model,
                 "session_id": execution.session_id,
                 "stop_reason": execution.stop_reason,
                 "update_count": execution.update_count,
@@ -254,6 +313,74 @@ fn resolve_provider(provider: &str, tool_policy: &str) -> Result<String, Box<dyn
         );
     }
     Err("no local AI Runtime Provider is available for runtime step".into())
+}
+
+/// 模型别名必须与解析出的 Runtime 属于同一命名空间。
+///
+/// 这条检查存在的意义：`himind:` 别名只有 Agent 内置 Runtime 认，`acp:` 别名
+/// 只有外部 ACP 客户端认。若把两者配错，运行期的结果不是「换了个模型」，而是
+/// 「这个 Runtime 上没有这个模型」——那类失败在错误信息里看起来像环境问题，
+/// 实际是包写错了。所以在启动子进程之前就拒绝。
+/// 从 `acp:<provider>:<model>` 里取出 `<model>`，并校验 provider 段与步骤一致。
+///
+/// provider 段的比对归一化：`acp:claude:...` 与步骤写 `acp.claude` 视为同一家，
+/// 因为 profile id 带点、别名写法带冒号，两种都出现在包作者的自然写法里。
+fn strip_acp_model_prefix<'a>(
+    provider: &str,
+    model_alias: Option<&'a str>,
+) -> Result<Option<&'a str>, Box<dyn Error>> {
+    let Some(alias) = model_alias.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let rest = alias.strip_prefix("acp:").ok_or_else(|| {
+        format!("acp runtime step received a non-acp model alias: {alias}")
+    })?;
+    let (alias_provider, model) = rest.split_once(':').ok_or_else(|| {
+        format!("acp model alias requires <provider>:<model>: {alias}")
+    })?;
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .strip_prefix("acp.")
+            .unwrap_or(value.trim())
+            .to_ascii_lowercase()
+    };
+    if normalize(alias_provider) != normalize(provider) {
+        return Err(format!(
+            "workflow runtime {provider} cannot execute model alias {alias}: provider segment does not match the step's ACP client"
+        )
+        .into());
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(format!("acp model alias has an empty model segment: {alias}").into());
+    }
+    Ok(Some(model))
+}
+
+fn enforce_model_namespace(provider: &str, model_alias: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let Some(alias) = model_alias.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let namespace = super::model_alias_namespace(alias).ok_or_else(|| {
+        format!(
+            "workflow runtime model alias must start with `himind:` or `acp:` (got {alias})"
+        )
+    })?;
+    // 与契约层同一判据：这里复用 `model_alias_matches_provider`，避免两处规则走偏。
+    super::model_alias_matches_provider(provider, alias)
+        .map_err(|error| format!("workflow runtime: {error}"))?;
+    Ok(())
+}
+
+/// 从 `cli:<target>:<model>` 取出要原样转给 CLI 的模型 id。
+fn strip_cli_model_prefix<'a>(alias: Option<&'a str>) -> Option<&'a str> {
+    let alias = alias.map(str::trim).filter(|value| !value.is_empty())?;
+    alias
+        .strip_prefix("cli:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(_, model)| model.trim())
+        .filter(|model| !model.is_empty())
 }
 
 fn enforce_runtime_network_policy(
@@ -562,6 +689,7 @@ fn execute_codex(
     workspace: &str,
     prompt: &str,
     timeout_seconds: u64,
+    model: Option<&str>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<String, Box<dyn Error>> {
     let (executable, _) = codex::resolve_codex_executable()?;
@@ -571,14 +699,19 @@ fn execute_codex(
     )?;
     process::remove_file_if_present(&result_path);
     let mut command = Command::new(executable);
+    command.args([
+        "-C",
+        workspace,
+        "-s",
+        "workspace-write",
+        "-a",
+        "never",
+    ]);
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--model").arg(model);
+    }
     command
         .args([
-            "-C",
-            workspace,
-            "-s",
-            "workspace-write",
-            "-a",
-            "never",
             "exec",
             "--json",
             "--color",
@@ -656,12 +789,16 @@ fn execute_copilot(
     workspace: &str,
     prompt: &str,
     timeout_seconds: u64,
+    model: Option<&str>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<String, Box<dyn Error>> {
     let (executable, _) = copilot::resolve_copilot_executable()?;
     let mut command = Command::new(executable);
+    command.args(["-p", prompt, "-s", "--no-ask-user", "--allow-all-tools"]);
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--model").arg(model);
+    }
     command
-        .args(["-p", prompt, "-s", "--no-ask-user", "--allow-all-tools"])
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -882,6 +1019,72 @@ mod tests {
         .unwrap()
     }
 
+    /// `cli:` 别名要按目标名分发，并只把 model 段原样转给 CLI。
+    #[test]
+    fn cli_model_alias_is_forwarded_to_the_matching_cli() {
+        assert_eq!(
+            strip_cli_model_prefix(Some("cli:codex:gpt-5-codex")),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            strip_cli_model_prefix(Some("cli:github-copilot:claude-sonnet-4-5")),
+            Some("claude-sonnet-4-5")
+        );
+        // 未声明 / 非 cli 命名空间 -> 不透传。
+        assert_eq!(strip_cli_model_prefix(None), None);
+        assert_eq!(strip_cli_model_prefix(Some("himind:svc:x")), None);
+
+        // 目标名写错要在启动前拒绝：`cli:codex:` 不能喂给 Copilot。
+        let error =
+            enforce_model_namespace("personal.github-copilot", Some("cli:codex:gpt-5")).unwrap_err();
+        assert!(error.to_string().contains("cli target must be"), "{error}");
+        assert!(enforce_model_namespace("personal.github-copilot", Some("cli:github-copilot:gpt-4.1")).is_ok());
+        assert!(enforce_model_namespace("personal.codex", Some("cli:codex:gpt-5-codex")).is_ok());
+        // himind 别名不能发给 CLI。
+        assert!(enforce_model_namespace("personal.codex", Some("himind:svc:x")).is_err());
+    }
+
+    #[test]
+    fn acp_model_alias_is_split_and_provider_matched() {
+        let extracted = strip_acp_model_prefix(
+            "acp.claude",
+            Some("acp:claude:claude-sonnet-4-5"),
+        )
+        .unwrap();
+        assert_eq!(extracted, Some("claude-sonnet-4-5"));
+
+        // 别名里的 provider 段带不带 `acp.` 都接受。
+        assert_eq!(
+            strip_acp_model_prefix("acp.claude", Some("acp:acp.claude:claude-opus-4-1")).unwrap(),
+            Some("claude-opus-4-1")
+        );
+        // 未声明 -> 不切换。
+        assert_eq!(strip_acp_model_prefix("acp.claude", None).unwrap(), None);
+
+        // provider 段与步骤不一致：包写错了，必须拒绝。
+        let mismatch = strip_acp_model_prefix("acp.claude", Some("acp:codex:gpt-5")).unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"), "{mismatch}");
+        // 非 acp 命名空间不能进 acp 分支。
+        assert!(strip_acp_model_prefix("acp.claude", Some("himind:svc:x")).is_err());
+        // 缺 model 段。
+        assert!(strip_acp_model_prefix("acp.claude", Some("acp:claude:")).is_err());
+    }
+
+    #[test]
+    fn model_namespace_must_match_the_runtime() {
+        assert!(enforce_model_namespace("himind.builtin", Some("himind:svc:x")).is_ok());
+        assert!(enforce_model_namespace("acp.claude", Some("acp:claude:x")).is_ok());
+        assert!(enforce_model_namespace("himind.builtin", None).is_ok());
+
+        let builtin_with_acp =
+            enforce_model_namespace("himind.builtin", Some("acp:claude:x")).unwrap_err();
+        assert!(builtin_with_acp.to_string().contains("acp:"), "{builtin_with_acp}");
+        let acp_with_himind =
+            enforce_model_namespace("acp.claude", Some("himind:svc:x")).unwrap_err();
+        assert!(acp_with_himind.to_string().contains("himind:"), "{acp_with_himind}");
+        assert!(enforce_model_namespace("himind.builtin", Some("bare-model")).is_err());
+    }
+
     #[test]
     fn role_overrides_step_runtime_settings() {
         let package = role_package(&[(
@@ -892,6 +1095,7 @@ mod tests {
                 runtime_provider: "himind.fixture".to_string(),
                 prompt: "审查这次改动".to_string(),
                 tool_policy: "none".to_string(),
+                model: String::new(),
             },
         )]);
         let step = role_step("software.reviewer", "personal.codex", "default", "步骤原始提示");
