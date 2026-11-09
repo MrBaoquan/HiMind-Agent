@@ -1180,7 +1180,11 @@ fn run_mission_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
         [action, mission_id, plan_sha256, task_ids, approved_paths] if action == "confirm" => {
             let store = mission::MissionStore::open_default()?;
             let task_ids = task_ids.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
-            let approved_paths = approved_paths.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
+            let approved_paths = if approved_paths.trim() == "-" {
+                Vec::new()
+            } else {
+                approved_paths.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()
+            };
             println!("{}", serde_json::to_string_pretty(&store.confirm_plan(
                 mission_id, plan_sha256, &task_ids, &approved_paths, "cli-user"
             )?)?);
