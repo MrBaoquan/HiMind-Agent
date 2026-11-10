@@ -216,5 +216,10 @@
     "personal.codex",
     "personal.github-copilot"
   ],
+  "optional_providers": [
+    "acp.claude",
+    "acp.codex",
+    "acp.opencode"
+  ],
   "created_at": "2026-11-07T00:00:00Z"
 }

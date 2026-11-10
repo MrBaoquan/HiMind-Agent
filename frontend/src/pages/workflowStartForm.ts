@@ -151,7 +151,8 @@ export function invalidOptionValue(field: WorkflowStartField, value: unknown) {
     return stringArray(value).find(item => !allowed.has(item)) || '';
   }
 
-  if (field.type === 'select') {
+  // runtime-provider / model 与 select 同形：都从 options 取值。
+  if (field.type === 'select' || field.type === 'runtime-provider' || field.type === 'model') {
     const current = String(value ?? '').trim();
     return current && !allowed.has(current) ? current : '';
   }
@@ -193,6 +194,9 @@ function parseOverride(value: unknown): { stepId: string; key: string } | undefi
  * 与 `fieldsToInput` 分开：前者产出「这一步要做什么」，这里产出「这次允许跑几轮」，
  * 两者在 runner 里走不同路径，混在一起会被当成步骤输入传给模型。
  */
+/** override 的取值语义按 key 区分：轮数是数字，provider/model 是字符串。 */
+const STRING_OVERRIDE_KEYS = new Set(['runtime_provider', 'model', 'on_failure']);
+
 export function fieldsToExecutionOverrides(
   fields: WorkflowStartField[],
   values: Record<string, unknown>,
@@ -201,11 +205,22 @@ export function fieldsToExecutionOverrides(
   for (const field of fields) {
     if (!field.override) continue;
     const raw = values[field.id];
-    const numeric = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
-    if (!Number.isFinite(numeric) || numeric <= 0) continue;
+    const key = field.override.key;
+    let value: unknown;
+    if (STRING_OVERRIDE_KEYS.has(key)) {
+      // `inherit` 是显式枚举值，表示「不覆盖」——下拉框不允许空 value，
+      // 所以用这个词而不是空串来表达默认行为。空串同样不产生覆盖。
+      const text = String(raw ?? '').trim();
+      if (!text || text === 'inherit') continue;
+      value = text;
+    } else {
+      const numeric = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
+      if (!Number.isFinite(numeric) || numeric <= 0) continue;
+      value = Math.floor(numeric);
+    }
     overrides[field.override.stepId] = {
       ...(overrides[field.override.stepId] || {}),
-      [field.override.key]: Math.floor(numeric),
+      [key]: value,
     };
   }
   return overrides;

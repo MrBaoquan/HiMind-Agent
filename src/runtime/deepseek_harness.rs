@@ -55,7 +55,12 @@ const HIMIND_SKILL_ROW_ID: &str = "himind-agent-skill-filesystem";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
 /// HiMind AI 对话启动时预激活的本机能力。只放"对话里随时可能用到、且不依赖
 /// AI 工作台"的本地能力；控制面能力仍按需激活，避免撑大默认工具面。
-const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str = "media.image.generate";
+///
+/// `workspace.registry.*` 由工作区登记插件提供，配套技能 `workspace-context`
+/// 在第一轮就要用它们判断当前目录属于哪个项目——晚一步激活，技能在首轮
+/// 就只剩「凭印象猜项目名」这一条路。只预激活两条只读能力，写入类仍按需激活。
+const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str =
+    "media.image.generate,workspace.registry.resolve,workspace.registry.context.get";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
@@ -516,6 +521,11 @@ struct Invocation {
     models: Vec<String>,
     permission_mode: &'static str,
     run_id: String,
+    /// 该会话属于哪个 workflow step；空串表示交互会话或整条运行的托管会话。
+    ///
+    /// 只影响 overlay 文件名：同一个 home 下若出现「一步一模型」，只有按 step
+    /// 分开文件名才不会后启动的会话盖掉先启动的 `agent-default-model`。
+    step_id: String,
     route_source: ModelRouteSource,
 }
 
@@ -1063,6 +1073,7 @@ pub(crate) fn prepare_interactive_launch(
         workspace,
         ControlPlaneFallback::Fail,
         LaunchHome::Interactive,
+        None,
     )
 }
 
@@ -1081,6 +1092,7 @@ pub(crate) fn prepare_interactive_launch_allow_degraded(
         workspace,
         ControlPlaneFallback::Degrade,
         LaunchHome::Interactive,
+        None,
     )
 }
 
@@ -1095,7 +1107,14 @@ enum ControlPlaneFallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchHome<'a> {
     Interactive,
-    Run(&'a str),
+    /// Run-scoped home. `step_id` 为空表示整条运行的共享 home（托管 Agent Run
+    /// 走这条）；非空表示某个 workflow step 独占的 home。
+    ///
+    /// 为什么 step 也要独占：同一次运行里的两个并行 delegate 分支会同时启动
+    /// 两个 DSH 进程，而 home 下的 profile / settings / overlay 都是写入型的。
+    /// 共用一个 home 时两边会互相覆盖 `agent-default-model`，表现为「这一步
+    /// 用了另一步声明的模型」——这是并发下才会出现的串模型故障。
+    Run { run_id: &'a str, step_id: &'a str },
 }
 
 /// Resolve the DSH home used by one launch.
@@ -1104,14 +1123,26 @@ enum LaunchHome<'a> {
 /// Headless workflow steps execute in a run-scoped home: they do not need the
 /// interactive rail, and avoiding cross-workspace junctions is also what lets
 /// current DSH versions create their own session/module directories on Windows.
+/// 从启动模式里取 step 标识：交互会话与整条运行共享 home 时为空。
+fn launch_step_id(mode: LaunchHome<'_>) -> String {
+    match mode {
+        LaunchHome::Run { step_id, .. } => step_id.trim().to_string(),
+        LaunchHome::Interactive => String::new(),
+    }
+}
+
 fn launch_home(version: &str, workspace: &Path, mode: LaunchHome<'_>) -> Result<PathBuf, String> {
     match mode {
         LaunchHome::Interactive => workspace_dsh_home(version, workspace),
-        LaunchHome::Run(run_id) => {
+        LaunchHome::Run { run_id, step_id } => {
             if run_id.trim().is_empty() {
                 return Err("workflow runtime run id is missing".to_string());
             }
-            dsh_run_home(version, run_id)
+            if step_id.trim().is_empty() {
+                dsh_run_home(version, run_id)
+            } else {
+                dsh_step_run_home(version, run_id, step_id)
+            }
         }
     }
 }
@@ -1121,10 +1152,12 @@ fn prepare_interactive_launch_with(
     workspace: Option<&Path>,
     fallback: ControlPlaneFallback,
     home_mode: LaunchHome<'_>,
+    requested_model: Option<&str>,
 ) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let workspace = interactive_workspace(workspace)?;
+    let step_id = launch_step_id(home_mode);
     if crate::app::control_plane_provider::available(options)
         && crate::store::ai_services::active_service()
             .map_err(|error| error.to_string())?
@@ -1136,6 +1169,7 @@ fn prepare_interactive_launch_with(
             version,
             workspace,
             home_mode,
+            requested_model,
         );
     }
     if !crate::app::control_plane_provider::available(options) {
@@ -1145,6 +1179,7 @@ fn prepare_interactive_launch_with(
             version,
             workspace,
             home_mode,
+            requested_model,
         );
     }
     // The Dashboard is an optional control plane. A live OAuth token is not
@@ -1163,7 +1198,12 @@ fn prepare_interactive_launch_with(
                 .map_err(|error| error.to_string())?;
         let home = launch_home(&version, &workspace, home_mode)?;
         let models = managed_model_catalog(&credential.access)?;
-        let model = credential.access.model.trim().to_string();
+        let model = resolve_requested_model(
+            requested_model,
+            &models,
+            "HiMind AI (managed)",
+        )?
+        .unwrap_or_else(|| credential.access.model.trim().to_string());
         let sync_snapshot =
             crate::app::builtin_ai_model_sync::snapshot(&delegated.user_id, &credential);
         let invocation = Invocation {
@@ -1177,6 +1217,7 @@ fn prepare_interactive_launch_with(
             models: models.clone(),
             permission_mode: INTERACTIVE_PERMISSION_MODE,
             run_id: "interactive".to_string(),
+            step_id: step_id.clone(),
             route_source: ModelRouteSource::Managed,
         };
         let agent_patch =
@@ -1209,6 +1250,7 @@ fn prepare_interactive_launch_with(
                 version,
                 workspace,
                 home_mode,
+                requested_model,
             )?;
             launch.control_plane_notice = degraded_notice(&error, &launch);
             eprintln!("{}", launch.control_plane_notice);
@@ -1245,6 +1287,7 @@ pub(crate) fn execute_workflow(
         prompt,
         timeout_seconds,
         disable_tools,
+        None,
         is_canceled,
         ControlPlaneFallback::Fail,
         LaunchHome::Interactive,
@@ -1252,6 +1295,14 @@ pub(crate) fn execute_workflow(
 }
 
 /// Execute one workflow Runtime step in its own run-scoped DSH home.
+///
+/// `step_id` 让每个步骤拿到独立的 home：并行 delegate 分支会同时启动多个 DSH
+/// 进程，共用 home 时 overlay / settings 会互相覆盖，表现为「这一步用了另一步的
+/// 模型」。传空字符串等价于整条运行共享一个 home（历史行为）。
+///
+/// `model_alias` 非空时表示这一步声明了自己的模型：overlay 的
+/// `agent-default-model` 会钉到它，并在启动前校验它确实在当前路由目录里。
+/// 传 `None` 表示沿用 Runtime 的当前配置。
 pub(crate) fn execute_workflow_in_run_home(
     options: &Options,
     workspace: &str,
@@ -1259,6 +1310,8 @@ pub(crate) fn execute_workflow_in_run_home(
     timeout_seconds: u64,
     disable_tools: bool,
     run_id: &str,
+    step_id: &str,
+    model_alias: Option<&str>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     execute_workflow_with(
@@ -1267,9 +1320,10 @@ pub(crate) fn execute_workflow_in_run_home(
         prompt,
         timeout_seconds,
         disable_tools,
+        model_alias,
         is_canceled,
         ControlPlaneFallback::Fail,
-        LaunchHome::Run(run_id),
+        LaunchHome::Run { run_id, step_id },
     )
 }
 
@@ -1290,6 +1344,7 @@ pub(crate) fn execute_workflow_allow_degraded(
         prompt,
         timeout_seconds,
         false,
+        None,
         is_canceled,
         ControlPlaneFallback::Degrade,
         LaunchHome::Interactive,
@@ -1302,6 +1357,7 @@ fn execute_workflow_with(
     prompt: &str,
     timeout_seconds: u64,
     disable_tools: bool,
+    model_alias: Option<&str>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
     fallback: ControlPlaneFallback,
     home_mode: LaunchHome<'_>,
@@ -1311,8 +1367,18 @@ fn execute_workflow_with(
     if prompt.is_empty() {
         return Err("DSH workflow prompt is empty".into());
     }
-    let launch = prepare_interactive_launch_with(options, Some(&workspace), fallback, home_mode)
-        .map_err(std::io::Error::other)?;
+    let requested_model = model_alias
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let launch = prepare_interactive_launch_with(
+        options,
+        Some(&workspace),
+        fallback,
+        home_mode,
+        requested_model.as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
     // `tool_policy=none` 的步骤用一份把工具行全部禁用的 overlay：模型看不到任何
     // 工具 schema，也就不可能“去工作区找文件”。这和 prompt 里的约定不同，是
     // 平台强制的事实。
@@ -1321,6 +1387,7 @@ fn execute_workflow_with(
     } else {
         launch.agent_patch.clone()
     };
+
     let mut command = dsh_command(launch.executable.as_os_str());
     command
         .args([
@@ -1364,16 +1431,29 @@ fn execute_workflow_with(
     let stdout = process::join_output(stdout);
     let stderr = process::join_output(stderr);
     if !status.success() {
-        let detail = if stderr.trim().is_empty() {
-            stdout
+        // 以前只拼 stderr（空则回落到 stdout）。两者都为空时错误就变成
+        // "DSH workflow runtime failed: " —— 排查时完全无信息可用。
+        // 现在总是带上退出码，并在两个流都空时明确说明，而不是留一句空话。
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
         } else {
-            stderr
+            String::new()
         };
-        return Err(format!(
-            "DSH workflow runtime failed: {}",
-            process::summarize_output(detail.trim(), OUTPUT_CAPTURE_LIMIT)
-        )
-        .into());
+        let exit = status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string());
+        let summarized = process::summarize_output(&detail, OUTPUT_CAPTURE_LIMIT);
+        let message = if summarized.trim().is_empty() {
+            format!(
+                "DSH workflow runtime failed (exit {exit}) with no output on stdout or stderr"
+            )
+        } else {
+            format!("DSH workflow runtime failed (exit {exit}): {summarized}")
+        };
+        return Err(message.into());
     }
     Ok(WorkflowRuntimeOutcome {
         text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
@@ -1400,9 +1480,11 @@ fn prepare_independent_interactive_launch(
     version: String,
     workspace: PathBuf,
     home_mode: LaunchHome<'_>,
+    requested_model: Option<&str>,
 ) -> Result<InteractiveLaunch, String> {
     let shared_home = native_dsh_home(&version)?;
     let home = launch_home(&version, &workspace, home_mode)?;
+    let step_id = launch_step_id(home_mode);
     let (provider_config, api_key, service_source, route_source) =
         match active_independent_provider_config().map_err(|error| error.to_string())? {
             Some(projection) => (
@@ -1422,8 +1504,9 @@ fn prepare_independent_interactive_launch(
         };
     let api_key_env = provider_config.api_key_env.clone();
     let base_url = provider_config.base_url.clone();
-    let model = provider_config.model.clone();
     let models = provider_config.models.clone();
+    let model = resolve_requested_model(requested_model, &models, "本机 AI 路由")?
+        .unwrap_or_else(|| provider_config.model.clone());
     let invocation = Invocation {
         executable: executable.clone().into(),
         args: Vec::new(),
@@ -1435,6 +1518,7 @@ fn prepare_independent_interactive_launch(
         models: models.clone(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
+        step_id: step_id.clone(),
         route_source,
     };
     let agent_patch =
@@ -1635,6 +1719,50 @@ pub(crate) fn interactive_tool_context_summary(
         // interactive session. Individual capabilities remain governed by Agent.
         mcp_services: 1 + personal_mcp,
     })
+}
+
+/// 把步骤声明的模型别名解析成「本次会话真正要钉的模型」。
+///
+/// 语义：
+/// - `None` / 空串：沿用 Runtime 当前配置（历史行为，返回 `None`）。
+/// - 声明了但目录里没有：fail-closed，错误里带上可用别名。不静默回落到默认
+///   模型——那会让「我明明指定了 opus」变成「悄悄用了便宜的 flash」，而且
+///   运行记录还会写着它真的用了 opus。
+/// - 命中：返回该别名，调用方写进 `agent-default-model`。
+///
+/// 只接受 `himind:` 前缀的别名：managed / 本机路由目录里都是 this 命名空间；
+/// `acp:` 别名由 ACP 适配器自己处理，不该走到这里。
+fn resolve_requested_model(
+    requested: Option<&str>,
+    available: &[String],
+    source_label: &str,
+) -> Result<Option<String>, String> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !requested.starts_with("himind:") {
+        return Err(format!(
+            "{source_label} 只能使用 `himind:` 命名空间的模型别名，收到 {requested}；`acp:` 别名应交给外部客户端处理"
+        ));
+    }
+    if !available.iter().any(|alias| alias.trim() == requested) {
+        let mut offered = available
+            .iter()
+            .map(|alias| alias.trim())
+            .filter(|alias| !alias.is_empty())
+            .collect::<Vec<_>>();
+        offered.sort_unstable();
+        offered.dedup();
+        return Err(format!(
+            "{source_label} 没有模型别名 {requested}；可用别名：{}",
+            if offered.is_empty() {
+                "<无>".to_string()
+            } else {
+                offered.join(", ")
+            }
+        ));
+    }
+    Ok(Some(requested.to_string()))
 }
 
 fn managed_model_catalog(
@@ -2346,6 +2474,7 @@ fn build_invocation(
         models: vec![claim.ai_model.trim().to_string()],
         permission_mode,
         run_id: claim.run.id.clone(),
+        step_id: String::new(),
         route_source: ModelRouteSource::Managed,
     })
 }
@@ -3010,17 +3139,42 @@ fn agent_overlay_path(home: &Path) -> PathBuf {
         .join(HIMIND_AGENT_OVERLAY_FILE)
 }
 
-/// 会话级交互 overlay 的路径：一个工作区一份。
+/// 会话级交互 overlay 的路径：一个工作区 + 一个 step 一份。
 ///
 /// DSH 在**进程启动时**读取 `--patch`，而 `--patch` 里写着该会话的
 /// `HIMIND_AI_WORKSPACE`。同一个 home 下并发跑两个工作区会话时，如果共用
 /// `agent.patch.yml`，后启动的写入会盖住前一个尚未读完的内容，A 会话的 MCP
 /// 桥会拿着 B 的工作区去建扩展。按工作区派生文件名即可让两份内容并存。
-fn interactive_overlay_path(home: &Path, workspace: &Path) -> PathBuf {
+///
+/// 同一次运行里有两个并行 delegate 分支时，工作区相同、home 已按 step 分开，
+/// 但文件名仍带上 step：万一将来 home 又回到共享，overlay 也不会互相覆盖，
+/// 而且从文件名就能看出这份配置属于哪一步。
+fn interactive_overlay_path(home: &Path, workspace: &Path, step_id: &str) -> PathBuf {
+    let step = step_id.trim();
+    let suffix = if step.is_empty() {
+        String::new()
+    } else {
+        format!(".{}", overlay_step_segment(step))
+    };
     home.join(HIMIND_AGENT_OVERLAY_DIR).join(format!(
-        "agent.{}.patch.yml",
-        workspace_fingerprint(workspace)
+        "agent.{}{}.patch.yml",
+        workspace_fingerprint(workspace),
+        suffix
     ))
+}
+
+/// step 标识进文件名前的归一化：只留 `[A-Za-z0-9._-]`，其余取短摘要。
+fn overlay_step_segment(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return value.to_string();
+    }
+    let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+    format!("s{}", &digest[..12])
 }
 
 /// 工作区的稳定短标识：同一目录恒定、不同目录不碰撞，且不把绝对路径写进文件名。
@@ -3142,7 +3296,7 @@ fn ensure_agent_overlay(
         overlay.as_bytes(),
     )?;
     // 会话级副本：并发会话各读自己那份，见 `interactive_overlay_path`。
-    let path = interactive_overlay_path(home, &invocation.workspace);
+    let path = interactive_overlay_path(home, &invocation.workspace, &invocation.step_id);
     write_if_changed(&path, overlay.as_bytes())?;
     Ok(path)
 }
@@ -3789,6 +3943,56 @@ fn himind_mcp_arguments(options: &Options) -> Vec<String> {
         options.state_path.to_string_lossy().to_string(),
     ]);
     arguments
+}
+
+/// DSH overlay 与 ACP `session/new` 共用的 MCP server 名称。
+pub(crate) fn himind_mcp_server_name() -> &'static str {
+    HIMIND_MCP_SERVER_NAME
+}
+
+/// HiMind MCP 的启动描述（可执行文件 + 参数 + 会话环境）。
+///
+/// 供 ACP 的 `session/new.mcp_servers` 复用：DSH overlay 与外部 AI 客户端必须
+/// 连到同一份能力面，否则「外部客户端能不能用 HiMind 业务能力」会随入口而变。
+pub(crate) struct HimindMcpLaunch {
+    pub executable: std::path::PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// 组装一次 MCP 启动：命令行与 DSH overlay 同源，环境变量带会话归属。
+///
+/// `workspace` 为空时不下发 `HIMIND_AI_WORKSPACE`，让 MCP 回落到自己的默认工作区。
+pub(crate) fn himind_mcp_launch(
+    options: &Options,
+    workspace: Option<&std::path::Path>,
+) -> Result<HimindMcpLaunch, Box<dyn Error>> {
+    let executable = himind_mcp_executable()?;
+    let mut env = vec![
+        (
+            "HIMIND_AI_CLIENT_ID".to_string(),
+            HIMIND_MCP_CLIENT_ID.to_string(),
+        ),
+        (
+            "HIMIND_AGENT_PROFILE".to_string(),
+            crate::store::paths::profile_name(),
+        ),
+        (
+            "HIMIND_MCP_DEFAULT_ACTIVATE".to_string(),
+            HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES.to_string(),
+        ),
+    ];
+    if let Some(workspace) = workspace {
+        env.push((
+            "HIMIND_AI_WORKSPACE".to_string(),
+            workspace.to_string_lossy().to_string(),
+        ));
+    }
+    Ok(HimindMcpLaunch {
+        executable,
+        args: himind_mcp_arguments(options),
+        env,
+    })
 }
 
 fn himind_mcp_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
@@ -4565,14 +4769,48 @@ fn safe_run_segment(value: &str) -> Result<String, String> {
 }
 
 fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
-    let root = env::var_os(DSH_HOME_ROOT_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| runtime_data_root().join("homes"));
-    Ok(root
-        .join("runs")
+    Ok(dsh_runs_root()?
         .join(safe_segment(version)?)
         .join(safe_run_segment(run_id)?))
+}
+
+/// 某个 workflow step 独占的 run home：`<runs>/<version>/<run>/steps/<step>`。
+///
+/// 与 [`dsh_run_home`] 同前缀，只是多一层 `steps/`，因此同一套清理与迁移逻辑
+/// 仍然按 run 目录工作，不需要知道 step 的存在。
+fn dsh_step_run_home(version: &str, run_id: &str, step_id: &str) -> Result<PathBuf, String> {
+    Ok(dsh_run_home(version, run_id)?
+        .join("steps")
+        .join(safe_step_segment(step_id)?))
+}
+
+fn dsh_runs_root() -> Result<PathBuf, String> {
+    Ok(env::var_os(DSH_HOME_ROOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_data_root().join("homes"))
+        .join("runs"))
+}
+
+/// Step 标识进目录名前的归一化。
+///
+/// Workflow step id 的字符集本来就只有 `[A-Za-z0-9._-]`（见
+/// `workflow::validate_workflow_id`），但 delegate 分支会拼成 `STEP:BRANCH`，
+/// 冒号在 Windows 上非法。与 run id 一致：能直接用就直接用，不能就取摘要，
+/// 保证同一 step 每次落到同一个目录。
+fn safe_step_segment(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err("workflow step id cannot be used as a runtime home segment".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+        return Ok(format!("step-{}", &digest[..16]));
+    }
+    Ok(value.to_string())
 }
 
 fn versioned_home(root: &Path, version: &str) -> Result<PathBuf, String> {
@@ -4777,8 +5015,8 @@ mod tests {
         let home = Path::new("C:/agent/runtimes/deepseek-harness/homes/interactive");
         let alpha = Path::new("F:/WebProjects/dsh-live-ws-alpha");
         let beta = Path::new("F:/WebProjects/dsh-live-ws-beta");
-        let alpha_overlay = super::interactive_overlay_path(home, alpha);
-        let beta_overlay = super::interactive_overlay_path(home, beta);
+        let alpha_overlay = super::interactive_overlay_path(home, alpha, "");
+        let beta_overlay = super::interactive_overlay_path(home, beta, "");
         assert_ne!(alpha_overlay, beta_overlay);
         assert_ne!(
             alpha_overlay,
@@ -4788,7 +5026,7 @@ mod tests {
         // 同一个目录的写法差异（大小写 / 分隔符）必须归一成同一份 overlay。
         assert_eq!(
             alpha_overlay,
-            super::interactive_overlay_path(home, Path::new("F:/WebProjects/DSH-Live-WS-Alpha"))
+            super::interactive_overlay_path(home, Path::new("F:/WebProjects/DSH-Live-WS-Alpha"), "")
         );
         let name = alpha_overlay
             .file_name()
@@ -5333,7 +5571,7 @@ mod tests {
         let home = super::launch_home(
             "0.1.0",
             std::path::Path::new("C:/workspace/project"),
-            super::LaunchHome::Run("run-123"),
+            super::LaunchHome::Run { run_id: "run-123", step_id: "" },
         )
         .unwrap();
         let normalized = home.to_string_lossy().replace('\\', "/");
@@ -5342,7 +5580,7 @@ mod tests {
         assert!(super::launch_home(
             "0.1.0",
             std::path::Path::new("C:/workspace/project"),
-            super::LaunchHome::Run("  "),
+            super::LaunchHome::Run { run_id: "  ", step_id: "" },
         )
         .is_err());
     }
@@ -5358,6 +5596,132 @@ mod tests {
         let traversal = traversal.to_string_lossy().replace('\\', "/");
         assert!(traversal.contains("runs/0.1.0-rc.6/run-"));
         assert!(!traversal.contains("workspaces"));
+    }
+
+    /// 同一 run 里的两个并行 delegate 分支必须落到两个 home，且 overlay 文件名
+    /// 互不相同：否则两边会互相覆盖 `agent-default-model`，出现串模型。
+    #[test]
+    fn workflow_steps_get_isolated_homes_and_overlays() {
+        let workspace = Path::new("C:/workspace/project");
+        let alpha = super::launch_home(
+            "0.1.0",
+            workspace,
+            super::LaunchHome::Run { run_id: "run-999", step_id: "AUDIT:CHECKS" },
+        )
+        .unwrap();
+        let beta = super::launch_home(
+            "0.1.0",
+            workspace,
+            super::LaunchHome::Run { run_id: "run-999", step_id: "AUDIT:LAYOUT" },
+        )
+        .unwrap();
+        assert_ne!(alpha, beta, "同一次运行的不同 step 必须各有 home");
+        assert!(alpha.starts_with(beta.parent().unwrap().parent().unwrap()));
+
+        let alpha_overlay = super::interactive_overlay_path(&alpha, workspace, "AUDIT:CHECKS");
+        let beta_overlay = super::interactive_overlay_path(&beta, workspace, "AUDIT:LAYOUT");
+        assert_ne!(alpha_overlay, beta_overlay);
+
+        // 同一 step 反复解析必须稳定（恢复运行要能找回同一份 overlay）。
+        assert_eq!(
+            alpha_overlay,
+            super::interactive_overlay_path(&alpha, workspace, "AUDIT:CHECKS")
+        );
+        // 文件名里不能出现路径分隔符或冒号。
+        let name = alpha_overlay.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.contains(':') && !name.contains('/') && !name.contains('\\'), "{name}");
+    }
+
+    /// 不声明 step 的调用（交互会话、托管 Agent Run）保持历史路径不变。
+    /// 步骤声明的模型别名必须真的写进 `agent-default-model`，而不是只校验通过。
+    #[test]
+    fn requested_model_is_pinned_into_the_overlay() {
+        let available = vec![
+            "himind:svc-a:deepseek-chat".to_string(),
+            "himind:svc-a:deepseek-reasoner".to_string(),
+        ];
+        let resolved = super::resolve_requested_model(
+            Some("himind:svc-a:deepseek-reasoner"),
+            &available,
+            "本机 AI 路由",
+        )
+        .unwrap();
+        assert_eq!(resolved, Some("himind:svc-a:deepseek-reasoner".to_string()));
+
+        // 没声明 -> 沿用 Runtime 当前配置。
+        assert_eq!(
+            super::resolve_requested_model(None, &available, "本机 AI 路由").unwrap(),
+            None
+        );
+        assert_eq!(
+            super::resolve_requested_model(Some("   "), &available, "本机 AI 路由").unwrap(),
+            None
+        );
+    }
+
+    /// overlay 渲染层：声明的别名真的要落到 `agent-default-model` 上。
+    #[test]
+    fn local_gateway_overlay_pins_the_requested_model_alias() {
+        let mut patch = String::new();
+        super::append_local_gateway_profile(
+            &mut patch,
+            "himind:svc-a:deepseek-reasoner",
+            "http://127.0.0.1:1234/v1",
+            &[
+                "himind:svc-a:deepseek-reasoner".to_string(),
+                "himind:svc-a:deepseek-chat".to_string(),
+            ],
+        )
+        .unwrap();
+        let default_model_line = patch
+            .lines()
+            .skip_while(|line| !line.contains("id: agent-default-model"))
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            default_model_line.contains("himind:svc-a:deepseek-reasoner"),
+            "agent-default-model 必须钉到声明别名：{default_model_line}"
+        );
+        // 目录里两个别名都要保留，否则 DSH 的模型选择器只剩一项。
+        assert!(patch.contains("himind:svc-a:deepseek-chat"));
+    }
+
+    /// 声明了目录里没有的模型时不能静默回落成默认模型。
+    #[test]
+    fn unavailable_requested_model_fails_closed_and_lists_alternatives() {
+        let available = vec![
+            "himind:svc-a:deepseek-chat".to_string(),
+            "himind:svc-b:qwen-max".to_string(),
+        ];
+        let error = super::resolve_requested_model(
+            Some("himind:svc-a:does-not-exist"),
+            &available,
+            "本机 AI 路由",
+        )
+        .unwrap_err();
+        assert!(error.contains("himind:svc-a:does-not-exist"), "{error}");
+        assert!(error.contains("himind:svc-a:deepseek-chat"), "必须列出可用别名：{error}");
+        assert!(error.contains("himind:svc-b:qwen-max"), "{error}");
+    }
+
+    /// `acp:` 别名不属于 DSH 路由目录，必须明确拒绝而不是当成「找不到模型」。
+    #[test]
+    fn acp_alias_is_rejected_by_the_builtin_router() {
+        let error =
+            super::resolve_requested_model(Some("acp:claude:x"), &[], "本机 AI 路由").unwrap_err();
+        assert!(error.contains("acp:"), "{error}");
+    }
+
+    #[test]
+    fn run_home_without_step_keeps_the_legacy_path() {
+        let legacy = super::launch_home(
+            "0.1.0",
+            Path::new("C:/workspace/project"),
+            super::LaunchHome::Run { run_id: "run-999", step_id: "" },
+        )
+        .unwrap();
+        assert_eq!(legacy, super::dsh_run_home("0.1.0", "run-999").unwrap());
     }
 
     #[test]

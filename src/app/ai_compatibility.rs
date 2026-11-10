@@ -333,6 +333,13 @@ pub(crate) struct CompatibilityDiagnosticV1 {
     pub attempted_normalizations: Vec<NormalizationAction>,
     pub suggested_action: String,
     pub safe_message: String,
+    /// 上游错误的结构化摘要（错误类型/码/字段 + 脱敏骨架）。
+    ///
+    /// 上游 400 常常只有一句 "invalid request"，没有它就无法复盘是哪一步
+    /// 撞上了兼容边界。默认空串，保持对旧诊断的向后兼容。
+    pub upstream_detail: String,
+    /// 出站请求的结构画像：字段名、内容块类型、采样参数，不含任何正文。
+    pub request_detail: String,
 }
 
 impl Default for CompatibilityDiagnosticV1 {
@@ -349,6 +356,8 @@ impl Default for CompatibilityDiagnosticV1 {
             attempted_normalizations: Vec::new(),
             suggested_action: "检查客户端、Provider 与模型组合是否在兼容矩阵中".to_string(),
             safe_message: "请求与 Provider 能力不兼容".to_string(),
+            upstream_detail: String::new(),
+            request_detail: String::new(),
         }
     }
 }
@@ -509,6 +518,7 @@ impl CapabilityMatrixV1 {
             UserInputImage,
             SamplingTemperature,
             SamplingTopP,
+            EmptyContent,
         ]
         .into_iter()
         .filter(|feature| {
@@ -529,6 +539,8 @@ pub(crate) enum CompatibilityFeature {
     UserInputImage,
     SamplingTemperature,
     SamplingTopP,
+    /// 上游不接受空内容（空 text 块、空 content 数组）。
+    EmptyContent,
 }
 
 impl CompatibilityFeature {
@@ -543,6 +555,7 @@ impl CompatibilityFeature {
             Self::UserInputImage => "user_input_image",
             Self::SamplingTemperature => "sampling_temperature",
             Self::SamplingTopP => "sampling_top_p",
+            Self::EmptyContent => "empty_content",
         }
     }
 
@@ -566,6 +579,8 @@ impl CompatibilityFeature {
                 .temperature
                 .merge(provider.sampling.temperature),
             Self::SamplingTopP => client.sampling.top_p.merge(provider.sampling.top_p),
+            // 空内容在任何 Provider 上都没有意义：客户端与上游一律按"不支持"处理。
+            Self::EmptyContent => CapabilitySupport::Unsupported,
         }
     }
 }
@@ -1652,6 +1667,54 @@ fn normalize_anthropic_request(
     provider: &ProviderCapability,
     changes: &mut Vec<NormalizationChange>,
 ) -> Result<(), CompatibilityNormalizationError> {
+    let mut dropped_empty_blocks = 0_usize;
+    let mut dropped_empty_messages = 0_usize;
+    if let Some(messages) = request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        // 空内容块是所有 Anthropic 兼容端都不接受的输入：Claude Code 在工具
+        // 结果为空、思考被截断时会发出 {"type":"text","text":""}。Vector Tide
+        // 对这类块返回"消息 content 每项都必须有合法 type"的泛化 400，被网关
+        // 的原有关键字匹配误判成 tool_choice 不支持——实际与工具无关。
+        // 先摘掉空块，再把因此变空的消息一起省掉，否则会退化成
+        // "messages.content 不能为空数组"的另一种 400。
+        let mut kept_messages = Vec::with_capacity(messages.len());
+        for mut message in std::mem::take(messages) {
+            let emptied = match message.get_mut("content") {
+                Some(serde_json::Value::Array(blocks)) => {
+                    let before = blocks.len();
+                    blocks.retain(|block| !is_empty_content_block(block));
+                    dropped_empty_blocks += before - blocks.len();
+                    blocks.is_empty()
+                }
+                Some(serde_json::Value::String(text)) if text.is_empty() => true,
+                _ => false,
+            };
+            if emptied {
+                dropped_empty_messages += 1;
+                continue;
+            }
+            kept_messages.push(message);
+        }
+        // 整段历史都是空内容时不能直接留下空数组：那只是换一条 400。
+        // 保留一条带占位文本的 user 消息，让上游至少收到一个合法请求。
+        if kept_messages.is_empty() && dropped_empty_messages > 0 {
+            kept_messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "[历史消息内容为空，已由 HiMind 兼容层省略]"}]
+            }));
+        }
+        *messages = kept_messages;
+    }
+    if dropped_empty_blocks > 0 || dropped_empty_messages > 0 {
+        record_change(
+            changes,
+            CompatibilityFeature::EmptyContent,
+            NormalizationAction::Degrade,
+            format!("已移除 {dropped_empty_blocks} 个空内容块与 {dropped_empty_messages} 条空消息"),
+        );
+    }
     if let Some(messages) = request
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
@@ -1740,6 +1803,23 @@ fn normalize_anthropic_request(
     }
     normalize_sampling(request, provider, changes);
     Ok(())
+}
+
+/// 上游不接受的空内容块：text 为空字符串或缺字段，以及缺 type 的空壳。
+///
+/// 只认"一定没有内容"的形状。纯空白（`"   "`）实测上游接受，保留原样——
+/// 它是客户端有意留的间隔，删掉等于改语义。工具结果里的图片/文件由各自的
+/// 降级分支负责，这里不碰。
+fn is_empty_content_block(block: &serde_json::Value) -> bool {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty),
+        // 不带 type 的块在 Anthropic 协议里本身就非法。
+        None => true,
+        Some(_) => false,
+    }
 }
 
 fn normalize_sampling(
@@ -1908,6 +1988,81 @@ mod tests {
         assert_eq!(provider.id, "volcengine_agent_plan");
         assert_eq!(provider.model_discovery, ModelDiscovery::LocalCatalog);
         assert!(provider.model_discovery.is_available());
+    }
+
+    /// 线上真实故障的回归用例：Claude Code 在一次工具结果为空之后发出了
+    /// `{"type":"text","text":""}`，Vector Tide 回泛化 400，网关按错误文案里的
+    /// "tool_choice" 字样误判成工具选择不支持，用户看到的是"请关闭强制工具选择"。
+    #[test]
+    fn vectide_anthropic_drops_empty_content_blocks() {
+        let matrix = CapabilityMatrixV1::builtin();
+        let provider =
+            matrix.resolve_provider("https://vectide.cn/v1", &AIServiceProtocol::Anthropic);
+        assert_eq!(provider.id, "vectide_anthropic");
+        let client = matrix.client("claude-code").unwrap();
+        let request = serde_json::json!({
+            "model": "deepseek-v4.1-flash-1017",
+            "max_tokens": 32000,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": ""}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]},
+                {"role": "assistant", "content": []},
+                {"role": "user", "content": [{"type": "text", "text": ""}]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+            "tool_choice": {"type": "auto"}
+        });
+        let normalized = normalize_provider_request(
+            &AIServiceProtocol::Anthropic,
+            request,
+            client,
+            provider,
+            None,
+        )
+        .unwrap();
+        let messages = normalized.request["messages"].as_array().unwrap();
+        // 只剩三条真有内容的消息；空块、空数组、纯空白消息各被摘掉。
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[2]["content"][0]["text"], "next");
+        assert!(normalized
+            .changes
+            .iter()
+            .any(|change| change.feature == CompatibilityFeature::EmptyContent.as_str()));
+        // 其余能力不能被这次清理牵连：工具与 tool_choice 原样保留。
+        assert_eq!(normalized.request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(normalized.request["tool_choice"]["type"], "auto");
+    }
+
+    /// 历史全是空内容时必须留下一个合法请求，而不是把 messages 清空。
+    #[test]
+    fn anthropic_all_empty_history_keeps_one_placeholder_message() {
+        let matrix = CapabilityMatrixV1::builtin();
+        let provider =
+            matrix.resolve_provider("https://vectide.cn/v1", &AIServiceProtocol::Anthropic);
+        let client = matrix.client("claude-code").unwrap();
+        let request = serde_json::json!({
+            "model": "deepseek-v4.1-flash-1017",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+        });
+        let normalized = normalize_provider_request(
+            &AIServiceProtocol::Anthropic,
+            request,
+            client,
+            provider,
+            None,
+        )
+        .unwrap();
+        let messages = normalized.request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let text = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.trim().is_empty());
     }
 
     #[test]

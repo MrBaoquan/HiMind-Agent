@@ -49,6 +49,8 @@ pub(crate) mod mcp_settings;
 pub(crate) mod mcp_target_types;
 pub(crate) mod mcp_targets;
 pub(crate) mod media_stream;
+pub(crate) mod mission_commands;
+pub(crate) mod mission_dispatch;
 pub(crate) mod operation_plan;
 pub(crate) mod plugin_manager;
 pub(crate) mod release_install;

@@ -34,6 +34,7 @@ import {
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
 import { formatError } from '../types';
+import { MissionTeamPanel } from './MissionTeamPanel';
 
 type TaskFilter = 'all' | 'running' | 'completed' | 'attention';
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
@@ -201,6 +202,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const [missionId, setMissionId] = useState('');
 
   // 本机记录是本地读取（快），工作台历史要打控制面接口（慢）。轮询按两个节奏走：
   // 本机 5 秒，工作台历史 30 秒，避免每 5 秒发一次网络请求。
@@ -277,22 +279,23 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
         description={dashboardEnabled ? '查看 AI 对话、自动化工作流和工作台发起的任务。' : '查看 AI 对话和本机自动化工作流发起的任务。'}
         actions={dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台</button> : undefined}
       />
+      <MissionTeamPanel selectedMissionId={missionId} onOpenMission={setMissionId} onBackToTasks={() => setMissionId('')} />
 
-      <section className="task-center-summary" aria-label="活动概览">
+      {!missionId ? <section className="task-center-summary" aria-label="活动概览">
         <SummaryItem label="进行中" value={active.length} tone="running" />
         <SummaryItem label="需处理" value={attention.length} tone={attention.length ? 'attention' : 'neutral'} />
         <SummaryItem label="已完成" value={completed.length} tone="success" />
         <SummaryItem label="记录总数" value={items.length} tone="neutral" />
-      </section>
+      </section> : null}
 
-      {active.length > 0 ? (
+      {!missionId && active.length > 0 ? (
         <section className="task-center-current" aria-labelledby="task-center-current-title">
           <div className="task-center-section-heading"><div><span className="task-center-section-kicker"><Clock3 size={14} />实时状态</span><h3 id="task-center-current-title">正在进行</h3></div><span>{active.length} 项</span></div>
           <div className="task-center-current-list">{active.map(item => <ActivityRow key={item.id} entry={item} featured={item.id === currentItem?.id} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} onCancelRun={onCancelRun} onApproveRun={onApproveRun} onRejectRun={onRejectRun} onPauseRun={onPauseRun} onResumePausedRun={onResumePausedRun} />)}</div>
         </section>
       ) : null}
 
-      <section className="task-center-history" aria-labelledby="task-center-history-title">
+      {!missionId ? <section className="task-center-history" aria-labelledby="task-center-history-title">
         <div className="task-center-section-heading">
           <div><span className="task-center-section-kicker"><CheckCircle2 size={14} />可回看</span><h3 id="task-center-history-title">运行记录</h3></div>
           <span>{loading ? <><BusyIndicator size={11} /> 更新中</> : updatedAt ? `${filteredItems.length} / ${items.length} · 更新于 ${updatedAt.toLocaleTimeString('zh-CN', { hour12: false })}` : `${filteredItems.length} / ${items.length}`}</span>
@@ -334,7 +337,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
                 />
                 {items.length === 0 && dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台发起任务</button> : null}
               </div>}
-      </section>
+      </section> : null}
     </div>
   );
 }

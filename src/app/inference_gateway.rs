@@ -7,11 +7,12 @@
 //! P1 只做直通：入口协议与上游协议一致时原样转发。协议互译属 P2（见 0113）。
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -23,14 +24,18 @@ const HEADER_LIMIT: usize = 64 * 1024;
 /// 但出站请求会在媒体外置后严格压到远端网关限制以下。
 ///
 /// 注意：这条上限必须比“客户端已积累的历史”更大，否则网关会在收到请求前
-/// 就拒绝，根本来不及把图片外置。默认 192 MiB，可用环境变量覆盖。
-const DEFAULT_INBOUND_BODY_MIB: usize = 192;
+/// 就拒绝，根本来不及把图片外置。默认 64 MiB；单个客户端最多 8 路并发，
+/// 最坏内存占用因此有上界。可用环境变量覆盖。
+const DEFAULT_INBOUND_BODY_MIB: usize = 64;
 const MIN_INBOUND_BODY_MIB: usize = 32;
 const MAX_INBOUND_BODY_MIB: usize = 512;
 const INBOUND_BODY_MIB_ENV: &str = "HIMIND_AGENT_GATEWAY_INBOUND_MIB";
 const OUTBOUND_BODY_LIMIT: usize = 24 * 1024 * 1024;
 const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+/// 单个客户端同时占用的请求槽。长流式请求会一直占槽，避免一个失控客户端
+/// 用 32 条连接把其他客户端的推理请求挤掉。
+const MAX_INFLIGHT_PER_CLIENT: usize = 8;
 
 fn inbound_body_limit_mib() -> usize {
     std::env::var(INBOUND_BODY_MIB_ENV)
@@ -927,6 +932,80 @@ fn response_unsupported_tools_fallback(body: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&value).ok()
 }
 
+struct ResponsesFallbackOutcome {
+    response: reqwest::blocking::Response,
+    /// 仅在真正执行过回退时返回改写后的请求体；调用方用它做诊断。
+    body: Option<Vec<u8>>,
+    applied: Vec<&'static str>,
+}
+
+/// Responses 兼容上游支持的子集并不一致。Codex 会同时携带
+/// `function_call` 历史、工具结果媒体和 `namespace` / `web_search` 工具；
+/// Vector Tide 等上游对这几类输入都会返回同一个泛化的 400。
+///
+/// 只在 400/422 时逐级收敛：先移除工具结果媒体，再降级工具历史/移除扩展工具；
+/// 每级都只重试一次，避免把真实故障放大成重试风暴。成功或非 400/422 响应
+/// 原样返回，不额外改写。
+fn send_responses_with_compatibility_fallback<F>(
+    binding: &GatewayBinding,
+    outgoing_body: &[u8],
+    send: &mut F,
+) -> reqwest::Result<ResponsesFallbackOutcome>
+where
+    F: FnMut(&[u8]) -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let mut fallback_body = outgoing_body.to_vec();
+    let mut applied = Vec::new();
+    let mut response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+    if !matches!(response.status().as_u16(), 400 | 422) {
+        return Ok(ResponsesFallbackOutcome {
+            response,
+            body: None,
+            applied,
+        });
+    }
+
+    // 先做最小兼容：仅移除工具结果中的图片/文件，保留 function_call 结构。
+    if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
+        fallback_body = media_body;
+        applied.push("tool_result_media");
+        crate::approval::manager::append_event_log(
+            "info",
+            "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
+        );
+        response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+    }
+
+    // 仍失败时再降级整个工具历史，并移除上游不支持的扩展工具。
+    if matches!(response.status().as_u16(), 400 | 422) {
+        let mut changes = Vec::new();
+        if let Some(history_body) = response_tool_history_fallback(&fallback_body) {
+            fallback_body = history_body;
+            changes.push("已将历史工具调用降级为普通消息");
+            applied.push("tool_history");
+        }
+        if let Some(tools_body) = response_unsupported_tools_fallback(&fallback_body) {
+            fallback_body = tools_body;
+            changes.push("已移除上游不支持的 namespace/web_search 工具");
+            applied.push("unsupported_tools");
+        }
+        if !changes.is_empty() {
+            crate::approval::manager::append_event_log(
+                "info",
+                &format!("本机网关兼容回退：{}后重试", changes.join("；")),
+            );
+            response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+        }
+    }
+
+    let body = (!applied.is_empty()).then_some(fallback_body);
+    Ok(ResponsesFallbackOutcome {
+        response,
+        body,
+        applied,
+    })
+}
+
 fn summarize_responses_request(body: &[u8]) -> String {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return "invalid-json".to_string();
@@ -1237,6 +1316,8 @@ fn route(
     body: &[u8],
 ) -> Result<(), GatewayError> {
     let started = Instant::now();
+    let gateway_request_id = new_request_id();
+    set_current_request_id(&gateway_request_id);
     let bindings = resolver();
     // 聚合模型目录由本机生成，不依赖任一上游 `/v1/models` 是否可用。
     if head.method == "GET" && normalize_api_path(&head.path) == "/models" {
@@ -1258,6 +1339,31 @@ fn route(
     }
     let required_protocol = path_protocol(&head.path).ok_or(GatewayError::UnsupportedPath)?;
     let binding = authorize(&bindings, &head.headers, body, required_protocol)?;
+    // 单客户端并发闸门：槽在本次请求返回时释放，长流式请求会一直占槽。
+    let Some(_request_slot) = acquire_request_slot(&binding.client) else {
+        let message = format!(
+            "客户端 {} 同时进行的推理请求过多（上限 {MAX_INFLIGHT_PER_CLIENT}），请稍后重试。request_id={}",
+            binding.client,
+            current_request_id()
+        );
+        let _ = write_json_error(
+            stream,
+            429,
+            "himind_gateway_too_many_requests",
+            &message,
+        );
+        let display_model = binding_exposed_model(&binding).to_string();
+        record_usage(
+            &binding,
+            &display_model,
+            false,
+            429,
+            Usage::default(),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(());
+    };
     // 入口协议与上游协议不一致时走互译：
     // Anthropic → Chat/Responses、Responses → Chat、Chat → Responses。
     let translatable = matches!(
@@ -1413,16 +1519,15 @@ const TRANSIENT_UPSTREAM_MAX_ATTEMPTS: usize = 2;
 
 /// 上游在开始流式输出前返回的瞬时 5xx 可以安全透明重试：此时客户端还没有收到
 /// 任何字节，模型请求也没有执行工具。只重试一次，避免把真实故障放大成重试风暴。
-fn send_upstream_with_transient_retry<F>(
+fn send_with_transient_retry<F>(
     binding: &GatewayBinding,
-    payload: &[u8],
     send: &mut F,
 ) -> reqwest::Result<reqwest::blocking::Response>
 where
-    F: FnMut(&[u8]) -> reqwest::Result<reqwest::blocking::Response>,
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
 {
     for attempt in 1..=TRANSIENT_UPSTREAM_MAX_ATTEMPTS {
-        let response = send(payload)?;
+        let response = send()?;
         let status = response.status().as_u16();
         let transient = matches!(status, 500 | 502 | 503 | 504);
         if transient && attempt < TRANSIENT_UPSTREAM_MAX_ATTEMPTS {
@@ -1441,6 +1546,18 @@ where
     }
     unreachable!("transient retry loop always returns")
 }
+
+fn send_upstream_with_transient_retry<F>(
+    binding: &GatewayBinding,
+    payload: &[u8],
+    send: &mut F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut(&[u8]) -> reqwest::Result<reqwest::blocking::Response>,
+{
+    send_with_transient_retry(binding, &mut || send(payload))
+}
+
 fn forward(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
@@ -1464,6 +1581,15 @@ fn forward(
     }
     let request_summary = if kind == "openai-responses" {
         summarize_responses_request(body)
+    } else {
+        String::new()
+    };
+    // Anthropic 入口直通上游时，上游 400 只会被记成 status + 字节数，
+    // 事后完全无法复盘。这里先按结构清点一次请求，失败日志直接带上它。
+    let anthropic_request_profile = if kind == "anthropic" {
+        serde_json::from_slice::<Value>(body)
+            .map(|request| describe_request_structure(&request))
+            .unwrap_or_else(|_| "invalid-json".to_string())
     } else {
         String::new()
     };
@@ -1520,7 +1646,7 @@ fn forward(
         }
         None => serde_json::from_slice::<Value>(body).ok(),
     };
-    let outgoing_body = match compatibility_request {
+    let (outgoing_body, mut attempted_normalizations) = match compatibility_request {
         Some(request) => {
             let normalized = normalize_compatibility_request(
                 stream,
@@ -1528,10 +1654,11 @@ fn forward(
                 binding.protocol.as_str(),
                 request,
             )?;
-            serde_json::to_vec(&normalized)
-                .map_err(|error| media_normalize_error(stream, &error.to_string()))?
+            let body = serde_json::to_vec(&normalized.request)
+                .map_err(|error| media_normalize_error(stream, &error.to_string()))?;
+            (body, normalized.attempted)
         }
-        None => body.to_vec(),
+        None => (body.to_vec(), Vec::new()),
     };
     if kind != "models" {
         enforce_outbound_body_limit(stream, outgoing_body.len())?;
@@ -1570,70 +1697,40 @@ fn forward(
         }
         request.send()
     };
-    let mut response =
-        match send_upstream_with_transient_retry(binding, &outgoing_body, &mut send_upstream) {
-            // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
-            Ok(response) => response,
+    let responses_fallback_applies =
+        kind == "openai-responses" && binding.protocol == "openai-responses";
+    let fallback_outcome = if responses_fallback_applies {
+        match send_responses_with_compatibility_fallback(
+            binding,
+            &outgoing_body,
+            &mut send_upstream,
+        ) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 return Err(write_upstream_failure(stream, &error.to_string()));
             }
-        };
-    // Responses 兼容上游支持的子集并不一致。Codex 会同时携带
-    // `function_call` 历史和 `namespace` / `web_search` 工具；Vector Tide 等
-    // 上游对两类输入都会返回同一个泛化的 400。首轮仅在 400/422 时把已知
-    // 不兼容的部分一起收敛，再重试一次，避免第一次回退后仍撞在另一类字段上。
-    if kind == "openai-responses"
-        && binding.protocol == "openai-responses"
-        && matches!(response.status().as_u16(), 400 | 422)
-    {
-        let mut fallback_body = outgoing_body.clone();
-        // 先做最小兼容：仅移除工具结果中的图片/文件，保留 function_call 结构。
-        if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
-            fallback_body = media_body;
-            crate::approval::manager::append_event_log(
-                "info",
-                "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
-            );
-            response = match send_upstream_with_transient_retry(
-                binding,
-                &fallback_body,
-                &mut send_upstream,
-            ) {
+        }
+    } else {
+        let response =
+            match send_upstream_with_transient_retry(binding, &outgoing_body, &mut send_upstream) {
                 Ok(response) => response,
                 Err(error) => {
                     return Err(write_upstream_failure(stream, &error.to_string()));
                 }
             };
+        ResponsesFallbackOutcome {
+            response,
+            body: None,
+            applied: Vec::new(),
         }
-        // 仍失败时再降级整个工具历史，并移除上游不支持的扩展工具。
-        if matches!(response.status().as_u16(), 400 | 422) {
-            let mut fallback_changes = Vec::new();
-            if let Some(history_body) = response_tool_history_fallback(&fallback_body) {
-                fallback_body = history_body;
-                fallback_changes.push("已将历史工具调用降级为普通消息");
-            }
-            if let Some(tools_body) = response_unsupported_tools_fallback(&fallback_body) {
-                fallback_body = tools_body;
-                fallback_changes.push("已移除上游不支持的 namespace/web_search 工具");
-            }
-            if !fallback_changes.is_empty() {
-                crate::approval::manager::append_event_log(
-                    "info",
-                    &format!("本机网关兼容回退：{}后重试", fallback_changes.join("；")),
-                );
-                response = match send_upstream_with_transient_retry(
-                    binding,
-                    &fallback_body,
-                    &mut send_upstream,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return Err(write_upstream_failure(stream, &error.to_string()));
-                    }
-                };
-            }
-        }
+    };
+    // 运行时回退也是“已经降级过”的事实，必须进诊断；否则最终仍 400 时
+    // 用户会被告知去排查早已被移除的字段。
+    for _ in &fallback_outcome.applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
     }
+    let mut response = fallback_outcome.response;
+    let final_request_body = fallback_outcome.body;
     let status = response.status();
     let content_type = response
         .headers()
@@ -1653,25 +1750,32 @@ fn forward(
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
-                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={}",
+                "本机网关上游返回失败：request_id={} status={} path={} bytes={} headers={} request={} structure={}",
+                current_request_id(),
                 status.as_u16(),
                 head.path,
                 raw.len(),
                 header_names,
                 request_summary,
+                anthropic_request_profile,
             ),
         );
         if matches!(status.as_u16(), 400 | 422) {
-            let request =
-                serde_json::from_slice::<Value>(&outgoing_body).unwrap_or_else(|_| json!({}));
+            let request = serde_json::from_slice::<Value>(
+                final_request_body.as_deref().unwrap_or(&outgoing_body),
+            )
+            .unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             if kind != "models" {
                 record_usage(
@@ -1820,19 +1924,23 @@ fn forward_translated(
             Ok(openai_body) => openai_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let openai_body = normalize_compatibility_request(stream, binding, "openai-chat", openai_body)?;
-    let openai_payload = openai_body.to_string();
+    let openai_normalized =
+        normalize_compatibility_request(stream, binding, "openai-chat", openai_body)?;
+    let attempted_normalizations = openai_normalized.attempted.clone();
+    let openai_payload = openai_normalized.request.to_string();
     enforce_outbound_body_limit(stream, openai_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let request = client
-        .post(join_upstream(&binding.base_url, "/v1/chat/completions"))
-        .header("authorization", format!("Bearer {}", binding.api_key))
-        .header("content-type", "application/json")
-        .header("accept-encoding", "identity");
-    let mut response = match with_opencode_session(request, binding, None, body)
-        .body(openai_payload)
-        .send()
-    {
+    let mut send = || {
+        let request = client
+            .post(join_upstream(&binding.base_url, "/v1/chat/completions"))
+            .header("authorization", format!("Bearer {}", binding.api_key))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity");
+        with_opencode_session(request, binding, None, body)
+            .body(openai_payload.clone())
+            .send()
+    };
+    let mut response = match send_with_transient_retry(binding, &mut send) {
         Ok(response) => response,
         Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
     };
@@ -1847,12 +1955,15 @@ fn forward_translated(
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -1921,12 +2032,13 @@ fn forward_translated(
         let tail = translator.finish().concat();
         let _ = stream.write_all(tail.as_bytes());
         let _ = stream.flush();
+        let failed = translator.failed();
         let (input, output) = translator.usage();
         record_usage(
             binding,
             &display_model,
             true,
-            status.as_u16(),
+            if failed { 502 } else { status.as_u16() },
             Usage {
                 input,
                 output,
@@ -1994,23 +2106,32 @@ fn forward_anthropic_responses_translated(
         Ok(body) => body,
         Err(error) => return Err(translate_error(stream, &error)),
     };
-    let responses_body =
+    let responses_normalized =
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
-    let payload = responses_body.to_string();
+    let mut attempted_normalizations = responses_normalized.attempted.clone();
+    let payload = responses_normalized.request.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let request_builder = client
-        .post(join_upstream(&binding.base_url, "/responses"))
-        .header("authorization", format!("Bearer {}", binding.api_key))
-        .header("content-type", "application/json")
-        .header("accept-encoding", "identity");
-    let mut response = match with_opencode_session(request_builder, binding, None, body)
-        .body(payload)
-        .send()
-    {
-        Ok(response) => response,
-        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+    let mut send = |payload: &[u8]| {
+        let request_builder = client
+            .post(join_upstream(&binding.base_url, "/responses"))
+            .header("authorization", format!("Bearer {}", binding.api_key))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity");
+        with_opencode_session(request_builder, binding, None, body)
+            .body(payload.to_vec())
+            .send()
     };
+    let fallback_outcome =
+        match send_responses_with_compatibility_fallback(binding, payload.as_bytes(), &mut send) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+        };
+    for _ in &fallback_outcome.applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+    }
+    let mut response = fallback_outcome.response;
+    let final_request_body = fallback_outcome.body;
     let status = response.status();
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
@@ -2018,15 +2139,20 @@ fn forward_anthropic_responses_translated(
         let _ = response.read_to_end(&mut raw_error);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
-            let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+            let request =
+                serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
+                    .unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2101,12 +2227,13 @@ fn forward_anthropic_responses_translated(
         let tail = translator.finish().concat();
         let _ = stream.write_all(tail.as_bytes());
         let _ = stream.flush();
+        let failed = translator.failed();
         let (input, output) = translator.usage();
         record_usage(
             binding,
             &display_model,
             true,
-            status.as_u16(),
+            if failed { 502 } else { status.as_u16() },
             Usage {
                 input,
                 output,
@@ -2185,19 +2312,25 @@ fn forward_responses_translated(
             Ok(chat_body) => chat_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let chat_body = normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
-    let chat_payload = chat_body.to_string();
+    let chat_normalized =
+        normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
+    let attempted_normalizations = chat_normalized.attempted.clone();
+    let chat_payload = chat_normalized.request.to_string();
     enforce_outbound_body_limit(stream, chat_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut upstream_request = client
-        .post(join_upstream(&binding.base_url, "/chat/completions"))
-        .header("authorization", format!("Bearer {}", binding.api_key))
-        .header("content-type", "application/json")
-        .header("accept-encoding", "identity");
-    if let Some(session) = opencode_session_for_value(binding, client_session, request) {
-        upstream_request = upstream_request.header(OPENCODE_SESSION_HEADER, session);
-    }
-    let mut response = match upstream_request.body(chat_payload).send() {
+    let opencode_session = opencode_session_for_value(binding, client_session, request);
+    let mut send = || {
+        let mut upstream_request = client
+            .post(join_upstream(&binding.base_url, "/chat/completions"))
+            .header("authorization", format!("Bearer {}", binding.api_key))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity");
+        if let Some(session) = opencode_session.as_deref() {
+            upstream_request = upstream_request.header(OPENCODE_SESSION_HEADER, session);
+        }
+        upstream_request.body(chat_payload.clone()).send()
+    };
+    let mut response = match send_with_transient_retry(binding, &mut send) {
         Ok(response) => response,
         Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
     };
@@ -2211,12 +2344,15 @@ fn forward_responses_translated(
             let request = request.clone();
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2233,7 +2369,8 @@ fn forward_responses_translated(
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
-                "本机网关上游返回失败：status={} path=/chat/completions binding={} model={} detail={}",
+                "本机网关上游返回失败：request_id={} status={} path=/chat/completions binding={} model={} detail={}",
+                current_request_id(),
                 status.as_u16(),
                 binding.id,
                 binding.exposed_model,
@@ -2292,12 +2429,13 @@ fn forward_responses_translated(
         let tail = translator.finish().concat();
         let _ = stream.write_all(tail.as_bytes());
         let _ = stream.flush();
+        let failed = translator.failed();
         let (input, output) = translator.usage();
         record_usage(
             binding,
             &display_model,
             true,
-            status.as_u16(),
+            if failed { 502 } else { status.as_u16() },
             Usage {
                 input,
                 output,
@@ -2361,23 +2499,32 @@ fn forward_chat_responses_translated(
             Ok(body) => body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let responses_body =
+    let responses_normalized =
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
-    let payload = responses_body.to_string();
+    let mut attempted_normalizations = responses_normalized.attempted.clone();
+    let payload = responses_normalized.request.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let upstream_request = client
-        .post(join_upstream(&binding.base_url, "/responses"))
-        .header("authorization", format!("Bearer {}", binding.api_key))
-        .header("content-type", "application/json")
-        .header("accept-encoding", "identity");
-    let mut response = match with_opencode_session(upstream_request, binding, None, body)
-        .body(payload)
-        .send()
-    {
-        Ok(response) => response,
-        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+    let mut send = |payload: &[u8]| {
+        let upstream_request = client
+            .post(join_upstream(&binding.base_url, "/responses"))
+            .header("authorization", format!("Bearer {}", binding.api_key))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity");
+        with_opencode_session(upstream_request, binding, None, body)
+            .body(payload.to_vec())
+            .send()
     };
+    let fallback_outcome =
+        match send_responses_with_compatibility_fallback(binding, payload.as_bytes(), &mut send) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+        };
+    for _ in &fallback_outcome.applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+    }
+    let mut response = fallback_outcome.response;
+    let final_request_body = fallback_outcome.body;
     let status = response.status();
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
@@ -2385,15 +2532,20 @@ fn forward_chat_responses_translated(
         let _ = response.read_to_end(&mut raw_error);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
-            let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+            let request =
+                serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
+                    .unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
                 stream,
-                status,
-                binding,
-                kind,
-                &request,
-                &raw_error,
-                &upstream_headers,
+                CompatibilityDiagnosticInput {
+                    status,
+                    binding,
+                    client_protocol: kind,
+                    request: &request,
+                    upstream_body: &raw_error,
+                    upstream_headers: &upstream_headers,
+                    attempted_normalizations: attempted_normalizations.clone(),
+                },
             )?;
             record_usage(
                 binding,
@@ -2457,12 +2609,13 @@ fn forward_chat_responses_translated(
         let tail = translator.finish().concat();
         let _ = stream.write_all(tail.as_bytes());
         let _ = stream.flush();
+        let failed = translator.failed();
         let (input, output) = translator.usage();
         record_usage(
             binding,
             &display_model,
             true,
-            status.as_u16(),
+            if failed { 502 } else { status.as_u16() },
             Usage {
                 input,
                 output,
@@ -2507,7 +2660,12 @@ fn forward_chat_responses_translated(
 }
 
 fn translate_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
-    let _ = write_json_error(stream, 400, "himind_gateway_translation_failed", detail);
+    let _ = write_json_error(
+        stream,
+        400,
+        "himind_gateway_translation_failed",
+        &format!("{detail}（request_id={}）", current_request_id()),
+    );
     GatewayError::Answered
 }
 
@@ -2520,7 +2678,8 @@ fn compatibility_normalize_error(
     crate::approval::manager::append_event_log(
         "warn",
         &format!(
-            "本机网关兼容矩阵拒绝发送：client={} provider={} protocol={} feature={}",
+            "本机网关兼容矩阵拒绝发送：request_id={} client={} provider={} protocol={} feature={}",
+            current_request_id(),
             binding.client,
             binding.service,
             protocol,
@@ -2533,10 +2692,11 @@ fn compatibility_normalize_error(
     let provider = matrix.resolve_provider(&binding.base_url, &provider_protocol);
     let suggested_action = suggested_action_for_feature(error.feature.as_str());
     let safe_message = format!(
-        "请求包含 Provider 无法安全降级的能力（{}）：{} {}",
+        "请求包含 Provider 无法安全降级的能力（{}）：{} {}（request_id={}）",
         error.feature.as_str(),
         error.message,
-        suggested_action
+        suggested_action,
+        current_request_id()
     );
     let diagnostic = crate::app::ai_compatibility::CompatibilityDiagnosticV1 {
         schema_version: crate::app::ai_compatibility::AI_COMPATIBILITY_SCHEMA_VERSION,
@@ -2550,6 +2710,10 @@ fn compatibility_normalize_error(
         attempted_normalizations: vec![crate::app::ai_compatibility::NormalizationAction::Reject],
         suggested_action: suggested_action.to_string(),
         safe_message: safe_message.clone(),
+        // 这一条是本地拒绝，没有上游响应；把拒绝理由放进 request_detail，
+        // 两个字段都保持非空，前端不必区分"缺字段"和"没有内容"。
+        upstream_detail: "local_reject=no_upstream_response".to_string(),
+        request_detail: format!("feature={}", error.feature.as_str()),
     };
     let payload = if binding.entry_protocol == "anthropic" {
         json!({
@@ -2583,12 +2747,15 @@ fn compatibility_normalize_error(
     GatewayError::Answered
 }
 
+/// 兼容矩阵规格化。除了改写后的请求，也把本次做过的动作一并交回：
+/// 上游随后返回 400 时，诊断里要写清"已经试着降级过什么"，否则用户会把
+/// 早已被降级的字段（比如工具结果图片）当成真正的诱因。
 fn normalize_compatibility_request(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     protocol: &str,
     request: Value,
-) -> Result<Value, GatewayError> {
+) -> Result<NormalizedOutbound, GatewayError> {
     let protocol = match crate::store::ai_services::AIServiceProtocol::parse(protocol) {
         Ok(protocol) => protocol,
         Err(error) => return Err(translate_error(stream, &error)),
@@ -2616,28 +2783,78 @@ fn normalize_compatibility_request(
             ),
         );
     }
-    Ok(normalized.request)
+    let attempted = normalized
+        .changes
+        .iter()
+        .map(|change| change.action)
+        .collect::<Vec<_>>();
+    Ok(NormalizedOutbound {
+        request: normalized.request,
+        attempted,
+    })
 }
+
+/// 规格化后的出站请求，连同已执行的兼容动作。
+struct NormalizedOutbound {
+    request: Value,
+    attempted: Vec<crate::app::ai_compatibility::NormalizationAction>,
+}
+
+/// 诊断要写清的三件事凑在一起：上游回了什么、发出去的请求长什么样、
+/// 兼容层已经改过什么。参数因此收进一个结构体，避免继续加字段就改签名。
+struct CompatibilityDiagnosticInput<'a> {
+    status: reqwest::StatusCode,
+    binding: &'a GatewayBinding,
+    client_protocol: &'a str,
+    request: &'a Value,
+    upstream_body: &'a [u8],
+    upstream_headers: &'a reqwest::header::HeaderMap,
+    attempted_normalizations: Vec<crate::app::ai_compatibility::NormalizationAction>,
+}
+
 fn write_upstream_compatibility_diagnostic(
     stream: &mut TcpStream,
-    status: reqwest::StatusCode,
-    binding: &GatewayBinding,
-    client_protocol: &str,
-    request: &Value,
-    upstream_body: &[u8],
-    upstream_headers: &reqwest::header::HeaderMap,
+    input: CompatibilityDiagnosticInput<'_>,
 ) -> Result<(), GatewayError> {
+    let CompatibilityDiagnosticInput {
+        status,
+        binding,
+        client_protocol,
+        request,
+        upstream_body,
+        upstream_headers,
+        attempted_normalizations,
+    } = input;
     let upstream_text = String::from_utf8_lossy(upstream_body);
+    let gateway_request_id = current_request_id();
     let request_id = upstream_request_id(upstream_headers, upstream_text.as_ref());
     let provider_protocol = crate::store::ai_services::AIServiceProtocol::parse(&binding.protocol)
         .unwrap_or(crate::store::ai_services::AIServiceProtocol::OpenaiChat);
     let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
     let provider = matrix.resolve_provider(&binding.base_url, &provider_protocol);
-    let unsupported_feature = infer_unsupported_feature(request, &upstream_text);
+    let unsupported_feature = infer_unsupported_feature_with_normalizations(
+        request,
+        &upstream_text,
+        &attempted_normalizations,
+    );
     let suggested_action = suggested_action_for_feature(&unsupported_feature);
+    // 上游 400 往往是泛化文案（"invalid request"），单看它定位不到字段。
+    // 因此把两侧的画像一起记下来：请求侧的字段/块类型清单与已执行的降级动作，
+    // 上游侧的错误骨架与原文摘要（凭据已脱敏）。两者都只记结构，不记用户内容。
+    let request_profile = describe_request_structure(request);
+    let attempted_profile = describe_attempted_normalizations(&attempted_normalizations);
+    let upstream_profile = summarize_upstream_error(&upstream_text);
     let safe_message = format!(
-        "{} 的请求与 Provider {} 不兼容（{}）。{}",
-        binding.client, provider.id, unsupported_feature, suggested_action
+        "{} 的请求与 Provider {} 不兼容（{}）。{} [诊断：client_request=[{}]；{}；已降级={}；request_id={}；gateway_request_id={}]",
+        binding.client,
+        provider.id,
+        unsupported_feature,
+        suggested_action,
+        request_profile,
+        upstream_profile,
+        attempted_profile,
+        request_id.as_deref().unwrap_or("none"),
+        gateway_request_id,
     );
     let diagnostic = crate::app::ai_compatibility::CompatibilityDiagnosticV1 {
         schema_version: crate::app::ai_compatibility::AI_COMPATIBILITY_SCHEMA_VERSION,
@@ -2648,19 +2865,29 @@ fn write_upstream_compatibility_diagnostic(
         unsupported_feature: unsupported_feature.clone(),
         upstream_status: status.as_u16(),
         request_id: request_id.clone(),
-        attempted_normalizations: Vec::new(),
+        attempted_normalizations: attempted_normalizations.clone(),
         suggested_action: suggested_action.to_string(),
         safe_message: safe_message.clone(),
+        upstream_detail: upstream_profile.clone(),
+        request_detail: request_profile.clone(),
     };
     crate::approval::manager::append_event_log(
         "warn",
         &format!(
-            "本机网关兼容诊断：client={} provider={} feature={} status={} request_id={}",
+            "本机网关兼容诊断：gateway_request_id={} client={} provider={} feature={} status={} request_id={}",
+            gateway_request_id,
             binding.client,
             provider.id,
             unsupported_feature,
             status.as_u16(),
             request_id.as_deref().unwrap_or("none")
+        ),
+    );
+    crate::approval::manager::append_event_log(
+        "warn",
+        &format!(
+            "本机网关兼容诊断明细：gateway_request_id={} client_request=[{}] attempted=[{}] upstream=[{}]",
+            gateway_request_id, request_profile, attempted_profile, upstream_profile
         ),
     );
     let payload = if client_protocol == "anthropic" {
@@ -2696,6 +2923,370 @@ fn write_upstream_compatibility_diagnostic(
     Ok(())
 }
 
+/// 请求结构画像：只列字段名与内容块类型，不含任何用户文本。
+///
+/// 上游的 400 常常只说 "invalid request"，不从请求侧做一次结构清点，
+/// 事后就无从判断是哪个字段撞上了兼容边界。这里的输出是稳定的单行文本，
+/// 直接进事件日志与诊断文案，所以必须保证不携带凭据与正文。
+fn describe_request_structure(request: &Value) -> String {
+    let Some(object) = request.as_object() else {
+        return format!("not-an-object kind={}", json_kind(request));
+    };
+    let mut parts = Vec::new();
+    // 空内容块是真实的 400 诱因，必须一眼可见；否则光看块类型清单会以为
+    // "text 块存在"就一切正常。
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        let empty_blocks = messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block.get("text").and_then(Value::as_str).is_none_or(str::is_empty)
+            })
+            .count();
+        let empty_messages = messages
+            .iter()
+            .filter(|message| match message.get("content") {
+                Some(Value::Array(blocks)) => blocks.is_empty(),
+                Some(Value::String(text)) => text.is_empty(),
+                _ => false,
+            })
+            .count();
+        if empty_blocks > 0 || empty_messages > 0 {
+            parts.push(format!(
+                "empty_content={{blocks:{empty_blocks},messages:{empty_messages}}}"
+            ));
+        }
+    }
+    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    for key in keys {
+        let value = &object[key];
+        let entry = match key {
+            // 消息/输入是请求的主体，值得展开到内容块类型这一层。
+            "messages" | "input" => {
+                let Some(items) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let roles = items
+                    .iter()
+                    .filter_map(|item| item.get("role").and_then(Value::as_str))
+                    .fold(BTreeMap::<&str, usize>::new(), |mut acc, role| {
+                        *acc.entry(role).or_default() += 1;
+                        acc
+                    });
+                let role_text = roles
+                    .iter()
+                    .map(|(role, count)| format!("{role}:{count}"))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let mut blocks = Vec::new();
+                collect_content_block_types(items, &mut blocks);
+                format!(
+                    "{key}=[{} roles={}] blocks={{{}}}",
+                    items.len(),
+                    if role_text.is_empty() {
+                        "-".to_string()
+                    } else {
+                        role_text
+                    },
+                    blocks.join(",")
+                )
+            }
+            "tools" => {
+                let Some(tools) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let mut types = tools
+                    .iter()
+                    .map(|tool| {
+                        tool.get("type")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                // Anthropic 的 tool 定义不带 type 键，只有自定义工具。
+                                tool.get("name").and_then(Value::as_str).map(|_| "custom")
+                            })
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                types.sort_unstable();
+                types.dedup();
+                format!("{key}=[{} types={}]", tools.len(), types.join(","))
+            }
+            // 采样与开关类标量：值本身有价值（比如 thinking 的 type），也不敏感。
+            "temperature" | "top_p" | "top_k" | "max_tokens" | "stream" => {
+                format!("{key}={}", short_scalar(value))
+            }
+            "max_output_tokens" | "store" | "previous_response_id" | "truncation" => {
+                format!("{key}={}", short_scalar(value))
+            }
+            "tool_choice" => format!("{key}={}", describe_tool_choice(value)),
+            "system" => {
+                // Claude Code 的 system 是带 cache_control 的文本块数组，
+                // 版本差异正好集中在这里，值本身不能记，结构要记。
+                let Some(blocks) = value.as_array() else {
+                    parts.push(format!("{key}={}", json_kind(value)));
+                    continue;
+                };
+                let mut kinds = Vec::new();
+                let mut cached = 0usize;
+                for block in blocks {
+                    push_block_type(block.get("type"), &mut kinds);
+                    if block.get("cache_control").is_some() {
+                        cached += 1;
+                    }
+                }
+                format!(
+                    "{key}=[{} types={} cache_control={cached}]",
+                    blocks.len(),
+                    kinds.join(",")
+                )
+            }
+            "thinking" => format!(
+                "{key}={}",
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or(json_kind(value))
+            ),
+            "output_config" => {
+                let effort = value.get("effort").and_then(Value::as_str).unwrap_or("-");
+                format!("{key}=effort:{effort}")
+            }
+            // 其余对象/数组只报形状与大小，正文与键名列表都不展开。
+            _ => match value {
+                Value::Array(items) => format!("{key}=[{}({})]", items.len(), json_kind(value)),
+                Value::Object(fields) => {
+                    format!("{key}={{{}({})}}", fields.len(), json_kind(value))
+                }
+                _ => format!("{key}={}", short_scalar(value)),
+            },
+        };
+        parts.push(entry);
+    }
+    parts.join(" ")
+}
+
+/// 递归收集消息里的内容块类型，按出现顺序去重。
+fn collect_content_block_types(items: &[Value], out: &mut Vec<String>) {
+    for item in items {
+        push_block_type(item.get("type"), out);
+        let Some(content) = item.get("content") else {
+            continue;
+        };
+        match content {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    push_block_type(block.get("type"), out);
+                    // tool_result 的 content 里还套着一层块类型。
+                    if let Some(Value::Array(nested)) = block.get("content") {
+                        collect_content_block_types(nested, out);
+                    }
+                }
+            }
+            // 纯字符串内容没有 type 键，但语义上就是 text 块。
+            Value::String(_) => push_block_type(Some(&Value::from("text")), out),
+            _ => {}
+        }
+    }
+}
+
+fn push_block_type(kind: Option<&Value>, out: &mut Vec<String>) {
+    let Some(kind) = kind.and_then(Value::as_str) else {
+        return;
+    };
+    if !out.iter().any(|seen| seen == kind) {
+        out.push(kind.to_string());
+    }
+}
+
+/// 已执行的兼容动作：只写动作名与次数。用于回答"这个字段还可能是原因吗"。
+fn describe_attempted_normalizations(
+    attempted: &[crate::app::ai_compatibility::NormalizationAction],
+) -> String {
+    if attempted.is_empty() {
+        return "none".to_string();
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for action in attempted {
+        let label = match action {
+            crate::app::ai_compatibility::NormalizationAction::Native => "native",
+            crate::app::ai_compatibility::NormalizationAction::Translate => "translate",
+            crate::app::ai_compatibility::NormalizationAction::Degrade => "degrade",
+            crate::app::ai_compatibility::NormalizationAction::Reject => "reject",
+        };
+        *counts.entry(label.to_string()).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(label, count)| format!("{label}x{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn describe_tool_choice(value: &Value) -> String {
+    match value {
+        Value::String(mode) => mode.to_string(),
+        Value::Object(fields) => {
+            let kind = fields
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            let name = fields
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!(":{name}"))
+                .unwrap_or_default();
+            format!("{kind}{name}")
+        }
+        other => json_kind(other).to_string(),
+    }
+}
+
+fn short_scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) if text.len() <= 32 => text.clone(),
+        Value::String(text) => format!("<str:{}>", text.chars().count()),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// 上游错误画像：错误类型/错误码/错误字段 + 原文骨架。
+///
+/// 上游的 400 原文是定位这类问题的唯一一手证据，但直接整段落进日志既可能带
+/// 凭据，也可能很长。这里只保留"骨架"：URL 收敛成 `<url>`，标点与数字去掉、
+/// 连续空白压成一个空格，再按字符（不是字节）截断，避免切坏 UTF-8。
+const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 600;
+
+fn summarize_upstream_error(upstream_text: &str) -> String {
+    let value = serde_json::from_str::<Value>(upstream_text).ok();
+    let mut facts = Vec::new();
+    if let Some(value) = value.as_ref() {
+        for pointer in [
+            "/error/type",
+            "/error/code",
+            "/error/param",
+            "/error/message",
+            "/type",
+            "/code",
+            "/param",
+            "/message",
+            "/error",
+        ] {
+            let Some(field) = value.pointer(pointer) else {
+                continue;
+            };
+            let Some(text) = field.as_str() else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            facts.push(format!(
+                "{}={}",
+                pointer.trim_start_matches('/'),
+                excerpt(text, 200)
+            ));
+        }
+    }
+    let skeleton = upstream_skeleton(upstream_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+    let mut out = String::new();
+    if facts.is_empty() {
+        out.push_str("shape=none");
+    } else {
+        out.push_str(&facts.join(" "));
+    }
+    out.push_str(&format!(" excerpt=\"{skeleton}\""));
+    out
+}
+
+/// 把上游错误体压成可安全落盘的骨架：URL 去掉，连续标点/数字折叠，限长。
+fn upstream_skeleton(text: &str, limit: usize) -> String {
+    let redacted = crate::approval::manager::redact_message(text);
+    let mut skeleton = String::with_capacity(redacted.len().min(limit * 2));
+    let mut last_was_space = true;
+    for character in redacted.chars() {
+        let normalized = if character.is_whitespace() || is_skeleton_noise(character) {
+            ' '
+        } else {
+            character
+        };
+        if normalized == ' ' {
+            if !last_was_space {
+                skeleton.push(' ');
+            }
+            last_was_space = true;
+            continue;
+        }
+        last_was_space = false;
+        skeleton.push(normalized);
+        if skeleton.chars().count() >= limit {
+            skeleton.push('…');
+            break;
+        }
+    }
+    skeleton.trim().to_string()
+}
+
+/// 骨架里要抹掉的字符：标点、数字、URL 分隔符。留下的是"这个词出现了"的信息，
+/// 足以判断上游在抱怨哪个字段，又不至于把整段错误原文抄进日志。
+fn is_skeleton_noise(character: char) -> bool {
+    character.is_ascii_punctuation() || character.is_numeric()
+}
+
+fn excerpt(text: &str, limit: usize) -> String {
+    // 上游有时把整个请求头或凭据抄进错误 message，摘要必须先过脱敏再截断。
+    let redacted = crate::approval::manager::redact_message(text);
+    let trimmed = redacted.trim();
+    let mut out = String::new();
+    for character in trimmed.chars().take(limit) {
+        out.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if trimmed.chars().count() > limit {
+        out.push('…');
+    }
+    out
+}
+
+/// 判断上游 400 对应哪个能力缺口，并在证据不足时如实说明。
+///
+/// 先按请求内容与上游文案定位；都定不到时，把刚才已经做过的降级动作一并带出，
+/// 因为"图片已被降级"和"图片可能就是原因"是互斥的两种结论——旧实现会把早已
+/// 降级掉的字段又列进排查方向，等于把人往死路上引。
+fn infer_unsupported_feature_with_normalizations(
+    request: &Value,
+    upstream_text: &str,
+    attempted: &[crate::app::ai_compatibility::NormalizationAction],
+) -> String {
+    let feature = infer_unsupported_feature(request, upstream_text);
+    if feature != "request_format" || attempted.is_empty() {
+        return feature;
+    }
+    // 泛化 400 + 已有降级：明确标成"仍未定位"，避免与具体能力混淆。
+    "request_format（已降级字段已排除）".to_string()
+}
+
 fn infer_unsupported_feature(request: &Value, upstream_text: &str) -> String {
     // Anthropic often reports a bare "invalid request" for unsupported
     // tool-result media. Inspect the actual request before falling back to the
@@ -2708,6 +3299,11 @@ fn infer_unsupported_feature(request: &Value, upstream_text: &str) -> String {
     }
     let detail = upstream_text.to_ascii_lowercase();
     let request_text = request.to_string().to_ascii_lowercase();
+    // 空内容块的报错文案里常常顺带提到 content/type 字样，先按请求自身的
+    // 结构判断，避免被下游文案里偶然出现的 "tool_choice" 带偏。
+    if request_has_empty_content(request) && detail.contains("content") {
+        return "empty_content".to_string();
+    }
     for (needles, feature) in [
         (&["tool_choice"][..], "tool_choice"),
         (&["temperature"][..], "sampling_temperature"),
@@ -2743,6 +3339,27 @@ fn infer_unsupported_feature(request: &Value, upstream_text: &str) -> String {
         return "tool_protocol".to_string();
     }
     "request_format".to_string()
+}
+
+/// 请求里是否还有空 text 块或空消息——上游会因此回泛化 400。
+fn request_has_empty_content(request: &Value) -> bool {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| match message.get("content") {
+        Some(Value::Array(blocks)) => {
+            blocks.is_empty()
+                || blocks.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty)
+                })
+        }
+        Some(Value::String(text)) => text.is_empty(),
+        _ => false,
+    })
 }
 
 fn contains_tool_result_media(value: &Value, media_type: &str) -> bool {
@@ -2785,8 +3402,13 @@ fn suggested_action_for_feature(feature: &str) -> &'static str {
         }
         "model" => "请从 /v1/models 中选择已登记的模型，不要在 Provider 间直接套用模型名。",
         "tool_protocol" => "请检查 tools/tool_choice/工具结果格式，或切换到兼容 Provider。",
+        "empty_content" => {
+            "请求里存在空内容块或空消息（Claude Code 在工具结果为空时会这样发）。本机网关会自动摘除后重试；仍失败请反馈参考编号。"
+        }
+        // 上游只回了泛化 400，网关据此猜不出具体字段。此时不要给出"逐项移除"的
+        // 假指令：诊断里已经带了请求字段清单与错误原文摘要，让用户按那份证据定位。
         _ => {
-            "请逐项移除 tools、tool_choice、temperature、top_p 和图片后重试；仍失败时反馈参考编号。"
+            "上游只返回了泛化的 400，已记录请求字段清单与错误原文摘要；请按诊断明细定位具体字段，仍无法判断时反馈参考编号。"
         }
     }
 }
@@ -2871,7 +3493,10 @@ fn media_normalize_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
         stream,
         400,
         "himind_gateway_media_normalize_failed",
-        &format!("媒体请求规格化失败：{detail}"),
+        &format!(
+            "媒体请求规格化失败：{detail}（request_id={}）",
+            current_request_id()
+        ),
     );
     GatewayError::Answered
 }
@@ -2961,12 +3586,16 @@ fn is_forwarded_request_header(name: &str) -> bool {
 }
 
 fn write_upstream_failure(stream: &mut TcpStream, detail: &str) -> GatewayError {
-    crate::approval::manager::append_event_log("warn", &format!("本机网关上游请求失败：{detail}"));
+    let request_id = current_request_id();
+    crate::approval::manager::append_event_log(
+        "warn",
+        &format!("本机网关上游请求失败：request_id={request_id} {detail}"),
+    );
     let _ = write_json_error(
         stream,
         502,
         "himind_gateway_upstream_failed",
-        &format!("上游请求失败：{detail}"),
+        &format!("上游请求失败：{detail}（request_id={request_id}）"),
     );
     GatewayError::Answered
 }
@@ -3002,6 +3631,67 @@ impl StreamScanner {
     }
 }
 
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static CURRENT_REQUEST_ID: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// 本机请求 ID。上游没有 request id 时，日志和用量台账靠它关联。
+/// 每个 TCP 连接只处理一个请求，因此线程局部足够，且不引入跨请求状态。
+fn new_request_id() -> String {
+    let sequence = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let millis = chrono::Utc::now().timestamp_millis();
+    format!("req_himind_{millis:x}_{sequence:x}")
+}
+
+fn set_current_request_id(request_id: &str) {
+    CURRENT_REQUEST_ID.with(|current| {
+        *current.borrow_mut() = request_id.to_string();
+    });
+}
+
+fn current_request_id() -> String {
+    CURRENT_REQUEST_ID.with(|current| current.borrow().clone())
+}
+
+static INFLIGHT_BY_CLIENT: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+struct RequestSlot {
+    client: String,
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        let Some(counts) = INFLIGHT_BY_CLIENT.get() else {
+            return;
+        };
+        let Ok(mut counts) = counts.lock() else {
+            return;
+        };
+        if let Some(count) = counts.get_mut(&self.client) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.client);
+            }
+        }
+    }
+}
+
+/// 单客户端并发闸门。达到上限时返回 `None`，调用方回 429。
+fn acquire_request_slot(client: &str) -> Option<RequestSlot> {
+    let counts = INFLIGHT_BY_CLIENT.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut counts = counts.lock().ok()?;
+    let count = counts.entry(client.to_string()).or_default();
+    if *count >= MAX_INFLIGHT_PER_CLIENT {
+        return None;
+    }
+    *count += 1;
+    Some(RequestSlot {
+        client: client.to_string(),
+    })
+}
+
 fn record_usage(
     binding: &GatewayBinding,
     model: &str,
@@ -3013,6 +3703,7 @@ fn record_usage(
 ) {
     let record = LocalUsageRecord {
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        request_id: current_request_id(),
         binding_id: binding.id.clone(),
         client: binding.client.clone(),
         service: binding.service.clone(),
@@ -3743,7 +4434,7 @@ mod tests {
         server.join().unwrap();
         assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
         assert!(response.contains("himind_gateway_request_too_large"));
-        assert!(response.contains("192 MiB"));
+        assert!(response.contains(&format!("{} MiB", inbound_body_limit_mib())));
     }
     #[test]
     fn outbound_budget_exceeded_returns_structured_413() {
@@ -4204,6 +4895,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn anthropic_native_400_diagnostic_carries_request_structure() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let rejected = br#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid request"}}"#;
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                rejected.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(rejected);
+            let _ = stream.flush();
+        });
+
+        let token = "anthropic-native-diag-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "claude-desktop:custom:vectide:model-a".to_string(),
+                client: "claude-desktop".to_string(),
+                service: "custom:vectide".to_string(),
+                profile_id: String::new(),
+                entry_protocol: "anthropic".to_string(),
+                exposed_model: "model-a".to_string(),
+                models: vec!["model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                // 直通：入口 anthropic，上游 anthropic，正是出事的那条路。
+                protocol: "anthropic".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-secret".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "model-a",
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "SECRET-USER-TEXT"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "SECRET-TOOL-OUTPUT"}
+                    ]}
+                ]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let _ = client.write_all(head.as_bytes());
+        let _ = client.write_all(request_body.as_bytes());
+        let _ = client.flush();
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        gateway.stop();
+        upstream_thread.join().unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "response={response}"
+        );
+        // 上游只说了 "invalid request"，但诊断里必须能从请求结构定位到字段。
+        assert!(response.contains("messages=[3"), "{response}");
+        assert!(response.contains("tool_result"), "{response}");
+        assert!(response.contains("thinking=adaptive"), "{response}");
+        assert!(response.contains("output_config=effort:high"), "{response}");
+        assert!(
+            response.contains("error/type=invalid_request_error"),
+            "{response}"
+        );
+        // 结构化字段也要落到 diagnostic 里，便于前端直接展示而不是解析文案。
+        assert!(response.contains(r#""request_detail""#), "{response}");
+        assert!(response.contains(r#""upstream_detail""#), "{response}");
+        // 正文与凭据一律不得外泄。
+        assert!(!response.contains("SECRET-USER-TEXT"), "{response}");
+        assert!(!response.contains("SECRET-TOOL-OUTPUT"), "{response}");
+        assert!(!response.contains("upstream-secret"), "{response}");
+    }
+
+    #[test]
     fn anthropic_entry_translates_to_responses_upstream() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_address = upstream.local_addr().unwrap();
@@ -4364,6 +5149,171 @@ mod tests {
         );
     }
     #[test]
+    fn request_profile_lists_structure_without_content() {
+        let request = serde_json::json!({
+            "model": "deepseek-v4.1-flash-1017",
+            "max_tokens": 32000,
+            "stream": true,
+            "temperature": 0.3,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "system": [{"type": "text", "text": "TOP SECRET SYSTEM PROMPT", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "请检查这张截图 SECRET-USER-TEXT"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "SECRET-THOUGHT"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.png"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "SECRET-TOOL-OUTPUT"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}}
+                ]}]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"}
+        });
+        let profile = describe_request_structure(&request);
+        // 结构信息必须到位：块类型、角色计数、工具数量、采样参数。
+        // 角色计数走 BTreeMap，顺序按角色名排序，保证同一请求永远同一行。
+        assert!(
+            profile.contains("messages=[3 roles=assistant:1/user:2]"),
+            "{profile}"
+        );
+        for block in ["text", "thinking", "tool_use", "tool_result", "image"] {
+            assert!(profile.contains(block), "{profile} missing {block}");
+        }
+        assert!(profile.contains("tools=[1 types=custom]"), "{profile}");
+        assert!(profile.contains("tool_choice=auto"), "{profile}");
+        assert!(profile.contains("thinking=adaptive"), "{profile}");
+        assert!(profile.contains("output_config=effort:high"), "{profile}");
+        assert!(profile.contains("temperature=0.3"), "{profile}");
+        // system 的版本差异集中在块与 cache_control，形态要记，正文不记。
+        assert!(
+            profile.contains("system=[1 types=text cache_control=1]"),
+            "{profile}"
+        );
+        // 正文一个字都不能出现。
+        for secret in [
+            "SECRET-USER-TEXT",
+            "SECRET-TOOL-OUTPUT",
+            "SECRET-THOUGHT",
+            "TOP SECRET SYSTEM PROMPT",
+            "AAAA",
+        ] {
+            assert!(!profile.contains(secret), "{profile} leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn upstream_error_summary_keeps_shape_and_redacts_credentials() {
+        let summarised = summarize_upstream_error(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.1: unexpected field `cache_control`; Authorization: Bearer sk-secret-value\nrequest id: req_vt_abc123"}}"#,
+        );
+        assert!(
+            summarised.contains("error/type=invalid_request_error"),
+            "{summarised}"
+        );
+        assert!(summarised.contains("cache_control"), "{summarised}");
+        assert!(summarised.contains("excerpt="), "{summarised}");
+        assert!(!summarised.contains("sk-secret-value"), "{summarised}");
+    }
+
+    #[test]
+    fn upstream_skeleton_is_char_bounded_and_keeps_words() {
+        let long = "messages.3.content.0.type must be one of text image".repeat(20);
+        let skeleton = upstream_skeleton(&long, 80);
+        assert!(skeleton.chars().count() <= 81, "{skeleton}");
+        assert!(skeleton.contains("messages"), "{skeleton}");
+        assert!(skeleton.contains("one of"), "{skeleton}");
+        // 中文字符不能被按字节切断。
+        let chinese = upstream_skeleton("不支持该字段：缓存控制", 600);
+        assert!(chinese.contains("不支持该字段"), "{chinese}");
+    }
+
+    #[test]
+    fn empty_content_in_request_wins_over_misleading_upstream_wording() {
+        // Vector Tide 对空内容块的报错里会带 "type"/"content" 字样，老用户在
+        // 线上看到的却是 tool_choice —— 因为旧实现只按上游文案匹配关键字。
+        let request = serde_json::json!({
+            "model": "model-a",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": ""}]}
+            ]
+        });
+        assert!(request_has_empty_content(&request));
+        assert_eq!(
+            infer_unsupported_feature(
+                &request,
+                "消息 content 字段缺失或结构不合法：请检查 content 中每个块的 type，参考 tool_choice 文档"
+            ),
+            "empty_content"
+        );
+        // 请求本身没有空内容时，仍然按上游文案判断。
+        let clean = serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        assert!(!request_has_empty_content(&clean));
+        assert_eq!(
+            infer_unsupported_feature(&clean, "tool_choice is not supported"),
+            "tool_choice"
+        );
+        assert!(suggested_action_for_feature("empty_content").contains("自动摘除"));
+    }
+
+    #[test]
+    fn generic_request_format_diagnostic_no_longer_gives_false_instruction() {
+        assert!(!suggested_action_for_feature("request_format").contains("逐项移除"));
+        assert!(suggested_action_for_feature("request_format").contains("参考编号"));
+    }
+
+    #[test]
+    fn already_degraded_features_are_not_relisted_as_cause() {
+        let request = serde_json::json!({
+            "model": "model-a",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        // 上游只回泛化 400，且本次已经做了降级：必须标明"仍未定位"，
+        // 而不是把 request_format 当成一个可以逐项排除的结论。
+        let feature = infer_unsupported_feature_with_normalizations(
+            &request,
+            r#"{"error":{"message":"invalid request"}}"#,
+            &[crate::app::ai_compatibility::NormalizationAction::Degrade],
+        );
+        assert!(feature.contains("request_format"), "{feature}");
+        assert!(feature.contains("已降级"), "{feature}");
+        // 没有降级动作时保持原样，避免把标签变得不可预测。
+        assert_eq!(
+            infer_unsupported_feature_with_normalizations(
+                &request,
+                r#"{"error":{"message":"invalid request"}}"#,
+                &[]
+            ),
+            "request_format"
+        );
+        // 能定位到具体能力时，降级动作不参与判断。
+        assert_eq!(
+            infer_unsupported_feature_with_normalizations(
+                &request,
+                r#"{"error":{"message":"tool_choice is unsupported"}}"#,
+                &[crate::app::ai_compatibility::NormalizationAction::Degrade]
+            ),
+            "tool_choice"
+        );
+        assert_eq!(
+            describe_attempted_normalizations(&[
+                crate::app::ai_compatibility::NormalizationAction::Degrade,
+                crate::app::ai_compatibility::NormalizationAction::Degrade,
+                crate::app::ai_compatibility::NormalizationAction::Translate,
+            ]),
+            "degradex2,translatex1"
+        );
+        assert_eq!(describe_attempted_normalizations(&[]), "none");
+    }
+
+    #[test]
     fn anthropic_tool_result_image_gets_specific_diagnostic_feature() {
         let request = serde_json::json!({
             "model": "model-a",
@@ -4449,7 +5399,15 @@ mod tests {
         assert!(response.contains(r#""unsupported_feature":"tool_choice""#));
         assert!(response.contains(r#""request_id":"req_vt_header_456""#));
         assert!(response.contains(r#""suggested_action""#));
-        assert!(!response.contains("sk-secret-value"));
+        // 泛化 400 也要把两侧画像带出来，否则用户手里没有任何可定位的证据。
+        assert!(response.contains("诊断："), "{response}");
+        assert!(
+            response.contains("request_id=req_vt_header_456"),
+            "{response}"
+        );
+        // 上游把 "Authorization: Bearer sk-secret-value" 写进了错误原文，
+        // 两个画像都必须先脱敏：响应体与日志里都不能出现它。
+        assert!(!response.contains("sk-secret-value"), "{response}");
         assert!(!response.contains("upstream-secret"));
         assert!(!response.contains("Bearer sk-"));
     }
@@ -4524,5 +5482,155 @@ mod tests {
         upstream_thread.join().unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("resp-retry-test"), "{response}");
+    }
+
+    #[test]
+    fn per_client_inflight_slots_are_bounded_and_released() {
+        let client = format!("slot-test-{}", new_request_id());
+        let mut slots = Vec::new();
+        for _ in 0..MAX_INFLIGHT_PER_CLIENT {
+            slots.push(acquire_request_slot(&client).expect("slot within limit"));
+        }
+        assert!(acquire_request_slot(&client).is_none(), "limit must hold");
+        slots.pop();
+        assert!(
+            acquire_request_slot(&client).is_some(),
+            "released slot must be reusable"
+        );
+    }
+
+    #[test]
+    fn request_ids_are_unique_and_thread_local() {
+        let first = new_request_id();
+        let second = new_request_id();
+        assert_ne!(first, second);
+        set_current_request_id(&first);
+        assert_eq!(current_request_id(), first);
+        assert!(first.starts_with("req_himind_"));
+    }
+
+    #[test]
+    fn translated_send_helper_retries_transient_500_once() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        let thread = thread::spawn(move || {
+            for attempt in 1..=2 {
+                let (mut stream, _) = upstream.accept().unwrap();
+                let _ = read_request(&mut stream).unwrap();
+                let (status, body) = if attempt == 1 {
+                    ("500 Internal Server Error", "temporary")
+                } else {
+                    ("200 OK", "ok")
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{address}/v1/chat/completions");
+        let mut send = || client.post(&url).body("{}").send();
+        let binding = binding("codex", "openai-chat", "retry-token");
+        let response = send_with_transient_retry(&binding, &mut send).unwrap();
+        let status = response.status();
+        let body = response.text().unwrap();
+        thread.join().unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+
+    #[test]
+    fn responses_fallback_removes_tool_media_then_history() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let seen_thread = Arc::clone(&seen);
+        let thread = thread::spawn(move || {
+            for attempt in 1..=3 {
+                let (mut stream, _) = upstream.accept().unwrap();
+                let (_, body) = match read_request(&mut stream).unwrap() {
+                    RequestRead::Request(head, body) => (head, body),
+                    _ => panic!("expected request"),
+                };
+                seen_thread.lock().unwrap().push(body);
+                let (status, response) = if attempt < 3 {
+                    ("400 Bad Request", r#"{"error":{"message":"bad"}}"#)
+                } else {
+                    ("200 OK", r#"{"ok":true}"#)
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]}
+            ],
+            "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object"}},
+                {"type": "web_search"}
+            ]
+        })
+        .to_string();
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{address}/v1/responses");
+        let mut send = |payload: &[u8]| client.post(&url).body(payload.to_vec()).send();
+        let binding = binding("codex", "openai-responses", "fallback-token");
+        let outcome =
+            send_responses_with_compatibility_fallback(&binding, body.as_bytes(), &mut send)
+                .unwrap();
+        assert_eq!(outcome.response.status(), reqwest::StatusCode::OK);
+        assert!(outcome.applied.contains(&"tool_result_media"));
+        assert!(outcome.applied.contains(&"tool_history"));
+        assert!(outcome.applied.contains(&"unsupported_tools"));
+
+        let final_body: Value =
+            serde_json::from_slice(outcome.body.as_ref().expect("fallback body")).unwrap();
+        let input = final_body["input"].as_array().unwrap();
+        assert!(
+            input
+                .iter()
+                .all(|item| matches!(item.get("type").and_then(Value::as_str), Some("message"))),
+            "final input={final_body}"
+        );
+        assert!(
+            final_body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("type").and_then(Value::as_str) != Some("web_search")),
+            "final body={final_body}"
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "attempt count");
+        assert!(String::from_utf8_lossy(&seen[0]).contains("input_image"));
+        assert!(!String::from_utf8_lossy(&seen[1]).contains("input_image"));
+        assert!(String::from_utf8_lossy(&seen[1]).contains("function_call"));
+        assert!(!String::from_utf8_lossy(&seen[2]).contains("function_call"));
+        thread.join().unwrap();
     }
 }

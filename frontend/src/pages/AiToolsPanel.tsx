@@ -44,7 +44,7 @@ type AiToolsPanelProps = {
   onRemoveAIClient: (target: string) => Promise<void>;
   /** 没有可用来源时，「模型」接线要给一条去「模型来源」的路，而不是只留一个禁用按钮。 */
   onOpenModelSources: () => void;
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) => Promise<void>;
   gatewayBusy: boolean;
   onRestartGateway: () => void;
   onStopGateway: () => void;
@@ -62,11 +62,22 @@ const SYNC_REASON_LABELS: Record<string, string> = {
   gateway_profile_unavailable: '聚合入口不存在或已停用',
   gateway_models_unavailable: '当前协议没有可用模型',
   client_config_missing: '客户端配置已丢失',
+  client_fields_modified: '客户端配置被外部修改',
+  client_managed_segment_removed: '客户端配置里的 HiMind 段落已被删除',
+  client_config_unparseable: '客户端配置无法解析',
 };
 
 function syncReasonText(status?: AIProviderImportStatus) {
   const reasons = (status?.sync_reason_codes ?? []).map((code) => SYNC_REASON_LABELS[code] ?? code);
   return reasons.length ? reasons.join('、') : status?.last_error || '客户端配置与当前来源不一致';
+}
+
+/**
+ * 漂移（`conflict`）与普通待更新不同：同步会覆盖别人写进去的内容，
+ * 因此需要用户显式确认，而不是点一下就直接写。
+ */
+function isDrifted(status?: AIProviderImportStatus) {
+  return status?.sync_state === 'conflict';
 }
 
 type Filter = 'all' | 'attention' | 'idle' | 'ready';
@@ -185,7 +196,23 @@ export function AiToolsPanel({
       await runRow(target, async () => {
         const plan = await agentApi.planAIClientSync(target);
         if (plan.blocked) throw new Error(plan.detail);
-        const result: AIProviderSyncResult = await agentApi.syncAIClient(target, plan.desired_revision);
+        // 漂移：文件已被外部改写，覆盖前必须让用户看到差在哪。
+        const drifted = plan.sync_state === 'conflict';
+        if (drifted) {
+          const status = clientStatusByTarget.get(target);
+          const accepted = await confirm({
+            title: `覆盖 ${target} 的外部修改？`,
+            description: status?.drift_detail
+              || '客户端配置里由 HiMind 写入的字段已被其它工具或手工改动；继续会覆盖这些改动。',
+            confirmText: '覆盖并更新',
+          });
+          if (!accepted) return;
+        }
+        const result: AIProviderSyncResult = await agentApi.syncAIClient(
+          target,
+          plan.desired_revision,
+          drifted,
+        );
         setSyncNotice(result.restart_required
           ? `${target} 已更新，请重启客户端后生效`
           : `${target} 已更新`);
@@ -293,7 +320,9 @@ export function AiToolsPanel({
               <strong>{pendingClientSync.length} 个已注册工具待更新</strong>
               <span>{syncNotice || pendingClientSync.map((entry) => `${entry.target}：${syncReasonText(entry)}`).join('；')}</span>
             </div>
-            <button type="button" className="btn btn-primary" disabled={syncAllBusy || Boolean(rowBusy)} onClick={() => void syncAllClients()}>
+            {/* 有漂移项时批量同步会跳过它们（覆盖外部改动必须逐个确认），
+                这里如实说明，而不是让用户以为「更新全部」已经把它们修好了。 */}
+            <button type="button" className="btn btn-primary" disabled={syncAllBusy || Boolean(rowBusy)} title={pendingClientSync.some((entry) => entry.sync_state === 'conflict') ? '被外部修改的客户端会跳过，需逐个确认后更新' : undefined} onClick={() => void syncAllClients()}>
               {syncAllBusy ? <BusyIndicator size={12} /> : <RefreshCw size={14} />}{syncAllBusy ? '更新中' : '更新全部'}
             </button>
           </div>
@@ -470,7 +499,7 @@ function ToolRow(props: {
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
   onOpenModelSources: () => void;
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) => Promise<void>;
   onSourceDraft: (value: string) => void;
   onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
   onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
@@ -520,15 +549,18 @@ function ToolRow(props: {
   }
 
   async function switchBindingMode(nextMode: 'gateway' | 'direct') {
-    if (nextMode === 'direct' && clientStatus?.warning) {
+    const directWarning = clientStatus?.direct_warning || clientStatus?.warning;
+    let allowDirectRisk = false;
+    if (nextMode === 'direct' && directWarning) {
       const accepted = await confirm({
         title: `改为直连 ${item.name}？`,
-        description: `${clientStatus.warning} 直连将绕过兼容规范化，可能再次触发 400。`,
+        description: `${directWarning} 直连将绕过兼容规范化，可能再次触发 400。`,
         confirmText: '仍然直连',
       });
       if (!accepted) return;
+      allowDirectRisk = true;
     }
-    await onRunRow(item.key, () => onSetBindingMode(item.key, nextMode));
+    await onRunRow(item.key, () => onSetBindingMode(item.key, nextMode, undefined, undefined, allowDirectRisk));
   }
   async function distributeSource() {
     if (!sourceDraft) return;
@@ -594,6 +626,7 @@ function ToolRow(props: {
                     {sourceOptions.some((option) => option.value === activeSource) ? null : <option value={activeSource}>未知来源</option>}
                   </select>
                   <span className="muted">· {gatewayProfile?.profile_name ? `聚合：${gatewayProfile.profile_name}（${gatewayProfile.models.length} 个模型）` : gatewayMode ? '经本机网关' : '直连'}</span>
+                  {isDrifted(clientStatus) ? <span className="warning-text">{clientStatus?.drift_detail || '客户端配置已被外部修改'}</span> : null}
                   {!gatewayMode && clientStatus?.warning ? <span className="warning-text">{clientStatus.warning}</span> : null}
                 </> : <>
                   <span className="status-dot" />

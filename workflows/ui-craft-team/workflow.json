@@ -1,14 +1,14 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.ui-craft-team",
-  "version": "1.0.3",
+  "version": "1.1.3",
   "distribution_targets": [
     "workbench",
     "github"
   ],
   "name": "UI 专业打磨团队",
   "description": "三路并行审查（信息架构 / 工艺 / 无障碍），人工勾选整改项后进入打磨循环，守门角色验收。",
-  "release_notes": "1.0.2：审查结果写入界面审查台账，跨运行可追踪已修/未修。 1.0.3：tool_policy=none 的步骤固定到 himind.builtin——auto 可能解析到不支持的 Runtime。",
+  "release_notes": "1.1.3：新增执行环境选择——打磨步骤可在启动时换成 ACP 客户端并指定模型；optional_providers 声明 acp.claude / codex / opencode。审查与守门仍固定内置引擎以保证上下文隔离。",
   "min_agent_version": "0.3.90",
   "local_requirements": {
     "platform": "windows",
@@ -54,18 +54,15 @@
   "roles": {
     "ui.auditor": {
       "label": "信息架构审查",
-      "brief": "你是信息架构审查员。只评价导航层级、页面结构、任务流是否顺畅、命名与文案是否准确。不评价视觉细节，不改代码。每条问题必须给出：位置、现象、为什么是问题、建议怎么改。",
-      "tool_policy": "none"
+      "brief": "你是信息架构审查员。只评价导航层级、页面结构、任务流是否顺畅、命名与文案是否准确。不评价视觉细节，不改代码。每条问题必须给出：位置、现象、为什么是问题、建议怎么改。"
     },
     "ui.craft": {
       "label": "工艺审查",
-      "brief": "你是界面工艺审查员。只评价间距、圆角、描边、阴影分层、字阶与字距、数字对齐、命中区大小、过渡范围。每条问题必须给出改前改后的具体数值，不接受「再精致一点」这类意见。",
-      "tool_policy": "none"
+      "brief": "你是界面工艺审查员。只评价间距、圆角、描边、阴影分层、字阶与字距、数字对齐、命中区大小、过渡范围。每条问题必须给出改前改后的具体数值，不接受「再精致一点」这类意见。"
     },
     "ui.a11y": {
       "label": "无障碍审查",
-      "brief": "你是无障碍审查员。检查对比度、键盘可达性、焦点可见性、读屏语义、命中区。对照 WCAG 2.2 AA 给出条款依据。",
-      "tool_policy": "none"
+      "brief": "你是无障碍审查员。检查对比度、键盘可达性、焦点可见性、读屏语义、命中区。对照 WCAG 2.2 AA 给出条款依据。"
     },
     "ui.polisher": {
       "label": "打磨实现",
@@ -98,12 +95,14 @@
       "role_id": "ui.auditor",
       "risk_level": "read_only",
       "runtime": {
-        "provider": "auto",
-        "prompt": "阅读工作区，列出这次要审查的页面与组件范围：涉及哪些文件、覆盖哪些界面状态（空态/加载/错误/窄窗）。不要开始评价，只输出范围清单。",
+        "provider": "himind.builtin",
+        "prompt": "先读审查判据：docs/ui-review-profile.json（不存在就说明找不到，不要自己编判据）。再读它的 focus_areas 指向的文件。列出这次要审的页面与组件范围：涉及哪些文件、覆盖哪些界面状态（空态/加载/错误/窄窗）。不要开始评价，只输出范围清单。",
         "tool_policy": "default",
         "timeout_seconds": 900
       },
-      "input": {}
+      "input": {
+        "profile_path": "input.profile_path"
+      }
     },
     {
       "id": "CONFIRM-SCOPE",
@@ -130,8 +129,8 @@
             "title": "信息架构审查",
             "role_id": "ui.auditor",
             "runtime": {
-              "provider": "auto",
-              "prompt": "按已确认的范围审查信息架构：导航层级是否清晰、页面结构是否合理、任务流有无断点、命名与文案是否准确。输出问题清单，每条含位置/现象/原因/建议。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "provider": "himind.builtin",
+              "prompt": "按已确认的范围审查信息架构：导航层级是否清晰、页面结构是否合理、任务流有无断点、命名与文案是否准确。判据来自 docs/ui-review-profile.json 的 judgement 段，逐条对照，不要凭个人偏好。检查项见同文件 checks 段。重点看 copy_budget 与 empty_state 两条。输出问题清单，每条含位置/现象/原因/建议。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category=ia、title、location、detail。",
               "tool_policy": "default",
               "timeout_seconds": 1800
             }
@@ -141,8 +140,8 @@
             "title": "工艺审查",
             "role_id": "ui.craft",
             "runtime": {
-              "provider": "auto",
-              "prompt": "按已确认的范围审查界面工艺：间距是否成阶梯、圆角与描边是否一致、阴影是否分层、字阶与字距、数字对齐、命中区是否够大、过渡时长是否统一。每条给出改前改后的具体数值。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "provider": "himind.builtin",
+              "prompt": "按已确认的范围审查界面工艺：间距是否成阶梯、圆角与描边是否一致、阴影是否分层、字阶与字距、数字对齐、命中区是否够大、过渡时长是否统一。判据来自 docs/ui-review-profile.json 的 judgement 段，逐条对照，不要凭个人偏好。检查项见同文件 checks 段。重点看 typography / tokens_only / hit_target / motion 四条。每条给出改前改后的具体数值。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category=craft、title、location、detail。",
               "tool_policy": "default",
               "timeout_seconds": 1800
             }
@@ -152,8 +151,8 @@
             "title": "无障碍审查",
             "role_id": "ui.a11y",
             "runtime": {
-              "provider": "auto",
-              "prompt": "按已确认的范围审查无障碍：对比度、键盘可达性与焦点顺序、焦点可见性、读屏语义、命中区尺寸。对照 WCAG 2.2 AA 给出条款依据。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category（ia/craft/a11y）、title、location、detail。台账会按「类别+位置+标题」去重，所以同一条问题换一轮再报不会重复。",
+              "provider": "himind.builtin",
+              "prompt": "按已确认的范围审查无障碍：对比度、键盘可达性与焦点顺序、焦点可见性、读屏语义、命中区尺寸。判据来自 docs/ui-review-profile.json 的 judgement 段，逐条对照，不要凭个人偏好。检查项见同文件 checks 段。重点看 contrast / hit_target 两条，并对照 WCAG 2.2 AA 给出条款依据。\n\n调查完成后调用 engineering.ui-audit.record 把发现写入台账：run_id 用当前运行号，findings 每项含 category=a11y、title、location、detail。",
               "tool_policy": "default",
               "timeout_seconds": 1800
             }
@@ -162,7 +161,10 @@
       },
       "depends_on": [
         "CONFIRM-SCOPE"
-      ]
+      ],
+      "input": {
+        "profile_path": "input.profile_path"
+      }
     },
     {
       "id": "CONFIRM-FIXES",
@@ -198,8 +200,8 @@
             "role_id": "ui.polisher",
             "risk_level": "local_write",
             "runtime": {
-              "provider": "auto",
-              "prompt": "按已确认的问题清单逐条整改。不做清单外的重构。每条整改后记录：改了哪个文件、改前改后的值。",
+              "provider": "himind.builtin",
+              "prompt": "按已确认的问题清单逐条整改，整改标准同样来自 docs/ui-review-profile.json 的 judgement 段——不要用「看起来更好」当理由。不做清单外的重构。每条整改后记录：改了哪个文件、改前改后的值。",
               "tool_policy": "default",
               "timeout_seconds": 3600
             }
@@ -218,8 +220,8 @@
                   "title": "跑界面自检",
                   "role_id": "ui.verifier",
                   "runtime": {
-                    "provider": "auto",
-                    "prompt": "在 frontend 目录运行 npm run check:ui 与 npm run build。原样贴出执行的命令、退出码与失败项。不要修改断言来让检查通过。",
+                    "provider": "himind.builtin",
+                    "prompt": "在 frontend 目录依次运行 profile.json checks 段里的 ui 与 build 两项（npm run check:ui、npx tsc --noEmit、npx vite build）。原样贴出执行的命令、退出码与失败项。不要修改断言来让检查通过。注意 check:copy 是已知遗留（文案长度天花板），失败时如实报告但不据此判定不达标。",
                     "tool_policy": "default",
                     "timeout_seconds": 1800
                   }
@@ -229,8 +231,8 @@
                   "title": "窄窗与排版复验",
                   "role_id": "ui.verifier",
                   "runtime": {
-                    "provider": "auto",
-                    "prompt": "复验窄窗与排版：运行 npm run check:text-layout 与 npm run check:design-tokens，报告对比度与溢出结论。原样贴出命令与输出。",
+                    "provider": "himind.builtin",
+                    "prompt": "在 frontend 目录运行 check:text-layout 与 check:design-tokens，按 profile.json 的 narrow_window 与 contrast/typography 两条报告结论。原样贴出命令与输出。",
                     "tool_policy": "default",
                     "timeout_seconds": 1800
                   }
@@ -247,7 +249,7 @@
             "risk_level": "read_only",
             "runtime": {
               "provider": "himind.builtin",
-              "prompt": "依据代码 diff 与验证结果判断本次打磨是否达标：已确认的问题清单是否全部处理、检查是否全部通过、有无引入新问题。只输出 JSON：{\"passed\": true|false, \"reasons\": [...], \"remaining\": [...]}。不采信实现方的自述。\n\n若本轮确认某些问题已修，调用 engineering.ui-audit.mark-fixed 标明（ids 用台账 id）。只标你实际验证过的：审查范围缩小导致的漏报不代表修好了。",
+              "prompt": "依据代码 diff 与验证结果判断本次打磨是否达标。判据是 docs/ui-review-profile.json 的 judgement 段：已确认的问题清单是否全部处理、对应判据是否满足、有无引入新问题。不采信实现方的自述。只输出 JSON：{\"passed\": true|false, \"reasons\": [...], \"remaining\": [...]}。\n\n同时：已确认修复的问题调用 engineering.ui-audit.mark-fixed 标为已修（ids 用台账 id）。只标你实际验证过的——审查范围缩小导致的漏报不代表修好了。",
               "tool_policy": "none",
               "timeout_seconds": 900
             }
@@ -257,7 +259,10 @@
       },
       "depends_on": [
         "CONFIRM-FIXES"
-      ]
+      ],
+      "input": {
+        "profile_path": "input.profile_path"
+      }
     },
     {
       "id": "DELIVER",
@@ -284,6 +289,11 @@
     "himind.builtin",
     "personal.codex",
     "personal.github-copilot"
+  ],
+  "optional_providers": [
+    "acp.claude",
+    "acp.codex",
+    "acp.opencode"
   ],
   "created_at": "2026-11-07T00:00:00Z"
 }

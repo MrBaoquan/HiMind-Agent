@@ -24,6 +24,9 @@ const MAX_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) struct LocalUsageRecord {
     /// RFC 3339，UTC。
     pub occurred_at: String,
+    /// 本机请求 ID；旧台账没有这个字段时为空。
+    #[serde(default)]
+    pub request_id: String,
     /// 绑定标识：`<client>:<service>`。
     pub binding_id: String,
     pub client: String,
@@ -288,6 +291,7 @@ mod tests {
     fn record(day: &str, client: &str, input: u64, output: u64) -> LocalUsageRecord {
         LocalUsageRecord {
             occurred_at: format!("{day}T08:00:00Z"),
+            request_id: String::new(),
             binding_id: format!("{client}:svc"),
             client: client.to_string(),
             service: "svc".to_string(),

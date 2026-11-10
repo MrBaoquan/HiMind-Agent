@@ -178,6 +178,115 @@ export type AgentActivityItem = {
     }> | null;
 };
 
+export type MissionStatus = 'draft' | 'planned' | 'awaiting_confirmation' | 'active' | 'waiting' | 'completed' | 'failed' | 'canceled';
+export type MissionTaskStatus = 'proposed' | 'blocked' | 'ready' | 'running' | 'awaiting_verification' | 'failed' | 'completed' | 'canceled';
+
+export type MissionExecutionBinding = {
+    executor: string;
+    model: string;
+    role_id: string;
+};
+
+export type MissionTaskSpec = {
+    id: string;
+    title: string;
+    objective: string;
+    depends_on: string[];
+    read_paths: string[];
+    write_paths: string[];
+    acceptance_criteria: string[];
+    required_checks: string[];
+    execution: MissionExecutionBinding;
+    repair_of: string;
+};
+
+export type MissionBudget = {
+    max_rounds: number;
+    max_minutes: number;
+    max_repair_attempts: number;
+};
+
+export type MissionPlanProposal = {
+    summary: string;
+    tasks: MissionTaskSpec[];
+    required_acceptance: string[];
+    budget: MissionBudget;
+};
+
+export type MissionWorkspace = {
+    root: string;
+    read_scope: string[];
+    write_scope: string[];
+};
+
+export type MissionExecutionOption = {
+    executor: string;
+    label: string;
+    available: boolean;
+    reason: string;
+    models: Array<{ alias: string; label: string }>;
+};
+
+export type MissionCreateInput = {
+    title: string;
+    objective: string;
+    workspace: MissionWorkspace;
+    acceptance_criteria: string[];
+};
+
+export type MissionConfirmation = {
+    plan_sha256: string;
+    selected_task_ids: string[];
+    approved_paths: string[];
+    confirmed_by: string;
+    confirmed_at: string;
+};
+
+export type MissionTaskView = {
+    spec: MissionTaskSpec;
+    status: MissionTaskStatus;
+    attempt_run_id: string;
+    verification_passed: boolean | null;
+    evidence_refs: string[];
+};
+
+export type MissionView = {
+    schema_version: 'mission.v1' | string;
+    mission_id: string;
+    title: string;
+    objective: string;
+    status: MissionStatus;
+    workspace: MissionWorkspace;
+    acceptance_criteria: string[];
+    plan_revision: number;
+    plan_sha256: string;
+    plan_summary: string;
+    required_acceptance: string[];
+    proposed_tasks: MissionTaskSpec[];
+    budget: MissionBudget | null;
+    confirmation: MissionConfirmation | null;
+    tasks: MissionTaskView[];
+    created_at: string;
+    updated_at: string;
+};
+
+export type MissionEvent = {
+    event_id: string;
+    mission_id: string;
+    sequence: number;
+    event_type: string;
+    task_id: string;
+    summary: string;
+    payload: Record<string, unknown>;
+    occurred_at: string;
+};
+
+export type MissionSnapshot = {
+    mission: MissionView;
+    events: MissionEvent[];
+    cursor: number;
+};
+
 export type CatalogPage<T> = {
     items: T[];
     total: number;
@@ -458,6 +567,10 @@ export type WorkflowLocalRun = {
         title: string;
         status: string;
         capability_id: string;
+        /** 这一步实际使用的 runtime provider；缺省表示未上报。 */
+        runtime_provider?: string;
+        /** 这一步实际使用的模型别名；空串表示没有调用模型。 */
+        model?: string;
         /** 执行角色；缺省表示没有声明角色。 */
         role_id?: string;
         attempt: number;
@@ -601,6 +714,29 @@ export type WorkflowInteractionKind = 'approval' | 'feedback' | 'form' | 'eviden
  * Workflow Runner 等待态的稳定 UI View Model。
  * 事实仍来自 Runtime Event；页面不再直接猜测 payload 字段。
  */
+/** 通知通道的展示视图：只含配置，不含 webhook 地址。 */
+export type NotificationChannelView = {
+  id: string;
+  kind: string;
+  label: string;
+  enabled: boolean;
+  events: string[];
+  min_risk: string;
+  /** webhook 是否已写入本机凭据。 */
+  configured: boolean;
+};
+
+export type NotificationChannelInput = {
+  id: string;
+  kind: string;
+  label?: string;
+  enabled: boolean;
+  events: string[];
+  min_risk?: string;
+  /** 只在需要写入/更新时传；留空表示不改已存的地址。 */
+  webhook?: string;
+};
+
 export type WorkflowInteractionRequest = {
     schema_version: 'interaction_request.v1' | string;
     id: string;
@@ -3037,7 +3173,12 @@ export type AIProviderImportStatus = {
     sync_reason_codes?: string[];
     restart_required?: boolean;
     last_error?: string;
+    /** 客户端配置中 HiMind 托管字段被外部修改时的可读差异说明。 */
+    drift_detail?: string;
     warning?: string;
+    direct_warning?: string;
+    direct_risk_acknowledged_at?: string;
+    direct_risk_reason?: string;
 };
 
 export type AIProviderSyncPlan = {
@@ -3245,12 +3386,27 @@ export type LocalUsageGroup = {
     key: string;
     label: string;
     requests: number;
+    failures: number;
+    failure_rate: number;
+    avg_latency_ms: number;
     input_tokens: number;
     output_tokens: number;
     tokens: number;
 };
 
 export type LocalUsageDimension = 'client' | 'model' | 'service';
+
+export type LocalUsageFailure = {
+    occurred_at: string;
+    request_id: string;
+    client: string;
+    service: string;
+    model: string;
+    protocol: string;
+    status: string;
+    latency_ms: number;
+    usage_unreported: boolean;
+};
 
 export type LocalUsageOverview = {
     available: boolean;
@@ -3259,6 +3415,10 @@ export type LocalUsageOverview = {
     date_to: string;
     has_trend: boolean;
     requests: number;
+    failures: number;
+    failure_rate: number;
+    avg_latency_ms: number;
+    p95_latency_ms: number;
     input_tokens: number;
     output_tokens: number;
     cached_tokens: number;
@@ -3271,6 +3431,7 @@ export type LocalUsageOverview = {
     labels: string[];
     daily_requests: number[];
     daily_tokens: number[];
+    recent_failures: LocalUsageFailure[];
     breakdowns: Partial<Record<LocalUsageDimension, LocalUsageGroup[]>>;
 };
 
@@ -3292,6 +3453,13 @@ export type InferenceGatewayStatus = {
         protocol: string;
         upstream_protocols: string[];
         models: string[];
+    }>;
+    capability_observations?: Array<{
+        provider: string;
+        protocol: string;
+        feature: string;
+        successes: number;
+        last_seen: string;
     }>;
     /** 直连注入的客户端：其用量不计入本机口径。 */
     direct_clients: string[];
@@ -3315,6 +3483,21 @@ export const agentApi = {
     setAgentMode: (mode: AgentModeSettings['mode']) => invoke<AgentModeSettings>('set_agent_mode', { mode }),
     taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
     localActivity: (limit = 60) => invoke<AgentActivityItem[]>('list_local_activity', { limit }),
+    listMissionExecutionOptions: () => invoke<MissionExecutionOption[]>('list_mission_execution_options'),
+    updateMissionTaskExecution: (missionId: string, taskId: string, expectedPlanSha256: string, execution: MissionTaskSpec['execution']) =>
+        invoke<MissionView>('update_mission_task_execution', { missionId, taskId, expectedPlanSha256, execution }),
+    createMission: (input: MissionCreateInput) => invoke<MissionView>('create_mission', { input }),
+    listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
+    getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),
+    proposeMissionPlan: (missionId: string, proposal: MissionPlanProposal) => invoke<MissionView>('propose_mission_plan', { missionId, proposal }),
+    generateMissionPlan: (missionId: string) => invoke<MissionView>('generate_mission_plan', { missionId }),
+    generateMissionFollowUp: (missionId: string) => invoke<MissionView>('generate_mission_follow_up', { missionId }),
+    confirmMissionPlan: (missionId: string, planSha256: string, selectedTaskIds: string[], approvedPaths: string[], confirmedBy: string) =>
+        invoke<MissionView>('confirm_mission_plan', { missionId, planSha256, selectedTaskIds, approvedPaths, confirmedBy }),
+    addMissionFollowUpTasks: (missionId: string, tasks: MissionTaskSpec[], reason: string) =>
+        invoke<MissionView>('add_mission_follow_up_tasks', { missionId, tasks, reason }),
+    missionSnapshot: (missionId: string, afterSequence = 0) => invoke<MissionSnapshot>('get_mission_snapshot', { missionId, afterSequence }),
+    dispatchNextMissionTask: (missionId: string) => invoke<{ accepted?: boolean; dispatched?: boolean; task_id?: string; run_id?: string; run_status?: string; mission?: MissionView; reason?: string }>('dispatch_next_mission_task', { missionId }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
     checkUpdate: () => invoke<AgentUpdateStatus>('check_agent_update'),
     downloadUpdate: () => invoke<AgentUpdateStatus>('download_agent_update'),
@@ -3324,12 +3507,13 @@ export const agentApi = {
     dashboardIdentity: () => invoke<DashboardIdentityStatus>('get_dashboard_identity_status'),
     builtinAiActivity: () => invoke<{ items: BuiltinAIRuntimeActivity[] }>('get_builtin_ai_activity'),
     localUsageOverview: (range: AiUsageRange) => invoke<LocalUsageOverview>('get_local_usage_overview', { range }),
+    cleanupInferenceMediaCache: () => invoke<{ removed_files: number; removed_records: number }>('cleanup_inference_media_cache'),
     inferenceGatewayStatus: () => invoke<InferenceGatewayStatus>('get_inference_gateway_status'),
     restartInferenceGateway: () => invoke<InferenceGatewayStatus>('restart_inference_gateway'),
     setInferenceGatewayPort: (port: number) => invoke<InferenceGatewayStatus>('set_inference_gateway_port', { port }),
     stopInferenceGatewayAndUnbind: () => invoke<InferenceGatewayStopReport>('stop_inference_gateway_and_unbind'),
-    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) =>
-        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null, profileId: profileId ?? null }),
+    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) =>
+        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null, profileId: profileId ?? null, allowDirectRisk: allowDirectRisk ?? false }),
     startDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('start_dashboard_authorization'),
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
@@ -3493,6 +3677,9 @@ export const agentApi = {
     rejectWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('reject_workflow_step', { runId, stepId }),
     cancelWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('cancel_workflow_run', { runId }),
     pauseWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('pause_workflow_run', { runId }),
+    notificationChannels: () => invoke<{ channels: NotificationChannelView[] }>('list_notification_channels'),
+    saveNotificationChannel: (input: NotificationChannelInput) => invoke<{ saved: boolean; id: string }>('save_notification_channel', input),
+    deleteNotificationChannel: (id: string) => invoke<{ removed: boolean; id: string }>('delete_notification_channel', { id }),
     retryWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('retry_workflow_step', { runId, stepId }),
     resumePausedWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('resume_paused_workflow_run', { runId }),
     resumeWorkflowRun: (runId: string, feedback?: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId, feedback }),
@@ -3734,7 +3921,7 @@ export const agentApi = {
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
     planAIClientSync: (target: string) => invoke<AIProviderSyncPlan>('plan_ai_client_sync', { target }),
-    syncAIClient: (target: string, expectedRevision?: string) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision }),
+    syncAIClient: (target: string, expectedRevision?: string, acceptDrift?: boolean) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision, acceptDrift }),
     syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),

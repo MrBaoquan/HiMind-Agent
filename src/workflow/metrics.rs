@@ -220,6 +220,7 @@ mod tests {
                 status: LocalStepStatus::Succeeded,
                 capability_id: String::new(),
                 runtime_provider: String::new(),
+                model: String::new(),
                 role_id: String::new(),
                 attempt: 2,
                 started_at: "100".to_string(),

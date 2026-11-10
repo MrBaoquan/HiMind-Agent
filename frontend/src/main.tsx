@@ -466,9 +466,9 @@ function AgentApp() {
     }
   }
   /** 注入模式切换：客户端配置、网关绑定与用量口径会同时变化，一起回读。 */
-  async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) {
+  async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string, allowDirectRisk?: boolean) {
     try {
-      await agentApi.setProviderBindingMode(target, mode, service, profileId);
+      await agentApi.setProviderBindingMode(target, mode, service, profileId, allowDirectRisk);
       notify('success', mode === 'gateway' ? `${target} 已切换到本机推理网关` : `${target} 已切回直连`);
       await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
     } catch (error) {

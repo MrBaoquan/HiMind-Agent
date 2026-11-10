@@ -1,7 +1,9 @@
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, Implementation, InitializeRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, TextContent,
+    CancelNotification, ContentBlock, EnvVariable, Implementation, InitializeRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionNotification, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -94,6 +96,8 @@ impl PermissionPolicy {
 pub(crate) struct AcpExecution {
     pub(crate) session_id: String,
     pub(crate) stop_reason: String,
+    /// 会话实际生效的模型；客户端未暴露模型配置时为空。
+    pub(crate) model: String,
     pub(crate) final_text: String,
     pub(crate) update_count: usize,
     pub(crate) tool_call_count: usize,
@@ -318,18 +322,40 @@ impl AcpSessionShared {
     }
 }
 
-/// 一次 ACP 会话的固定输入，连接线程按 initialize → session/new → session/prompt 驱动。
+/// 一次 ACP 会话的固定输入，连接线程按 initialize → session/new → [set_config_option]
+/// → session/prompt 驱动。
 struct AcpSessionPlan {
     workspace: PathBuf,
     prompt: String,
     policy: PermissionPolicy,
     attribution: AcpAttribution,
+    /// 要挂到外部客户端上的 HiMind MCP；`None` 表示本次不注入（例如测试替身）。
+    mcp: Option<HimindMcpSpec>,
+    /// 步骤声明的模型（`acp:<provider>:<model>` 里的 `<model>` 部分）。
+    ///
+    /// 只有声明了才去读 `session/new` 返回的 `config_options` 并下发
+    /// `session/set_config_option`；未声明保持客户端自己的当前模型。
+    requested_model: Option<String>,
+}
+
+/// 注入给外部客户端的 HiMind MCP 描述。
+///
+/// 与 `deepseek_harness::HimindMcpLaunch` 一一对应，但在 acp 模块里独立成型：
+/// 这里需要的是「可以序列化进 `NewSessionRequest` 的形态」，不是启动器。
+#[derive(Clone)]
+struct HimindMcpSpec {
+    name: String,
+    command: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
 struct AcpSessionOutcome {
     session_id: String,
     stop_reason: String,
+    /// 会话最终生效的模型标识；客户端没暴露 model 配置项时为空。
+    model: String,
 }
 
 struct AcpProcess {
@@ -618,6 +644,7 @@ fn execute_claimed(
     }
     let workspace = process::canonical_workspace(&claim.workspace_path)?;
     let prompt = build_prompt(claim)?;
+    let mcp = himind_mcp_spec(options, Some(&workspace));
     update_agent_run_status(
         client,
         &options.api_base(),
@@ -654,6 +681,8 @@ fn execute_claimed(
             &prompt,
             ACP_SESSION_TIMEOUT_SECONDS,
             &claim.run.id,
+            None,
+            mcp,
             &mut is_canceled,
         )
     };
@@ -684,17 +713,50 @@ pub(crate) fn execute_workflow(
     prompt: &str,
     timeout_seconds: u64,
     run_id: &str,
+    requested_model: Option<&str>,
+    options: Option<&Options>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<AcpExecution, Box<dyn Error>> {
     let workspace = process::canonical_workspace(workspace)?;
+    // 工作流步骤必须带上 HiMind MCP：否则外部客户端能改代码却调不到项目/展项/知识
+    // 这些业务能力，与「可选外部 AI 工具」的目标直接冲突。
+    // 没有 Agent options（理论上不会发生）时不注入，而不是让整步失败——那会让
+    // 一个可用的 ACP 配置因为缺少 MCP 而完全不可用。
+    let mcp = options.and_then(|options| himind_mcp_spec(options, Some(&workspace)));
     run_session(
         provider,
         &workspace,
         prompt,
         timeout_seconds,
         run_id,
+        requested_model,
+        mcp,
         &mut || is_canceled(),
     )
+}
+
+/// 把 `deepseek_harness::himind_mcp_launch` 转成 ACP 会话要用的形态。
+///
+/// 解析失败（例如 companion 未安装）时只记日志并返回 `None`：注入 MCP 是增强，
+/// 不该把原本能跑的 ACP 步骤变成失败。
+fn himind_mcp_spec(options: &Options, workspace: Option<&Path>) -> Option<HimindMcpSpec> {
+    match crate::runtime::deepseek_harness::himind_mcp_launch(options, workspace) {
+        Ok(launch) => Some(HimindMcpSpec {
+            name: deepseek_mcp_server_name(),
+            command: launch.executable,
+            args: launch.args,
+            env: launch.env,
+        }),
+        Err(error) => {
+            eprintln!("himind-agent: ACP session will run without HiMind MCP: {error}");
+            None
+        }
+    }
+}
+
+/// DSH overlay 与 ACP 会话共用同一个 server name。
+fn deepseek_mcp_server_name() -> String {
+    crate::runtime::deepseek_harness::himind_mcp_server_name().to_string()
 }
 
 fn run_session(
@@ -703,6 +765,8 @@ fn run_session(
     prompt: &str,
     timeout_seconds: u64,
     run_id: &str,
+    requested_model: Option<&str>,
+    mcp: Option<HimindMcpSpec>,
     is_canceled: &mut dyn FnMut() -> Result<bool, Box<dyn Error>>,
 ) -> Result<AcpExecution, Box<dyn Error>> {
     if prompt.trim().is_empty() {
@@ -725,6 +789,7 @@ fn run_session(
             "args": &profile.args,
             "permission_policy": policy.as_str(),
             "timeout_seconds": timeout_seconds,
+            "requested_model": requested_model,
         }),
     );
     let plan = AcpSessionPlan {
@@ -732,6 +797,11 @@ fn run_session(
         prompt: prompt.to_string(),
         policy,
         attribution,
+        requested_model: requested_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        mcp,
     };
     let mut process = AcpProcess::spawn(&profile, plan, trace.clone())?;
     let outcome = process.drive(timeout, is_canceled)?;
@@ -741,12 +811,13 @@ fn run_session(
     state.update_count = state.update_count.max(process.raw_update_frames());
     let stderr = process.finish()?;
     let stderr = process::summarize_output(stderr.trim(), 8 * 1024);
-    let session_id = outcome.session_id;
-    let stop_reason = outcome.stop_reason;
+    let session_id = outcome.session_id.clone();
+    let stop_reason = outcome.stop_reason.clone();
     trace.event(
         "session_end",
         json!({
             "stop_reason": &stop_reason,
+            "model": &outcome.model,
             "update_count": state.update_count,
             "tool_call_count": state.tool_call_count,
             "permission_request_count": state.permission_requests.len(),
@@ -757,6 +828,7 @@ fn run_session(
     Ok(AcpExecution {
         session_id,
         stop_reason,
+        model: outcome.model,
         final_text: process::summarize_output(&state.final_text, ACP_OUTPUT_LIMIT),
         update_count: state.update_count,
         tool_call_count: state.tool_call_count,
@@ -1179,8 +1251,12 @@ async fn drive_session(
     trace.event("initialize", json!({"protocol_version": negotiated}));
 
     shared.set_phase("session/new");
+    let mut new_session = NewSessionRequest::new(plan.workspace.clone());
+    if let Some(mcp) = plan.mcp.as_ref() {
+        new_session = new_session.mcp_servers(vec![McpServer::Stdio(mcp_server_stdio(mcp))]);
+    }
     let session = cx
-        .send_request(NewSessionRequest::new(plan.workspace.clone()))
+        .send_request(new_session)
         .block_task()
         .await
         .map_err(|error| process::summarize_output(&error.to_string(), 2_000))?;
@@ -1190,6 +1266,61 @@ async fn drive_session(
         .lock()
         .map_err(|_| "ACP session state is unavailable".to_string())?;
     *session_slot = Some(session_id.clone());
+    drop(session_slot);
+
+    // 步骤声明了模型：先看客户端在 session/new 里报了什么，再决定能不能切。
+    // 必须在 session/prompt 之前完成——prompt 一旦发出，模型已经开始了。
+    let model_config = select_model_config_option(&session.config_options);
+    trace.event(
+        "session_config",
+        json!({
+            "has_model_option": model_config.is_some(),
+            "available_models": model_config
+                .as_ref()
+                .map(|option| option.choices.clone())
+                .unwrap_or_default(),
+            "current_model": model_config.as_ref().map(|option| option.current.clone()),
+            "requested_model": plan.requested_model.clone(),
+        }),
+    );
+    let mut effective_model = model_config
+        .as_ref()
+        .map(|option| option.current.clone())
+        .unwrap_or_default();
+    // 克隆一份：`plan` 是引用，而 `send_request(...).await` 要求参数不借自函数栈。
+    if let Some(requested) = plan.requested_model.clone() {
+        let requested = requested.as_str();
+        let option = model_config.as_ref().ok_or_else(|| {
+            format!(
+                "ACP client {0} does not expose a model config option; cannot honor model {requested}",
+                plan.attribution.provider
+            )
+        })?;
+        if !option.choices.iter().any(|choice| choice == requested) {
+            let available = if option.choices.is_empty() {
+                "<none>".to_string()
+            } else {
+                option.choices.join(", ")
+            };
+            return Err(format!(
+                "ACP client {0} has no model {requested}; available models: {available}",
+                plan.attribution.provider
+            ));
+        }
+        if option.current != requested {
+            shared.set_phase("session/set_config_option");
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.config_id.clone(),
+                SessionConfigOptionValue::value_id(requested.to_string()),
+            ))
+            .block_task()
+            .await
+            .map_err(|error| process::summarize_output(&error.to_string(), 2_000))?;
+            trace.event("session_config_applied", json!({ "model": requested }));
+        }
+        effective_model = requested.to_string();
+    }
 
     shared.set_phase("session/prompt");
     let prompt = cx
@@ -1210,6 +1341,7 @@ async fn drive_session(
     Ok(AcpSessionOutcome {
         session_id,
         stop_reason,
+        model: effective_model,
     })
 }
 
@@ -1312,6 +1444,89 @@ fn build_prompt(claim: &AgentRunClaim) -> Result<String, Box<dyn Error>> {
         prompt.push_str(&serde_json::to_string(&claim.run.input)?);
     }
     Ok(prompt)
+}
+
+/// 把 MCP 描述转成 SDK 的 stdio 传输形态。
+fn mcp_server_stdio(spec: &HimindMcpSpec) -> McpServerStdio {
+    McpServerStdio::new(spec.name.clone(), spec.command.clone())
+        .args(spec.args.clone())
+        .env(
+            spec.env
+                .iter()
+                .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                .collect(),
+        )
+}
+
+/// 客户端在 `session/new` 里报出来的模型选择器。
+struct AcpModelConfig {
+    config_id: agent_client_protocol::schema::v1::SessionConfigId,
+    current: String,
+    choices: Vec<String>,
+}
+
+/// 从 `config_options` 里挑出「模型选择器」。
+///
+/// 判定顺序：
+/// 1. `category == model` —— 协议为此定义了语义分类，优先信它；
+/// 2. `_meta` 里带 `model` / `isModel` 标记 —— 部分客户端还没标 category；
+/// 3. `id == "model"` —— 最后的兜底，只在没有 category 标注时生效。
+///
+/// 只要是 `select` 类型才认：boolean 选项不可能是模型列表。
+fn select_model_config_option(
+    options: &Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
+) -> Option<AcpModelConfig> {
+    let options = options.as_ref()?;
+    // 先只留 select 类型：boolean 选项不可能是模型列表，而 id 撞名（"model"）
+    // 在真实客户端里出现过，先按 id 匹配会误命中开关。
+    let selectkinds = options
+        .iter()
+        .filter_map(|option| match &option.kind {
+            SessionConfigKind::Select(select) => Some((option, select)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let (chosen, select) = selectkinds
+        .iter()
+        .find(|(option, _)| {
+            matches!(
+                option.category,
+                Some(SessionConfigOptionCategory::Model) | Some(SessionConfigOptionCategory::ModelConfig)
+            )
+        })
+        .or_else(|| {
+            selectkinds.iter().find(|(option, _)| {
+                option
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| serde_json::to_value(meta).ok())
+                    .is_some_and(|meta| {
+                        meta.get("model").is_some() || meta.get("isModel").is_some()
+                    })
+            })
+        })
+        .or_else(|| {
+            selectkinds
+                .iter()
+                .find(|(option, _)| option.id.0.as_ref().eq_ignore_ascii_case("model"))
+        })?;
+    let mut choices = Vec::new();
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(items) => {
+            choices.extend(items.iter().map(|item| item.value.0.to_string()));
+        }
+        SessionConfigSelectOptions::Grouped(groups) => {
+            for group in groups {
+                choices.extend(group.options.iter().map(|item| item.value.0.to_string()));
+            }
+        }
+        _ => {}
+    }
+    Some(AcpModelConfig {
+        config_id: chosen.id.clone(),
+        current: select.current_value.0.to_string(),
+        choices,
+    })
 }
 
 fn permission_outcome(
@@ -1436,6 +1651,7 @@ fn execution_metadata(execution: &AcpExecution, attribution: &AcpAttribution) ->
     json!({
         "provider": attribution.provider,
         "run_id": attribution.run_id,
+        "model": execution.model,
         "stop_reason": execution.stop_reason,
         "update_count": execution.update_count,
         "tool_call_count": execution.tool_call_count,
@@ -1449,12 +1665,116 @@ fn execution_metadata(execution: &AcpExecution, attribution: &AcpAttribution) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        permission_outcome, AcpAttribution, AcpTrace, PermissionPolicy, ACP_TRACE_ENVIRONMENT,
+        mcp_server_stdio, permission_outcome, select_model_config_option, AcpAttribution,
+        AcpTrace, HimindMcpSpec, PermissionPolicy, ACP_TRACE_ENVIRONMENT,
+    };
+    use agent_client_protocol::schema::v1::{McpServer, NewSessionRequest};
+    use std::path::PathBuf;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+        SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId,
     };
     use serde_json::json;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+
+    fn model_option(current: &str, choices: &[&str], category: Option<SessionConfigOptionCategory>) -> SessionConfigOption {
+        let mut option = SessionConfigOption::select(
+            "model",
+            "Model",
+            SessionConfigValueId::new(current),
+            SessionConfigSelectOptions::Ungrouped(
+                choices
+                    .iter()
+                    .map(|value| {
+                        let value = value.to_string();
+                        SessionConfigSelectOption::new(SessionConfigValueId::new(value.clone()), value)
+                    })
+                    .collect(),
+            ),
+        );
+        option.category = category;
+        option
+    }
+
+    /// MCP 注入必须与 DSH overlay 同源：同一个 server name、同一个可执行文件、
+    /// 同一组参数，并带会话归属环境变量。
+    #[test]
+    fn mcp_spec_is_serialized_into_session_new() {
+        let spec = HimindMcpSpec {
+            name: "himind-agent".to_string(),
+            command: PathBuf::from("C:/agent/himind-agent-mcp.exe"),
+            args: vec!["--mcp".to_string(), "--mode".to_string(), "independent".to_string()],
+            env: vec![
+                ("HIMIND_AI_CLIENT_ID".to_string(), "himind-ai".to_string()),
+                (
+                    "HIMIND_AI_WORKSPACE".to_string(),
+                    "F:/WebProjects/demo".to_string(),
+                ),
+            ],
+        };
+        let request = NewSessionRequest::new(PathBuf::from("F:/WebProjects/demo"))
+            .mcp_servers(vec![McpServer::Stdio(mcp_server_stdio(&spec))]);
+        let payload = serde_json::to_value(&request).unwrap();
+        let servers = payload["mcpServers"].as_array().expect("mcpServers 必须出现");
+        assert_eq!(servers.len(), 1, "{payload}");
+        assert_eq!(servers[0]["name"], "himind-agent");
+        assert!(
+            servers[0]["command"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("himind-agent-mcp.exe"),
+            "{payload}"
+        );
+        assert_eq!(servers[0]["args"][0], "--mcp");
+        let env = servers[0]["env"].as_array().expect("env 必须出现");
+        assert!(env.iter().any(|item| item["name"] == "HIMIND_AI_WORKSPACE"));
+    }
+
+    #[test]
+    fn picks_the_model_config_option_by_category() {
+        let options = Some(vec![
+            SessionConfigOption::boolean("always_approve", "Always approve", false),
+            model_option(
+                "claude-sonnet-4-5",
+                &["claude-sonnet-4-5", "claude-opus-4-1"],
+                Some(SessionConfigOptionCategory::Model),
+            ),
+        ]);
+        let picked = select_model_config_option(&options).expect("model option must be found");
+        assert_eq!(picked.current, "claude-sonnet-4-5");
+        assert_eq!(picked.choices, vec!["claude-sonnet-4-5", "claude-opus-4-1"]);
+    }
+
+    /// 客户端没标 category 时，按 id == "model" 兜底；boolean 选项不能被误认。
+    #[test]
+    fn falls_back_to_id_when_category_is_missing() {
+        let options = Some(vec![
+            SessionConfigOption::boolean("model", "Not a model", true),
+            model_option("gpt-5", &["gpt-5", "gpt-5-mini"], None),
+        ]);
+        let picked = select_model_config_option(&options).expect("model option must be found");
+        assert_eq!(picked.current, "gpt-5");
+
+        // 只有一个 id 叫 model 的 boolean 时，不能当成模型选择器。
+        let boolean_only = Some(vec![SessionConfigOption::boolean("model", "Toggle", true)]);
+        assert!(select_model_config_option(&boolean_only).is_none());
+    }
+
+    #[test]
+    fn handshake_without_model_option_yields_none() {
+        assert!(select_model_config_option(&None).is_none());
+        assert!(select_model_config_option(&Some(Vec::new())).is_none());
+        // 空 choices 仍然返回配置项：调用方据此报出「没有可用模型」。
+        let empty = Some(vec![model_option(
+            "x",
+            &[],
+            Some(SessionConfigOptionCategory::Model),
+        )]);
+        let picked = select_model_config_option(&empty).expect("option exists");
+        assert!(picked.choices.is_empty());
+    }
 
     #[test]
     fn permission_policy_denies_by_default() {

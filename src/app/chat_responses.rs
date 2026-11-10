@@ -437,6 +437,7 @@ pub(crate) struct ChatStream {
     finish_reason: Option<String>,
     usage: Value,
     done: bool,
+    failed: bool,
 }
 
 struct StreamTool {
@@ -457,7 +458,12 @@ impl ChatStream {
             finish_reason: None,
             usage: json!({}),
             done: false,
+            failed: false,
         }
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
     }
 
     pub(crate) fn usage(&self) -> (u64, u64) {
@@ -553,6 +559,7 @@ impl ChatStream {
                     .and_then(Value::as_str)
                     .unwrap_or("Responses 上游流式生成失败");
                 self.done = true;
+                self.failed = true;
                 vec![format!(
                     "data: {}\n\n",
                     json!({ "error": { "type": "api_error", "message": message } })
@@ -930,6 +937,19 @@ mod tests {
             Some(&json!("stop"))
         );
         assert!(output.concat().ends_with("data: [DONE]\n\n"));
+        assert!(stream.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_failure_marks_failed_and_suppresses_done() {
+        let mut stream = ChatStream::new("service/model".to_string());
+        let output = stream
+            .push_line(
+                r#"data: {"type":"response.failed","response":{"error":{"message":"上游失败"}}}"#,
+            )
+            .concat();
+        assert!(stream.failed());
+        assert!(output.contains("\"error\""), "output={output}");
         assert!(stream.finish().is_empty());
     }
 }

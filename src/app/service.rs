@@ -357,6 +357,18 @@ pub(crate) fn start_background_services(
                 });
     }
 
+    // 通知通道的重试循环：投递失败时退避重试，与审批/HTTP 服务完全解耦。
+    // 通道没配、或队列为空时每轮只做一次文件读取，开销可以忽略。
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(60));
+        let (delivered, dropped) = crate::notification_channels::retry_due();
+        if delivered > 0 || dropped > 0 {
+            eprintln!(
+                "notification retry: delivered={delivered} dropped={dropped}"
+            );
+        }
+    });
+
     let http_ws = Arc::clone(&worker_status);
     let http_opts = options.clone();
     let http_gateway = capability_gateway;
@@ -1290,6 +1302,7 @@ fn handle_local_http(
                 json!({
                     "target": payload.target,
                     "expected_revision": payload.expected_revision,
+                    "accept_drift": payload.accept_drift,
                 }),
             ) {
                 Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),

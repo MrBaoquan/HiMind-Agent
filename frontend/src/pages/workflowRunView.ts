@@ -16,6 +16,10 @@ export type RunTimelineStep = {
   executionMode: string;
   /** 执行该步骤的角色；空串表示未声明。 */
   roleId: string;
+  /** 这一步实际用的 runtime provider；空串表示未上报。 */
+  runtimeProvider: string;
+  /** 这一步实际用的模型别名；空串表示没有调用模型。 */
+  model: string;
   /** 并行委派的分支摘要；null 表示不是委派步骤。 */
   delegate: WorkflowGraphNode['delegate'];
   depth: number;
@@ -276,6 +280,8 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
       capabilityId: node.capabilityId || '',
       executionMode: node.executionMode || '',
       roleId: node.roleId || '',
+      runtimeProvider: runtimeStep?.runtime_provider || '',
+      model: runtimeStep?.model || '',
       delegate: node.delegate,
       depth: node.depth,
       approvalRequired: node.approvalRequired,

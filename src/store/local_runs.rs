@@ -1375,6 +1375,7 @@ mod tests {
                 status: LocalStepStatus::Running,
                 capability_id: "workspace.inspect".to_string(),
                 runtime_provider: String::new(),
+                model: String::new(),
                 role_id: String::new(),
                 attempt: 1,
                 started_at: String::new(),

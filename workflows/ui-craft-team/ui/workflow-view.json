@@ -23,11 +23,19 @@
       "title": "审查范围",
       "fields": [
         {
+          "id": "profile_path",
+          "label": "审查判据文件",
+          "type": "text",
+          "default": "docs/ui-review-profile.json",
+          "hint": "相对代码仓库的路径。缺失时审查员会报错停住，不会自己编判据。",
+          "span": "full"
+        },
+        {
           "id": "target_area",
           "label": "重点区域",
           "type": "textarea",
           "placeholder": "例如：设置窗口的 AI 连接页；或留空由审查员自行圈定",
-          "hint": "留空时由信息架构审查员先产出范围清单，经你确认后再继续。",
+          "hint": "留空时按判据文件的 focus_areas 圈定；也可在此覆盖。",
           "span": "full"
         },
         {
@@ -40,7 +48,43 @@
             "560",
             "400"
           ],
-          "hint": "每行一个宽度（CSS px），用于窄窗复验。"
+          "hint": "每行一个宽度（CSS px）。留空时用判据文件的 viewports。"
+        }
+      ]
+    },
+    {
+      "id": "execution",
+      "title": "执行环境",
+      "fields": [
+        {
+          "id": "implement_provider",
+          "label": "打磨步骤的 AI 客户端",
+          "type": "runtime-provider",
+          "options": [
+            { "value": "inherit", "label": "按包声明（默认）" },
+            { "value": "himind.builtin", "label": "HiMind AI（内置）" },
+            { "value": "acp.claude", "label": "Claude Agent（ACP）" },
+            { "value": "acp.codex", "label": "Codex（ACP）" },
+            { "value": "acp.opencode", "label": "OpenCode（ACP）" }
+          ],
+          "hint": "只影响打磨步骤；审查与守门仍走内置引擎以保证隔离。",
+          "override": {
+            "stepId": "POLISH",
+            "key": "runtime_provider"
+          }
+        },
+        {
+          "id": "implement_model",
+          "label": "打磨步骤的模型",
+          "type": "model",
+          "options": [
+            { "value": "inherit", "label": "沿用客户端当前模型" }
+          ],
+          "hint": "himind:<服务id>:<模型> 或 acp:<客户端>:<模型>；选「沿用」表示不改。",
+          "override": {
+            "stepId": "POLISH",
+            "key": "model"
+          }
         }
       ]
     },
@@ -53,7 +97,7 @@
           "label": "最多打磨轮次",
           "type": "number",
           "default": 3,
-          "hint": "3 到 6 之间。超过 3 轮说明问题反复出现，值得看看审查标准是不是没写清。",
+          "hint": "3 到 6 之间。超过 3 轮说明问题反复出现，值得看看判据是不是没写清。",
           "override": {
             "stepId": "POLISH-LOOP",
             "key": "max_iterations"
