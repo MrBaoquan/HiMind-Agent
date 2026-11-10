@@ -55,7 +55,12 @@ const HIMIND_SKILL_ROW_ID: &str = "himind-agent-skill-filesystem";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
 /// HiMind AI 对话启动时预激活的本机能力。只放"对话里随时可能用到、且不依赖
 /// AI 工作台"的本地能力；控制面能力仍按需激活，避免撑大默认工具面。
-const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str = "media.image.generate";
+///
+/// `workspace.registry.*` 由工作区登记插件提供，配套技能 `workspace-context`
+/// 在第一轮就要用它们判断当前目录属于哪个项目——晚一步激活，技能在首轮
+/// 就只剩「凭印象猜项目名」这一条路。只预激活两条只读能力，写入类仍按需激活。
+const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str =
+    "media.image.generate,workspace.registry.resolve,workspace.registry.context.get";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
