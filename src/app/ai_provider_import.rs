@@ -111,6 +111,12 @@ pub(crate) struct AIProviderSyncRequest {
     /// 调用方从 sync.plan 拿到的期望修订号；用于拒绝执行过期计划。
     #[serde(default)]
     pub expected_revision: String,
+    /// 用户在确认框里明确同意「覆盖外部修改」后置 true。
+    ///
+    /// 默认 `false`：客户端配置里由 HiMind 写入的字段被外部改过时，同步拒绝写入
+    /// 并返回 `conflict`，避免静默覆盖用户或其它工具的选择。
+    #[serde(default)]
+    pub accept_drift: bool,
 }
 
 impl AIProviderImportRequest {
@@ -154,6 +160,28 @@ pub(crate) trait AIClientAdapter {
         options: &Options,
         restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>>;
+
+    /// 本次适配器写入的**托管字段**。README 语义见 [`ManagedFields`]。
+    ///
+    /// 只应包含「HiMind 自己写入、且外部改动即为漂移」的字段：
+    /// 不含凭据明文（用 [`secret_placeholder`] 代替）、不含用户自有配置。
+    /// 默认返回 `None`，表示该适配器暂不参与字段级漂移检测——行为与引入本
+    /// 方法之前完全一致。
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        None
+    }
+
+    /// 从当前磁盘上的客户端配置读出托管字段，与 [`AIClientAdapter::managed_fields`]
+    /// 同构。用于「文件现在是什么样」与「我写的是什么样」逐字段比对。
+    ///
+    /// 不存在的文件或字段应以 `None` 表达，而不是报错；无法解析时返回
+    /// [`ManagedFieldsError::Unparseable`]，由调用方映射成 `blocked`。
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        Err(ManagedFieldsError::Unsupported)
+    }
 }
 
 pub(crate) struct VSCodeAdapter;
@@ -251,6 +279,15 @@ impl AIClientAdapter for CodexAdapter {
         restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_codex(options, restore)
+    }
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        codex_managed_fields()
+    }
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        codex_current_managed_fields()
     }
 }
 
@@ -388,6 +425,15 @@ impl AIClientAdapter for ClaudeCodeAdapter {
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_claude_code(restore)
     }
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        claude_code_managed_fields()
+    }
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        current_claude_code_managed_fields()
+    }
 }
 
 impl AIClientAdapter for ClaudeDesktopAdapter {
@@ -421,6 +467,15 @@ impl AIClientAdapter for ClaudeDesktopAdapter {
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_claude_desktop(restore)
     }
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        claude_desktop_managed_fields()
+    }
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        current_claude_desktop_managed_fields()
+    }
 }
 
 impl AIClientAdapter for OpenCodeAdapter {
@@ -450,6 +505,15 @@ impl AIClientAdapter for OpenCodeAdapter {
         _restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_opencode()
+    }
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        opencode_current_managed_fields().ok().flatten()
+    }
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        opencode_current_managed_fields()
     }
 }
 
@@ -533,6 +597,203 @@ const SYNC_REASON_ENDPOINT_CHANGED: &str = "gateway_endpoint_changed";
 const SYNC_REASON_PROFILE_UNAVAILABLE: &str = "gateway_profile_unavailable";
 const SYNC_REASON_NO_MODELS: &str = "gateway_models_unavailable";
 const SYNC_REASON_CONFIG_MISSING: &str = "client_config_missing";
+/// 托管字段仍在，但值已被外部改写（用户手工改回、或被其它工具覆写）。
+const SYNC_REASON_FIELDS_MODIFIED: &str = "client_fields_modified";
+/// 适配器写入的托管段整体消失（例如 `[model_providers.himind]` 被删）。
+const SYNC_REASON_SEGMENT_REMOVED: &str = "client_managed_segment_removed";
+/// 客户端配置文件无法解析，无法判断漂移。
+const SYNC_REASON_UNPARSEABLE: &str = "client_config_unparseable";
+/// 本次同步被漂移拦截（默认不覆盖外部改动），等待用户显式确认。
+const SYNC_REASON_DRIFT_UNCONFIRMED: &str = "client_drift_unconfirmed";
+
+/// 适配器「托管字段」的落盘快照。
+///
+/// 存在意义：`desired_revision` 只能回答「上游/Profile 变了没有」，回答不了
+/// 「客户端文件还是不是我们写的」。后者需要读文件，所以由适配器提供
+/// [`AIClientAdapter::managed_fields`]（我写了什么）和
+/// [`AIClientAdapter::current_managed_fields`]（现在是什么）两侧，本模块比对。
+///
+/// 约定：
+/// - `keys` 是扁平的 `路径 -> 可比较值` 映射（用 `.` 分隔嵌套），由适配器自行组织；
+/// - 凭据位置一律用 [`secret_placeholder`]，绝不落明文；
+/// - `segments` 记录适配器拥有的「段」是否存在（例如 `model_providers.himind`），
+///   用于区分「字段被改」与「整段被删」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct ManagedFields {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    keys: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<String>,
+}
+
+impl ManagedFields {
+    fn with_key(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.keys.insert(key.into(), value.into());
+        self
+    }
+
+    fn with_segment(mut self, segment: impl Into<String>) -> Self {
+        self.segments.push(segment.into());
+        self
+    }
+}
+
+/// 凭据占位值。两侧都用它，因此「凭据是否存在」可比、明文永不出现在簿记或日志里。
+fn secret_placeholder() -> String {
+    "<secret>".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagedFieldsError {
+    /// 适配器尚未实现托管字段读取；调用方应视为「无漂移信息」，不改变状态。
+    Unsupported,
+    /// 文件存在但无法解析；这是明确的异常，应报 `blocked`。
+    Unparseable(String),
+}
+
+/// 托管字段比对结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftVerdict {
+    /// 无从比对（适配器未实现，或从未写入过快照）。
+    Unknown,
+    /// 托管字段与写入时一致。
+    Intact,
+    /// 有字段被改，或整段已消失。
+    Drifted(DriftKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftKind {
+    FieldsModified,
+    SegmentRemoved,
+    Unparseable,
+}
+
+fn compare_managed_fields(applied: &ManagedFields, current: &ManagedFields) -> DriftVerdict {
+    // 先看段：段整体消失是最强信号，优先于逐字段差异上报。
+    let missing_segment = applied
+        .segments
+        .iter()
+        .find(|segment| !current.segments.contains(segment));
+    if missing_segment.is_some() {
+        return DriftVerdict::Drifted(DriftKind::SegmentRemoved);
+    }
+    // 再看字段：只比较「我们写过」的键。用户新增自己的键不在 applied 里，天然不参与。
+    let changed = applied.keys.iter().any(|(key, expected)| {
+        current
+            .keys
+            .get(key)
+            .is_none_or(|actual| actual != expected)
+    });
+    if changed {
+        DriftVerdict::Drifted(DriftKind::FieldsModified)
+    } else {
+        DriftVerdict::Intact
+    }
+}
+
+/// 漂移结论 + 可读差异说明。`detail` 只在确实漂移时非空。
+#[derive(Debug, Clone, Default)]
+struct DriftReport {
+    verdict: DriftVerdict,
+    detail: String,
+}
+
+impl DriftReport {
+    fn unknown() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for DriftVerdict {
+    fn default() -> Self {
+        DriftVerdict::Unknown
+    }
+}
+
+/// 计算某个绑定的漂移结论。
+///
+/// 三条早退：
+/// - 适配器未实现（`Unsupported`）→ `Unknown`，绝不因此把客户端标成异常；
+/// - 簿记里没有 `applied_fields`（旧簿记或从未成功写入）→ `Unknown`；
+/// - 文件无法解析 → `Drifted(Unparseable)`，这是需要用户看一眼的真实异常。
+fn managed_field_drift(
+    adapter: &dyn AIClientAdapter,
+    options: &Options,
+    binding: &AIProviderImportBinding,
+) -> DriftReport {
+    let Some(applied) = binding.applied_fields.as_ref() else {
+        return DriftReport::unknown();
+    };
+    let Ok(applied) = serde_json::from_value::<ManagedFields>(applied.clone()) else {
+        return DriftReport::unknown();
+    };
+    match adapter.current_managed_fields(options) {
+        Ok(Some(current)) => {
+            let verdict = compare_managed_fields(&applied, &current);
+            DriftReport {
+                detail: describe_drift(&applied, &current, verdict),
+                verdict,
+            }
+        }
+        // 文件整个不见了：托管段当然也消失。
+        Ok(None) => DriftReport {
+            verdict: DriftVerdict::Drifted(DriftKind::SegmentRemoved),
+            detail: "客户端配置文件已不存在".to_string(),
+        },
+        Err(ManagedFieldsError::Unsupported) => DriftReport::unknown(),
+        Err(ManagedFieldsError::Unparseable(error)) => DriftReport {
+            verdict: DriftVerdict::Drifted(DriftKind::Unparseable),
+            detail: format!("客户端配置文件无法解析：{error}"),
+        },
+    }
+}
+
+/// 生成「差在哪」的可读说明。只列键名与两侧取值，不打印凭据（两侧都是占位符）。
+fn describe_drift(applied: &ManagedFields, current: &ManagedFields, verdict: DriftVerdict) -> String {
+    match verdict {
+        DriftVerdict::Intact | DriftVerdict::Unknown => String::new(),
+        DriftVerdict::Drifted(DriftKind::SegmentRemoved) => {
+            let missing = applied
+                .segments
+                .iter()
+                .filter(|segment| !current.segments.contains(segment))
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                "托管段已不存在".to_string()
+            } else {
+                format!("托管段已不存在：{}", missing.join("、"))
+            }
+        }
+        DriftVerdict::Drifted(DriftKind::Unparseable) => "配置文件无法解析".to_string(),
+        DriftVerdict::Drifted(DriftKind::FieldsModified) => {
+            let secret = secret_placeholder();
+            let mut changes = Vec::new();
+            for (key, expected) in &applied.keys {
+                match current.keys.get(key) {
+                    Some(actual) if actual == expected => {}
+                    // 凭据位置两侧都用占位符表达，差异同样只能说明「变了」：
+                    // 绝不能把任何一侧的值打进日志或界面。
+                    Some(actual) if expected == &secret || actual == &secret => {
+                        changes.push(format!("{key}：已变更"))
+                    }
+                    Some(actual) => changes.push(format!("{key}：{expected} → {actual}")),
+                    None => changes.push(format!("{key}：已删除")),
+                }
+                if changes.len() >= 4 {
+                    changes.push("…".to_string());
+                    break;
+                }
+            }
+            if changes.is_empty() {
+                "托管字段与写入时不一致".to_string()
+            } else {
+                format!("托管字段已被修改：{}", changes.join("；"))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AIProviderImportBinding {
@@ -551,9 +812,16 @@ struct AIProviderImportBinding {
     /// 原有配置；旧簿记没有这个字段，退化为「只移除自己写入的键」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restore: Option<Value>,
-    /// ADR 0114：最近一次写入后复核得到的验证等级，供状态检测回显。
+    /// 最近一次写入后复核得到的验证等级，供状态检测回显。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     verification_status: String,
+    /// 最近一次成功写入时，适配器声明的**托管字段**落盘快照（适配器私有格式）。
+    ///
+    /// 与 `restore` 不同：`restore` 是「用户原来是什么」，用于取消导入时还原；
+    /// 这里是「我写了什么」，用于之后判断托管字段是否被外部改动。
+    /// 只含可比较的非秘密标记，不含明文凭据（凭据位置以「存在 + 摘要」记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_fields: Option<Value>,
     /// ADR 0118：写入时源凭据的修订号（`managed` 为 `updated_at|rotated_at|model_metadata_digest`，
     /// `custom:<id>` 为服务 `updated_at`）。客户端持有的凭据与当前接入来源修订号
     /// 不一致，即说明 Key 已轮换或来源已切换，注册已过期。
@@ -639,6 +907,12 @@ pub(crate) struct AIProviderImportStatus {
     pub restart_required: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub last_error: String,
+    /// 客户端配置中 HiMind 托管字段被外部修改时的可读差异说明。
+    ///
+    /// 与 `detail` 分开：`detail` 描述「注册/同步这个动作」的状态，这里描述
+    /// 「文件现在与写入时差在哪」，UI 在 `conflict` 行直接展示它。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub drift_detail: String,
     /// 自检告警：条目「看起来已注册、实际会失败」时的可读修复建议（当前用于
     /// Claude Desktop 的 3P 网关档案）。为空表示自检通过。与 `detail` 分开是因为
     /// `detail` 只在未注册时渲染，已注册的告警需要一个独立通道才可见。
@@ -1083,6 +1357,8 @@ struct BindingDesiredState {
     reason_codes: Vec<String>,
     restart_required: bool,
     detail: String,
+    /// 仅在漂移判定时填充：客户端文件与写入快照的差异说明。
+    drift_detail: String,
 }
 
 fn projection_digest(value: &Value) -> String {
@@ -1188,6 +1464,45 @@ fn desired_state_for_binding(
         restart_required: adapter_requires_restart(target),
         ..Default::default()
     };
+    // 字段级漂移：先看客户端文件现在是不是我们写的样子。
+    //
+    // 这一步只读文件、不改任何东西，因此可以在状态查询里直接调用。漂移的优先级
+    // 高于「上游变了没有」——文件已经不是我们的，讨论期望态没有意义。
+    let drift_report = adapter_for(target)
+        .map(|adapter| managed_field_drift(adapter, options, binding))
+        .unwrap_or(DriftReport::unknown());
+    if let DriftVerdict::Drifted(kind) = drift_report.verdict {
+        result.reason_codes.push(
+            match kind {
+                DriftKind::FieldsModified => SYNC_REASON_FIELDS_MODIFIED,
+                DriftKind::SegmentRemoved => SYNC_REASON_SEGMENT_REMOVED,
+                DriftKind::Unparseable => SYNC_REASON_UNPARSEABLE,
+            }
+            .to_string(),
+        );
+        result.drift_detail = drift_report.detail;
+        result.sync_state = if kind == DriftKind::Unparseable {
+            SYNC_STATE_BLOCKED.to_string()
+        } else {
+            SYNC_STATE_CONFLICT.to_string()
+        };
+        result.detail = match kind {
+            DriftKind::FieldsModified => {
+                "客户端配置中由 HiMind 写入的字段已被外部修改；同步会覆盖这些改动".to_string()
+            }
+            DriftKind::SegmentRemoved => {
+                "客户端配置中由 HiMind 写入的段落已不存在（可能被其它工具覆盖或手工删除）"
+                    .to_string()
+            }
+            DriftKind::Unparseable => "客户端配置文件无法解析，无法判断是否仍指向 HiMind".to_string(),
+        };
+        result.desired_revision = projection_digest(&json!({
+            "schema": BINDING_PROJECTION_SCHEMA_VERSION,
+            "target": target,
+            "drift": format!("{kind:?}"),
+        }));
+        return result;
+    }
     let Some(gateway) = binding.gateway.as_ref() else {
         let current_source_revision = if binding.service.starts_with("custom:") {
             resolve_service_revision(options, "", &binding.service)
@@ -1341,6 +1656,20 @@ fn apply_desired_state(binding: &mut AIProviderImportBinding, desired: &BindingD
     binding.sync_state = desired.sync_state.clone();
     binding.sync_reason_codes = desired.reason_codes.clone();
     binding.restart_required = desired.restart_required;
+}
+
+/// 写入成功后，把适配器声明的托管字段落成快照。
+///
+/// 必须在**同一次写入之后**立刻调用：延迟采集会让快照反映到别人的改动上去，
+/// 之后就无法区分漂移。适配器未实现时保持 `None`（不参与漂移检测）。
+fn record_applied_fields(
+    options: &Options,
+    target: &str,
+    binding: &mut AIProviderImportBinding,
+) {
+    binding.applied_fields = adapter_for(target)
+        .and_then(|adapter| adapter.managed_fields(options))
+        .and_then(|fields| serde_json::to_value(fields).ok());
 }
 
 fn mark_binding_applied(binding: &mut AIProviderImportBinding, desired: &BindingDesiredState) {
@@ -1762,6 +2091,7 @@ pub(crate) fn enable_gateway_binding(
         service_revision: resolve_service_revision(options, expected_user_id, &service_source),
         ..Default::default()
     };
+    record_applied_fields(options, target, &mut binding);
     let desired = desired_state_for_binding(options, target, &binding);
     mark_binding_applied(&mut binding, &desired);
     // applied_revision 写入后再计算一次，否则首次绑定会永久残留
@@ -1916,6 +2246,7 @@ pub(crate) fn enable_gateway_profile_binding(
         service_revision: resolve_service_revision(options, expected_user_id, &service_source),
         ..Default::default()
     };
+    record_applied_fields(options, target, &mut binding);
     let desired = desired_state_for_binding(options, target, &binding);
     mark_binding_applied(&mut binding, &desired);
     // applied_revision 写入后再计算一次，否则首次绑定会永久残留
@@ -2368,7 +2699,10 @@ pub(crate) fn gateway_bindings(
                 .unwrap_or_default();
             for (route, service, api_key) in routes {
                 result.push(GatewayBinding {
-                    id: format!("{client}:{}:{}", profile.id, route.exposed_model),
+                    id: format!(
+                        "{client}:{}:{}:{}:{}",
+                        profile.id, route.exposed_model, service.id, route.upstream_model
+                    ),
                     client: client.clone(),
                     service: format!("custom:{}", service.id),
                     profile_id: profile.id.clone(),
@@ -2511,6 +2845,7 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                         status.sync_state = desired.sync_state;
                         status.sync_reason_codes = desired.reason_codes;
                         status.restart_required = desired.restart_required;
+                        status.drift_detail = desired.drift_detail;
                         status.last_error = binding.last_error.clone();
                         // 直连风险无论当前模式都要计算：UI 在「切到直连」之前
                         // 需要先看到它，不能等切换完才提示。
@@ -2666,6 +3001,7 @@ fn sync_profile_binding(
     });
     binding.service_revision =
         resolve_service_revision(options, expected_user_id, &projection.service_source);
+    record_applied_fields(options, target, binding);
     let desired = desired_state_for_binding(options, target, binding);
     mark_binding_applied(binding, &desired);
     save_import_bindings(options, &bindings)?;
@@ -2752,6 +3088,7 @@ fn sync_legacy_gateway_binding(
     });
     binding.service_revision =
         resolve_service_revision(options, expected_user_id, &binding.service);
+    record_applied_fields(options, target, binding);
     let desired = desired_state_for_binding(options, target, binding);
     mark_binding_applied(binding, &desired);
     save_import_bindings(options, &bindings)?;
@@ -2766,6 +3103,17 @@ pub(crate) fn sync_binding(
     target: &str,
     expected_revision: Option<&str>,
 ) -> Result<AIProviderSyncResult, Box<dyn Error>> {
+    sync_binding_with_drift_consent(options, expected_user_id, target, expected_revision, false)
+}
+
+/// [`sync_binding`] 的完整形态：`accept_drift` 为 true 才允许覆盖外部改动。
+pub(crate) fn sync_binding_with_drift_consent(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    expected_revision: Option<&str>,
+    accept_drift: bool,
+) -> Result<AIProviderSyncResult, Box<dyn Error>> {
     let target = target.trim();
     let bindings = load_import_bindings(options);
     let binding = bindings
@@ -2778,6 +3126,15 @@ pub(crate) fn sync_binding(
         if expected != desired.desired_revision {
             return Err("同步计划已过期，请重新读取客户端状态后再同步".into());
         }
+    }
+    // 漂移拦截排在 `blocked` 之前：文件已不是我们的，先说清楚这一点，比先报
+    // 「聚合入口不可用」更能让用户找对方向。
+    if desired.sync_state == SYNC_STATE_CONFLICT && !accept_drift {
+        return Err(format!(
+            "{}；已停止写入。请在界面上确认「覆盖外部修改」后重试。",
+            desired.detail
+        )
+        .into());
     }
     if desired.sync_state == SYNC_STATE_BLOCKED {
         return Err(desired.detail.into());
@@ -2818,6 +3175,7 @@ pub(crate) fn sync_binding(
     let Some(binding) = bindings.clients.get_mut(target) else {
         return Err("同步后绑定簿记丢失".into());
     };
+    record_applied_fields(options, target, binding);
     let desired = desired_state_for_binding(options, target, binding);
     mark_binding_applied(binding, &desired);
     let desired_revision = desired.desired_revision;
@@ -2852,7 +3210,9 @@ pub(crate) fn sync_all(options: &Options, expected_user_id: &str) -> AIProviderS
             result.skipped.push(status.target);
             continue;
         }
-        if status.sync_state == SYNC_STATE_BLOCKED {
+        // `conflict` 是「被外部改过、等待用户确认」，批量同步不得替用户做这个
+        // 决定，因此与 `blocked` 一样跳过，由用户逐个确认。
+        if status.sync_state == SYNC_STATE_BLOCKED || status.sync_state == SYNC_STATE_CONFLICT {
             result.skipped.push(status.target);
             continue;
         }
@@ -2884,6 +3244,8 @@ pub(crate) fn cancel(
         .get(target.trim())
         .and_then(|binding| binding.restore.clone());
     let result = adapter.cancel(options, restore.as_ref())?;
+    // 取消后客户端已回到用户原始配置：托管字段快照随之失效，留着会在下次重新
+    // 注册前造成一个假 conflict。
     let mut bindings = load_import_bindings(options);
     bindings.clients.remove(target.trim());
     save_import_bindings(options, &bindings)?;
@@ -3891,6 +4253,70 @@ fn build_codex_config_toml(
     provider["wire_api"] = value(openai_wire_api(credential));
     provider["experimental_bearer_token"] = value(credential.api_key.as_str());
     Ok(document.to_string())
+}
+
+/// Codex 托管字段的**期望值**——与 [`build_codex_config_toml`] 写入的是同一组键。
+///
+/// 声明清单本身不读文件：它描述「如果现在导入，我会写成什么样」。漂移比对的
+/// 另一侧由 [`codex_current_managed_fields`] 从磁盘读，两边同构。
+///
+/// 凭据用 [`secret_placeholder`]：本函数不接触真实 Key，只声明「这里应有一枚」。
+fn codex_managed_fields() -> Option<ManagedFields> {
+    let config_file = codex_config_path().join("config.toml");
+    let text = fs::read_to_string(&config_file).ok()?;
+    let document = text.parse::<DocumentMut>().ok()?;
+    // 期望态取自当前文件里我们已写入的值：模型目录路径与默认模型会随导入变化，
+    // 「我写了什么」应来自写入结果，而不是凭空重建一份可能与实际不符的期望。
+    Some(codex_managed_fields_from_document(&document))
+}
+
+fn codex_managed_fields_from_document(document: &DocumentMut) -> ManagedFields {
+    let mut fields = ManagedFields::default().with_segment("model_providers.himind");
+    for key in ["model", "model_provider", "model_catalog_json"] {
+        if let Some(value) = document.get(key).and_then(toml_scalar_text) {
+            fields = fields.with_key(key, value);
+        }
+    }
+    if let Some(provider) = document
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|table| table.get(CODEX_PROVIDER_ID))
+        .and_then(Item::as_table)
+    {
+        for key in ["name", "base_url", "wire_api"] {
+            if let Some(value) = provider.get(key).and_then(toml_scalar_text) {
+                fields = fields.with_key(format!("model_providers.himind.{key}"), value);
+            }
+        }
+        // 令牌只记录「有/无」，不落任何可还原的形式。
+        if provider.contains_key("experimental_bearer_token") {
+            fields = fields.with_key(
+                "model_providers.himind.experimental_bearer_token",
+                secret_placeholder(),
+            );
+        }
+    }
+    fields
+}
+
+fn toml_scalar_text(item: &Item) -> Option<String> {
+    item.as_str()
+        .map(str::to_string)
+        .or_else(|| item.as_integer().map(|value| value.to_string()))
+        .or_else(|| item.as_bool().map(|value| value.to_string()))
+}
+
+fn codex_current_managed_fields() -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    let config_file = codex_config_path().join("config.toml");
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+    };
+    let document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
+    Ok(Some(codex_managed_fields_from_document(&document)))
 }
 
 fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
@@ -5559,6 +5985,120 @@ fn build_claude_settings(
     ))
 }
 
+/// Claude Code 的托管面是 `settings.json` 的 `env` 块里 HiMind 写入的那五个键。
+///
+/// `env` 里还有用户自己的键（代理、调试开关等），它们不在本清单内，因此用户
+/// 新增或修改自己的环境变量不会被判定为漂移。
+fn claude_code_managed_fields() -> Option<ManagedFields> {
+    current_claude_code_managed_fields().ok().flatten()
+}
+
+fn current_claude_code_managed_fields() -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    let path = claude_code_settings_path();
+    read_claude_env_managed_fields(&path)
+}
+
+/// 从 Claude 系客户端的 `env` 块读出 HiMind 托管的键。
+fn read_claude_env_managed_fields(
+    path: &Path,
+) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let root: Value = serde_json::from_str(&text)
+        .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
+    let Some(env) = root.get("env").and_then(Value::as_object) else {
+        // 没有 env 块 = 我们写的东西不在了。返回空清单而非 None，
+        // 让比对得出「托管字段消失」而不是「文件不可读」。
+        return Ok(Some(ManagedFields::default().with_segment("env")));
+    };
+    let mut fields = ManagedFields::default().with_segment("env");
+    for key in claude_env_keys() {
+        let Some(value) = env.get(key) else {
+            continue;
+        };
+        if key == CLAUDE_AUTH_TOKEN_ENV {
+            fields = fields.with_key(format!("env.{key}"), secret_placeholder());
+        } else {
+            // `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 写入时是字符串，但用户手工改过的
+            // 文件里可能是数字；两种都要能比较。
+            let text = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            fields = fields.with_key(format!("env.{key}"), text);
+        }
+    }
+    Ok(Some(fields))
+}
+
+/// Claude Desktop 的托管面是 3P 配置库里的**条目文件**，不是 `_meta.json`——
+/// 用户可以在客户端里改档案名或排序，那些都不影响接线是否还指向 HiMind。
+fn claude_desktop_managed_fields() -> Option<ManagedFields> {
+    claude_desktop_entry_managed_fields().ok().flatten()
+}
+
+fn current_claude_desktop_managed_fields(
+) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    claude_desktop_entry_managed_fields()
+}
+
+fn claude_desktop_entry_managed_fields(
+) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    let meta_path = claude_desktop_library_meta_path();
+    let meta = match read_json_object(&meta_path) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+    };
+    // 条目 id 由 `_meta.json` 的 note 标记定位：客户端用户重命名档案不影响它。
+    let Some(entry_id) = claude_desktop_owned_entry_id(&meta) else {
+        return Ok(Some(ManagedFields::default().with_segment("configLibrary.entry")));
+    };
+    let entry_path = claude_desktop_library_dir().join(format!("{entry_id}.json"));
+    let entry = match read_json_object(&entry_path) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Ok(Some(ManagedFields::default().with_segment("configLibrary.entry"))),
+        Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+    };
+    let mut fields = ManagedFields::default()
+        .with_segment("configLibrary.entry")
+        .with_key("entry.id", entry_id);
+    for key in [
+        "inferenceProvider",
+        "inferenceGatewayBaseUrl",
+        "inferenceGatewayAuthScheme",
+        "inferenceCredentialKind",
+        "modelDiscoveryEnabled",
+        "modelPrefer1mContext",
+    ] {
+        if let Some(value) = entry.get(key) {
+            let text = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            fields = fields.with_key(format!("entry.{key}"), text);
+        }
+    }
+    if entry.contains_key("inferenceGatewayApiKey") {
+        fields = fields.with_key("entry.inferenceGatewayApiKey", secret_placeholder());
+    }
+    if let Some(headers) = entry.get("inferenceCustomHeaders").and_then(Value::as_object) {
+        if let Some(surface) = headers.get(CLAUDE_DESKTOP_SURFACE_HEADER) {
+            fields = fields.with_key(
+                "entry.inferenceCustomHeaders.surface",
+                surface.as_str().unwrap_or_default().to_string(),
+            );
+        }
+    }
+    Ok(Some(fields))
+}
+
 fn claude_import_status(path: &Path, target: &str, client_name: &str) -> AIProviderImportStatus {
     let client_detected = path.is_file();
     let models = read_claude_himind_models(path, target).unwrap_or_default();
@@ -6255,6 +6795,56 @@ fn read_opencode_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Error
         .and_then(Value::as_object)
         .map(|models| models.keys().cloned().collect())
         .unwrap_or_default())
+}
+
+/// OpenCode 的托管面只有 `provider.himind` 这一段：npm 包（决定讲哪套协议）、
+/// 端点、凭据和模型目录。`mcp`、`permission`、`theme` 等用户配置不在清单内。
+fn opencode_current_managed_fields() -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    let path = opencode_config_path();
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+    };
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let root: Value = serde_json::from_str(&crate::app::mcp_targets::strip_jsonc_comments(&content))
+        .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
+    let Some(provider) = root
+        .get("provider")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(OPENCODE_PROVIDER_ID))
+        .and_then(Value::as_object)
+    else {
+        // provider 段还在、只有 himind 没了，也算托管段消失。
+        return Ok(Some(
+            ManagedFields::default().with_segment("provider.himind"),
+        ));
+    };
+    let mut fields = ManagedFields::default().with_segment("provider.himind");
+    if let Some(npm) = provider.get("npm").and_then(Value::as_str) {
+        fields = fields.with_key("provider.himind.npm", npm);
+    }
+    if let Some(options) = provider.get("options").and_then(Value::as_object) {
+        if let Some(base_url) = options.get("baseURL").and_then(Value::as_str) {
+            fields = fields.with_key("provider.himind.options.baseURL", base_url);
+        }
+        if options.contains_key("apiKey") {
+            fields = fields.with_key("provider.himind.options.apiKey", secret_placeholder());
+        }
+    }
+    let models = provider
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| {
+            let mut names = models.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
+    fields = fields.with_key("provider.himind.models", models.join(","));
+    Ok(Some(fields))
 }
 
 fn opencode_import_status() -> AIProviderImportStatus {
@@ -7910,6 +8500,141 @@ impl AIClientAdapter for ProviderConfigAdapter {
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_provider_config(self.0, restore)
     }
+    fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
+        // 声明式表的漂移检测按布局分派：只有 ZCode 有双文件结构，其余布局的
+        // 托管段是单对象，提取规则尚未逐个验证，暂不参与比对。
+        provider_config_managed_fields(self.0).ok().flatten()
+    }
+    fn current_managed_fields(
+        &self,
+        _options: &Options,
+    ) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+        provider_config_managed_fields(self.0)
+    }
+}
+
+/// 声明式客户端的托管字段提取。当前只实现 ZCode：它的写入面是两份文件、三个
+/// 规则数组，是六个声明式客户端里结构最复杂、也最容易在重新导入时被写坏的一个。
+///
+/// 其余布局（Continue、Aider、Crush、Qoder）返回 `None` → `Unknown`，行为与引入
+/// 漂移检测之前一致，避免在未逐个核实字段语义前误报。
+fn provider_config_managed_fields(
+    definition: &AiProviderTargetDefinition,
+) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+    if definition.id != "zcode" {
+        return Err(ManagedFieldsError::Unsupported);
+    }
+    let mut merged = ManagedFields::default();
+    let mut found_any = false;
+    for file in (definition.config_files)() {
+        let text = match fs::read_to_string(&file.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
+        };
+        found_any = true;
+        let parsed = parse_provider_config(&text, provider_config_format(&file.path), "ZCode")
+            .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
+        let Some(Value::Object(root)) = parsed else {
+            continue;
+        };
+        match file.layout {
+            ProviderConfigLayout::ZCodeConfig => {
+                merged = merged.with_segment("zcode.provider.himind");
+                let provider = root
+                    .get("provider")
+                    .and_then(Value::as_object)
+                    .and_then(|providers| providers.get(DECLARATIVE_PROVIDER_ID))
+                    .and_then(Value::as_object);
+                let Some(provider) = provider else { continue };
+                for key in ["kind", "enabled", "source"] {
+                    if let Some(value) = provider.get(key) {
+                        merged = merged.with_key(
+                            format!("zcode.provider.himind.{key}"),
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| value.to_string()),
+                        );
+                    }
+                }
+                if let Some(options) = provider.get("options").and_then(Value::as_object) {
+                    if let Some(base_url) = options.get("baseURL").and_then(Value::as_str) {
+                        merged = merged.with_key("zcode.provider.himind.baseURL", base_url);
+                    }
+                    if options.contains_key("apiKey") {
+                        merged = merged.with_key(
+                            "zcode.provider.himind.apiKey",
+                            secret_placeholder(),
+                        );
+                    }
+                }
+                let models = provider
+                    .get("models")
+                    .and_then(Value::as_object)
+                    .map(|models| {
+                        let mut names = models.keys().cloned().collect::<Vec<_>>();
+                        names.sort();
+                        names.join(",")
+                    })
+                    .unwrap_or_default();
+                merged = merged.with_key("zcode.provider.himind.models", models);
+            }
+            ProviderConfigLayout::ZCodeProviderRules => {
+                merged = merged.with_segment("zcode.providerRules");
+                let config = root.get("config").and_then(Value::as_object);
+                let rules = config
+                    .and_then(|config| config.get("providerConfigRules"))
+                    .and_then(Value::as_object);
+                let rule = rules
+                    .and_then(|rules| rules.get("providerRules"))
+                    .and_then(Value::as_array)
+                    .and_then(|rules| {
+                        rules.iter().find(|rule| {
+                            rule.get("providerId").and_then(Value::as_str)
+                                == Some(DECLARATIVE_PROVIDER_ID)
+                        })
+                    });
+                let Some(rule) = rule else { continue };
+                merged = merged.with_key(
+                    "zcode.providerRules.enabled",
+                    rule.get("enabled")
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                );
+                let api = rule
+                    .get("config")
+                    .and_then(Value::as_object)
+                    .and_then(|config| config.get("api"))
+                    .and_then(Value::as_object);
+                if let Some(api) = api {
+                    for key in ["type", "baseUrl"] {
+                        if let Some(value) = api.get(key).and_then(Value::as_str) {
+                            merged = merged.with_key(format!("zcode.providerRules.api.{key}"), value);
+                        }
+                    }
+                }
+                let model_ids = rule
+                    .get("config")
+                    .and_then(Value::as_object)
+                    .and_then(|config| config.get("personalModelIds"))
+                    .and_then(Value::as_array)
+                    .map(|ids| {
+                        let mut names = ids
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        names.join(",")
+                    })
+                    .unwrap_or_default();
+                merged = merged.with_key("zcode.providerRules.models", model_ids);
+            }
+            _ => {}
+        }
+    }
+    Ok(found_any.then_some(merged))
 }
 
 /// 布局在导入时会覆盖用户既有键时（Aider、Crush 的槽位、Qoder 的默认模型），
@@ -13119,5 +13844,260 @@ command = "uvx.exe"
         let unknown = super::require_direct_risk_acknowledgement("not-a-client", "managed", false)
             .expect("unknown client should not be gated");
         assert!(unknown.is_empty());
+    }
+
+    // ---- 字段级漂移检测（P0） ----
+
+    /// 用户自己新增的键不进比较：只有「我们写过」的字段参与。
+    #[test]
+    fn drift_ignores_keys_himind_never_wrote() {
+        let applied = super::ManagedFields::default()
+            .with_segment("env")
+            .with_key("env.ANTHROPIC_MODEL", "model-a");
+        let current = super::ManagedFields::default()
+            .with_segment("env")
+            .with_key("env.ANTHROPIC_MODEL", "model-a")
+            // 用户在同一个 env 块里加了自己的代理变量。
+            .with_key("env.HTTP_PROXY", "http://proxy.local");
+        assert_eq!(
+            super::compare_managed_fields(&applied, &current),
+            super::DriftVerdict::Intact
+        );
+    }
+
+    #[test]
+    fn drift_reports_modified_and_deleted_fields() {
+        let applied = super::ManagedFields::default()
+            .with_segment("model_providers.himind")
+            .with_key("model_provider", "himind")
+            .with_key("model", "deepseek-v4");
+        let changed = super::ManagedFields::default()
+            .with_segment("model_providers.himind")
+            .with_key("model_provider", "openai")
+            .with_key("model", "deepseek-v4");
+        assert_eq!(
+            super::compare_managed_fields(&applied, &changed),
+            super::DriftVerdict::Drifted(super::DriftKind::FieldsModified)
+        );
+
+        let deleted = super::ManagedFields::default()
+            .with_segment("model_providers.himind")
+            .with_key("model_provider", "himind");
+        assert_eq!(
+            super::compare_managed_fields(&applied, &deleted),
+            super::DriftVerdict::Drifted(super::DriftKind::FieldsModified)
+        );
+    }
+
+    /// 托管段整体消失是比「字段被改」更强的信号，必须先报段消失。
+    #[test]
+    fn drift_prefers_missing_segment_over_field_changes() {
+        let applied = super::ManagedFields::default()
+            .with_segment("model_providers.himind")
+            .with_key("model", "deepseek-v4");
+        let current = super::ManagedFields::default().with_key("model", "gpt-5");
+        assert_eq!(
+            super::compare_managed_fields(&applied, &current),
+            super::DriftVerdict::Drifted(super::DriftKind::SegmentRemoved)
+        );
+    }
+
+    #[test]
+    fn drift_detail_never_prints_secrets() {
+        let applied = super::ManagedFields::default()
+            .with_segment("env")
+            .with_key("env.ANTHROPIC_AUTH_TOKEN", super::secret_placeholder());
+        let current = super::ManagedFields::default()
+            .with_segment("env")
+            .with_key("env.ANTHROPIC_AUTH_TOKEN", "sk-live-abcdef");
+        let detail = super::describe_drift(
+            &applied,
+            &current,
+            super::DriftVerdict::Drifted(super::DriftKind::FieldsModified),
+        );
+        assert!(!detail.contains("sk-live-abcdef"), "{detail}");
+        assert!(detail.contains("env.ANTHROPIC_AUTH_TOKEN"), "{detail}");
+        assert!(detail.contains("已变更"), "{detail}");
+    }
+
+    /// 未实现 `current_managed_fields` 的适配器不得把客户端标成异常。
+    #[test]
+    fn drift_is_unknown_without_an_applied_snapshot() {
+        let options = crate::Options::from_env();
+        let adapter = adapter_for("crush").expect("crush adapter");
+        let binding = super::AIProviderImportBinding::default();
+        let report = super::managed_field_drift(adapter, &options, &binding);
+        assert_eq!(report.verdict, super::DriftVerdict::Unknown);
+        assert!(report.detail.is_empty());
+    }
+
+    /// 影子函数是 `mark_binding_applied` 的伴生：只在写入成功后采集，
+    /// 未实现 `managed_fields` 的适配器保持 `None`（旧行为）。
+    #[test]
+    fn applied_fields_are_absent_for_adapters_without_managed_fields() {
+        let options = crate::Options::from_env();
+        let mut binding = super::AIProviderImportBinding::default();
+        super::record_applied_fields(&options, "crush", &mut binding);
+        assert!(binding.applied_fields.is_none());
+    }
+
+    /// Codex 的托管字段清单必须覆盖 `build_codex_config_toml` 写的每一个键，
+    /// 否则那些字段被外部改动也检测不到。
+    #[test]
+    fn codex_managed_fields_cover_every_written_key() {
+        use toml_edit::DocumentMut;
+        let document: DocumentMut = r#"
+model = "himind/deepseek-v4"
+model_provider = "himind"
+model_catalog_json = "/tmp/himind-models.json"
+
+[model_providers.himind]
+name = "HiMind"
+base_url = "http://127.0.0.1:18181"
+wire_api = "responses"
+experimental_bearer_token = "tok"
+"#
+        .parse()
+        .expect("valid toml");
+        let fields = super::codex_managed_fields_from_document(&document);
+        for key in [
+            "model",
+            "model_provider",
+            "model_catalog_json",
+            "model_providers.himind.name",
+            "model_providers.himind.base_url",
+            "model_providers.himind.wire_api",
+            "model_providers.himind.experimental_bearer_token",
+        ] {
+            assert!(fields.keys.contains_key(key), "missing managed key: {key}");
+        }
+        assert_eq!(
+            fields.keys.get("model_providers.himind.experimental_bearer_token"),
+            Some(&super::secret_placeholder()),
+            "token must be recorded as a placeholder, never as the value"
+        );
+        assert!(fields.segments.contains(&"model_providers.himind".to_string()));
+    }
+
+    /// Claude Code 的托管面只有 env 里那五个键；`env` 之外的设置不受影响。
+    #[test]
+    fn claude_code_managed_fields_match_the_written_env_keys() {
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-drift-claude-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = root.join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18181",
+    "ANTHROPIC_AUTH_TOKEN": "local-token",
+    "ANTHROPIC_MODEL": "deepseek-v4",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "deepseek-v4",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "128000",
+    "HTTP_PROXY": "http://proxy.local"
+  },
+  "theme": "dark"
+}"#,
+        )
+        .unwrap();
+        let fields = super::read_claude_env_managed_fields(&settings)
+            .expect("readable settings")
+            .expect("fields present");
+        assert!(fields.segments.contains(&"env".to_string()));
+        assert_eq!(
+            fields.keys.get("env.ANTHROPIC_MODEL").map(String::as_str),
+            Some("deepseek-v4")
+        );
+        // 数字形式的上下文窗口也要能比较。
+        assert_eq!(
+            fields
+                .keys
+                .get("env.CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .map(String::as_str),
+            Some("128000")
+        );
+        assert!(!fields.keys.contains_key("env.HTTP_PROXY"));
+        assert_eq!(
+            fields.keys.get("env.ANTHROPIC_AUTH_TOKEN"),
+            Some(&super::secret_placeholder())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 未确认漂移时同步必须在写入前拒绝，且不改动客户端文件。
+    #[test]
+    fn sync_rejects_unconfirmed_drift_without_writing() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let previous_codex_home = std::env::var("CODEX_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-drift-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let codex_home = root.join("codex");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let options = crate::Options::from_env();
+
+        // 代码里的 config.toml 已被外部改成官方供应商。
+        let config_file = codex_home.join("config.toml");
+        std::fs::write(
+            &config_file,
+            "model = \"gpt-5\"\nmodel_provider = \"openai\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&config_file).unwrap();
+
+        // 簿记里记着「我们写的是 himind / deepseek-v4」，与磁盘不一致 → 漂移。
+        let applied = super::ManagedFields::default()
+            .with_segment("model_providers.himind")
+            .with_key("model", "deepseek-v4")
+            .with_key("model_provider", "himind");
+        let mut binding = super::AIProviderImportBinding {
+            service: "custom:test".to_string(),
+            mode: super::BINDING_MODE_GATEWAY.to_string(),
+            applied_revision: "r1".to_string(),
+            ..Default::default()
+        };
+        binding.applied_fields = Some(serde_json::to_value(applied).unwrap());
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings.clients.insert("codex".to_string(), binding);
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let error = super::sync_binding_with_drift_consent(&options, "", "codex", None, false)
+            .expect_err("unconfirmed drift must block the sync");
+        assert!(
+            error.to_string().contains("覆盖外部修改"),
+            "error must ask for explicit consent: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_file).unwrap(),
+            before,
+            "a blocked sync must not touch the client config"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        match previous_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
     }
 }

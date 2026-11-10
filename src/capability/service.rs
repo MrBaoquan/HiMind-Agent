@@ -799,7 +799,7 @@ impl CapabilityGateway {
             registration(
                 "ai.client.sync",
                 "同步 AI 客户端",
-                "把已注册客户端更新到当前 AI 服务或聚合入口期望态；复用本机令牌与首次注册快照，不执行首次注册。",
+                "把已注册客户端更新到当前 AI 服务或聚合入口期望态；复用本机令牌与首次注册快照，不执行首次注册。客户端配置中由 HiMind 写入的字段被外部修改时默认拒绝写入，需显式传 accept_drift。",
                 "local_write",
                 json!({
                     "type": "object",
@@ -808,6 +808,10 @@ impl CapabilityGateway {
                         "expected_revision": {
                             "type": "string",
                             "description": "sync.plan 返回的 desired_revision；非空时用于拒绝过期计划"
+                        },
+                        "accept_drift": {
+                            "type": "boolean",
+                            "description": "为 true 时覆盖客户端配置里被外部修改的 HiMind 托管字段；默认 false 会拒绝写入"
                         }
                     },
                     "required": ["target"],
@@ -4087,11 +4091,12 @@ impl CapabilityGateway {
                     serde_json::from_value(input)?;
                 let user_id = self.dashboard_user_id(context).unwrap_or_default();
                 Ok(serde_json::to_value(
-                    crate::app::ai_provider_import::sync_binding(
+                    crate::app::ai_provider_import::sync_binding_with_drift_consent(
                         &self.options,
                         &user_id,
                         &request.target,
                         Some(request.expected_revision.as_str()),
+                        request.accept_drift,
                     )?,
                 )?)
             }
@@ -10317,6 +10322,10 @@ mod tests {
                         "expected_revision": {
                             "type": "string",
                             "description": "sync.plan 返回的 desired_revision；非空时用于拒绝过期计划"
+                        },
+                        "accept_drift": {
+                            "type": "boolean",
+                            "description": "为 true 时覆盖客户端配置里被外部修改的 HiMind 托管字段；默认 false 会拒绝写入"
                         }
                     },
                     "required": ["target"],

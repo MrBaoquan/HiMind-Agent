@@ -245,6 +245,17 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         Err(error) => eprintln!("本机推理网关未启动：{error}"),
     }
 
+    // ADR 0122 §5：启动时做一次只读漂移检查——只刷新簿记状态，不改任何客户端文件。
+    // 放在网关启动之后：漂移判定要读绑定簿记，而绑定簿记与网关是否在跑无关，但
+    // 让「网关先就绪」保证用户打开界面时看到的状态与网关事实一致。
+    if let Ok(refreshed) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::app::ai_provider_import::refresh_all_binding_sync_states(&options)
+    })) {
+        if !refreshed.is_empty() {
+            println!("AI 客户端状态已刷新：{}", refreshed.join(", "));
+        }
+    }
+
     let builder = tauri::Builder::default();
     // 单实例键 = identifier + profile（见 app::single_instance）：生产 profile 与
     // 历史键逐字一致，其它 profile 各占一个键，开发实例与已安装产品互不顶替。

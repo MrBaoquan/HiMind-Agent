@@ -3769,15 +3769,17 @@ pub(crate) async fn sync_ai_client(
     state: State<'_, AgentState>,
     target: String,
     expected_revision: Option<String>,
+    accept_drift: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let user_id = crate::app::identity::identity_status(&options).user_id;
-        let result = crate::app::ai_provider_import::sync_binding(
+        let result = crate::app::ai_provider_import::sync_binding_with_drift_consent(
             &options,
             &user_id,
             &target,
             expected_revision.as_deref(),
+            accept_drift.unwrap_or(false),
         )
         .map_err(|error| error.to_string())?;
         serde_json::to_value(result).map_err(|error| error.to_string())

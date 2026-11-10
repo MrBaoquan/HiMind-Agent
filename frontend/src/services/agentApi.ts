@@ -3173,6 +3173,8 @@ export type AIProviderImportStatus = {
     sync_reason_codes?: string[];
     restart_required?: boolean;
     last_error?: string;
+    /** 客户端配置中 HiMind 托管字段被外部修改时的可读差异说明。 */
+    drift_detail?: string;
     warning?: string;
     direct_warning?: string;
     direct_risk_acknowledged_at?: string;
@@ -3919,7 +3921,7 @@ export const agentApi = {
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
     planAIClientSync: (target: string) => invoke<AIProviderSyncPlan>('plan_ai_client_sync', { target }),
-    syncAIClient: (target: string, expectedRevision?: string) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision }),
+    syncAIClient: (target: string, expectedRevision?: string, acceptDrift?: boolean) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision, acceptDrift }),
     syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),

@@ -1302,6 +1302,7 @@ fn handle_local_http(
                 json!({
                     "target": payload.target,
                     "expected_revision": payload.expected_revision,
+                    "accept_drift": payload.accept_drift,
                 }),
             ) {
                 Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
