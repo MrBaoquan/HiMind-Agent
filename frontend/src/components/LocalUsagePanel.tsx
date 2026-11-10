@@ -1,5 +1,5 @@
-import { useMemo } from 'react';
-import { Network, RefreshCw, TriangleAlert } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { ChevronDown, ChevronUp, Network, RefreshCw } from 'lucide-react';
 import { BusyIndicator } from './BusyIndicator';
 import { IconButton } from './Common';
 import type { AiUsageRange, InferenceGatewayStatus, LocalUsageGroup, LocalUsageOverview } from '../services/agentApi';
@@ -21,14 +21,24 @@ const RANGE_OPTIONS: Array<{ key: AiUsageRange; label: string }> = [
   { key: '30d', label: '近 30 天' },
 ];
 
+/** 横条最多列几行。超过 5 行时后面的工具占比都很小，读图不如读数字。 */
+const BREAKDOWN_ROWS = 5;
+
 /**
- * 用量（ADR 0113）。只做本机推理网关这一条口径：读数、按日趋势、按工具构成。
- * 平台口径留在工作台，不在 Agent 重复展示。
+ * 用量（ADR 0113 §4 的形态）。
+ *
+ * 固定三块：一行读数、按日趋势、按工具构成。不提供维度切换——网关口径唯一
+ * 回答得了、别处回答不了的问题是「哪个工具在用」，模型与服务维度在网关状态
+ * 面板里已有。失败明细与能力观测都不常驻：前者是排查时才需要的，后者是运维
+ * 事实，已移到「AI 连接 → 模型网关」。
  */
 export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange, onRefresh, onBindGateway, bindBusy }: LocalUsagePanelProps) {
+  const [failuresOpen, setFailuresOpen] = useState(false);
+  // 构成固定按工具：这是 ADR 0113 收敛时定下的口径，不随维度切换。
   const groups = useMemo(() => overview?.breakdowns.client ?? [], [overview]);
   const totalTokens = groups.reduce((sum, group) => sum + group.tokens, 0);
   const gatewayClients = gateway?.gateway_clients ?? [];
+  const recentFailures = overview?.recent_failures ?? [];
 
   return (
     <section className="ai-usage-panel" aria-label="本机用量">
@@ -83,51 +93,22 @@ export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange,
     const direct = gateway?.direct_clients ?? [];
     return (
       <>
-        <div className="ai-usage-kpis">
-          <UsageKpi label="调用" value={formatCount(overview.requests)} meta={`${gatewayClients.length} 个工具`} />
-          <UsageKpi label="Token" value={formatTokens(overview.input_tokens + overview.output_tokens)} meta={`输入 ${formatTokens(overview.input_tokens)} · 输出 ${formatTokens(overview.output_tokens)}`} />
+        <p className="ai-usage-readout">
+          <span>调用 <strong>{formatCount(overview.requests)}</strong></span>
+          <span>Token <strong>{formatTokens(overview.input_tokens + overview.output_tokens)}</strong><small>输入 {formatTokens(overview.input_tokens)} · 输出 {formatTokens(overview.output_tokens)}</small></span>
+          <span className={overview.failures > 0 ? 'warning' : undefined}>失败 <strong>{formatPercent(overview.failure_rate)}</strong><small>{formatCount(overview.failures)} 次</small></span>
+          <span>P95 <strong>{formatCount(overview.p95_latency_ms)} ms</strong><small>平均 {formatCount(overview.avg_latency_ms)} ms</small></span>
           {overview.usage_unreported > 0
-            ? <UsageKpi label="未上报" value={formatCount(overview.usage_unreported)} meta="只计入次数" tone="warning" />
+            ? <span className="warning">未上报 <strong>{formatCount(overview.usage_unreported)}</strong><small>只计次数</small></span>
             : null}
-        </div>
+        </p>
         {overview.has_trend ? <TrendChart overview={overview} /> : <div className="ai-usage-trend-note">今日只有单日数据，切换近 7 天看趋势。</div>}
-        <div className="ai-usage-breakdown">
-          <div className="ai-usage-trend-head">
-            <span>按工具</span>
-          </div>
-          {groups.length === 0 ? (
-            <div className="ai-usage-trend-note">该区间内没有数据。</div>
-          ) : (
-            <table className="ai-usage-table">
-              <thead>
-                <tr>
-                  <th scope="col">工具</th>
-                  <th scope="col">调用</th>
-                  <th scope="col">Token</th>
-                  <th scope="col">占比</th>
-                </tr>
-              </thead>
-              <tbody>
-                {groups.slice(0, 10).map(row => {
-                  const share = totalTokens > 0 ? row.tokens / totalTokens : 0;
-                  return (
-                    <tr key={row.key || row.label}>
-                      <td title={row.label}>{row.label}</td>
-                      <td>{formatCount(row.requests)}</td>
-                      <td>{formatTokens(row.tokens)}</td>
-                      <td>
-                        <span className="ai-usage-share">
-                          <span className="ai-usage-share-track" aria-hidden="true"><i style={{ width: `${Math.min(100, share * 100)}%` }} /></span>
-                          {formatPercent(share)}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </div>
+        <Breakdown groups={groups} totalTokens={totalTokens} />
+        <FailureSummary
+          failures={recentFailures}
+          open={failuresOpen}
+          onToggle={() => setFailuresOpen(current => !current)}
+        />
         <p
           className="ai-usage-footnote"
           title={[
@@ -143,23 +124,13 @@ export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange,
   }
 }
 
-function UsageKpi({ label, value, meta, tone }: { label: string; value: string; meta: string; tone?: 'warning' }) {
-  return (
-    <div className={`ai-usage-kpi${tone ? ` ${tone}` : ''}`}>
-      <span className="ai-usage-kpi-label">{label}</span>
-      <strong>{value}</strong>
-      <span className="ai-usage-kpi-meta">{meta}</span>
-    </div>
-  );
-}
-
 function TrendChart({ overview }: { overview: LocalUsageOverview }) {
   const values = overview.daily_tokens;
   const max = values.reduce((current, value) => Math.max(current, value), 0);
   const peak = max > 0 ? max : 1;
-  // 高度用像素而不是百分比：图区高度是固定的（96px），像素值不受父级
-  // 高度解析规则影响，避免出现「同一天数据在别的样式环境里变成 2px」。
-  const plotHeight = 96;
+  // 高度用像素而不是百分比：图区高度是固定的，像素值不受父级高度解析规则影响，
+  // 避免出现「同一天数据在别的样式环境里变成 2px」。
+  const plotHeight = 140;
   return (
     <div className="ai-usage-trend">
       <div className="ai-usage-trend-head"><span>趋势</span><span>按日 Token</span></div>
@@ -189,6 +160,103 @@ function TrendChart({ overview }: { overview: LocalUsageOverview }) {
   );
 }
 
+/**
+ * 按工具构成。用横条而不是表格：这里只有一个维度，表格的「调用/失败/Token/占比」
+ * 四列里只有占比值得扫一眼，其余数字放悬停。
+ */
+function Breakdown({ groups, totalTokens }: { groups: LocalUsageGroup[]; totalTokens: number }) {
+  const rows = groups.slice(0, BREAKDOWN_ROWS);
+  return (
+    <div className="ai-usage-breakdown">
+      <div className="ai-usage-trend-head"><span>按工具</span>{rows.length ? null : <span>该区间内没有数据</span>}</div>
+      {rows.length ? (
+        <ul className="ai-usage-legend">
+          {rows.map(row => {
+            const share = totalTokens > 0 ? row.tokens / totalTokens : 0;
+            return (
+              <li key={row.key || row.label}>
+                <span className="ai-usage-legend-label" title={row.label}>{row.label}</span>
+                <span className="ai-usage-legend-track" aria-hidden="true"><i style={{ width: `${Math.min(100, share * 100)}%` }} /></span>
+                <span className="ai-usage-legend-share">{formatPercent(share)}</span>
+                <span
+                  className="ai-usage-legend-meta"
+                  title={[
+                    `${formatCount(row.requests)} 次调用`,
+                    row.failures > 0 ? `${formatCount(row.failures)} 次失败（${formatPercent(row.failure_rate)}）` : '没有失败',
+                    `平均延迟 ${formatCount(row.avg_latency_ms)} ms`,
+                  ].join(' · ')}
+                >
+                  {formatTokens(row.tokens)}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 失败摘要：平时只占一行，展开才出明细。
+ *
+ * 失败表的价值在排查时，不在平时扫一眼时——常驻 10 行等于为偶发事件付出永久空间。
+ */
+function FailureSummary({ failures, open, onToggle }: { failures: LocalUsageOverview['recent_failures']; open: boolean; onToggle: () => void }) {
+  const latest = failures[0];
+  return (
+    <div className="ai-usage-failures">
+      <button
+        type="button"
+        className="ai-usage-failure-summary"
+        aria-expanded={open}
+        onClick={onToggle}
+        disabled={failures.length === 0}
+      >
+        <span className="ai-usage-failure-text">
+          {failures.length === 0
+            ? '该区间内没有失败调用'
+            : latest
+              ? `最近失败：${latest.client} · ${latest.status || 'failure'} · ${formatFailureTime(latest.occurred_at)}`
+              : '查看失败明细'}
+        </span>
+        {failures.length ? (
+          <span className="ai-usage-failure-count">
+            {open ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            {open ? '收起' : `${failures.length} 条`}
+          </span>
+        ) : null}
+      </button>
+      {open && failures.length ? (
+        <table className="ai-usage-table">
+          <thead>
+            <tr>
+              <th scope="col">时间</th>
+              <th scope="col">工具</th>
+              <th scope="col">模型</th>
+              <th scope="col">状态</th>
+              <th scope="col">请求 ID</th>
+              <th scope="col">延迟</th>
+            </tr>
+          </thead>
+          <tbody>
+            {failures.slice(0, 10).map(failure => (
+              <tr key={`${failure.request_id}-${failure.occurred_at}`}>
+                <td>{formatFailureTime(failure.occurred_at)}</td>
+                <td title={failure.client}>{failure.client}</td>
+                <td title={failure.model}>{failure.model}</td>
+                <td>{failure.status || 'failure'}</td>
+                <td title={failure.request_id}><code>{failure.request_id || '—'}</code></td>
+                <td>{formatCount(failure.latency_ms)} ms</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+    </div>
+  );
+}
+
 function formatCount(value: number): string {
   return Math.round(value).toLocaleString('zh-CN');
 }
@@ -207,4 +275,9 @@ function formatPercent(value: number): string {
 
 function formatDay(value: string): string {
   return value.length >= 10 ? value.slice(5, 10) : value;
+}
+
+function formatFailureTime(value: string): string {
+  if (value.length < 16) return value;
+  return `${value.slice(5, 10).replace('-', '/')} ${value.slice(11, 16)}`;
 }

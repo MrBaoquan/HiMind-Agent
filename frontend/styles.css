@@ -5299,22 +5299,17 @@ img { outline: 1px solid rgba(0, 0, 0, .1); outline-offset: -1px; }
 .ai-usage-notice { display: flex; align-items: center; gap: var(--space-2); margin: 12px 12px 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-muted); color: var(--text-muted); font-size: 12px; }
 .ai-usage-notice svg { flex: 0 0 auto; }
 .ai-usage-notice.warning { border-color: var(--warning-border); background: var(--warning-soft); color: var(--warning-strong); }
-/* 列数跟着卡片数量走：固定 4 列时，只有 3 张卡会在右侧留一个灰格，
-   看起来像少了一张卡。 */
-.ai-usage-kpis { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 1px; margin: 12px 12px 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--border); }
-.ai-usage-kpi { position: relative; min-width: 0; display: grid; align-content: start; gap: 3px; padding: var(--space-2) var(--space-3); background: var(--surface); }
-.ai-usage-kpi-label { color: var(--text-muted); font-size: 11px; }
-.ai-usage-kpi strong { font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
-.ai-usage-kpi-meta { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.ai-usage-kpi.warning strong { color: var(--warning-strong); }
-.ai-usage-delta { position: absolute; top: 10px; right: 12px; color: var(--text-muted); font-size: 11px; }
-.ai-usage-delta.up { color: var(--danger); }
-.ai-usage-delta.down { color: var(--success); }
+/* 一行读数：5 张卡里只有 Token 与失败率值得扫，其余作为次级读数跟在后面。
+   数字用 tabular-nums，后续加实时增长动画时宽度不会跳。 */
+.ai-usage-readout { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-4); margin: 12px 12px 0; color: var(--text-muted); font-size: 12px; }
+.ai-usage-readout > span { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+.ai-usage-readout strong { color: var(--text); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.ai-usage-readout small { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ai-usage-readout .warning strong { color: var(--warning-strong); }
 .ai-usage-trend { margin: 16px 12px 0; }
 .ai-usage-trend-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: 8px; color: var(--text-muted); font-size: 11px; }
 .ai-usage-trend-head > span:first-child { color: var(--text); font-size: 12px; font-weight: 600; }
-.ai-usage-breakdown-count { margin-left: auto; }
-.ai-usage-chart { display: grid; grid-template-columns: 46px minmax(0, 1fr); grid-template-rows: 96px auto; gap: var(--space-1) var(--space-2); }
+.ai-usage-chart { display: grid; grid-template-columns: 46px minmax(0, 1fr); grid-template-rows: 140px auto; gap: var(--space-1) var(--space-2); }
 .ai-usage-chart-scale { grid-row: 1; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; color: var(--text-muted); font-size: 10px; }
 .ai-usage-bars { grid-row: 1; display: flex; align-items: flex-end; gap: 2px; border-bottom: 1px solid var(--border); }
 /* 缺省高度就是「无数据」的细线：即使内联高度缺失也不会被别的规则撑高。 */
@@ -5323,21 +5318,34 @@ img { outline: 1px solid rgba(0, 0, 0, .1); outline-offset: -1px; }
 .ai-usage-chart-axis { grid-column: 2; display: flex; justify-content: space-between; color: var(--text-muted); font-size: 10px; }
 .ai-usage-trend-note { margin: 12px 12px 0; color: var(--text-muted); font-size: 11px; }
 .ai-usage-breakdown { margin: 16px 12px 0; }
+/* 构成只有「哪个工具」一个维度，横条比四列表格省一半高度，也更易比较。 */
+.ai-usage-legend { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.ai-usage-legend li { display: grid; grid-template-columns: minmax(64px, 132px) minmax(48px, 1fr) 48px 60px; align-items: center; gap: var(--space-2); font-size: 12px; }
+.ai-usage-legend-label { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.ai-usage-legend-track { height: 6px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
+.ai-usage-legend-track i { display: block; height: 100%; border-radius: inherit; background: var(--primary); opacity: .7; }
+.ai-usage-legend-share { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
+.ai-usage-legend-meta { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
 .ai-usage-failures { margin: 16px 12px 0; }
 .ai-usage-failures code { color: var(--text-muted); font-size: 10px; }
-.ai-usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* 常驻只占一行；展开才出明细表。 */
+.ai-usage-failure-summary { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: 6px 0; border: 0; border-top: 1px solid var(--border); background: transparent; color: var(--text-muted); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.ai-usage-failure-summary:disabled { cursor: default; }
+.ai-usage-failure-summary:not(:disabled):hover .ai-usage-failure-count { color: var(--text); }
+.ai-usage-failure-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-usage-failure-count { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; font-size: 11px; }
+.ai-usage-table { width: 100%; margin-top: var(--space-2); border-collapse: collapse; font-size: 12px; }
 .ai-usage-table th { padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 500; text-align: right; }
 .ai-usage-table th:first-child { text-align: left; }
 .ai-usage-table td { padding: var(--space-2); border-bottom: 1px solid #f0f1f3; text-align: right; white-space: nowrap; }
 .ai-usage-table td:first-child { max-width: 260px; overflow: hidden; font-weight: 500; text-align: left; text-overflow: ellipsis; }
 .ai-usage-table tr:last-child td { border-bottom: 0; }
-.ai-usage-share { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2); }
-.ai-usage-share-track { width: 64px; height: 5px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
-.ai-usage-share-track i { display: block; height: 100%; background: var(--primary); opacity: .7; }
 .ai-usage-footnote { margin: 12px 12px 12px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 @container agent-main (max-width: 720px) {
-  .ai-usage-kpis { grid-auto-flow: row; grid-auto-columns: unset; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ai-usage-readout { gap: var(--space-1) var(--space-3); }
   .ai-usage-head { flex-wrap: wrap; padding: 8px 12px; }
+  .ai-usage-legend li { grid-template-columns: minmax(56px, 100px) minmax(40px, 1fr) 44px; }
+  .ai-usage-legend-meta { display: none; }
 }
 
 /* 本机推理网关的状态条（ADR 0113）：状态、地址与恢复动作同屏。 */
@@ -5974,6 +5982,13 @@ img { outline: 1px solid rgba(0, 0, 0, .1); outline-offset: -1px; }
 .gateway-profile-empty { display: grid; justify-items: center; gap: var(--space-1); padding: 22px 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); color: var(--text-muted); text-align: center; }
 .gateway-profile-empty strong { color: var(--text); font-size: 13px; }
 .gateway-profile-empty span { max-width: 460px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+
+/* 能力观测：从首页用量面板移过来的运维事实（governance §6）。 */
+.gateway-observations-section { min-width: 0; margin-bottom: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+.gateway-observations-section .ai-section-heading { align-items: flex-start; gap: var(--space-3); }
+.gateway-observations-count { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.gateway-observations-note { margin: 0 0 var(--space-2); max-width: 620px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.gateway-observations-table { max-width: 760px; }
 
 @media (max-width: 1100px) {
   .gateway-profile-form-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }

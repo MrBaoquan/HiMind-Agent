@@ -6,6 +6,7 @@ import { AiToolsPanel } from './AiToolsPanel';
 import { AiProvidersPanel } from './AiProvidersPanel';
 import { AiServiceRoutesPanel } from './AiServiceRoutesPanel';
 import { GatewayProfilesPanel } from './GatewayProfilesPanel';
+import { GatewayObservationsPanel } from '../components/GatewayObservationsPanel';
 import type {
   AIServiceProtocol,
   AIServiceBalanceSnapshot,
@@ -215,6 +216,11 @@ export function AiConnectionsPage({
             onSave={onSaveGatewayProfile}
             onRemove={onRemoveGatewayProfile}
           />
+          {/* 能力观测曾放在首页用量面板里，那是运维事实而非用量，归到理解网关
+              实际行为的地方。没有观测时不渲染，避免空表占位。 */}
+          {gatewayStatus?.capability_observations?.length
+            ? <GatewayObservationsPanel observations={gatewayStatus.capability_observations} />
+            : null}
         </div>
       ) : activeTab === 'routes' ? (
         <div id="ai-panel-routes" role="tabpanel" aria-labelledby="ai-tab-routes">
