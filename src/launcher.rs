@@ -257,7 +257,7 @@ fn report_launcher_problem(message: &str) {
 }
 
 fn is_cli_launch(arguments: &[String]) -> bool {
-    let value_flags = ["--api", "--profile", "--state", "--local-port", "--mode"];
+    let value_flags = ["--api", "--profile", "--state", "--local-port", "--mode", "--protocol-url"];
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].as_str();
@@ -295,7 +295,7 @@ fn arguments_with_default_state(
     } else {
         arguments.to_vec()
     };
-    let value_flags = ["--api", "--profile", "--local-port", "--mode"];
+    let value_flags = ["--api", "--profile", "--local-port", "--mode", "--protocol-url"];
     let mut command_index = arguments.len();
     let mut index = 0;
     while index < arguments.len() {
@@ -742,6 +742,18 @@ mod tests {
         }
         let too_long = format!("himind-agent://open?open=mission&mission_id={}", "a".repeat(161));
         assert!(validated_arguments(vec!["--protocol-url".into(), too_long]).is_err());
+    }
+
+    #[test]
+    fn default_state_preserves_protocol_url_as_one_argument_pair() {
+        let url = "himind-agent://open?open=mission&mission_id=mission_abc-123";
+        let args = vec!["--local-app".into(), "--protocol-url".into(), url.into()];
+        let updated = arguments_with_default_state(&args, PathBuf::from(r"C:\Agent Data\state.json"), false);
+        let protocol_index = updated.iter().position(|arg| arg == "--protocol-url").unwrap();
+        assert_eq!(updated.get(protocol_index + 1).map(String::as_str), Some(url));
+        let state_index = updated.iter().position(|arg| arg == "--state").unwrap();
+        assert_eq!(updated[state_index + 1], r"C:\Agent Data\state.json");
+        assert_eq!(updated.iter().filter(|arg| arg.as_str() == url).count(), 1);
     }
 
     #[test]
