@@ -631,14 +631,34 @@ fn is_safe_open_url(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
     };
-    url.scheme() == "himind-agent"
-        && url.host_str() == Some("open")
-        && (url.path().is_empty() || url.path() == "/")
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
+    if url.scheme() != "himind-agent"
+        || url.host_str() != Some("open")
+        || !(url.path().is_empty() || url.path() == "/")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let mut open = None;
+    let mut mission_id = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "open" if open.is_none() => open = Some(value.into_owned()),
+            "mission_id" if mission_id.is_none() => mission_id = Some(value.into_owned()),
+            _ => return false,
+        }
+    }
+    match open.as_deref().unwrap_or("main") {
+        "main" | "ai" | "accounts" => mission_id.is_none(),
+        "mission" => mission_id.is_some_and(|id| {
+            !id.is_empty()
+                && id.len() <= 160
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        }),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +711,37 @@ mod tests {
             "himind-agent://open?command=exec".into(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn protocol_navigation_accepts_mission_and_settings_but_no_extra_authority() {
+        for url in [
+            "himind-agent://open?open=mission&mission_id=mission_abc-123",
+            "himind-agent://open?mission_id=mission_abc&open=mission",
+            "himind-agent://open?open=ai",
+            "himind-agent://open?open=accounts",
+            "himind-agent://open?open=main",
+        ] {
+            assert!(validated_arguments(vec!["--protocol-url".into(), url.into()]).is_ok(), "rejected {url}");
+        }
+        for url in [
+            "himind-agent://open?open=mission",
+            "himind-agent://open?open=mission&mission_id=",
+            "himind-agent://open?open=mission&mission_id=bad%2Fid",
+            "himind-agent://open?open=mission&mission_id=abc&command=exec",
+            "himind-agent://open?open=mission&mission_id=abc&mission_id=def",
+            "himind-agent://open?open=mission&open=main&mission_id=abc",
+            "himind-agent://open?open=ai&mission_id=abc",
+            "himind-agent://open?open=unknown",
+            "himind-agent://user@open?open=mission&mission_id=abc",
+            "himind-agent://open/path?open=mission&mission_id=abc",
+            "himind-agent://open?open=mission&mission_id=abc#fragment",
+            "https://open?open=mission&mission_id=abc",
+        ] {
+            assert!(validated_arguments(vec!["--protocol-url".into(), url.into()]).is_err(), "accepted {url}");
+        }
+        let too_long = format!("himind-agent://open?open=mission&mission_id={}", "a".repeat(161));
+        assert!(validated_arguments(vec!["--protocol-url".into(), too_long]).is_err());
     }
 
     #[test]
