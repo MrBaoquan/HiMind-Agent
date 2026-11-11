@@ -25,7 +25,7 @@ export function GatewayObservationsPanel({ observations }: GatewayObservationsPa
         <span className="gateway-observations-count"><Activity size={13} />{observations.length} 项</span>
       </div>
       <p className="gateway-observations-note">
-        这些能力在对接该上游时会自动降级，不需要手动配置；观测 7 天后过期，上游修好后会自动恢复完整能力。
+        能力自动降级，观测保留 7 天；上游修复后自动恢复。
       </p>
       <table className="ai-usage-table gateway-observations-table">
         <thead>

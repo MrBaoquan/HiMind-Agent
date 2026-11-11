@@ -33,7 +33,7 @@ pub(crate) use authoring::{
     validate_release_dependency_versions, WorkflowDraft,
 };
 #[allow(unused_imports)]
-pub(crate) use candidate::{freeze_candidate, read_candidate};
+pub(crate) use candidate::{current_candidate_identity, freeze_candidate, read_candidate};
 #[allow(unused_imports)]
 pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
@@ -66,7 +66,7 @@ pub(crate) use runner::{
     WorkflowStepExecution, WorkflowStepExecutor,
 };
 pub(crate) use runtime::execute_runtime_step;
-pub(crate) use store::{InstalledWorkflow, WorkflowStore};
+pub(crate) use store::{package_digest, InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
 
@@ -167,46 +167,62 @@ pub(crate) fn apply_execution_overrides(
                 )
                 .into());
             }
-            let runtime = step.runtime.as_mut().ok_or_else(|| {
-                format!(
-                    "execution override runtime_provider requires a runtime step: {step_id}"
-                )
-            })?;
-            // 换 provider 不能把「强制隔离」换成「做不到隔离」。
-            // 这条和预检的 tool_policy 检查是同一个约束，但必须在这里也拦一次：
-            // 用户可能在预检通过后才提交覆盖，而覆盖是启动路径上最后一处可写点。
-            if runtime.tool_policy.trim() == "none" && !runtime_supports_tool_none(provider) {
-                return Err(format!(
-                    "execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=none"
-                )
-                .into());
+            for runtime in step_runtime_steps_mut(step, step_id)? {
+                // 换 provider 不能把「强制隔离」换成「做不到隔离」。
+                if runtime.tool_policy.trim() == "none" && !runtime_supports_tool_none(provider) {
+                    return Err(format!(
+                        "execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=none"
+                    )
+                    .into());
+                }
+                runtime.provider = provider.to_string();
             }
-            runtime.provider = provider.to_string();
         }
         // 换模型：与换 provider 同一道门。空串表示「清掉声明、回到 Runtime 默认」，
         // 因此必须是显式 null/空串才生效，避免前端漏字段时误清。
         if let Some(model) = spec.get("model").and_then(Value::as_str) {
             let model = model.trim();
-            let runtime = step.runtime.as_mut().ok_or_else(|| {
-                format!("execution override model requires a runtime step: {step_id}")
-            })?;
-            if model.is_empty() {
-                runtime.model = String::new();
-                runtime.model_fallbacks.clear();
-            } else {
-                validate_model_alias(model)
-                    .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
-                model_alias_matches_provider(&runtime.provider, model)
-                    .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
-                runtime.model = model.to_string();
-                // 换了主模型，旧降级序列（可能属于另一命名空间）就不再成立。
-                runtime.model_fallbacks.clear();
+            for runtime in step_runtime_steps_mut(step, step_id)? {
+                if model.is_empty() {
+                    runtime.model = String::new();
+                    runtime.model_fallbacks.clear();
+                } else {
+                    validate_model_alias(model)
+                        .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
+                    model_alias_matches_provider(&runtime.provider, model)
+                        .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
+                    runtime.model = model.to_string();
+                    // 换了主模型，旧降级序列（可能属于另一命名空间）就不再成立。
+                    runtime.model_fallbacks.clear();
+                }
             }
         }
     }
     // 覆盖后必须仍然是一个合法包：例如给 runtime 步骤加审批会撞上能力步骤的约束。
     patched.validate().map_err(std::io::Error::other)?;
     Ok(patched)
+}
+
+fn step_runtime_steps_mut<'a>(
+    step: &'a mut WorkflowStep,
+    step_id: &str,
+) -> Result<Vec<&'a mut WorkflowRuntimeStep>, String> {
+    if let Some(runtime) = step.runtime.as_mut() {
+        return Ok(vec![runtime]);
+    }
+    if let Some(delegate) = step.delegate.as_mut() {
+        let runtimes = delegate
+            .branches
+            .iter_mut()
+            .filter_map(|branch| branch.runtime.as_mut())
+            .collect::<Vec<_>>();
+        if !runtimes.is_empty() {
+            return Ok(runtimes);
+        }
+    }
+    Err(format!(
+        "execution override requires a runtime or delegated runtime step: {step_id}"
+    ))
 }
 
 fn find_step_mut<'a>(steps: &'a mut [WorkflowStep], step_id: &str) -> Option<&'a mut WorkflowStep> {
@@ -343,6 +359,28 @@ impl WorkflowPackage {
 /// `auto` 不接受任何声明模型：auto 的语义是「运行时自己挑一个能干的」，
 /// 它可能挑到不认这个命名空间的 Runtime，所以在契约阶段就拒绝，
 /// 让作者显式写出 provider。
+/// Split a namespaced model alias into `(namespace, scope, model)`.
+///
+/// `scope` is the service id for `himind:` aliases and the normalized provider
+/// for `acp:` / `cli:` aliases. Callers that already validated the alias can use
+/// this to audit the exact route without maintaining another parser.
+pub(crate) fn model_alias_parts(alias: &str) -> Option<(&'static str, &str, &str)> {
+    let alias = alias.trim();
+    if let Some(rest) = alias.strip_prefix(MODEL_ALIAS_HIMIND_PREFIX) {
+        let (scope, model) = rest.split_once(':')?;
+        return Some(("himind", scope.trim(), model.trim()));
+    }
+    if let Some(rest) = alias.strip_prefix(MODEL_ALIAS_ACP_PREFIX) {
+        let (scope, model) = rest.split_once(':')?;
+        return Some(("acp", scope.trim().strip_prefix("acp.").unwrap_or(scope.trim()), model.trim()));
+    }
+    if let Some(rest) = alias.strip_prefix(MODEL_ALIAS_CLI_PREFIX) {
+        let (scope, model) = rest.split_once(':')?;
+        return Some(("cli", scope.trim(), model.trim()));
+    }
+    None
+}
+
 pub(crate) fn model_alias_matches_provider(provider: &str, alias: &str) -> Result<(), String> {
     let alias = alias.trim();
     if alias.is_empty() {
@@ -753,12 +791,19 @@ pub(crate) struct WorkflowRole {
 pub(crate) struct WorkflowDelegate {
     /// 分出去的子任务。每个分支起一条**独立子运行**，挂在父运行下。
     pub branches: Vec<WorkflowDelegateBranch>,
+    /// Branch execution order. Use sequential when delegated workers share a writable workspace.
+    #[serde(default = "default_delegate_strategy")]
+    pub strategy: String,
     /// 至少要有几个分支成功，这一步才算成功。
     ///
     /// 留 0 表示「全部分支都要成功」；显式写 1 就是「任一成功即可」。
     /// 审查与测试并行时通常要全部成功，所以默认从严。
     #[serde(default)]
     pub min_succeeded: u32,
+}
+
+fn default_delegate_strategy() -> String {
+    "parallel".to_string()
 }
 
 /// 一条被委派出去的子任务。
@@ -2045,6 +2090,12 @@ fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), Strin
     if depth > 4 {
         return Err("workflow delegate nesting exceeds 4 levels".to_string());
     }
+    if !matches!(delegate.strategy.trim(), "parallel" | "sequential") {
+        return Err(format!(
+            "workflow delegate step {} strategy must be parallel or sequential",
+            step.id
+        ));
+    }
     if delegate.branches.len() < 2 {
         return Err(format!(
             "workflow delegate step {} requires at least two branches; a single branch is just a step",
@@ -2329,6 +2380,67 @@ mod tests {
         // 该工作流只做构建与上传，不再内嵌 AI 开发 Loop。
         assert!(package.steps.iter().all(|step| step.kind != "loop"));
         assert!(package.supported_runtimes.is_empty());
+    }
+
+    #[test]
+    fn ui_craft_team_is_a_review_confirm_delegate_acceptance_loop() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("ui-craft-team");
+        let package = load_from_directory(&root).unwrap();
+        assert_eq!(package.version, "1.2.0");
+        for schema_path in [
+            "schemas/review-findings.schema.json",
+            "schemas/remediation-plan.schema.json",
+            "schemas/task-execution-report.schema.json",
+            "schemas/verification-report.schema.json",
+            "schemas/acceptance-verdict.schema.json",
+        ] {
+            let schema: Value = serde_json::from_slice(
+                &fs::read(root.join(schema_path)).unwrap_or_else(|error| {
+                    panic!("missing workflow schema {schema_path}: {error}")
+                }),
+            )
+            .unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap_or_else(|error| panic!("invalid schema {schema_path}: {error}"));
+        }
+
+        let step = |id: &str| package.steps.iter().find(|step| step.id == id).unwrap();
+        let plan = step("PLAN");
+        assert_eq!(plan.kind, "runtime");
+        assert!(plan.depends_on.contains(&"AUDIT".to_string()));
+        assert_eq!(
+            plan.runtime.as_ref().unwrap().result_schema,
+            "schemas/remediation-plan.schema.json"
+        );
+        let approval = step("CONFIRM-FIXES");
+        assert!(approval.approval_required);
+        assert!(approval.depends_on.contains(&"PLAN".to_string()));
+
+        let polish_loop = step("POLISH-LOOP");
+        assert!(polish_loop.depends_on.contains(&"CONFIRM-FIXES".to_string()));
+        let loop_config = polish_loop.loop_config.as_ref().unwrap();
+        assert!(loop_config.pause_for_feedback);
+        assert!(loop_config.max_iterations <= 3);
+        let polish = loop_config.steps.iter().find(|step| step.id == "POLISH").unwrap();
+        let delegate = polish.delegate.as_ref().unwrap();
+        assert_eq!(delegate.strategy, "sequential");
+        assert_eq!(delegate.min_succeeded as usize, delegate.branches.len());
+        assert_eq!(delegate.branches.len(), 4);
+
+        let gate = loop_config.steps.iter().find(|step| step.id == "GATE").unwrap();
+        assert_eq!(gate.runtime.as_ref().unwrap().tool_policy, "none");
+        assert_eq!(
+            gate.runtime.as_ref().unwrap().result_schema,
+            "schemas/acceptance-verdict.schema.json"
+        );
+        assert_eq!(package.default_exitpoint, "delivered");
+        assert_eq!(
+            package.exits.iter().find(|exit| exit.id == "delivered").unwrap().at_step,
+            "POLISH-LOOP"
+        );
+        assert!(!package.steps.iter().any(|step| step.id == "DELIVER"));
     }
 
     #[test]
@@ -3089,7 +3201,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("requires a runtime step"), "{error}");
+        assert!(error.to_string().contains("requires a runtime"), "{error}");
     }
 
     /// 启动时换模型：同命名空间允许，跨命名空间或裸 id 拒绝；
@@ -3197,7 +3309,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("requires a runtime step"), "{error}");
+        assert!(error.to_string().contains("requires a runtime"), "{error}");
     }
 
     /// 声明了 model 就必须写死 provider：auto 可能挑到不认这个命名空间的 Runtime。
@@ -3240,6 +3352,59 @@ mod tests {
 
     /// 覆盖测试自带一个最小包：直接依赖某个已发布包的形状，会让「包改了」误伤
     /// 「覆盖逻辑坏了」这两件事分不开。
+    #[test]
+    fn provider_and_model_overrides_apply_to_every_delegate_branch() {
+        let package: WorkflowPackage = serde_json::from_value(serde_json::json!({
+            "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,
+            "id": "test.delegate-overrides",
+            "version": "1.0.0",
+            "name": "Delegate Overrides",
+            "min_agent_version": "0.3.90",
+            "execution_policy": "strict",
+            "supported_runtimes": ["himind.builtin"],
+            "optional_providers": ["acp.claude"],
+            "steps": [{
+                "id": "POLISH",
+                "title": "Polish",
+                "kind": "delegate",
+                "execution_mode": "long_running",
+                "risk_level": "local_write",
+                "delegate": {
+                    "strategy": "sequential",
+                    "min_succeeded": 2,
+                    "branches": [
+                        { "id": "FIX-IA", "title": "IA", "runtime": { "provider": "himind.builtin", "prompt": "fix IA" } },
+                        { "id": "FIX-CRAFT", "title": "Craft", "runtime": { "provider": "himind.builtin", "prompt": "fix craft" } }
+                    ]
+                }
+            }],
+            "artifacts": [],
+            "ui": { "mode": "standard" }
+        }))
+        .unwrap();
+        package.validate().unwrap();
+
+        let overridden = apply_execution_overrides(
+            &package,
+            &serde_json::json!({
+                "execution_overrides": {
+                    "POLISH": {
+                        "runtime_provider": "acp.claude",
+                        "model": "acp:claude:claude-sonnet-4-5"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let branches = &overridden.steps[0].delegate.as_ref().unwrap().branches;
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            let runtime = branch.runtime.as_ref().unwrap();
+            assert_eq!(runtime.provider, "acp.claude", "branch {}", branch.id);
+            assert_eq!(runtime.model, "acp:claude:claude-sonnet-4-5", "branch {}", branch.id);
+        }
+    }
+
     fn loop_override_package(rounds: u32) -> WorkflowPackage {
         let mut package: WorkflowPackage = serde_json::from_value(serde_json::json!({
             "schema_version": WORKFLOW_PACKAGE_SCHEMA_VERSION,

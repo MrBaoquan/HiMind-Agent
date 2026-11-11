@@ -17,6 +17,7 @@
 //! 不在这里实现 reasoning / web search / `response_format` / `stop` / `n` 等
 //! 两端语义不对等的能力：丢弃这些字段，而不是把不兼容结构原样发给上游。
 
+use crate::app::reasoning_tags::{sanitize_reasoning_tags, ReasoningTagSanitizer};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -192,14 +193,27 @@ fn chat_content_parts(content: &Value, assistant: bool) -> Vec<Value> {
         "input_text"
     };
     match content {
-        Value::String(text) => vec![json!({ "type": text_type, "text": text })],
+        Value::String(text) => {
+            let text = if assistant {
+                sanitize_reasoning_tags(text).0
+            } else {
+                text.clone()
+            };
+            vec![json!({ "type": text_type, "text": text })]
+        }
         Value::Array(parts) => parts
             .iter()
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                Some("text" | "input_text" | "output_text") | None => part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(|text| json!({ "type": text_type, "text": text })),
+                Some("text" | "input_text" | "output_text") | None => {
+                    part.get("text").and_then(Value::as_str).map(|text| {
+                        let text = if assistant {
+                            sanitize_reasoning_tags(text).0
+                        } else {
+                            text.to_string()
+                        };
+                        json!({ "type": text_type, "text": text })
+                    })
+                }
                 // 图片只有 user 通道合法；assistant 历史里的图片无法进入 Responses。
                 Some("image_url") if !assistant => chat_image_to_input(part),
                 _ => None,
@@ -326,6 +340,7 @@ pub(crate) fn response_to_chat(response: &Value, model: &str) -> Result<Value, S
             _ => {}
         }
     }
+    let (text, _removed) = sanitize_reasoning_tags(&text);
     let incomplete = response.get("status").and_then(Value::as_str) == Some("incomplete");
     let finish_reason = if !tool_calls.is_empty() {
         "tool_calls"
@@ -436,6 +451,7 @@ pub(crate) struct ChatStream {
     tools_by_item: HashMap<String, usize>,
     finish_reason: Option<String>,
     usage: Value,
+    content_sanitizer: ReasoningTagSanitizer,
     done: bool,
     failed: bool,
 }
@@ -457,6 +473,7 @@ impl ChatStream {
             tools_by_item: HashMap::new(),
             finish_reason: None,
             usage: json!({}),
+            content_sanitizer: ReasoningTagSanitizer::default(),
             done: false,
             failed: false,
         }
@@ -526,6 +543,7 @@ impl ChatStream {
                 let Some(text) = event.get("delta").and_then(Value::as_str) else {
                     return Vec::new();
                 };
+                let text = self.content_sanitizer.push(text);
                 if text.is_empty() {
                     return Vec::new();
                 }
@@ -700,6 +718,20 @@ impl ChatStream {
             return Vec::new();
         }
         let mut events = self.role_chunk();
+        let tail = self.content_sanitizer.finish();
+        if !tail.is_empty() {
+            events.push(self.chunk(json!({ "content": tail }), None, None));
+        }
+        if self.content_sanitizer.removed() > 0 {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "本机网关已清洗上游推理控制标签：count={} model={}",
+                    self.content_sanitizer.removed(),
+                    self.model
+                ),
+            );
+        }
         let reason = self.finish_reason.clone().unwrap_or_else(|| {
             if self.tools.is_empty() {
                 "stop".to_string()
@@ -951,5 +983,49 @@ mod tests {
         assert!(stream.failed());
         assert!(output.contains("\"error\""), "output={output}");
         assert!(stream.finish().is_empty());
+    }
+
+    #[test]
+    fn response_strips_reasoning_tags_from_non_streaming_text() {
+        let response = json!({
+            "id": "resp_tags",
+            "status": "completed",
+            "output": [{ "type": "message", "role": "assistant", "content": [
+                { "type": "output_text", "text": "回答</thought></thought>" }
+            ] }]
+        });
+        let chat = response_to_chat(&response, "m").unwrap();
+        assert_eq!(chat["choices"][0]["message"]["content"], "回答");
+    }
+
+    #[test]
+    fn stream_strips_reasoning_tags_split_across_chunks() {
+        let mut stream = ChatStream::new("m".to_string());
+        let mut output = Vec::new();
+        for line in [
+            r#"data: {"type":"response.output_text.delta","delta":"回答</thou"}"#,
+            r#"data: {"type":"response.output_text.delta","delta":"ght>继续"}"#,
+            r#"data: {"type":"response.completed","response":{"usage":{}}}"#,
+        ] {
+            output.extend(stream.push_line(line));
+        }
+        let joined = output.concat();
+        assert!(!joined.contains("</thought>"), "output={joined}");
+        assert!(!joined.contains("</think>"), "output={joined}");
+        assert!(joined.contains("回答"), "output={joined}");
+        assert!(joined.contains("继续"), "output={joined}");
+    }
+
+    #[test]
+    fn request_strips_reasoning_tags_from_assistant_history() {
+        let request = json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": "answer</thought></thought>"
+            }]
+        });
+        let responses = request_to_responses(&request, "m").unwrap();
+        assert_eq!(responses["input"][0]["content"][0]["text"], "answer");
     }
 }

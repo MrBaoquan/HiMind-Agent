@@ -483,6 +483,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                                     model: String::new(),
                                                     service_source: "fixture",
                                                     endpoint: String::new(),
+                                                    usage: None,
                                                 },
                                             )
                                         }

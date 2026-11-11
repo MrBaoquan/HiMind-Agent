@@ -1271,6 +1271,10 @@ pub(crate) struct WorkflowRuntimeOutcome {
     pub service_source: &'static str,
     /// 只保留 scheme://host，避免把凭据或路径带进运行记录。
     pub endpoint: String,
+    /// Aggregate usage read from this run-scoped DSH home. It contains totals
+    /// only, never transcript content. `None` means the Runtime did not expose a
+    /// measurement and callers that enforce token/cost limits must fail closed.
+    pub usage: Option<crate::agent_core_contracts::LocalRunUsage>,
 }
 
 pub(crate) fn execute_workflow(
@@ -1288,6 +1292,7 @@ pub(crate) fn execute_workflow(
         timeout_seconds,
         disable_tools,
         None,
+        WorkflowAccess::Write,
         is_canceled,
         ControlPlaneFallback::Fail,
         LaunchHome::Interactive,
@@ -1312,6 +1317,7 @@ pub(crate) fn execute_workflow_in_run_home(
     run_id: &str,
     step_id: &str,
     model_alias: Option<&str>,
+    access: WorkflowAccess,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     execute_workflow_with(
@@ -1321,10 +1327,36 @@ pub(crate) fn execute_workflow_in_run_home(
         timeout_seconds,
         disable_tools,
         model_alias,
+        access,
         is_canceled,
         ControlPlaneFallback::Fail,
         LaunchHome::Run { run_id, step_id },
     )
+}
+
+/// 这一步需要什么级别的文件访问。
+///
+/// DSH 的只读模式**不创建 capability-SID 写授权**（见 dsh-sandbox-windows-acl
+/// runner：`read-only: no capability-SID grants`），因此也不需要调用方拥有
+/// 目标目录的 WRITE_DAC / WRITE_OWNER。写模式才需要。
+///
+/// 之前工作流步骤无论风险等级一律传 `workspace-write`，导致纯只读的审查步骤
+/// 也要争写权限；在用户没有目标目录写 ACL 的机器上就直接失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowAccess {
+    /// 只读：模型可以读、搜索，不能改文件。
+    Read,
+    /// 可写：模型可以在工作区内改文件。
+    Write,
+}
+
+impl WorkflowAccess {
+    fn dsh_mode(self) -> &'static str {
+        match self {
+            WorkflowAccess::Read => "read-only",
+            WorkflowAccess::Write => "workspace-write",
+        }
+    }
 }
 
 /// 与 [`execute_workflow`] 相同，但控制面凭据不可用时按本机服务降级拉起会话。
@@ -1345,6 +1377,7 @@ pub(crate) fn execute_workflow_allow_degraded(
         timeout_seconds,
         false,
         None,
+        WorkflowAccess::Write,
         is_canceled,
         ControlPlaneFallback::Degrade,
         LaunchHome::Interactive,
@@ -1358,6 +1391,7 @@ fn execute_workflow_with(
     timeout_seconds: u64,
     disable_tools: bool,
     model_alias: Option<&str>,
+    access: WorkflowAccess,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
     fallback: ControlPlaneFallback,
     home_mode: LaunchHome<'_>,
@@ -1400,7 +1434,7 @@ fn execute_workflow_with(
         .current_dir(&launch.workspace)
         .env(DSH_HOME_ENV, &launch.home)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
-        .env("DSH_PERMISSION_MODE", "workspace-write")
+        .env("DSH_PERMISSION_MODE", access.dsh_mode())
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1455,11 +1489,24 @@ fn execute_workflow_with(
         };
         return Err(message.into());
     }
+    // Step homes are nested at `<run>/steps/<step>`. Workflow persistence uses
+    // `<run>/storages`, so usage must be read one level above `steps`, not from
+    // the leaf. This keeps a successful Runtime from being misclassified as
+    // "usage unavailable" and incorrectly failing a token-budgeted Mission.
+    let usage_home = match home_mode {
+        LaunchHome::Run { step_id, .. } if !step_id.trim().is_empty() => launch
+            .home
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&launch.home),
+        _ => &launch.home,
+    };
     Ok(WorkflowRuntimeOutcome {
         text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
         model: launch.default_model.clone(),
         service_source: launch.service_source,
         endpoint: endpoint_host(&launch.base_url),
+        usage: crate::mission::read_projection_usage(usage_home)?,
     })
 }
 
@@ -1495,6 +1542,15 @@ fn prepare_independent_interactive_launch(
             ),
             None => {
                 let provider_config = native_dsh_provider_config(&shared_home);
+                if provider_config.base_url.trim().is_empty()
+                    || provider_config.model.trim().is_empty()
+                    || provider_config.api_key_env.as_deref().is_none_or(|name| env::var(name).unwrap_or_default().trim().is_empty())
+                {
+                    return Err(
+                        "未选择可用的本机 AI 模型路由，且 DSH 原生路由未配置。请先在「设置 → AI 连接 → 模型服务」选择服务，或配置 Runtime 的原生模型凭据。"
+                            .to_string(),
+                    );
+                }
                 let api_key = match provider_config.api_key_env.as_deref() {
                     Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
                     None => String::new(),

@@ -1318,15 +1318,421 @@ mod tests {
     use crate::capability::service::CapabilityGateway;
     use crate::store::types::LocalWorkerStatus;
     use crate::Options;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct EnvironmentRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvironmentRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn copy_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_directory(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn git(workspace: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+        let output = Command::new("git").args(args).current_dir(workspace).output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn initialize_client(gateway: &CapabilityGateway, name: &str) -> McpSessionState {
+        let mut session = McpSessionState::default();
+        let initialized = handle_request_with_session(
+            gateway,
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "clientInfo": {"name": name, "version": "1.0.0"}
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(initialized["serverInfo"]["name"], "himind-agent");
+        session
+    }
+
+    fn activate_for_client(gateway: &CapabilityGateway, session: &mut McpSessionState, query: &str) {
+        let activated = handle_request_with_session(
+            gateway,
+            "tools/call",
+            json!({
+                "name": "system.capability.activate",
+                "arguments": {"query": query}
+            }),
+            session,
+        )
+        .unwrap();
+        assert_eq!(activated["isError"], false, "{activated}");
+    }
+
+    fn call_tool(
+        gateway: &CapabilityGateway,
+        session: &mut McpSessionState,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        handle_request_with_session(
+            gateway,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+            session,
+        )
+        .unwrap()
+    }
+
+    fn call_tool_with_user_approval(
+        gateway: &CapabilityGateway,
+        approval_manager: Arc<crate::approval::manager::ApprovalManager>,
+        session: &mut McpSessionState,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let control_name = name.to_string();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_finished = Arc::clone(&finished);
+        let watcher = thread::spawn(move || {
+            while !watcher_finished.load(Ordering::Relaxed) {
+                for request in approval_manager.list_pending() {
+                    if request.request_type == control_name {
+                        let _ = approval_manager.respond(&request.id, true);
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = call_tool(gateway, session, name, arguments);
+        finished.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+        result
+    }
+
+    fn cross_client_mission_e2e_body() {
+        let _env_lock = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-mission-cross-client-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let _home = EnvironmentRestore::set("HIMIND_AGENT_HOME", &home);
+        let _profile = EnvironmentRestore::set("HIMIND_AGENT_PROFILE", "development");
+        let _fixture = EnvironmentRestore::set("HIMIND_WORKFLOW_RUNTIME_FIXTURE", "1");
+        let _client_id = EnvironmentRestore::remove("HIMIND_AI_CLIENT_ID");
+        let _default_activate = EnvironmentRestore::remove("HIMIND_MCP_DEFAULT_ACTIVATE");
+
+        git(&workspace, &["init"]).unwrap();
+        std::fs::write(workspace.join("README.md"), "cross-client mission e2e
+").unwrap();
+        git(&workspace, &["add", "README.md"]).unwrap();
+        git(
+            &workspace,
+            &["-c", "user.name=HiMind Test", "-c", "user.email=test@himind.local", "commit", "-m", "initial"],
+        )
+        .unwrap();
+
+        let package_source = root.join("fixture-workflow");
+        copy_directory(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows/ui-craft-team"),
+            &package_source,
+        )
+        .unwrap();
+        let workflow_json_path = package_source.join("workflow.json");
+        let mut workflow_json: Value =
+            serde_json::from_slice(&std::fs::read(&workflow_json_path).unwrap()).unwrap();
+        workflow_json["supported_runtimes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("himind.fixture"));
+        std::fs::write(&workflow_json_path, serde_json::to_vec_pretty(&workflow_json).unwrap()).unwrap();
+        let workflow_store = crate::workflow::WorkflowStore::new(home.join("workflows"));
+        let installed = workflow_store.install_from_directory(&package_source).unwrap();
+        let digest = crate::workflow::package_digest(&installed.package.source_root).unwrap();
+
+        let mut options = Options::from_env();
+        options.set_api_base("http://127.0.0.1:9");
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+        options.state_path = home.join("data").join("agent-state.json");
+        let approval_manager = Arc::new(crate::approval::manager::ApprovalManager::new());
+        let gateway = CapabilityGateway::new_with_approval_manager(
+            options,
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+            Arc::clone(&approval_manager),
+        );
+
+        let plan = json!({
+            "summary": "cross-client deterministic verification",
+            "tasks": [{
+                "id": "smoke",
+                "title": "Fixture implementation",
+                "objective": "Use the enabled deterministic fixture runtime",
+                "depends_on": [],
+                "read_paths": ["."],
+                "write_paths": [".himind-workflow-fixture"],
+                "acceptance_criteria": ["fixture writes its state file"],
+                "required_checks": ["git diff --check"],
+                "execution": {
+                    "executor": "himind.builtin",
+                    "model": "",
+                    "role_id": "ui.auditor",
+                    "service_id": ""
+                },
+                "repair_of": ""
+            }],
+            "required_acceptance": ["fixture writes its state file"],
+            "budget": {"max_rounds": 4, "max_minutes": 10, "max_repair_attempts": 0}
+        });
+        let handoff_input = json!({
+            "idempotency_key": "codex:cross-client:smoke",
+            "source_client": "codex",
+            "source_reference": "thread:cross-client",
+            "source_message_refs": ["message:1"],
+            "context_summary": "isolated cross-client mission test",
+            "title": "Cross-client collaboration mission",
+            "objective": "Verify handoff, assignment, confirmation, host execution and shared query",
+            "workspace": {
+                "root": workspace.to_string_lossy(),
+                "read_scope": ["."],
+                "write_scope": [".himind-workflow-fixture"]
+            },
+            "acceptance_criteria": ["fixture writes its state file"],
+            "workflow": {
+                "workflow_id": installed.package.id,
+                "workflow_version": installed.package.version,
+                "workflow_sha256": digest,
+                "entrypoint": "full"
+            },
+            "plan_mode": "imported",
+            "imported_plan": plan
+        });
+
+        let mut codex = initialize_client(&gateway, "Codex");
+        activate_for_client(&gateway, &mut codex, "mission.");
+        let denied = call_tool(&gateway, &mut codex, "mission.handoff.create", handoff_input.clone());
+        assert_eq!(denied["isError"], true, "{denied}");
+        assert!(crate::mission::MissionStore::open_default().unwrap().list(10).unwrap().is_empty());
+
+        let created = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut codex,
+            "mission.handoff.create",
+            handoff_input.clone(),
+        );
+        assert_eq!(created["isError"], false, "{created}");
+        let mission = created["structuredContent"].clone();
+        let mission_id = mission["mission_id"].as_str().unwrap().to_string();
+        assert_eq!(mission["status"], "awaiting_assignment");
+
+        let replayed = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut codex,
+            "mission.handoff.create",
+            handoff_input.clone(),
+        );
+        assert_eq!(replayed["isError"], false, "{replayed}");
+        assert_eq!(replayed["structuredContent"]["mission_id"], mission_id);
+        let mut conflicting = handoff_input;
+        conflicting["objective"] = json!("different request under the same idempotency key");
+        let conflict = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut codex,
+            "mission.handoff.create",
+            conflicting,
+        );
+        assert_eq!(conflict["isError"], true, "{conflict}");
+
+        let mut claude = initialize_client(&gateway, "Claude Code");
+        activate_for_client(&gateway, &mut claude, "mission.");
+        let options_result = call_tool(
+            &gateway,
+            &mut claude,
+            "mission.assignment.options",
+            json!({"mission_id": mission_id}),
+        );
+        assert_eq!(options_result["isError"], false, "{options_result}");
+        assert!(options_result["structuredContent"]["roles"]
+            .as_array()
+            .is_some_and(|roles| roles.iter().any(|role| role["role_id"] == "ui.auditor")));
+        let assigned = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "mission.assignment.apply",
+            json!({
+                "mission_id": mission_id,
+                "input": {
+                    "roles": [{
+                        "role_id": "ui.auditor",
+                        "label": "Fixture auditor",
+                        "executor": "himind.fixture",
+                        "service_id": "",
+                        "model": ""
+                    }],
+                    "task_roles": [{"task_id": "smoke", "role_id": "ui.auditor"}],
+                    "applied_by": "second-client",
+                    "recommended": false
+                }
+            }),
+        );
+        assert_eq!(assigned["isError"], false, "{assigned}");
+        assert_eq!(assigned["structuredContent"]["status"], "awaiting_confirmation");
+
+        let store = crate::mission::MissionStore::open_default().unwrap();
+        let ready_to_confirm = store.get(&mission_id).unwrap();
+        let confirmed = store
+            .confirm_plan(
+                &mission_id,
+                &ready_to_confirm.plan_sha256,
+                &["smoke".to_string()],
+                &[".himind-workflow-fixture".to_string()],
+                &[],
+                &[],
+                "agent-ui",
+            )
+            .unwrap();
+        assert_eq!(confirmed.status, crate::mission::MissionStatus::Active);
+
+        drop(codex);
+        drop(claude);
+
+        let supervisor_options = gateway.options().clone();
+        let mut final_mission = confirmed;
+        for _ in 0..4 {
+            let errors = crate::app::mission_supervisor::scan_once(
+                &gateway,
+                &supervisor_options,
+                &store,
+            )
+            .unwrap();
+            assert!(errors.is_empty(), "supervisor errors: {errors:?}");
+            final_mission = store.get(&mission_id).unwrap();
+            if final_mission.status == crate::mission::MissionStatus::Completed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            final_mission.status,
+            crate::mission::MissionStatus::Completed,
+            "{final_mission:#?}"
+        );
+        assert!(workspace.join(".himind-workflow-fixture/development.json").is_file());
+
+        let mut third_client = initialize_client(&gateway, "Qoder");
+        activate_for_client(&gateway, &mut third_client, "mission.");
+        let shared = call_tool(
+            &gateway,
+            &mut third_client,
+            "mission.get",
+            json!({"mission_id": mission_id}),
+        );
+        assert_eq!(shared["isError"], false, "{shared}");
+        assert_eq!(shared["structuredContent"]["status"], "completed");
+        assert_eq!(shared["structuredContent"]["mission_id"], mission_id);
+        assert_eq!(shared["structuredContent"]["tasks"][0]["verification_passed"], true);
+
+        let exported = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut third_client,
+            "mission.workflow.export",
+            json!({
+                "mission_id": mission_id,
+                "workflow_id": "com.himind.workflow.cross-client-smoke",
+                "version": "1.0.0",
+                "name": "Cross-client smoke workflow",
+                "entrypoint": "start"
+            }),
+        );
+        assert_eq!(exported["isError"], false, "{exported}");
+        assert_eq!(exported["structuredContent"]["state"], "tested");
+        assert_eq!(exported["structuredContent"]["package_id"], "com.himind.workflow.cross-client-smoke");
+        let candidate_path = exported["structuredContent"]["candidate_path"].as_str().unwrap();
+        assert!(Path::new(candidate_path).is_file(), "export candidate was not persisted: {candidate_path}");
+        assert!(!candidate_path.contains(&mission_id), "export used the Mission ID as its package identity");
+
+        drop(third_client);
+        drop(store);
+        let reopened = crate::mission::MissionStore::new(home.join("mission-runs.sqlite3"));
+        let persisted = reopened.get(&mission_id).unwrap();
+        assert_eq!(persisted.status, crate::mission::MissionStatus::Completed);
+
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "result": "passed",
+                "mission_id": mission_id,
+                "clients": ["Codex", "Claude Code", "Qoder"],
+                "states_seen": ["awaiting_assignment", "awaiting_confirmation", "active", "completed"],
+                "idempotent_replay": true,
+                "conflicting_replay_rejected": true,
+                "source_sessions_closed_before_execution": true,
+                "restart_read_same_mission": true,
+                "implementation_run_id": persisted.tasks[0].attempt_run_id,
+                "verification_run_id": persisted.tasks[0].verification_run_id,
+                "verification_passed": persisted.tasks[0].verification_passed,
+            }))
+            .unwrap()
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     static TEST_GATEWAY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2319,6 +2725,50 @@ mod tests {
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "workbench.business.project.create"));
+    }
+
+    #[test]
+    fn cross_client_mission_handoff_assignment_execution_and_restart_are_shared() {
+        // The Gateway registry is large enough to exhaust the default Rust test
+        // stack on Windows. Run this E2E on a bounded dedicated stack.
+        let handle = thread::Builder::new()
+            .name("mission-cross-client-e2e".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(cross_client_mission_e2e_body)
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn connected_mcp_exposes_mission_handoff_but_not_confirmation() {
+        let gateway = test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Connected);
+        let result = handle_request(&gateway, "tools/list", json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        for name in [
+            "mission.handoff.create",
+            "mission.get",
+            "mission.events.list",
+            "mission.assignment.options",
+            "mission.assignment.apply",
+            "mission.control",
+            "mission.workflow.export",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == name), "missing Mission control capability: {name}");
+        }
+        for (name, approval) in [
+            ("mission.get", false),
+            ("mission.events.list", false),
+            ("mission.assignment.options", false),
+            ("mission.handoff.create", true),
+            ("mission.assignment.apply", true),
+            ("mission.control", true),
+            ("mission.workflow.export", true),
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(tool["annotations"]["approvalRequired"], approval, "{name}");
+        }
+        assert!(!tools.iter().any(|tool| tool["name"] == "mission.plan.confirm"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "mission.paths.authorize"));
     }
 
     #[test]

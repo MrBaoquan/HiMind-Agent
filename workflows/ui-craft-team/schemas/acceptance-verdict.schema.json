@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["passed", "verified_task_ids", "failed_task_ids", "reasons", "remaining"],
+  "properties": {
+    "passed": { "type": "boolean" },
+    "verified_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "failed_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "reasons": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 1000 } },
+    "remaining": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+  }
+}

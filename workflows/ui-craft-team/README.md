@@ -1,55 +1,36 @@
 # UI 专业打磨团队
 
-三路并行审查 → 人工勾选整改项 → 打磨循环 → 守门验收。
+闭环：**审查 → 计划 → 人工确认 → 按角色委派优化 → 独立验证 → 守门验收**。
 
-架构说明见 `docs/ui-craft-team-architecture.md`。
+`full` 运行完整闭环；`audit` 只运行审查并在审查出口结束。没有整改项时计划置 `has_tasks=false`，优化循环跳过。
 
-## 两个入口
+## 角色
 
-| 入口 | 用途 |
+| 角色 | 职责 |
 |---|---|
-| `full` | 完整流程：审查后打磨并交付 |
-| `audit` | 只审查，不改代码；适合定期体检 |
+| `ui.auditor` / `ui.craft` / `ui.a11y` | 并行审查结构、工艺、无障碍，输出带源码位置与证据的 JSON findings |
+| `ui.planner` | 合并重复问题，分配稳定 task id、负责角色、文件范围、验收与验证条件 |
+| `ui.implementer.ia` / `.craft` / `.a11y` / `.shared` | 只执行用户批准计划中分配给自己的 task id |
+| `ui.verifier` | 独立运行检查，并按 task id 逐项核对差异和验收条件 |
+| `ui.guard` | 无工具，只根据批准计划、实施回执、验证报告核对 task id 完成情况 |
 
-## 团队
+确认卡直接展示 PLAN 输出中的摘要和任务明细。批准事件绑定 PLAN 的不可变运行输出；拒绝则不进入优化。确认后的计划经父步骤上下文传给每个委派子运行；Loop 反馈也会带入下一轮。任务类别分支顺序执行，因为它们共享同一工作树。验证分支可并行只读。任何计划项未被验证通过，GATE 都不得返回通过。
 
-| 角色 | 职责 | 工具 |
-|---|---|---|
-| `ui.auditor` | 信息架构：导航、结构、任务流、命名 | 只读审查 |
-| `ui.craft` | 工艺：间距、圆角、阴影、字阶、命中区 | 只读审查 |
-| `ui.a11y` | 无障碍：对比度、键盘、焦点、语义 | 只读审查 |
-| `ui.polisher` | 按确认清单改代码 | 可写 |
-| `ui.verifier` | 跑真实检查，贴原始输出 | 可执行 |
-| `ui.guard` | 依据 diff 与结果判达标 | **无工具** |
+## 运行环境
 
-`ui.guard` 用 `tool_policy: none` 是刻意的：它读不到实现方的推理过程，
-只能看代码与检查结果，避免变成自我确认。
+默认使用 `himind.builtin`。启动时可为 POLISH 委派步骤选择 `himind.builtin`、已接入的 `acp.*` 或包声明的其它 provider，并输入对应模型别名：
 
-## 三处用到的新能力
+- HiMind 路由：`himind:<service_id>:<model>`
+- ACP 会话模型：`acp:<provider>:<model>`
+- Codex / GitHub Copilot CLI：`cli:codex:<model>` / `cli:github-copilot:<model>`
 
-**并行委派**（`kind: "delegate"`）：AUDIT 与 VERIFY 各起独立子运行，
-三个审查员同时在跑。台账里 `delegated_runs` 累加，`rework_runs` 保持 0。
+审查与无工具守门仍固定内置 Runtime，以保持隔离边界。外部 ACP 是否能访问工作区取决于该客户端实现；ACP 工具权限由其 profile 策略控制。
 
-**守门循环**（`kind: "loop"` + `exit_when`）：`POLISH → VERIFY → GATE`
-最多 3 轮，GATE 输出 `passed: true` 才退出。
+## 判据与验证
 
-**角色覆盖**（`roles`）：brief 作为独立段落拼进提示词，
-同一 Runtime 按角色行事。
+- 审查判据：`docs/ui-review-profile.json`
+- UI 自检：`npm run check:ui`、`npx tsc --noEmit`、`npx vite build`
+- 窄窗 / 工艺：`check:text-layout`、`check:design-tokens`
+- 运行结果 schema：`schemas/`
 
-## 判据来自已有资产
-
-不重复造轮子：
-
-| 已有 | 用在 |
-|---|---|
-| `npm run check:ui`（26 项） | VERIFY/CHECKS |
-| `check:text-layout` | VERIFY/LAYOUT |
-| `check:design-tokens` | 工艺与无障碍的量化依据 |
-| `ui-craft` / `software-ui-spec` Skill | 审查员方法论 |
-
-## 已知局限
-
-- 检查命令由模型执行，非确定性；VERIFY 要求贴原始命令与退出码，GATE 交叉验证
-- 无真机截图，视觉问题依赖 DOM 断言
-- 无视觉回归，改 A 弄坏 B 不易发现
-- 审查结论不落盘，跨运行无追踪（规划中的 `ui-audit-ledger.json`）
+检查没有实际运行、命令失败或 task id 缺少验证证据时，不得报告通过。

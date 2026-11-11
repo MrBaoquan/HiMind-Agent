@@ -73,7 +73,12 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
     if is_destructive_capability(&capability_id)
         || matches!(
             capability_id.as_str(),
-            "distribution.release.publish" | "extension.review.decide"
+            "distribution.release.publish"
+                | "extension.review.decide"
+                | "mission.handoff.create"
+                | "mission.assignment.apply"
+                | "mission.control"
+                | "mission.workflow.export"
         )
     {
         "R3"

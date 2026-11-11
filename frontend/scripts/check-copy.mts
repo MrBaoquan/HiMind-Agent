@@ -153,6 +153,7 @@ const files = walk(srcRoot);
 const violations: string[] = [];
 const duplicates = new Map<string, { count: number; file: string }>();
 const bands = { over40: 0, band28: 0, band18: 0 };
+const band28Texts: string[] = [];
 const where = (file: string, text: string, budget: number, reason: string) =>
   violations.push(`${relative(srcRoot, file)} · ${reason}（${han(text)}/${budget} 字）\n    ${text}`);
 
@@ -181,7 +182,7 @@ for (const file of files) {
     const text = match[0].trim();
     const length = han(text);
     if (length >= 40) bands.over40++;
-    else if (length >= 28) bands.band28++;
+    else if (length >= 28) { bands.band28++; band28Texts.push(`${relative(srcRoot, file)} · ${text}`); }
     else if (length >= 18) bands.band18++;
     if (length > BUDGET.hardCap) where(file, text, BUDGET.hardCap, '单条文案超出硬上限');
     for (const filler of FILLERS) if (text.includes(filler)) where(file, text, BUDGET.hardCap, `含填充语「${filler}」`);
@@ -199,7 +200,7 @@ assert.equal(violations.length, 0, `文案约束未通过（${violations.length}
 
 // 增长天花板：当前 20 条 / 0 条，留出余量但拦住成规模的文案膨胀。
 assert.ok(bands.over40 === 0, `不得出现超过 40 字的用户可见文案，当前 ${bands.over40} 条`);
-assert.ok(bands.band28 <= 28, `28–39 字的文案不得超过 28 条，当前 ${bands.band28} 条：说明又在解释默认行为`);
+assert.ok(bands.band28 <= 28, `28–39 字的文案不得超过 28 条，当前 ${bands.band28} 条：说明又在解释默认行为\n  - ${band28Texts.join('\n  - ')}`);
 
 const repeated = [...duplicates.entries()].filter(([, value]) => value.count > 1);
 if (repeated.length) {

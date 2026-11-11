@@ -2635,8 +2635,15 @@ pub(crate) fn disable_gateway_binding(
             binding.direct_risk_acknowledged_at.clear();
             binding.direct_risk_reason.clear();
         } else {
+            let service_label = binding.service.clone();
             binding.direct_risk_acknowledged_at = now_rfc3339();
-            binding.direct_risk_reason = direct_risk;
+            binding.direct_risk_reason = direct_risk.clone();
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "直连风险已确认：client={target} service={service_label} reason={direct_risk}"
+                ),
+            );
         }
     }
     save_import_bindings(options, &bindings)?;
@@ -2691,6 +2698,23 @@ pub(crate) fn gateway_bindings(
                 }
                 routes.push((route, service, api_key));
             }
+            // 同一 exposed model 的多条路由：健康路由优先；冷却中的路由排到后面。
+            // 比较器对不同模型返回 Equal，稳定排序因此保留 Profile 原有的模型顺序，
+            // 只在同模型组内做健康切换。
+            routes.sort_by(|(left, left_service, _), (right, right_service, _)| {
+                if left.exposed_model != right.exposed_model {
+                    return std::cmp::Ordering::Equal;
+                }
+                let left_healthy = crate::store::ai_route_health::is_healthy(
+                    &gateway_upstream_base_url(left_service, &entry_protocol),
+                    &left.upstream_model,
+                );
+                let right_healthy = crate::store::ai_route_health::is_healthy(
+                    &gateway_upstream_base_url(right_service, &entry_protocol),
+                    &right.upstream_model,
+                );
+                right_healthy.cmp(&left_healthy)
+            });
             let default_model = routes
                 .iter()
                 .find(|(route, _, _)| route.exposed_model == profile.default_model)

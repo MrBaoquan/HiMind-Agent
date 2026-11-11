@@ -1400,13 +1400,17 @@ fn rotate_logs(path: &std::path::Path) {
 }
 
 pub(crate) fn redact_message(message: &str) -> String {
-    const MARKERS: [&str; 6] = [
+    const MARKERS: [&str; 10] = [
         "Bearer ",
         "credential=",
         "access_token=",
         "refresh_token=",
         "password=",
         "token=",
+        "x-api-key:",
+        "api-key:",
+        "authorization:",
+        "authorization=",
     ];
     let mut result = message.to_string();
     for marker in MARKERS {
@@ -1424,7 +1428,32 @@ pub(crate) fn redact_message(message: &str) -> String {
             offset = start + "[REDACTED]".len();
         }
     }
+    redact_sk_like_tokens(&mut result);
     result
+}
+
+/// `sk-...` 可能裸出现在上游错误体或日志里，没有 `Bearer` / `token=` 前缀。
+/// 这里按字符扫描，只处理足够长的 ASCII 令牌，避免误伤普通单词。
+fn redact_sk_like_tokens(value: &mut String) {
+    let mut offset = 0;
+    while let Some(relative) = value[offset..].find("sk-") {
+        let start = offset + relative;
+        let mut end = start + 3;
+        while end < value.len() {
+            let byte = value.as_bytes()[end];
+            if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end.saturating_sub(start) >= 16 {
+            value.replace_range(start..end, "sk-[REDACTED]");
+            offset = start + "sk-[REDACTED]".len();
+        } else {
+            offset = start + 3;
+        }
+    }
 }
 
 fn generate_id() -> String {
@@ -1490,6 +1519,16 @@ mod log_tests {
         assert!(!redacted.contains("access-secret"));
         assert!(!redacted.contains("device-secret"));
         assert!(redacted.matches("[REDACTED]").count() >= 3);
+    }
+
+    #[test]
+    fn diagnostic_logs_redact_bare_api_keys_and_auth_headers() {
+        let message = "x-api-key: sk-abcdefghijklmnop123456 Authorization: Bearer sk-zyxwvutsrqponmlk987654 suffix";
+        let redacted = redact_message(message);
+        assert!(!redacted.contains("abcdefghijklmnop123456"), "{redacted}");
+        assert!(!redacted.contains("zyxwvutsrqponmlk987654"), "{redacted}");
+        assert!(redacted.contains("sk-[REDACTED]"), "{redacted}");
+        assert!(redacted.ends_with("suffix"), "{redacted}");
     }
 
     #[test]

@@ -34,7 +34,7 @@ import {
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
 import { formatError } from '../types';
-import { MissionTeamPanel } from './MissionTeamPanel';
+import { CollaborationTaskPanel } from './MissionTeamPanel';
 
 type TaskFilter = 'all' | 'running' | 'completed' | 'attention';
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
@@ -43,6 +43,10 @@ type SourceFilter = 'all' | ActivitySource;
 type TaskCenterPageProps = {
   currentTask: CurrentTaskStatus | null;
   dashboardEnabled: boolean;
+  /** Mission deep links select one collaboration task on first render. */
+  initialMissionId?: string;
+  /** A new revision makes repeated navigation to the same Mission observable. */
+  missionNavigationRevision?: number;
   onLoadTaskHistory: () => Promise<AgentTaskHistoryItem[]>;
   onLoadLocalActivity: () => Promise<AgentActivityItem[]>;
   onOpenDashboard: () => void;
@@ -194,7 +198,7 @@ function activityTime(entry: ActivityEntry) {
   return entry.finishedAt || entry.updatedAt || entry.createdAt;
 }
 
-export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun, onCancelRun, onApproveRun, onRejectRun, onPauseRun, onResumePausedRun, onRetryStep }: TaskCenterPageProps) {
+export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId, missionNavigationRevision, onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun, onCancelRun, onApproveRun, onRejectRun, onPauseRun, onResumePausedRun, onRetryStep }: TaskCenterPageProps) {
   const [items, setItems] = useState<ActivityEntry[]>([]);
   const [filter, setFilter] = useState<TaskFilter>('all');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
@@ -202,7 +206,12 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-  const [missionId, setMissionId] = useState('');
+  const [missionId, setMissionId] = useState(initialMissionId || '');
+
+  useEffect(() => {
+    // Empty is an intentional "show the task list" navigation, not a no-op.
+    setMissionId(initialMissionId || '');
+  }, [initialMissionId, missionNavigationRevision]);
 
   // 本机记录是本地读取（快），工作台历史要打控制面接口（慢）。轮询按两个节奏走：
   // 本机 5 秒，工作台历史 30 秒，避免每 5 秒发一次网络请求。
@@ -279,7 +288,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
         description={dashboardEnabled ? '查看 AI 对话、自动化工作流和工作台发起的任务。' : '查看 AI 对话和本机自动化工作流发起的任务。'}
         actions={dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台</button> : undefined}
       />
-      <MissionTeamPanel selectedMissionId={missionId} onOpenMission={setMissionId} onBackToTasks={() => setMissionId('')} />
+      <CollaborationTaskPanel selectedMissionId={missionId} onOpenMission={setMissionId} onBackToTasks={() => setMissionId('')} />
 
       {!missionId ? <section className="task-center-summary" aria-label="活动概览">
         <SummaryItem label="进行中" value={active.length} tone="running" />

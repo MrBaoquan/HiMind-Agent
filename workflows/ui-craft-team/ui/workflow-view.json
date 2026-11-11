@@ -76,11 +76,9 @@
         {
           "id": "implement_model",
           "label": "打磨步骤的模型",
-          "type": "model",
-          "options": [
-            { "value": "inherit", "label": "沿用客户端当前模型" }
-          ],
-          "hint": "himind:<服务id>:<模型> 或 acp:<客户端>:<模型>；选「沿用」表示不改。",
+          "type": "text",
+          "placeholder": "留空沿用默认；例如 acp:codex:gpt-5-codex",
+          "hint": "HiMind：himind:<服务id>:<模型>；ACP：acp:<客户端>:<模型>；CLI：cli:<codex|github-copilot>:<模型>。",
           "override": {
             "stepId": "POLISH",
             "key": "model"

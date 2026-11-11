@@ -19,6 +19,7 @@ const DashboardPage = lazyNamed(() => import('./pages/DashboardPage'), 'Dashboar
 import { PluginsPage, userInstalledPlugins } from './pages/PluginsPage';
 import { SkillsWorkspacePage, installedSkills, skillClientDescriptors, targetForSkillClient } from './pages/SkillsWorkspacePage';
 const InstalledPage = lazyNamed(() => import('./pages/InstalledPage'), 'InstalledPage');
+const WorkspaceRegistryPage = lazyNamed(() => import('./pages/WorkspaceRegistryPage'), 'WorkspaceRegistryPage');
 const ExpertStudioPanel = lazyNamed(() => import('./components/ExpertStudioPanel'), 'ExpertStudioPanel');
 const InstructionProjectionPanel = lazyNamed(() => import('./components/InstructionProjectionPanel'), 'InstructionProjectionPanel');
 const ManagedCapabilitiesPanel = lazyNamed(() => import('./pages/ManagedCapabilitiesPage'), 'ManagedCapabilitiesPanel');
@@ -37,6 +38,7 @@ const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'Schedule
 import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionActivationReceipt, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type GatewayProfile, type GatewayProfileInput, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 
 import { hydrateWorkflowOptionSources } from './pages/workflowOptionSources';
+import { MISSION_OPEN_EVENT, missionIdFromBootstrap, type MissionOpenBootstrap } from './pages/missionDeepLink';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -128,10 +130,22 @@ function settingsWindowQuery(): { panel: SettingsWindowPanel; section: SettingsS
   }
 }
 
+function initialMissionOpen(): string {
+  try {
+    const bootstrap = (window as Window & { __HIMIND_MISSION_OPEN__?: unknown }).__HIMIND_MISSION_OPEN__;
+    return missionIdFromBootstrap(bootstrap);
+  } catch {
+    return '';
+  }
+}
+
 function initialPage(): PageKey {
   try {
     const settingsWindow = settingsWindowQuery();
     if (settingsWindow) return settingsWindow.panel;
+    // Opening an assignment link is an explicit request to land on Tasks even
+    // when the previous session was left on another page.
+    if (initialMissionOpen()) return 'tasks';
     const saved = window.localStorage.getItem('himind.page');
     const allowed: PageKey[] = ['dashboard', 'builtin-ai', 'ai', 'approvals', 'inbox', 'tasks', 'workflows', 'schedules', 'extensions', 'installed', 'development', 'settings'];
     // 旧版本把插件、技能各存成一个页面；现在它们是我能力里的页签，读回时落到对应页签。
@@ -242,6 +256,9 @@ function AgentApp() {
   const [schedulePresetTarget, setSchedulePresetTarget] = useState('');
   // 跨页面打开 Workflow Run 时保留目标，避免只能回到列表里手动查找。
   const [workflowRunTarget, setWorkflowRunTarget] = useState('');
+  // Deep links carry a revision as well as an ID: reopening the same Mission after
+  // returning to the list must still be observable by TaskCenterPage.
+  const [missionTarget, setMissionTarget] = useState(() => ({ missionId: initialMissionOpen(), revision: 0 }));
   const [workflowLoading, setWorkflowLoading] = useState(true);
   const [workflowError, setWorkflowError] = useState('');
   // 工作流中心的瞬时读失败（启动瞬间控制面还没就绪、快照接口偶发超时）不该把整页刷成
@@ -1185,6 +1202,21 @@ function AgentApp() {
   }, []);
 
   useEffect(() => {
+    if (isSettingsWindow) return;
+    let unlisten: (() => void) | undefined;
+    void listen<MissionOpenBootstrap>(MISSION_OPEN_EVENT, event => {
+      const missionId = missionIdFromBootstrap(event.payload);
+      if (!missionId) {
+        console.error('协作任务深链缺少有效 mission_id', event.payload);
+        return;
+      }
+      setMissionTarget(current => ({ missionId, revision: current.revision + 1 }));
+      setPage('tasks');
+    }).then(remove => { unlisten = remove; }).catch(error => console.error('协作任务导航监听失败', error));
+    return () => unlisten?.();
+  }, [isSettingsWindow]);
+
+  useEffect(() => {
     if (!isSettingsWindow) return;
     let unlisten: (() => void) | undefined;
     void listen<{ panel?: string; section?: string; tab?: string; aiTab?: string }>('himind:settings-navigate', event => {
@@ -2117,6 +2149,14 @@ function AgentApp() {
 
   function navigate(target: NavigationTarget) {
     const nextPage = typeof target === 'string' ? target : target.page;
+    const missionId = typeof target !== 'string' ? missionIdFromBootstrap({ mission_id: target.missionId }) : '';
+    if (missionId) {
+      setMissionTarget(current => ({ missionId, revision: current.revision + 1 }));
+    } else if (nextPage === 'tasks') {
+      // A normal Tasks navigation means the list, not the Mission last opened
+      // through a deep link.
+      setMissionTarget(current => ({ missionId: '', revision: current.revision + 1 }));
+    }
     if (typeof target !== 'string' && target.kind) setInstalledKind(target.kind);
     // 从侧栏/「查看」菜单进入 AI 对话时必须同时点亮激活标记：页面内容由
     // builtinAiActivated 门控，只有 openBuiltinAi() 系列入口会设置它。
@@ -2300,6 +2340,8 @@ function AgentApp() {
     if (page === 'tasks') return <TaskCenterPage
       dashboardEnabled={dashboardEnabled()}
       currentTask={status?.current_task || null}
+      initialMissionId={missionTarget.missionId}
+      missionNavigationRevision={missionTarget.revision}
       onLoadTaskHistory={agentApi.taskHistory}
       onLoadLocalActivity={agentApi.localActivity}
       onOpenDashboard={() => run(agentApi.openDashboard)}
@@ -2466,6 +2508,7 @@ function AgentApp() {
     />;
     // 「我的能力」：自己装的 + 组织配发的。类型是页内页签，页面标题归容器，
     // 所以三个类型视图都按"只出内容与动作区"的方式嵌进来。
+    if (page === 'workspaces') return <WorkspaceRegistryPage />;
     if (page === 'installed') return <InstalledPage
       kind={installedKind}
       dashboardEnabled={dashboardEnabled()}

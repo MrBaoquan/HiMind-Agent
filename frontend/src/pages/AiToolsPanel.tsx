@@ -203,7 +203,7 @@ export function AiToolsPanel({
           const accepted = await confirm({
             title: `覆盖 ${target} 的外部修改？`,
             description: status?.drift_detail
-              || '客户端配置里由 HiMind 写入的字段已被其它工具或手工改动；继续会覆盖这些改动。',
+              || 'HiMind 托管字段已被修改，继续将覆盖这些改动。',
             confirmText: '覆盖并更新',
           });
           if (!accepted) return;

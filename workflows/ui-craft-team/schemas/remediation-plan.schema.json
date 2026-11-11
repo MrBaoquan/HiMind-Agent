@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["summary", "has_tasks", "tasks"],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 },
+    "has_tasks": { "type": "boolean" },
+    "tasks": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "assignee", "title", "files", "evidence", "change", "acceptance", "verification"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" },
+          "category": { "type": "string", "enum": ["ia", "craft", "a11y", "shared"] },
+          "assignee": { "type": "string", "enum": ["ui.implementer.ia", "ui.implementer.craft", "ui.implementer.a11y", "ui.implementer.shared"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "files": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 400 } },
+          "evidence": { "type": "string", "minLength": 1, "maxLength": 1200 },
+          "change": { "type": "string", "minLength": 1, "maxLength": 1200 },
+          "acceptance": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 300 } },
+          "verification": { "type": "array", "minItems": 1, "maxItems": 6, "items": { "type": "string", "minLength": 1, "maxLength": 300 } }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": { "properties": { "category": { "const": "ia" } }, "required": ["category"] },
+            "then": { "properties": { "id": { "pattern": "^IA-" }, "assignee": { "const": "ui.implementer.ia" } } }
+          },
+          {
+            "if": { "properties": { "category": { "const": "craft" } }, "required": ["category"] },
+            "then": { "properties": { "id": { "pattern": "^CRAFT-" }, "assignee": { "const": "ui.implementer.craft" } } }
+          },
+          {
+            "if": { "properties": { "category": { "const": "a11y" } }, "required": ["category"] },
+            "then": { "properties": { "id": { "pattern": "^A11Y-" }, "assignee": { "const": "ui.implementer.a11y" } } }
+          },
+          {
+            "if": { "properties": { "category": { "const": "shared" } }, "required": ["category"] },
+            "then": { "properties": { "id": { "pattern": "^SHARED-" }, "assignee": { "const": "ui.implementer.shared" } } }
+          }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "tasks": { "minItems": 1 } }, "required": ["tasks"] },
+      "then": { "properties": { "has_tasks": { "const": true } } },
+      "else": { "properties": { "has_tasks": { "const": false } } }
+    }
+  ]
+}

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::app::reasoning_tags::{sanitize_reasoning_tags, ReasoningTagSanitizer};
 use crate::store::local_usage::{self, LocalUsageRecord};
 
 const HEADER_LIMIT: usize = 64 * 1024;
@@ -32,6 +33,8 @@ const MAX_INBOUND_BODY_MIB: usize = 512;
 const INBOUND_BODY_MIB_ENV: &str = "HIMIND_AGENT_GATEWAY_INBOUND_MIB";
 const OUTBOUND_BODY_LIMIT: usize = 24 * 1024 * 1024;
 const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// 上游错误体只用于诊断，不允许把任意大的错误页读进内存。
+const ERROR_BODY_LIMIT: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 /// 单个客户端同时占用的请求槽。长流式请求会一直占槽，避免一个失控客户端
 /// 用 32 条连接把其他客户端的推理请求挤掉。
@@ -246,7 +249,7 @@ fn start_locked(
 }
 
 /// 一个「服务 × 客户端」绑定。令牌只证明请求来自已绑定的客户端。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GatewayBinding {
     pub id: String,
     pub client: String,
@@ -271,6 +274,30 @@ pub(crate) struct GatewayBinding {
     pub token: String,
     /// 上游是平台托管服务：以平台口径为准，本机合计里排除。
     pub platform_metered: bool,
+}
+
+/// 绑定里同时有上游 API Key 和本机令牌；`{:?}` 不能把任何一个打印出来。
+impl std::fmt::Debug for GatewayBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayBinding")
+            .field("id", &self.id)
+            .field("client", &self.client)
+            .field("service", &self.service)
+            .field("profile_id", &self.profile_id)
+            .field("entry_protocol", &self.entry_protocol)
+            .field("exposed_model", &self.exposed_model)
+            .field("models", &self.models)
+            .field("default_model", &self.default_model)
+            .field("upstream_model", &self.upstream_model)
+            .field("is_default", &self.is_default)
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("platform_metered", &self.platform_metered)
+            .finish()
+    }
 }
 
 type BindingResolver = Arc<dyn Fn() -> Vec<GatewayBinding> + Send + Sync>;
@@ -708,8 +735,20 @@ fn authorize(
     bindings: &[GatewayBinding],
     headers: &HashMap<String, String>,
     body: &[u8],
-    _required_protocol: &str,
+    required_protocol: &str,
 ) -> Result<GatewayBinding, GatewayError> {
+    let mut candidates = authorize_candidates(bindings, headers, body, required_protocol)?;
+    Ok(candidates.remove(0))
+}
+
+/// 令牌 + 模型命中的全部路由，按解析顺序返回。第一条是主路由，其余是同模型
+/// 可做同请求故障转移的候选；调用方会再按协议/上游模型/Provider 过滤。
+fn authorize_candidates(
+    bindings: &[GatewayBinding],
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    _required_protocol: &str,
+) -> Result<Vec<GatewayBinding>, GatewayError> {
     let model = model_from_body(body);
     let token = token_from_headers(headers);
     let scoped = if let Some(token) = token.as_deref() {
@@ -743,23 +782,26 @@ fn authorize(
             })
             .collect::<Vec<_>>();
         if token.is_some() {
-            return exact
-                .first()
-                .map(|binding| with_requested_alias((**binding).clone(), model))
-                .ok_or(GatewayError::UnknownModel);
+            if exact.is_empty() {
+                return Err(GatewayError::UnknownModel);
+            }
+            return Ok(exact
+                .into_iter()
+                .map(|binding| with_requested_alias((*binding).clone(), model))
+                .collect());
         }
         if exact.len() == 1 {
-            return Ok(with_requested_alias((*exact[0]).clone(), model));
+            return Ok(vec![with_requested_alias((*exact[0]).clone(), model)]);
         }
         if exact.len() > 1 {
             return Err(GatewayError::AmbiguousModel);
         }
     }
     if scoped.len() == 1 {
-        return Ok(scoped[0].clone());
+        return Ok(vec![scoped[0].clone()]);
     }
     if let Some(default) = scoped.iter().find(|binding| binding.is_default) {
-        return Ok((*default).clone());
+        return Ok(vec![(*default).clone()]);
     }
     Err(GatewayError::AmbiguousModel)
 }
@@ -939,6 +981,153 @@ struct ResponsesFallbackOutcome {
     applied: Vec<&'static str>,
 }
 
+/// 路由健康只根据“上游是否可用”判断：401/403/429/5xx/网络失败进入冷却，
+/// 2xx 立即恢复。400/422 是兼容性问题，不应把整条路由判死。
+fn mark_route_outcome(binding: &GatewayBinding, status: u16) {
+    if matches!(status, 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504) {
+        let failures =
+            crate::store::ai_route_health::mark_failure(&binding.base_url, &binding.upstream_model);
+        crate::approval::manager::append_event_log(
+            "warn",
+            &format!(
+                "本机网关路由进入冷却：id={} model={} status={status} failures={failures}",
+                binding.id, binding.upstream_model
+            ),
+        );
+    } else if status < 400 {
+        crate::store::ai_route_health::mark_success(&binding.base_url, &binding.upstream_model);
+    }
+}
+
+fn route_status_is_retryable(status: u16) -> bool {
+    matches!(status, 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// 首次写出前的同请求路由切换：按候选顺序发送，遇到可重试状态/网络错误就换下一条。
+/// `active` 记录真正返回响应的候选下标，供用量与响应头使用。
+fn send_with_route_failover<F>(
+    candidates: &[GatewayBinding],
+    active: &std::cell::Cell<usize>,
+    send: &mut F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut(&GatewayBinding) -> reqwest::Result<reqwest::blocking::Response>,
+{
+    for (index, candidate) in candidates.iter().enumerate() {
+        let has_next = index + 1 < candidates.len();
+        match send(candidate) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if has_next && route_status_is_retryable(status) {
+                    let next = &candidates[index + 1];
+                    crate::approval::manager::append_event_log(
+                        "warn",
+                        &format!(
+                            "本机网关路由切换：from={} to={} model={} status={status}",
+                            candidate.id, next.id, candidate.upstream_model
+                        ),
+                    );
+                    mark_route_outcome(candidate, status);
+                    let _ = response.bytes();
+                    continue;
+                }
+                active.set(index);
+                return Ok(response);
+            }
+            Err(error) => {
+                if has_next {
+                    let next = &candidates[index + 1];
+                    crate::approval::manager::append_event_log(
+                        "warn",
+                        &format!(
+                            "本机网关路由切换：from={} to={} model={} network_error={error}",
+                            candidate.id, next.id, candidate.upstream_model
+                        ),
+                    );
+                }
+                mark_route_outcome(candidate, 503);
+                if has_next {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("route candidates are never empty")
+}
+
+/// 能力观测的 Provider 键。已知 Provider 用矩阵 ID；未知 Provider 必须带 host，
+/// 否则所有“未知兼容上游”会共享同一份降级事实。
+fn capability_provider_key(binding: &GatewayBinding) -> (String, String) {
+    use crate::store::ai_services::AIServiceProtocol;
+    let protocol = AIServiceProtocol::parse(&binding.protocol)
+        .unwrap_or(AIServiceProtocol::OpenaiChat);
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = matrix.resolve_provider(&binding.base_url, &protocol);
+    let key = if provider.id == crate::app::ai_compatibility::UNKNOWN_PROVIDER_ID {
+        let host = url::Url::parse(binding.base_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| binding.base_url.clone());
+        format!("unknown@{host}")
+    } else {
+        provider.id.clone()
+    };
+    (key, protocol.as_str().to_string())
+}
+
+/// 已有两次以上成功回退观测时，提前把同一 Provider 的同类请求收敛到已知可用形状，
+/// 避免每个新会话都先撞一次 400。只处理 Responses 入口。
+fn apply_observed_responses_fallbacks(
+    binding: &GatewayBinding,
+    body: &[u8],
+) -> (Vec<u8>, Vec<&'static str>) {
+    let (provider, protocol) = capability_provider_key(binding);
+    let observed = crate::store::ai_capability_observations::observed_features(&provider, &protocol);
+    if observed.is_empty() {
+        return (body.to_vec(), Vec::new());
+    }
+    let mut current = body.to_vec();
+    let mut applied = Vec::new();
+    if observed.iter().any(|feature| feature == "tool_result_media") {
+        if let Some(next) = response_tool_output_media_fallback(&current) {
+            current = next;
+            applied.push("tool_result_media");
+        }
+    }
+    if observed.iter().any(|feature| feature == "tool_history") {
+        if let Some(next) = response_tool_history_fallback(&current) {
+            if next.len() <= OUTBOUND_BODY_LIMIT {
+                current = next;
+                applied.push("tool_history");
+            }
+        }
+    }
+    if observed.iter().any(|feature| feature == "unsupported_tools") {
+        if let Some(next) = response_unsupported_tools_fallback(&current) {
+            current = next;
+            applied.push("unsupported_tools");
+        }
+    }
+    if !applied.is_empty() {
+        crate::approval::manager::append_event_log(
+            "info",
+            &format!(
+                "能力观测预降级：provider={provider} protocol={protocol} features={}",
+                applied.join(",")
+            ),
+        );
+    }
+    (current, applied)
+}
+
+#[derive(Debug)]
+enum ResponsesFallbackFailure {
+    Upstream(reqwest::Error),
+    /// 降级改写后的请求体反而超过出站预算；必须在发出前拒绝。
+    TooLarge(usize),
+}
+
 /// Responses 兼容上游支持的子集并不一致。Codex 会同时携带
 /// `function_call` 历史、工具结果媒体和 `namespace` / `web_search` 工具；
 /// Vector Tide 等上游对这几类输入都会返回同一个泛化的 400。
@@ -950,13 +1139,17 @@ fn send_responses_with_compatibility_fallback<F>(
     binding: &GatewayBinding,
     outgoing_body: &[u8],
     send: &mut F,
-) -> reqwest::Result<ResponsesFallbackOutcome>
+) -> Result<ResponsesFallbackOutcome, ResponsesFallbackFailure>
 where
     F: FnMut(&[u8]) -> reqwest::Result<reqwest::blocking::Response>,
 {
     let mut fallback_body = outgoing_body.to_vec();
+    if fallback_body.len() > OUTBOUND_BODY_LIMIT {
+        return Err(ResponsesFallbackFailure::TooLarge(fallback_body.len()));
+    }
     let mut applied = Vec::new();
-    let mut response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+    let mut response = send_with_transient_retry(binding, &mut || send(&fallback_body))
+        .map_err(ResponsesFallbackFailure::Upstream)?;
     if !matches!(response.status().as_u16(), 400 | 422) {
         return Ok(ResponsesFallbackOutcome {
             response,
@@ -968,12 +1161,16 @@ where
     // 先做最小兼容：仅移除工具结果中的图片/文件，保留 function_call 结构。
     if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
         fallback_body = media_body;
+        if fallback_body.len() > OUTBOUND_BODY_LIMIT {
+            return Err(ResponsesFallbackFailure::TooLarge(fallback_body.len()));
+        }
         applied.push("tool_result_media");
         crate::approval::manager::append_event_log(
             "info",
             "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
         );
-        response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+        response = send_with_transient_retry(binding, &mut || send(&fallback_body))
+            .map_err(ResponsesFallbackFailure::Upstream)?;
     }
 
     // 仍失败时再降级整个工具历史，并移除上游不支持的扩展工具。
@@ -990,14 +1187,35 @@ where
             applied.push("unsupported_tools");
         }
         if !changes.is_empty() {
+            if fallback_body.len() > OUTBOUND_BODY_LIMIT {
+                return Err(ResponsesFallbackFailure::TooLarge(fallback_body.len()));
+            }
             crate::approval::manager::append_event_log(
                 "info",
                 &format!("本机网关兼容回退：{}后重试", changes.join("；")),
             );
-            response = send_with_transient_retry(binding, &mut || send(&fallback_body))?;
+            response = send_with_transient_retry(binding, &mut || send(&fallback_body))
+                .map_err(ResponsesFallbackFailure::Upstream)?;
         }
     }
 
+    if !applied.is_empty() && response.status().is_success() {
+        let (provider, protocol) = capability_provider_key(binding);
+        for feature in &applied {
+            if let Err(error) = crate::store::ai_capability_observations::record_success(
+                &provider, &protocol, feature,
+            ) {
+                eprintln!("能力观测写入失败：{error}");
+            }
+        }
+        crate::approval::manager::append_event_log(
+            "info",
+            &format!(
+                "能力观测：provider={provider} protocol={protocol} features={}",
+                applied.join(",")
+            ),
+        );
+    }
     let body = (!applied.is_empty()).then_some(fallback_body);
     Ok(ResponsesFallbackOutcome {
         response,
@@ -1170,7 +1388,7 @@ fn anchor_text(value: &Value) -> String {
     }
 }
 
-fn upstream_client(base_url: &str) -> Result<reqwest::blocking::Client, reqwest::Error> {
+fn upstream_client(base_url: &str) -> reqwest::Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
@@ -1338,7 +1556,21 @@ fn route(
         return write_models_response(stream, &scoped, claude_desktop);
     }
     let required_protocol = path_protocol(&head.path).ok_or(GatewayError::UnsupportedPath)?;
-    let binding = authorize(&bindings, &head.headers, body, required_protocol)?;
+    let candidates = authorize_candidates(&bindings, &head.headers, body, required_protocol)?;
+    let binding = candidates
+        .first()
+        .cloned()
+        .ok_or(GatewayError::UnknownModel)?;
+    // 同请求故障转移只针对“同一 Provider、同一上游模型、同一协议”的路由：
+    // 这样请求体改写结果完全一致，切换只需换 base_url / API Key。
+    let retry_candidates = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.protocol == binding.protocol
+                && candidate.upstream_model == binding.upstream_model
+                && capability_provider_key(candidate).0 == capability_provider_key(&binding).0
+        })
+        .collect::<Vec<_>>();
     // 单客户端并发闸门：槽在本次请求返回时释放，长流式请求会一直占槽。
     let Some(_request_slot) = acquire_request_slot(&binding.client) else {
         let message = format!(
@@ -1375,7 +1607,15 @@ fn route(
     if binding.protocol != required_protocol && !translatable {
         return Err(GatewayError::ProtocolMismatch);
     }
-    forward(stream, &binding, head, body, required_protocol, started)
+    forward(
+        stream,
+        &binding,
+        &retry_candidates,
+        head,
+        body,
+        required_protocol,
+        started,
+    )
 }
 
 fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String {
@@ -1484,20 +1724,138 @@ fn rewrite_request_model(body: &[u8], upstream_model: &str) -> Vec<u8> {
 }
 
 fn rewrite_json_model(raw: &[u8], exposed_model: &str) -> Vec<u8> {
-    if raw.is_empty() || exposed_model.trim().is_empty() {
+    if raw.is_empty() {
         return raw.to_vec();
     }
     let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
         return raw.to_vec();
     };
-    if value.get("model").is_none() {
+    let has_model = value.get("model").is_some();
+    let has_responses_output =
+        value.get("output").is_some() || value.get("output_text").is_some();
+    if !has_model && !has_responses_output {
         return raw.to_vec();
     }
-    value["model"] = json!(exposed_model);
+    if has_model && !exposed_model.trim().is_empty() {
+        value["model"] = json!(exposed_model);
+    }
+    sanitize_responses_output(&mut value);
     serde_json::to_vec(&value).unwrap_or_else(|_| raw.to_vec())
 }
 
-fn rewrite_sse_model_line(line: &str, exposed_model: &str) -> String {
+/// 清洗原生 Responses 响应里的可见文本。工具参数、结构化输出等字段不动，
+/// 只处理最终给用户/客户端看的 `output_text`。
+fn sanitize_responses_output(value: &mut Value) -> usize {
+    let mut removed = sanitize_text_field(value, "output_text");
+    if let Some(output) = value.get_mut("output").and_then(Value::as_array_mut) {
+        for item in output {
+            removed += sanitize_output_item(item);
+        }
+    }
+    removed
+}
+
+fn sanitize_output_item(item: &mut Value) -> usize {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return 0;
+    }
+    item.get_mut("content")
+        .and_then(Value::as_array_mut)
+        .map(|parts| parts.iter_mut().map(sanitize_content_part).sum())
+        .unwrap_or(0)
+}
+
+fn sanitize_content_part(part: &mut Value) -> usize {
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text" | "text") => sanitize_text_field(part, "text"),
+        Some("refusal") => sanitize_text_field(part, "refusal"),
+        _ => 0,
+    }
+}
+
+fn sanitize_text_field(object: &mut Value, field: &str) -> usize {
+    object
+        .get_mut(field)
+        .map(sanitize_string_value)
+        .unwrap_or(0)
+}
+
+fn sanitize_string_value(value: &mut Value) -> usize {
+    let Some(text) = value.as_str().map(str::to_string) else {
+        return 0;
+    };
+    let (clean, removed) = sanitize_reasoning_tags(&text);
+    if removed > 0 {
+        *value = json!(clean);
+    }
+    removed
+}
+
+/// 入口是原生 Responses 时，assistant 历史里已有的闭合标签也会被上游模型看到。
+/// 只清洗 assistant 消息，用户/系统消息保持原样，避免改写用户输入。
+fn sanitize_responses_request_input(request: &mut Value) -> usize {
+    let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for item in input {
+        let is_assistant_message = item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant");
+        if !is_assistant_message {
+            continue;
+        }
+        if let Some(content) = item.get_mut("content") {
+            removed += match content {
+                Value::String(_) => sanitize_string_value(content),
+                Value::Array(parts) => parts.iter_mut().map(sanitize_content_part).sum(),
+                _ => 0,
+            };
+        }
+    }
+    removed
+}
+
+/// 原生 SSE 事件里的文本字段清洗。`reasoning` 等事件不会命中这些字段。
+fn sanitize_responses_stream_event(
+    value: &mut Value,
+    event_type: Option<&str>,
+    sanitizer: &mut ReasoningTagSanitizer,
+) -> Option<usize> {
+    match event_type {
+        Some("response.output_text.delta") => {
+            let delta = value.get("delta").and_then(Value::as_str).unwrap_or_default();
+            let clean = sanitizer.push(delta);
+            value["delta"] = json!(clean);
+            Some(0)
+        }
+        Some("response.output_text.done") => Some(sanitize_text_field(value, "text")),
+        Some("response.content_part.added" | "response.content_part.done") => Some(
+            value
+                .get_mut("part")
+                .map(sanitize_content_part)
+                .unwrap_or(0),
+        ),
+        Some("response.output_item.added" | "response.output_item.done") => Some(
+            value
+                .get_mut("item")
+                .map(sanitize_output_item)
+                .unwrap_or(0),
+        ),
+        Some("response.completed" | "response.incomplete" | "response.failed") => Some(
+            value
+                .get_mut("response")
+                .map(sanitize_responses_output)
+                .unwrap_or(0),
+        ),
+        _ => None,
+    }
+}
+
+fn rewrite_sse_model_line(
+    line: &str,
+    exposed_model: &str,
+    sanitizer: &mut ReasoningTagSanitizer,
+) -> String {
     let trimmed = line.trim_end_matches('\r');
     let Some(payload) = trimmed.strip_prefix("data:") else {
         return line.to_string();
@@ -1509,10 +1867,18 @@ fn rewrite_sse_model_line(line: &str, exposed_model: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
         return line.to_string();
     };
-    if value.get("model").is_none() {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let handled = sanitize_responses_stream_event(&mut value, event_type.as_deref(), sanitizer);
+    let has_model = value.get("model").is_some();
+    if handled.is_none() && !has_model {
         return line.to_string();
     }
-    value["model"] = json!(exposed_model);
+    if has_model && !exposed_model.trim().is_empty() {
+        value["model"] = json!(exposed_model);
+    }
     format!("data: {value}")
 }
 const TRANSIENT_UPSTREAM_MAX_ATTEMPTS: usize = 2;
@@ -1561,6 +1927,7 @@ where
 fn forward(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
+    retry_candidates: &[GatewayBinding],
     head: &RequestHead,
     body: &[u8],
     kind: &str,
@@ -1573,10 +1940,16 @@ fn forward(
     // Claude Code / Claude Desktop 讲 Anthropic：按上游协议选择互译实现。
     if kind == "anthropic" {
         if binding.protocol == "openai-chat" {
-            return forward_translated(stream, binding, body, started);
+            return forward_translated(stream, binding, retry_candidates, body, started);
         }
         if binding.protocol == "openai-responses" {
-            return forward_anthropic_responses_translated(stream, binding, body, started);
+            return forward_anthropic_responses_translated(
+                stream,
+                binding,
+                retry_candidates,
+                body,
+                started,
+            );
         }
     }
     let request_summary = if kind == "openai-responses" {
@@ -1617,7 +1990,18 @@ fn forward(
                 &format!("本机网关媒体规格化警告：{warning}"),
             );
         }
-        Some(normalized.request)
+        let mut request = normalized.request;
+        let removed = sanitize_responses_request_input(&mut request);
+        if removed > 0 {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "本机网关已清洗 Responses 历史中的推理控制标签：count={removed} client={}",
+                    binding.client
+                ),
+            );
+        }
+        Some(request)
     } else {
         None
     };
@@ -1626,6 +2010,7 @@ fn forward(
         return forward_responses_translated(
             stream,
             binding,
+            retry_candidates,
             normalized_responses
                 .as_ref()
                 .expect("Responses request was normalized above"),
@@ -1637,7 +2022,13 @@ fn forward(
     }
     // OpenCode 等通用客户端讲 Chat，落在只提供 Responses 的上游上。
     if kind == "openai-chat" && binding.protocol == "openai-responses" {
-        return forward_chat_responses_translated(stream, binding, body, started);
+        return forward_chat_responses_translated(
+            stream,
+            binding,
+            retry_candidates,
+            body,
+            started,
+        );
     }
     let compatibility_request = match normalized_responses {
         Some(request) => Some(request),
@@ -1660,42 +2051,55 @@ fn forward(
         }
         None => (body.to_vec(), Vec::new()),
     };
+    let responses_entry = kind == "openai-responses" && binding.protocol == "openai-responses";
+    let (outgoing_body, observed_applied) = if responses_entry {
+        apply_observed_responses_fallbacks(binding, &outgoing_body)
+    } else {
+        (outgoing_body, Vec::new())
+    };
+    for _ in &observed_applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+    }
     if kind != "models" {
         enforce_outbound_body_limit(stream, outgoing_body.len())?;
     }
-    let upstream_url = join_upstream(&binding.base_url, &head.path);
-    let client = upstream_client(&upstream_url).map_err(|_| GatewayError::Answered)?;
     let method =
         reqwest::Method::from_bytes(head.method.as_bytes()).unwrap_or(reqwest::Method::POST);
+    let active_index = std::cell::Cell::new(0usize);
     let mut send_upstream = |payload: &[u8]| {
-        let mut request = client
-            .request(method.clone(), &upstream_url)
-            .header("accept-encoding", "identity");
-        for (name, value) in &head.headers {
-            if is_forwarded_request_header(name) {
-                request = request.header(name.as_str(), value.as_str());
+        let mut route_send = |candidate: &GatewayBinding| {
+            let upstream_url = join_upstream(&candidate.base_url, &head.path);
+            let client = upstream_client(&upstream_url)?;
+            let mut request = client
+                .request(method.clone(), &upstream_url)
+                .header("accept-encoding", "identity");
+            for (name, value) in &head.headers {
+                if is_forwarded_request_header(name) {
+                    request = request.header(name.as_str(), value.as_str());
+                }
             }
-        }
-        // Anthropic 只用 `x-api-key`；同时发 Authorization 会被部分上游判为无效凭据。
-        request = if binding.protocol == "anthropic" {
-            request
-                .header("x-api-key", binding.api_key.as_str())
-                .header("anthropic-version", ANTHROPIC_VERSION)
-        } else {
-            request.header("authorization", format!("Bearer {}", binding.api_key))
+            // Anthropic 只用 `x-api-key`；同时发 Authorization 会被部分上游判为无效凭据。
+            request = if candidate.protocol == "anthropic" {
+                request
+                    .header("x-api-key", candidate.api_key.as_str())
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            } else {
+                request.header("authorization", format!("Bearer {}", candidate.api_key))
+            };
+            request = with_opencode_session(
+                request,
+                candidate,
+                head.headers
+                    .get(OPENCODE_SESSION_HEADER)
+                    .map(String::as_str),
+                body,
+            );
+            if kind != "models" {
+                request = request.body(payload.to_vec());
+            }
+            request.send()
         };
-        request = with_opencode_session(
-            request,
-            binding,
-            head.headers
-                .get(OPENCODE_SESSION_HEADER)
-                .map(String::as_str),
-            body,
-        );
-        if kind != "models" {
-            request = request.body(payload.to_vec());
-        }
-        request.send()
+        send_with_route_failover(retry_candidates, &active_index, &mut route_send)
     };
     let responses_fallback_applies =
         kind == "openai-responses" && binding.protocol == "openai-responses";
@@ -1706,7 +2110,11 @@ fn forward(
             &mut send_upstream,
         ) {
             Ok(outcome) => outcome,
-            Err(error) => {
+            Err(ResponsesFallbackFailure::TooLarge(actual)) => {
+                return enforce_outbound_body_limit(stream, actual);
+            }
+            Err(ResponsesFallbackFailure::Upstream(error)) => {
+                mark_route_outcome(binding, 503);
                 return Err(write_upstream_failure(stream, &error.to_string()));
             }
         }
@@ -1715,6 +2123,7 @@ fn forward(
             match send_upstream_with_transient_retry(binding, &outgoing_body, &mut send_upstream) {
                 Ok(response) => response,
                 Err(error) => {
+                    mark_route_outcome(binding, 503);
                     return Err(write_upstream_failure(stream, &error.to_string()));
                 }
             };
@@ -1731,7 +2140,9 @@ fn forward(
     }
     let mut response = fallback_outcome.response;
     let final_request_body = fallback_outcome.body;
+    let response_binding = retry_candidates.get(active_index.get()).unwrap_or(binding);
     let status = response.status();
+    mark_route_outcome(response_binding, status.as_u16());
     let content_type = response
         .headers()
         .get("content-type")
@@ -1744,8 +2155,7 @@ fn forward(
     // 当成正常的流式响应交给客户端，导致真正原因被吞掉。
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
-        let mut raw = Vec::new();
-        let _ = response.read_to_end(&mut raw);
+        let raw = read_error_body(response);
         let header_names = head.headers.keys().cloned().collect::<Vec<_>>().join(",");
         crate::approval::manager::append_event_log(
             "warn",
@@ -1769,7 +2179,7 @@ fn forward(
                 stream,
                 CompatibilityDiagnosticInput {
                     status,
-                    binding,
+                    binding: response_binding,
                     client_protocol: kind,
                     request: &request,
                     upstream_body: &raw,
@@ -1779,7 +2189,7 @@ fn forward(
             )?;
             if kind != "models" {
                 record_usage(
-                    binding,
+                    response_binding,
                     &display_model,
                     streaming,
                     status.as_u16(),
@@ -1794,7 +2204,7 @@ fn forward(
             stream,
             status.as_u16(),
             &content_type,
-            &binding.id,
+            &response_binding.id,
             raw.len(),
         )
         .map_err(|_| GatewayError::Answered)?;
@@ -1802,7 +2212,7 @@ fn forward(
         let _ = stream.flush();
         if kind != "models" {
             record_usage(
-                binding,
+                response_binding,
                 &display_model,
                 streaming,
                 status.as_u16(),
@@ -1816,9 +2226,10 @@ fn forward(
 
     // 流式：长度不可知，用 `Connection: close` 结束，客户端按 EOF 收尾。
     if streaming {
-        write_stream_head(stream, status.as_u16(), &content_type, &binding.id)
+        write_stream_head(stream, status.as_u16(), &content_type, &response_binding.id)
             .map_err(|_| GatewayError::Answered)?;
-        let mut scanner = StreamScanner::new(binding.protocol.clone());
+        let mut scanner = StreamScanner::new(response_binding.protocol.clone());
+        let mut content_sanitizer = ReasoningTagSanitizer::default();
         let mut pending = String::new();
         let mut chunk = [0_u8; 8192];
         let mut client_gone = false;
@@ -1833,7 +2244,8 @@ fn forward(
             while let Some(position) = pending.find('\n') {
                 let line = pending[..position].trim_end_matches('\r').to_string();
                 pending.drain(..=position);
-                let rewritten = rewrite_sse_model_line(&line, &display_model);
+                let rewritten =
+                    rewrite_sse_model_line(&line, &display_model, &mut content_sanitizer);
                 if stream.write_all(rewritten.as_bytes()).is_err()
                     || stream.write_all(b"\n").is_err()
                 {
@@ -1847,14 +2259,25 @@ fn forward(
             }
         }
         if !client_gone && !pending.is_empty() {
-            let rewritten = rewrite_sse_model_line(&pending, &display_model);
+            let rewritten =
+                rewrite_sse_model_line(&pending, &display_model, &mut content_sanitizer);
             let _ = stream.write_all(rewritten.as_bytes());
         }
         let _ = stream.flush();
+        if content_sanitizer.removed() > 0 {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "本机网关已清洗原生 Responses 流式输出中的推理控制标签：count={} model={}",
+                    content_sanitizer.removed(),
+                    display_model
+                ),
+            );
+        }
         let usage = scanner.usage;
         if kind != "models" {
             record_usage(
-                binding,
+                response_binding,
                 &display_model,
                 true,
                 status.as_u16(),
@@ -1867,17 +2290,36 @@ fn forward(
     }
 
     // 非流式：先收完再写，才能给出准确的 content-length。
-    let mut raw = Vec::new();
-    let _ = response.read_to_end(&mut raw);
-    if raw.len() > RESPONSE_BODY_LIMIT {
-        raw.truncate(RESPONSE_BODY_LIMIT);
-    }
+    let raw = match read_success_body(response) {
+        Ok(raw) => raw,
+        Err(actual) => {
+            let message = format!(
+                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+            );
+            let _ = write_json_error(
+                stream,
+                502,
+                "himind_gateway_response_too_large",
+                &message,
+            );
+            record_usage(
+                response_binding,
+                &display_model,
+                false,
+                502,
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
+    };
     let output_raw = rewrite_json_model(&raw, &display_model);
     write_buffered_head(
         stream,
         status.as_u16(),
         &content_type,
-        &binding.id,
+        &response_binding.id,
         output_raw.len(),
     )
     .map_err(|_| GatewayError::Answered)?;
@@ -1885,10 +2327,10 @@ fn forward(
     let _ = stream.flush();
     if kind != "models" {
         let usage = serde_json::from_slice::<Value>(&raw)
-            .map(|value| extract_usage(&binding.protocol, &value))
+            .map(|value| extract_usage(&response_binding.protocol, &value))
             .unwrap_or_default();
         record_usage(
-            binding,
+            response_binding,
             &display_model,
             false,
             status.as_u16(),
@@ -1904,6 +2346,7 @@ fn forward(
 fn forward_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
+    retry_candidates: &[GatewayBinding],
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
@@ -1929,27 +2372,30 @@ fn forward_translated(
     let attempted_normalizations = openai_normalized.attempted.clone();
     let openai_payload = openai_normalized.request.to_string();
     enforce_outbound_body_limit(stream, openai_payload.len())?;
-    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut send = || {
+    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
+    let active_index = std::cell::Cell::new(0usize);
+    let mut send = |candidate: &GatewayBinding| {
+        let client = upstream_client(&candidate.base_url)?;
         let request = client
-            .post(join_upstream(&binding.base_url, "/v1/chat/completions"))
-            .header("authorization", format!("Bearer {}", binding.api_key))
+            .post(join_upstream(&candidate.base_url, "/v1/chat/completions"))
+            .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
-        with_opencode_session(request, binding, None, body)
+        with_opencode_session(request, candidate, None, body)
             .body(openai_payload.clone())
             .send()
     };
-    let mut response = match send_with_transient_retry(binding, &mut send) {
-        Ok(response) => response,
-        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
-    };
+    let mut response = send_with_transient_retry(binding, &mut || {
+        send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+    })
+    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
     let status = response.status();
+    mark_route_outcome(binding, status.as_u16());
     if !status.is_success() {
         // 上游错误原样翻成 Anthropic 的错误体，客户端才能显示真实原因。
         let upstream_headers = response.headers().clone();
-        let mut raw_error = Vec::new();
-        let _ = response.read_to_end(&mut raw_error);
+        let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
@@ -2051,8 +2497,30 @@ fn forward_translated(
         return Ok(());
     }
 
-    let mut raw = Vec::new();
-    let _ = response.read_to_end(&mut raw);
+    let raw = match read_success_body(response) {
+        Ok(raw) => raw,
+        Err(actual) => {
+            let message = format!(
+                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+            );
+            let _ = write_json_error(
+                stream,
+                502,
+                "himind_gateway_response_too_large",
+                &message,
+            );
+            record_usage(
+                binding,
+                &display_model,
+                false,
+                502,
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
+    };
     let openai: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
     let anthropic =
         match crate::app::anthropic_openai::response_to_anthropic(&openai, &display_model) {
@@ -2086,6 +2554,7 @@ fn forward_translated(
 fn forward_anthropic_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
+    retry_candidates: &[GatewayBinding],
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
@@ -2110,33 +2579,38 @@ fn forward_anthropic_responses_translated(
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
     let mut attempted_normalizations = responses_normalized.attempted.clone();
     let payload = responses_normalized.request.to_string();
+    let (payload, observed_applied) =
+        apply_observed_responses_fallbacks(binding, payload.as_bytes());
+    for _ in &observed_applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+    }
     enforce_outbound_body_limit(stream, payload.len())?;
-    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut send = |payload: &[u8]| {
+    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
+    let active_index = std::cell::Cell::new(0usize);
+    let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+        let client = upstream_client(&candidate.base_url)?;
         let request_builder = client
-            .post(join_upstream(&binding.base_url, "/responses"))
-            .header("authorization", format!("Bearer {}", binding.api_key))
+            .post(join_upstream(&candidate.base_url, "/responses"))
+            .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
-        with_opencode_session(request_builder, binding, None, body)
+        with_opencode_session(request_builder, candidate, None, body)
             .body(payload.to_vec())
             .send()
     };
-    let fallback_outcome =
-        match send_responses_with_compatibility_fallback(binding, payload.as_bytes(), &mut send) {
-            Ok(outcome) => outcome,
-            Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
-        };
-    for _ in &fallback_outcome.applied {
-        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
-    }
-    let mut response = fallback_outcome.response;
-    let final_request_body = fallback_outcome.body;
+    let mut response = send_with_transient_retry(binding, &mut || {
+        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+            send(candidate, &payload)
+        })
+    })
+    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
+    let final_request_body = Some(payload.clone());
     let status = response.status();
+    mark_route_outcome(binding, status.as_u16());
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
-        let mut raw_error = Vec::new();
-        let _ = response.read_to_end(&mut raw_error);
+        let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
             let request =
@@ -2246,8 +2720,30 @@ fn forward_anthropic_responses_translated(
         return Ok(());
     }
 
-    let mut raw = Vec::new();
-    let _ = response.read_to_end(&mut raw);
+    let raw = match read_success_body(response) {
+        Ok(raw) => raw,
+        Err(actual) => {
+            let message = format!(
+                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+            );
+            let _ = write_json_error(
+                stream,
+                502,
+                "himind_gateway_response_too_large",
+                &message,
+            );
+            record_usage(
+                binding,
+                &display_model,
+                false,
+                502,
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
+    };
     let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
     let usage = extract_usage("openai-responses", &upstream);
     if streaming {
@@ -2297,6 +2793,7 @@ fn forward_anthropic_responses_translated(
 fn forward_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
+    retry_candidates: &[GatewayBinding],
     request: &Value,
     client_session: Option<&str>,
     started: Instant,
@@ -2317,12 +2814,14 @@ fn forward_responses_translated(
     let attempted_normalizations = chat_normalized.attempted.clone();
     let chat_payload = chat_normalized.request.to_string();
     enforce_outbound_body_limit(stream, chat_payload.len())?;
-    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let opencode_session = opencode_session_for_value(binding, client_session, request);
-    let mut send = || {
+    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
+    let active_index = std::cell::Cell::new(0usize);
+    let mut send = |candidate: &GatewayBinding| {
+        let client = upstream_client(&candidate.base_url)?;
+        let opencode_session = opencode_session_for_value(candidate, client_session, request);
         let mut upstream_request = client
-            .post(join_upstream(&binding.base_url, "/chat/completions"))
-            .header("authorization", format!("Bearer {}", binding.api_key))
+            .post(join_upstream(&candidate.base_url, "/chat/completions"))
+            .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
         if let Some(session) = opencode_session.as_deref() {
@@ -2330,15 +2829,16 @@ fn forward_responses_translated(
         }
         upstream_request.body(chat_payload.clone()).send()
     };
-    let mut response = match send_with_transient_retry(binding, &mut send) {
-        Ok(response) => response,
-        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
-    };
+    let mut response = send_with_transient_retry(binding, &mut || {
+        send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+    })
+    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
     let status = response.status();
+    mark_route_outcome(binding, status.as_u16());
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
-        let mut raw_error = Vec::new();
-        let _ = response.read_to_end(&mut raw_error);
+        let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
             let request = request.clone();
@@ -2448,8 +2948,30 @@ fn forward_responses_translated(
         return Ok(());
     }
 
-    let mut raw = Vec::new();
-    let _ = response.read_to_end(&mut raw);
+    let raw = match read_success_body(response) {
+        Ok(raw) => raw,
+        Err(actual) => {
+            let message = format!(
+                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+            );
+            let _ = write_json_error(
+                stream,
+                502,
+                "himind_gateway_response_too_large",
+                &message,
+            );
+            record_usage(
+                binding,
+                &display_model,
+                false,
+                502,
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
+    };
     let chat: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
     let payload =
         crate::app::responses_chat::response_to_responses(&chat, &display_model).to_string();
@@ -2481,6 +3003,7 @@ fn forward_responses_translated(
 fn forward_chat_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
+    retry_candidates: &[GatewayBinding],
     body: &[u8],
     started: Instant,
 ) -> Result<(), GatewayError> {
@@ -2503,33 +3026,38 @@ fn forward_chat_responses_translated(
         normalize_compatibility_request(stream, binding, "openai-responses", responses_body)?;
     let mut attempted_normalizations = responses_normalized.attempted.clone();
     let payload = responses_normalized.request.to_string();
+    let (payload, observed_applied) =
+        apply_observed_responses_fallbacks(binding, payload.as_bytes());
+    for _ in &observed_applied {
+        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+    }
     enforce_outbound_body_limit(stream, payload.len())?;
-    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut send = |payload: &[u8]| {
+    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
+    let active_index = std::cell::Cell::new(0usize);
+    let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+        let client = upstream_client(&candidate.base_url)?;
         let upstream_request = client
-            .post(join_upstream(&binding.base_url, "/responses"))
-            .header("authorization", format!("Bearer {}", binding.api_key))
+            .post(join_upstream(&candidate.base_url, "/responses"))
+            .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
-        with_opencode_session(upstream_request, binding, None, body)
+        with_opencode_session(upstream_request, candidate, None, body)
             .body(payload.to_vec())
             .send()
     };
-    let fallback_outcome =
-        match send_responses_with_compatibility_fallback(binding, payload.as_bytes(), &mut send) {
-            Ok(outcome) => outcome,
-            Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
-        };
-    for _ in &fallback_outcome.applied {
-        attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
-    }
-    let mut response = fallback_outcome.response;
-    let final_request_body = fallback_outcome.body;
+    let mut response = send_with_transient_retry(binding, &mut || {
+        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+            send(candidate, &payload)
+        })
+    })
+    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
+    let final_request_body = Some(payload.clone());
     let status = response.status();
+    mark_route_outcome(binding, status.as_u16());
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
-        let mut raw_error = Vec::new();
-        let _ = response.read_to_end(&mut raw_error);
+        let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
         if matches!(status.as_u16(), 400 | 422) {
             let request =
@@ -2628,8 +3156,30 @@ fn forward_chat_responses_translated(
         return Ok(());
     }
 
-    let mut raw = Vec::new();
-    let _ = response.read_to_end(&mut raw);
+    let raw = match read_success_body(response) {
+        Ok(raw) => raw,
+        Err(actual) => {
+            let message = format!(
+                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+            );
+            let _ = write_json_error(
+                stream,
+                502,
+                "himind_gateway_response_too_large",
+                &message,
+            );
+            record_usage(
+                binding,
+                &display_model,
+                false,
+                502,
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
+    };
     let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
     let usage = extract_usage("openai-responses", &upstream);
     let payload = match crate::app::chat_responses::response_to_chat(&upstream, &display_model) {
@@ -3585,6 +4135,28 @@ fn is_forwarded_request_header(name: &str) -> bool {
     )
 }
 
+fn read_error_body(response: reqwest::blocking::Response) -> Vec<u8> {
+    let mut raw = Vec::new();
+    let mut reader = response.take(ERROR_BODY_LIMIT as u64 + 1);
+    let _ = reader.read_to_end(&mut raw);
+    if raw.len() > ERROR_BODY_LIMIT {
+        raw.truncate(ERROR_BODY_LIMIT);
+    }
+    raw
+}
+
+/// 非流式成功响应也必须有上界；超过时返回实际读到的字节数，由调用方回 502，
+/// 而不是悄悄截断成一个非法 JSON。
+fn read_success_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, usize> {
+    let mut raw = Vec::new();
+    let mut reader = response.take(RESPONSE_BODY_LIMIT as u64 + 1);
+    let _ = reader.read_to_end(&mut raw);
+    if raw.len() > RESPONSE_BODY_LIMIT {
+        return Err(raw.len());
+    }
+    Ok(raw)
+}
+
 fn write_upstream_failure(stream: &mut TcpStream, detail: &str) -> GatewayError {
     let request_id = current_request_id();
     crate::approval::manager::append_event_log(
@@ -4148,12 +4720,67 @@ mod tests {
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["model"], "service-a/model-a");
 
+        let mut sanitizer = ReasoningTagSanitizer::default();
         let line = rewrite_sse_model_line(
             r#"data: {"model":"model-a","delta":"ok"}"#,
             "service-a/model-a",
+            &mut sanitizer,
         );
         assert!(line.contains(r#""model":"service-a/model-a""#));
     }
+
+    #[test]
+    fn native_responses_request_sanitizes_assistant_history_only() {
+        let mut request = json!({
+            "model": "model-a",
+            "input": [
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "ok</thought></thought>"}
+                ]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "keep</thought>"}
+                ]}
+            ]
+        });
+        assert_eq!(sanitize_responses_request_input(&mut request), 2);
+        assert_eq!(request["input"][0]["content"][0]["text"], "ok");
+        assert_eq!(request["input"][1]["content"][0]["text"], "keep</thought>");
+    }
+
+    #[test]
+    fn native_responses_non_streaming_sanitizes_output_text() {
+        let raw = br#"{"model":"model-a","output":[{"type":"message","content":[{"type":"output_text","text":"ok</thought></thought>"}]}]}"#;
+        let response = rewrite_json_model(raw, "service-a/model-a");
+        let value: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(value["output"][0]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn native_responses_sse_sanitizes_split_reasoning_tags() {
+        let mut sanitizer = ReasoningTagSanitizer::default();
+        let first = rewrite_sse_model_line(
+            r#"data: {"type":"response.output_text.delta","delta":"ok</thou"}"#,
+            "service-a/model-a",
+            &mut sanitizer,
+        );
+        let second = rewrite_sse_model_line(
+            r#"data: {"type":"response.output_text.delta","delta":"ght>done"}"#,
+            "service-a/model-a",
+            &mut sanitizer,
+        );
+        let done = rewrite_sse_model_line(
+            r#"data: {"type":"response.output_text.done","text":"okdone</thought>"}"#,
+            "service-a/model-a",
+            &mut sanitizer,
+        );
+        assert!(first.contains(r#""delta":"ok""#), "{first}");
+        assert!(second.contains(r#""delta":"done""#), "{second}");
+        assert!(done.contains(r#""text":"okdone""#), "{done}");
+        assert!(!first.contains("</thought>"), "{first}");
+        assert!(!second.contains("</thought>"), "{second}");
+        assert!(!done.contains("</thought>"), "{done}");
+    }
+
     #[test]
     fn upstream_url_does_not_duplicate_v1() {
         assert_eq!(
@@ -5500,6 +6127,70 @@ mod tests {
     }
 
     #[test]
+    fn observed_fallbacks_predegrade_future_requests() {
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-gateway-observed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        crate::store::ai_capability_observations::reset_cache_for_test();
+
+        let mut binding = binding("codex", "openai-responses", "observed-token");
+        binding.base_url = "https://vectide.cn/v1".to_string();
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "x"}
+            ]
+        })
+        .to_string();
+        for _ in 0..2 {
+            crate::store::ai_capability_observations::record_success(
+                "vectide_responses",
+                "openai-responses",
+                "tool_history",
+            )
+            .unwrap();
+        }
+        let (next, applied) = apply_observed_responses_fallbacks(&binding, body.as_bytes());
+        assert_eq!(applied, vec!["tool_history"]);
+        let next: Value = serde_json::from_slice(&next).unwrap();
+        assert!(
+            next["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call")),
+            "next={next}"
+        );
+
+        crate::store::ai_capability_observations::reset_cache_for_test();
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gateway_binding_debug_redacts_upstream_and_local_secrets() {
+        let binding = binding("codex", "openai-responses", "local-token-secret");
+        let debug = format!("{binding:?}");
+        assert!(!debug.contains("real-secret"), "{debug}");
+        assert!(!debug.contains("local-token-secret"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
     fn request_ids_are_unique_and_thread_local() {
         let first = new_request_id();
         let second = new_request_id();
@@ -5507,6 +6198,280 @@ mod tests {
         set_current_request_id(&first);
         assert_eq!(current_request_id(), first);
         assert!(first.starts_with("req_himind_"));
+    }
+
+    #[test]
+    fn route_failover_treats_auth_rate_limit_and_transient_as_retryable() {
+        for status in [401, 403, 408, 429, 500, 502, 503, 504] {
+            assert!(route_status_is_retryable(status), "status={status}");
+        }
+        for status in [400, 404, 422] {
+            assert!(!route_status_is_retryable(status), "status={status}");
+        }
+    }
+
+    #[test]
+    fn route_health_marks_403_and_429_as_cooling_down() {
+        let mut binding = binding("codex", "openai-responses", "health-token");
+        binding.base_url = "https://route-health.example/v1".to_string();
+        binding.upstream_model = "route-health-model".to_string();
+        assert!(crate::store::ai_route_health::is_healthy(
+            &binding.base_url,
+            &binding.upstream_model
+        ));
+        mark_route_outcome(&binding, 403);
+        assert!(!crate::store::ai_route_health::is_healthy(
+            &binding.base_url,
+            &binding.upstream_model
+        ));
+        mark_route_outcome(&binding, 200);
+        assert!(crate::store::ai_route_health::is_healthy(
+            &binding.base_url,
+            &binding.upstream_model
+        ));
+        mark_route_outcome(&binding, 429);
+        assert!(!crate::store::ai_route_health::is_healthy(
+            &binding.base_url,
+            &binding.upstream_model
+        ));
+        mark_route_outcome(&binding, 200);
+        assert!(crate::store::ai_route_health::is_healthy(
+            &binding.base_url,
+            &binding.upstream_model
+        ));
+    }
+
+    fn assert_route_failover_for_status(status_line: &'static str, good_body: &'static str) {
+        let bad = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bad_address = bad.local_addr().unwrap();
+        let bad_thread = thread::spawn(move || {
+            let (mut stream, _) = bad.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let body = br#"{"error":{"message":"primary unavailable"}}"#;
+            let head = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+        let good = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_address = good.local_addr().unwrap();
+        let good_thread = thread::spawn(move || {
+            let (mut stream, _) = good.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                good_body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(good_body.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = format!("failover-token-{}", new_request_id());
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new({
+            let token = token.clone();
+            move || {
+                let mut primary = binding("codex", "openai-responses", &token);
+                primary.id = "codex:profile:service/model-a:one:model-a".to_string();
+                primary.base_url = format!("http://{bad_address}");
+                let mut secondary = primary.clone();
+                secondary.id = "codex:profile:service/model-a:two:model-a".to_string();
+                secondary.base_url = format!("http://{good_address}");
+                vec![primary, secondary]
+            }
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        bad_thread.join().unwrap();
+        good_thread.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains(good_body), "{response}");
+    }
+
+    #[test]
+    fn route_failover_handles_403() {
+        assert_route_failover_for_status(
+            "403 Forbidden",
+            r#"{"id":"resp-failover-403","object":"response","output":[],"usage":{"input_tokens":2,"output_tokens":1}}"#,
+        );
+    }
+
+    #[test]
+    fn route_failover_handles_429() {
+        assert_route_failover_for_status(
+            "429 Too Many Requests",
+            r#"{"id":"resp-failover-429","object":"response","output":[],"usage":{"input_tokens":2,"output_tokens":1}}"#,
+        );
+    }
+
+    #[test]
+    fn same_request_route_failover_skips_failed_primary() {
+        let bad = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bad_address = bad.local_addr().unwrap();
+        let bad_thread = thread::spawn(move || {
+            let (mut stream, _) = bad.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let body = br#"{"error":{"message":"primary down"}}"#;
+            let head = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+        let good = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_address = good.local_addr().unwrap();
+        let good_thread = thread::spawn(move || {
+            let (mut stream, _) = good.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let body = br#"{"id":"resp-failover","object":"response","output":[],"usage":{"input_tokens":2,"output_tokens":1}}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "failover-token".to_string();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new({
+            let token = token.clone();
+            move || {
+                let mut primary = binding("codex", "openai-responses", &token);
+                primary.id = "codex:profile:service/model-a:one:model-a".to_string();
+                primary.base_url = format!("http://{bad_address}");
+                let mut secondary = primary.clone();
+                secondary.id = "codex:profile:service/model-a:two:model-a".to_string();
+                secondary.base_url = format!("http://{good_address}");
+                vec![primary, secondary]
+            }
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        bad_thread.join().unwrap();
+        good_thread.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("resp-failover"), "{response}");
+    }
+
+    #[test]
+    fn native_responses_stream_sanitizes_reasoning_tags_end_to_end() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let upstream_seen = seen.clone();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            if let Ok(RequestRead::Request(_, body)) = read_request(&mut stream) {
+                *upstream_seen.lock().unwrap() = body;
+            }
+            let body = concat!(
+                r#"data: {"type":"response.output_text.delta","delta":"ok</thou"}"#,
+                "\n\n",
+                r#"data: {"type":"response.output_text.delta","delta":"ght>done"}"#,
+                "\n\n",
+                r#"data: {"type":"response.completed","response":{"id":"resp-native","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"okdone</thought>"}]}]}}"#,
+                "\n\n",
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "native-stream-token".to_string();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new({
+            let token = token.clone();
+            move || {
+                let mut binding = binding("codex", "openai-responses", &token);
+                binding.base_url = format!("http://{address}");
+                vec![binding]
+            }
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "before"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "prior</thought></thought>"}
+                ]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}
+                ]}
+            ],
+            "stream": true
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\naccept: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("event-stream"), "{response}");
+        assert!(!response.contains("</thought>"), "{response}");
+        assert!(!response.contains("</think>"), "{response}");
+        assert!(response.contains(r#""delta":"ok""#), "{response}");
+        assert!(response.contains(r#""delta":"done""#), "{response}");
+        assert!(response.contains(r#""text":"okdone""#), "{response}");
+
+        let upstream_request = String::from_utf8_lossy(&seen.lock().unwrap()).to_string();
+        assert!(!upstream_request.contains("</thought>"), "{upstream_request}");
+        assert!(
+            upstream_request.contains(r#""role":"assistant""#),
+            "{upstream_request}"
+        );
     }
 
     #[test]

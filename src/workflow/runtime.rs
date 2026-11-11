@@ -90,6 +90,7 @@ pub(crate) fn execute_runtime_step(
         .unwrap_or_default();
     let mut runtime_facts: Option<(String, String, String)> = None;
     let mut acp_facts: Option<Value> = None;
+    let mut usage = None;
     let output = match provider.as_str() {
         "personal.codex" => {
             // `cli:codex:<id>` 里的 id 原样转给 Codex；没声明就沿用 Codex 自己的默认模型。
@@ -140,6 +141,7 @@ pub(crate) fn execute_runtime_step(
                 run_id,
                 step.id.as_str(),
                 model_alias,
+                workflow_access_for_risk(&step.risk_level),
                 is_canceled,
             )?;
             // 把“实际用了哪个模型/哪类服务”写进步骤输出，随运行事实一起留痕。
@@ -148,6 +150,7 @@ pub(crate) fn execute_runtime_step(
                 outcome.service_source.to_string(),
                 outcome.endpoint.clone(),
             ));
+            usage = outcome.usage;
             outcome.text
         }
         provider if crate::runtime::acp::is_provider(provider) => {
@@ -215,7 +218,11 @@ pub(crate) fn execute_runtime_step(
         }
     }
     validate_runtime_output(package, runtime.result_schema.trim(), &result)?;
-    Ok(WorkflowStepExecution::output(result))
+    Ok(WorkflowStepExecution {
+        output: result,
+        artifacts: Vec::new(),
+        usage,
+    })
 }
 
 fn parse_runtime_payload(output: &str) -> Option<Value> {
@@ -383,6 +390,22 @@ fn strip_cli_model_prefix<'a>(alias: Option<&'a str>) -> Option<&'a str> {
         .filter(|model| !model.is_empty())
 }
 
+/// 步骤风险等级 -> 实际需要的文件访问级别。
+///
+/// 只读步骤必须走 DSH 的 `read-only`：它不创建写授权，也就不要求调用方拥有
+/// 目标目录的 WRITE_DAC / WRITE_OWNER。把只读步骤也按 workspace-write 跑，
+/// 会让「只做审查」的任务在 ACL 受限的机器上直接失败。
+///
+/// 判定用白名单倒推：只有明确声明为只读的才降级，其余一律按可写处理——
+/// 宁可多要权限，也不能让需要写盘的步骤静默变成只读。
+fn workflow_access_for_risk(risk_level: &str) -> crate::runtime::deepseek_harness::WorkflowAccess {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match risk_level.trim().to_ascii_uppercase().as_str() {
+        "READ_ONLY" | "R1" => WorkflowAccess::Read,
+        _ => WorkflowAccess::Write,
+    }
+}
+
 fn enforce_runtime_network_policy(
     provider: &str,
     allow_network: Option<bool>,
@@ -444,6 +467,32 @@ fn fixture_runtime_output(
             }
         })
         .to_string());
+    }
+    // Mission verification is a deterministic host-bound fixture. It echoes
+    // only identities and host checks supplied in the run input; it can never
+    // turn an arbitrary implementation into a pass.
+    if step_id == "VERIFY" {
+        let input_checks = input.get("host_checks").and_then(Value::as_array).cloned().unwrap_or_default();
+        let checks = input_checks.iter().filter_map(|check| {
+            let command = check.get("command")?.as_str()?;
+            let exit_code = check.get("exit_code")?.as_i64()?;
+            let digest = check.get("output_sha256")?.as_str().unwrap_or_default();
+            Some(serde_json::json!({
+                "command": command,
+                "exit_code": exit_code,
+                "detail": format!("source=host; output_sha256={digest}")
+            }))
+        }).collect::<Vec<_>>();
+        let host_passed = !checks.is_empty() && checks.iter().all(|check| check["exit_code"] == 0);
+        let candidate = input.get("candidate_before").cloned().unwrap_or(Value::Null);
+        return Ok(serde_json::json!({
+            "passed": host_passed && candidate.get("candidate_id").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
+            "verified_task_ids": [input.get("task_id").cloned().unwrap_or(Value::Null)],
+            "plan_sha256": input.get("expected_plan_sha256").cloned().unwrap_or(Value::Null),
+            "candidate": candidate,
+            "checks": checks,
+            "reasons": if host_passed { Vec::<String>::new() } else { vec!["host checks incomplete or failed".to_string()] }
+        }).to_string());
     }
     let state_dir = std::path::Path::new(workspace).join(".himind-workflow-fixture");
     std::fs::create_dir_all(&state_dir)?;
@@ -1068,6 +1117,21 @@ mod tests {
         assert!(strip_acp_model_prefix("acp.claude", Some("himind:svc:x")).is_err());
         // 缺 model 段。
         assert!(strip_acp_model_prefix("acp.claude", Some("acp:claude:")).is_err());
+    }
+
+    /// 只读步骤必须走 read-only 权限模式：它不创建写授权，也就不要求调用方
+    /// 拥有目标目录的 WRITE_DAC / WRITE_OWNER。
+    #[test]
+    fn only_read_only_risk_steps_request_read_only_access() {
+        use crate::runtime::deepseek_harness::WorkflowAccess;
+        assert_eq!(workflow_access_for_risk("read_only"), WorkflowAccess::Read);
+        assert_eq!(workflow_access_for_risk("READ_ONLY"), WorkflowAccess::Read);
+        assert_eq!(workflow_access_for_risk("R1"), WorkflowAccess::Read);
+        // 任何可能写盘或执行进程的等级都按可写处理：宁可多要权限，
+        // 也不能让需要写盘的步骤静默退化成只读。
+        for risk in ["local_write", "R2", "process", "network", "R3", "R4", "system", "", "unknown"] {
+            assert_eq!(workflow_access_for_risk(risk), WorkflowAccess::Write, "risk={risk}");
+        }
     }
 
     #[test]

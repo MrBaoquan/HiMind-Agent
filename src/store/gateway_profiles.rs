@@ -205,7 +205,9 @@ fn validate_routes(
     if inputs.is_empty() {
         return Err("聚合入口至少需要一个模型路由".into());
     }
-    let mut exposed = HashSet::new();
+    // 同一个 exposed_model 允许配置多条上游路由（故障转移）；只拒绝完全相同的
+    // “别名 + 服务 + 上游模型”三元组。
+    let mut route_keys = HashSet::new();
     let mut routes = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.into_iter().enumerate() {
         let service_id = input.service_id.trim().to_string();
@@ -238,8 +240,15 @@ fn validate_routes(
             input.exposed_model
         };
         let exposed_model = normalize_exposed_model(&exposed_model)?;
-        if !exposed.insert(exposed_model.clone()) {
-            return Err(format!("对外模型 ID 重复：{exposed_model}").into());
+        if !route_keys.insert((
+            exposed_model.clone(),
+            service_id.clone(),
+            upstream_model.clone(),
+        )) {
+            return Err(format!(
+                "重复的模型路由：{exposed_model} 已指向 {service_id}/{upstream_model}"
+            )
+            .into());
         }
         routes.push(GatewayModelRoute {
             exposed_model,
@@ -475,10 +484,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_exposed_model() {
+    fn duplicate_exposed_model_allows_distinct_routes_but_rejects_exact_duplicate() {
         with_isolated_home(|| {
             add_service("a", AIServiceProtocol::OpenaiChat, &["m1", "m2"]);
-            let error = save(profile_input(
+            let saved = save(profile_input(
                 "duplicate",
                 vec![
                     GatewayModelRouteInput {
@@ -491,6 +500,26 @@ mod tests {
                         exposed_model: "same".to_string(),
                         service_id: "a".to_string(),
                         upstream_model: "m2".to_string(),
+                        enabled: true,
+                    },
+                ],
+            ))
+            .expect("distinct upstream routes may share an exposed model");
+            assert_eq!(saved.routes.len(), 2);
+
+            let error = save(profile_input(
+                "duplicate",
+                vec![
+                    GatewayModelRouteInput {
+                        exposed_model: "same".to_string(),
+                        service_id: "a".to_string(),
+                        upstream_model: "m1".to_string(),
+                        enabled: true,
+                    },
+                    GatewayModelRouteInput {
+                        exposed_model: "same".to_string(),
+                        service_id: "a".to_string(),
+                        upstream_model: "m1".to_string(),
                         enabled: true,
                     },
                 ],

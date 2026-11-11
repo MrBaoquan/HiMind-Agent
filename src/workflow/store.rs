@@ -526,6 +526,28 @@ impl WorkflowStore {
         load_from_directory(&version_root)
     }
 
+    /// Load an exact installed version and prove its content still matches the
+    /// digest recorded with the Mission. Unlike `load_enabled_for_run`, this does
+    /// not silently follow the current version or a development override.
+    pub(crate) fn load_pinned_version(
+        &self,
+        package_id: &str,
+        version: &str,
+        expected_digest: &str,
+    ) -> Result<(WorkflowPackage, String), Box<dyn Error>> {
+        if expected_digest.trim().is_empty() {
+            return Err("pinned workflow digest is required".into());
+        }
+        let package = self.load_version(package_id, version)?;
+        let actual_digest = package_digest(&package.source_root)?;
+        if actual_digest != expected_digest.trim().to_ascii_lowercase() {
+            return Err(format!(
+                "workflow package content differs from the Mission pin: {package_id}@{version}"
+            ).into());
+        }
+        Ok((package, actual_digest))
+    }
+
     pub(crate) fn load_enabled_for_run(
         &self,
         package_id: &str,

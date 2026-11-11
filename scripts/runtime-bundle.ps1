@@ -140,6 +140,13 @@ function Copy-RuntimeBundle {
     $token = [Guid]::NewGuid().ToString("N")
     $staging = Join-Path $parent ".runtime.installing-$token"
     $backup = Join-Path $parent ".runtime.previous-$token"
+    foreach ($candidatePath in @($destination, $staging, $backup)) {
+        $resolvedTarget = [IO.Path]::GetFullPath($candidatePath)
+        $resolvedParent = [IO.Path]::GetFullPath($parent).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $resolvedTarget.StartsWith($resolvedParent, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Runtime temporary path escaped its target parent: $resolvedTarget"
+        }
+    }
     $installed = $false
     try {
         New-Item -ItemType Directory -Path $staging -Force | Out-Null

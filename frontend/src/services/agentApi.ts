@@ -178,13 +178,14 @@ export type AgentActivityItem = {
     }> | null;
 };
 
-export type MissionStatus = 'draft' | 'planned' | 'awaiting_confirmation' | 'active' | 'waiting' | 'completed' | 'failed' | 'canceled';
+export type MissionStatus = 'draft' | 'awaiting_assignment' | 'planned' | 'awaiting_confirmation' | 'active' | 'waiting' | 'completed' | 'failed' | 'canceled';
 export type MissionTaskStatus = 'proposed' | 'blocked' | 'ready' | 'running' | 'awaiting_verification' | 'failed' | 'completed' | 'canceled';
 
 export type MissionExecutionBinding = {
     executor: string;
     model: string;
     role_id: string;
+    service_id?: string;
 };
 
 export type MissionTaskSpec = {
@@ -204,6 +205,8 @@ export type MissionBudget = {
     max_rounds: number;
     max_minutes: number;
     max_repair_attempts: number;
+    max_total_tokens: number | null;
+    max_cost: number | null;
 };
 
 export type MissionPlanProposal = {
@@ -227,6 +230,70 @@ export type MissionExecutionOption = {
     models: Array<{ alias: string; label: string }>;
 };
 
+export type MissionWorkflowPin = {
+    workflow_id: string;
+    workflow_version: string;
+    workflow_sha256: string;
+    entrypoint: string;
+};
+
+export type MissionPlanMode = 'imported' | 'generated';
+
+export type MissionHandoffInput = {
+    idempotency_key: string;
+    source_client: string;
+    source_reference: string;
+    source_message_refs?: string[];
+    context_summary?: string;
+    title: string;
+    objective?: string;
+    workspace: MissionWorkspace;
+    acceptance_criteria?: string[];
+    workflow: MissionWorkflowPin;
+    plan_mode: MissionPlanMode;
+    imported_plan?: MissionPlanProposal | null;
+};
+
+export type MissionRoleAssignment = {
+    role_id: string;
+    label: string;
+    executor: string;
+    service_id: string;
+    model: string;
+};
+
+export type MissionTaskRoleMapping = {
+    task_id: string;
+    role_id: string;
+};
+
+export type MissionAssignmentInput = {
+    roles: MissionRoleAssignment[];
+    task_roles: MissionTaskRoleMapping[];
+    applied_by: string;
+    recommended: boolean;
+};
+
+export type MissionRoleOption = {
+    role_id: string;
+    label: string;
+    brief: string;
+    recommended_executor: string;
+    recommended_service_id: string;
+    recommended_model: string;
+    model_override_supported: boolean;
+    availability: string;
+    unavailable_reason: string;
+};
+
+export type MissionAssignmentOptions = {
+    workflow_id: string;
+    workflow_version: string;
+    workflow_sha256: string;
+    roles: MissionRoleOption[];
+    source: string;
+};
+
 export type MissionCreateInput = {
     title: string;
     objective: string;
@@ -237,6 +304,8 @@ export type MissionCreateInput = {
 export type MissionConfirmation = {
     plan_sha256: string;
     selected_task_ids: string[];
+    approved_absolute_read_paths: string[];
+    approved_absolute_write_paths: string[];
     approved_paths: string[];
     confirmed_by: string;
     confirmed_at: string;
@@ -248,6 +317,24 @@ export type MissionTaskView = {
     attempt_run_id: string;
     verification_passed: boolean | null;
     evidence_refs: string[];
+};
+
+export type MissionHandoff = {
+    idempotency_key: string;
+    source_client: string;
+    source_reference: string;
+    source_message_refs: string[];
+    context_summary: string;
+    request_sha256: string;
+    received_at: string;
+};
+
+export type MissionRoleAssignmentRecord = {
+    roles: MissionRoleAssignment[];
+    task_roles: MissionTaskRoleMapping[];
+    applied_by: string;
+    applied_at: string;
+    recommended: boolean;
 };
 
 export type MissionView = {
@@ -264,6 +351,11 @@ export type MissionView = {
     required_acceptance: string[];
     proposed_tasks: MissionTaskSpec[];
     budget: MissionBudget | null;
+    usage: LocalRunUsage | null;
+    handoff?: MissionHandoff | null;
+    workflow?: MissionWorkflowPin | null;
+    assignment?: MissionRoleAssignmentRecord | null;
+    plan_mode?: MissionPlanMode;
     confirmation: MissionConfirmation | null;
     tasks: MissionTaskView[];
     created_at: string;
@@ -279,6 +371,14 @@ export type MissionEvent = {
     summary: string;
     payload: Record<string, unknown>;
     occurred_at: string;
+};
+
+export type LocalRunUsage = {
+    input_tokens: number;
+    output_tokens: number;
+    estimated_cost: number;
+    currency: string;
+    billing_owner: string;
 };
 
 export type MissionSnapshot = {
@@ -1158,6 +1258,74 @@ export type AgentStorageEntry = {
 };
 
 /** 可以清理的一项：预计删除多少目录、释放多少空间。 */
+
+/**
+ * 工作区登记表。内核页与插件视图读的是同一份 `data/workspace-registry.json`，
+ * 所以这里只描述形状，不重复业务语义。
+ */
+export type WorkspaceRegistryProject = {
+  id: string;
+  name: string;
+  aliases?: string[];
+  kind?: string;
+  status?: string;
+  parent_id?: string;
+  color?: string;
+  description?: string;
+  context?: {
+    stack?: string[];
+    commands?: Array<{ name: string; command: string; cwd: string }>;
+    docs?: Array<{ label: string; path: string }>;
+    rules?: Array<{ label: string; path: string }>;
+    notes?: string;
+  };
+  links?: { work_log_project_id?: string; work_log_project_name?: string; workbench_project_id?: string };
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type WorkspaceRegistryBinding = {
+  id: string;
+  project_id: string;
+  path: string;
+  role: string;
+  source: string;
+  confidence: string;
+  created_at: string;
+};
+
+export type WorkspaceRegistryCandidate = {
+  path: string;
+  suggested_project?: string;
+  suggested_parent?: string;
+  confidence: string;
+  source: string;
+  seen_at: string;
+  seen_count: number;
+  status: string;
+};
+
+export type WorkspaceRegistryTree = {
+  project: WorkspaceRegistryProject;
+  paths: WorkspaceRegistryBinding[];
+  children: WorkspaceRegistryTree[];
+};
+
+export type WorkspaceRegistrySnapshot = {
+  tree: WorkspaceRegistryTree[];
+  projects: WorkspaceRegistryProject[];
+  workspaces: WorkspaceRegistryBinding[];
+  updated_at: string;
+};
+
+export type WorkspaceRegistryValidation = {
+  ok: boolean;
+  problems: string[];
+  missing_paths: string[];
+  project_count: number;
+  workspace_count: number;
+};
+
 export type AgentStorageCleanup = {
     key: string;
     label: string;
@@ -3487,13 +3655,34 @@ export const agentApi = {
     updateMissionTaskExecution: (missionId: string, taskId: string, expectedPlanSha256: string, execution: MissionTaskSpec['execution']) =>
         invoke<MissionView>('update_mission_task_execution', { missionId, taskId, expectedPlanSha256, execution }),
     createMission: (input: MissionCreateInput) => invoke<MissionView>('create_mission', { input }),
+    createMissionHandoff: (input: MissionHandoffInput) => invoke<MissionView>('create_mission_handoff', { input }),
+    missionAssignmentOptions: (missionId: string) => invoke<MissionAssignmentOptions>('list_mission_assignment_options', { missionId }),
+    assignMissionRoles: (missionId: string, input: MissionAssignmentInput) => invoke<MissionView>('assign_mission_roles', { missionId, input }),
+    exportMissionWorkflow: (missionId: string, workflowId: string, version: string, name: string, entrypoint = 'start') =>
+        invoke<AuthoringWorkflowDraft>('export_mission_workflow', { missionId, workflowId, version, name, entrypoint }),
     listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
     getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),
+    controlMission: (missionId: string, action: 'pause' | 'resume' | 'cancel') => invoke<MissionView>('control_mission', { missionId, action }),
     proposeMissionPlan: (missionId: string, proposal: MissionPlanProposal) => invoke<MissionView>('propose_mission_plan', { missionId, proposal }),
     generateMissionPlan: (missionId: string) => invoke<MissionView>('generate_mission_plan', { missionId }),
     generateMissionFollowUp: (missionId: string) => invoke<MissionView>('generate_mission_follow_up', { missionId }),
-    confirmMissionPlan: (missionId: string, planSha256: string, selectedTaskIds: string[], approvedPaths: string[], confirmedBy: string) =>
-        invoke<MissionView>('confirm_mission_plan', { missionId, planSha256, selectedTaskIds, approvedPaths, confirmedBy }),
+    confirmMissionPlan: (
+        missionId: string,
+        planSha256: string,
+        selectedTaskIds: string[],
+        approvedPaths: string[],
+        approvedAbsoluteReadPaths: string[],
+        approvedAbsoluteWritePaths: string[],
+        confirmedBy: string,
+    ) => invoke<MissionView>('confirm_mission_plan', {
+        missionId,
+        planSha256,
+        selectedTaskIds,
+        approvedPaths,
+        approvedAbsoluteReadPaths,
+        approvedAbsoluteWritePaths,
+        confirmedBy,
+    }),
     addMissionFollowUpTasks: (missionId: string, tasks: MissionTaskSpec[], reason: string) =>
         invoke<MissionView>('add_mission_follow_up_tasks', { missionId, tasks, reason }),
     missionSnapshot: (missionId: string, afterSequence = 0) => invoke<MissionSnapshot>('get_mission_snapshot', { missionId, afterSequence }),
@@ -3944,6 +4133,15 @@ export const agentApi = {
     openInnerAdmin: () => invoke('open_inner_admin_page'),
     openAgentDirectory: () => invoke('open_agent_directory'),
     storageReport: (keep?: number) => invoke<{ report: AgentStorageReport }>('get_agent_storage_report', { keep: keep ?? null }),
+    workspaceRegistry: () => invoke<WorkspaceRegistrySnapshot>('get_workspace_registry'),
+    upsertWorkspaceProject: (input: Record<string, unknown>) => invoke<WorkspaceRegistryProject>('upsert_workspace_project', { input }),
+    deleteWorkspaceProject: (projectId: string, force = false) => invoke<{ deleted: string }>('delete_workspace_project', { projectId, force }),
+    bindWorkspacePath: (input: Record<string, unknown>) => invoke<unknown>('bind_workspace_path', { input }),
+    listWorkspaceCandidates: (status?: string) => invoke<{ candidates: WorkspaceRegistryCandidate[]; status: string }>('list_workspace_candidates', { status: status ?? null }),
+    acceptWorkspaceCandidate: (path: string, mode: 'create' | 'bind', projectRef?: string, parentRef?: string) => invoke<unknown>('accept_workspace_candidate', { path, mode, projectRef: projectRef ?? null, parentRef: parentRef ?? null }),
+    dismissWorkspaceCandidate: (path: string) => invoke<{ dismissed: string }>('dismiss_workspace_candidate', { path }),
+    validateWorkspaceRegistry: () => invoke<WorkspaceRegistryValidation>('validate_workspace_registry'),
+
     cleanupDrafts: (keep: number) => invoke<AgentStorageCleanupResult>('cleanup_agent_drafts', { keep }),
     cleanupVersions: () => invoke<AgentStorageCleanupResult>('cleanup_agent_versions'),
     cleanupCache: () => invoke<AgentStorageCleanupResult>('cleanup_agent_cache'),

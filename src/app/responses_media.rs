@@ -12,6 +12,7 @@ use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use crate::store::media_registry::{self, MediaRecord, NewMedia};
@@ -25,6 +26,9 @@ const PREVIEW_TARGET_BYTES: usize = 512 * 1024;
 /// 低于这个大小且尺寸合理的最近图片保持原样，减少不必要的画质损失。
 const KEEP_ORIGINAL_MAX_BYTES: usize = 256 * 1024;
 const KEEP_ORIGINAL_MAX_DIMENSION: u32 = 1280;
+/// 解码前的像素上限，防止压缩炸弹把本机内存打满。超过后只保留原图引用，
+/// 不再生成预览。
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct MediaNormalizationStats {
@@ -128,6 +132,51 @@ fn normalize_image_object(
     let parsed = parse_data_image(data_url)?;
     let sha256 = format!("{:x}", Sha256::digest(&parsed.bytes));
     let format = image::guess_format(&parsed.bytes).ok();
+    let declared_dimensions = image::ImageReader::new(Cursor::new(&parsed.bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    let dimensions = declared_dimensions.unwrap_or((0, 0));
+    // 尺寸无法解析或像素数超限时不做解码：压缩炸弹的字节数可以很小，
+    // 但解码后的位图可能直接把内存打满。原图仍然入库，只保留引用。
+    let unsafe_to_decode = match declared_dimensions {
+        None => true,
+        Some((width, height)) => !image_within_pixel_limit(width, height),
+    };
+    if unsafe_to_decode {
+        let mime_type = format
+            .map(|format| image_mime(format).to_string())
+            .unwrap_or_else(|| parsed.mime_type.clone());
+        let record = store_original(
+            &parsed.bytes,
+            &mime_type,
+            &sha256,
+            dimensions.0,
+            dimensions.1,
+            format,
+        )?;
+        state.stats.images_offloaded += 1;
+        state.stats.images_replaced_with_reference += 1;
+        let warning = if declared_dimensions.is_none() {
+            "图片尺寸无法解析，已仅保留原图引用，未生成解码预览".to_string()
+        } else {
+            format!(
+                "图片尺寸 {}×{} 超过 {} 像素上限，已仅保留原图引用：{}",
+                dimensions.0,
+                dimensions.1,
+                MAX_IMAGE_PIXELS,
+                record.id
+            )
+        };
+        state.warnings.push(warning);
+        return Ok(vec![media_note(
+            &record,
+            dimensions,
+            parsed.bytes.len(),
+            true,
+        )]);
+    }
+
     let decoded = format.and_then(|format| {
         image::load_from_memory_with_format(&parsed.bytes, format)
             .ok()
@@ -136,7 +185,7 @@ fn normalize_image_object(
     let dimensions = decoded
         .as_ref()
         .map(|(_, image)| image.dimensions())
-        .unwrap_or((0, 0));
+        .unwrap_or(dimensions);
     let mime_type = decoded
         .as_ref()
         .map(|(format, _)| image_mime(*format).to_string())
@@ -404,12 +453,69 @@ fn media_cache_dir() -> PathBuf {
     crate::store::paths::agent_home().join("media-inbox")
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaCleanupStats {
+    pub removed_files: usize,
+    pub removed_records: usize,
+}
+
+/// 清理 `media-inbox` 中超过保留期或超出文件数上限的原图/预览，并同步
+/// 登记表。只服务本机推理网关的自动外置媒体，不碰用户生成的其它媒体。
+pub(crate) fn cleanup_cache(
+    max_age_days: u64,
+    max_files: usize,
+) -> Result<MediaCleanupStats, String> {
+    let dir = media_cache_dir();
+    let mut entries = Vec::<(PathBuf, std::time::SystemTime)>::new();
+    if dir.is_dir() {
+        let reader = std::fs::read_dir(&dir).map_err(|error| error.to_string())?;
+        for entry in reader.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            entries.push((path, modified));
+        }
+    }
+    entries.sort_by(|left, right| right.1.cmp(&left.1));
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(
+            max_age_days.max(1).saturating_mul(86_400),
+        ))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let keep = max_files.max(1);
+    let mut removed_files = 0usize;
+    for (index, (path, modified)) in entries.iter().enumerate() {
+        if index < keep && *modified >= cutoff {
+            continue;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            removed_files += 1;
+        }
+    }
+    let removed_records = crate::store::media_registry::prune_missing_gateway_media(&dir)
+        .map_err(|error| error.to_string())?;
+    Ok(MediaCleanupStats {
+        removed_files,
+        removed_records,
+    })
+}
+
 fn preview_cache_path(record: &MediaRecord, format: ImageFormat) -> PathBuf {
     media_cache_dir().join(format!(
         "{}-{}.preview.jpg",
         record.sha256,
         image_extension(format)
     ))
+}
+
+fn image_within_pixel_limit(width: u32, height: u32) -> bool {
+    u64::from(width).saturating_mul(u64::from(height)) <= MAX_IMAGE_PIXELS
 }
 
 fn image_mime(format: ImageFormat) -> &'static str {
@@ -563,5 +669,26 @@ mod tests {
             assert_eq!(normalized.stats.images_replaced_with_reference, 1);
             assert!(content.iter().any(|part| part["type"] == "input_text"));
         });
+    }
+
+    #[test]
+    fn cleanup_keeps_only_the_most_recent_files() {
+        with_isolated_home(|| {
+            let dir = media_cache_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("old.png"), b"old").unwrap();
+            std::fs::write(dir.join("new.png"), b"new").unwrap();
+            let stats = cleanup_cache(30, 1).expect("cleanup");
+            assert_eq!(stats.removed_files, 1);
+            assert!(dir.read_dir().unwrap().count() <= 1);
+        });
+    }
+
+    #[test]
+    fn image_pixel_limit_rejects_decompression_bombs() {
+        assert!(image_within_pixel_limit(1280, 1280));
+        assert!(image_within_pixel_limit(8000, 5000));
+        assert!(!image_within_pixel_limit(10_000, 10_000));
+        assert!(!image_within_pixel_limit(u32::MAX, u32::MAX));
     }
 }

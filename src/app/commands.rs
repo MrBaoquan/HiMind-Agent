@@ -2870,7 +2870,18 @@ fn inference_gateway_status_value(options: &Options) -> serde_json::Value {
         "notice": notice,
         "gateway_clients": gateway_clients,
         "direct_clients": crate::app::ai_provider_import::direct_bound_clients(options),
+        "capability_observations": crate::store::ai_capability_observations::list().unwrap_or_default(),
     })
+}
+
+/// 清理本机网关自动外置的图片缓存；只动 `media-inbox` 与对应登记记录。
+#[tauri::command]
+pub(crate) fn cleanup_inference_media_cache() -> Result<serde_json::Value, String> {
+    let stats = crate::app::responses_media::cleanup_cache(30, 2000)?;
+    Ok(serde_json::json!({
+        "removed_files": stats.removed_files,
+        "removed_records": stats.removed_records,
+    }))
 }
 
 #[tauri::command]
@@ -2949,10 +2960,12 @@ pub(crate) async fn stop_inference_gateway_and_unbind(
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let user_id = crate::app::identity::identity_status(&options).user_id;
-        let clients = crate::app::ai_provider_import::gateway_bindings(&options)
+        let mut clients = crate::app::ai_provider_import::gateway_bindings(&options)
             .into_iter()
             .map(|binding| binding.client)
             .collect::<Vec<String>>();
+        clients.sort();
+        clients.dedup();
         let mut switched = Vec::new();
         let mut failures = Vec::new();
         for client in &clients {
@@ -9193,6 +9206,158 @@ fn workflow_run_verification(
     Ok(serde_json::to_value(crate::workflow::verify_run(
         &package, &run,
     )?)?)
+}
+
+// ---------------------------------------------------------------------------
+// 工作区登记（内核页面用）
+//
+// 这些命令是能力网关之外的第二个入口：内核页面和插件视图一样，不该自己
+// 读文件，而是走同一套 `workspace_registry` 实现。写操作与能力共用一套
+// 校验和锁，不存在「界面能绕过校验」的情况。
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub(crate) async fn get_workspace_registry() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry =
+            crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
+        Ok(crate::workspace_registry::list_view(&registry))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn upsert_workspace_project(
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let project_input: crate::workspace_registry::ProjectInput =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        let mut saved = None;
+        crate::workspace_registry::Registry::update(|registry| {
+            let project = crate::workspace_registry::upsert_project(registry, project_input)?;
+            saved = Some(project);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(saved.ok_or("项目已保存但结果丢失")?).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn delete_workspace_project(
+    project_id: String,
+    force: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::workspace_registry::Registry::update(|registry| {
+            crate::workspace_registry::delete_project(registry, &project_id, force.unwrap_or(false))
+        })
+        .map(|_| json!({ "deleted": project_id }))
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn bind_workspace_path(input: serde_json::Value) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bind_input: crate::workspace_registry::BindInput =
+            serde_json::from_value(input).map_err(|error| error.to_string())?;
+        let requested = bind_input.path.clone();
+        let unbind = bind_input.unbind;
+        let mut bound = None;
+        crate::workspace_registry::Registry::update(|registry| {
+            bound = Some(crate::workspace_registry::bind_path(registry, bind_input)?);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+        if unbind {
+            return Ok(json!({ "unbound": requested }));
+        }
+        serde_json::to_value(bound.ok_or("绑定已写入但结果丢失")?).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn list_workspace_candidates(status: Option<String>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry =
+            crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
+        let status = status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(crate::workspace_registry::CANDIDATE_PENDING);
+        let items: Vec<_> = registry
+            .candidates
+            .iter()
+            .filter(|candidate| status == "all" || candidate.status == status)
+            .cloned()
+            .collect();
+        Ok(json!({ "candidates": items, "status": status }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn accept_workspace_candidate(
+    path: String,
+    mode: Option<String>,
+    project_ref: Option<String>,
+    parent_ref: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut accepted = None;
+        crate::workspace_registry::Registry::update(|registry| {
+            let (project, workspace) = crate::workspace_registry::accept_candidate(
+                registry,
+                &path,
+                mode.as_deref().unwrap_or_default(),
+                project_ref.as_deref().unwrap_or_default(),
+                parent_ref.as_deref().unwrap_or_default(),
+            )?;
+            accepted = Some((project, workspace));
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+        let (project, workspace) = accepted.ok_or("候选已处理但结果丢失")?;
+        Ok(json!({ "project": project, "workspace": workspace }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn dismiss_workspace_candidate(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::workspace_registry::Registry::update(|registry| {
+            crate::workspace_registry::dismiss_candidate(registry, &path)
+        })
+        .map(|_| json!({ "dismissed": path }))
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn validate_workspace_registry() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry =
+            crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
+        serde_json::to_value(crate::workspace_registry::validate_registry(&registry))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]

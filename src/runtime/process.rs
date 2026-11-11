@@ -157,7 +157,7 @@ fn wait_for_child_until(
     wait_for_child_until_with_cancel(child, timeout, runtime_name, &mut || Ok(false))
 }
 
-fn wait_for_child_until_with_cancel<F>(
+pub(crate) fn wait_for_child_until_with_cancel<F>(
     child: &mut Child,
     timeout: Duration,
     runtime_name: &str,

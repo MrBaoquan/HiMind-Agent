@@ -1,4 +1,4 @@
-export type PageKey = 'dashboard' | 'builtin-ai' | 'ai' | 'approvals' | 'inbox' | 'tasks' | 'workflows' | 'schedules' | 'extensions' | 'installed' | 'development' | 'settings' | 'logs';
+export type PageKey = 'dashboard' | 'builtin-ai' | 'ai' | 'approvals' | 'inbox' | 'tasks' | 'workflows' | 'schedules' | 'extensions' | 'installed' | 'workspaces' | 'development' | 'settings' | 'logs';
 
 /**
  * 「我的能力」页内的类型页签：三类可安装能力 + 组织策略。
@@ -12,7 +12,7 @@ export type InstalledKind = 'plugin' | 'skill' | 'workflow' | 'expert' | 'instru
  */
 export type NavigationTarget =
   | PageKey
-  | { page: PageKey; runId?: string; workflowId?: string; kind?: InstalledKind };
+  | { page: PageKey; runId?: string; workflowId?: string; missionId?: string; kind?: InstalledKind };
 
 export type UiMessage = {
     id: number;

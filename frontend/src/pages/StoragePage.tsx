@@ -127,6 +127,27 @@ export function StoragePage() {
     }
   }
 
+  async function cleanupInferenceMedia() {
+    const accepted = await confirm({
+      title: '清理推理媒体缓存？',
+      description: '清理 30 天前或超出 2000 个的缓存图片，保留生成媒体。',
+      confirmText: '清理',
+    });
+    if (!accepted) return;
+    setBusy('inference-media');
+    setFeedback('');
+    try {
+      const result = await agentApi.cleanupInferenceMediaCache();
+      if (!alive.current) return;
+      setFeedback(`推理媒体缓存已清理：删除 ${result.removed_files} 个文件、${result.removed_records} 条登记。`);
+      await reload();
+    } catch (error) {
+      setFeedback(`清理推理媒体缓存失败：${failureText(error)}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function dismissResult() {
     setBusy('dismiss');
     try {
@@ -253,6 +274,9 @@ export function StoragePage() {
           </button>
           <button type="button" className="btn" onClick={() => void agentApi.openAgentDirectory()}>
             <FolderOpen size={15} />打开数据目录
+          </button>
+          <button type="button" className="btn" disabled={Boolean(busy)} onClick={() => void cleanupInferenceMedia()}>
+            {busy === 'inference-media' ? <BusyIndicator size={15} /> : <Trash2 size={15} />}清理推理媒体缓存
           </button>
         </div>
       </div>

@@ -8,6 +8,7 @@
 //! `function_call_output`。`reasoning` 等无法映射的项直接丢弃——Chat 上游没有
 //! 对应概念，保留只会让请求非法。
 
+use crate::app::reasoning_tags::{sanitize_reasoning_tags, ReasoningTagSanitizer};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
@@ -259,7 +260,12 @@ fn message_content(content: Option<&Value>, role: &str) -> Result<Value, String>
         return Ok(Value::String(String::new()));
     };
     if let Value::String(text) = content {
-        return Ok(Value::String(text.clone()));
+        let text = if role == "assistant" {
+            sanitize_reasoning_tags(text).0
+        } else {
+            text.clone()
+        };
+        return Ok(Value::String(text));
     }
     let Some(parts) = content.as_array() else {
         return Ok(Value::String(String::new()));
@@ -270,7 +276,12 @@ fn message_content(content: Option<&Value>, role: &str) -> Result<Value, String>
         match part.get("type").and_then(Value::as_str) {
             Some("input_text" | "output_text" | "text") => {
                 if let Some(value) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(value);
+                    let value = if role == "assistant" {
+                        sanitize_reasoning_tags(value).0
+                    } else {
+                        value.to_string()
+                    };
+                    text.push_str(&value);
                     chat_parts.push(json!({ "type": "text", "text": value }));
                 }
             }
@@ -376,8 +387,9 @@ pub(crate) fn response_to_responses(chat: &Value, model: &str) -> Value {
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
     let mut output = Vec::<Value>::new();
     if let Some(text) = message.get("content").and_then(Value::as_str) {
+        let (text, _removed) = sanitize_reasoning_tags(text);
         if !text.is_empty() {
-            output.push(message_item(text));
+            output.push(message_item(&text));
         }
     }
     for (index, call) in message
@@ -457,6 +469,7 @@ pub(crate) struct ResponsesStream {
     created: bool,
     message_started: bool,
     message_text: String,
+    content_sanitizer: ReasoningTagSanitizer,
     tool_items: Vec<ToolItem>,
     stop_reason: Option<String>,
     failed: bool,
@@ -482,6 +495,7 @@ impl ResponsesStream {
             created: false,
             message_started: false,
             message_text: String::new(),
+            content_sanitizer: ReasoningTagSanitizer::default(),
             tool_items: Vec::new(),
             stop_reason: None,
             failed: false,
@@ -531,6 +545,33 @@ impl ResponsesStream {
 
     pub(crate) fn reasoning_tokens(&self) -> u64 {
         self.reasoning_tokens
+    }
+
+    fn emit_text(&mut self, text: &str, events: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.message_started {
+            self.message_started = true;
+            events.push(event(
+                "response.output_item.added",
+                json!({ "type": "response.output_item.added", "output_index": self.message_output_index(),
+                        "item": { "type": "message", "id": "msg_himind_gateway", "status": "in_progress",
+                                  "role": "assistant", "content": [] } }),
+            ));
+            events.push(event(
+                "response.content_part.added",
+                json!({ "type": "response.content_part.added", "item_id": "msg_himind_gateway",
+                        "output_index": self.message_output_index(), "content_index": 0,
+                        "part": { "type": "output_text", "text": "", "annotations": [] } }),
+            ));
+        }
+        self.message_text.push_str(text);
+        events.push(event(
+            "response.output_text.delta",
+            json!({ "type": "response.output_text.delta", "item_id": "msg_himind_gateway",
+                    "output_index": self.message_output_index(), "content_index": 0, "delta": text }),
+        ));
     }
 
     pub(crate) fn push_line(&mut self, line: &str) -> Vec<String> {
@@ -600,29 +641,8 @@ impl ResponsesStream {
         };
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                if !self.message_started {
-                    self.message_started = true;
-                    events.push(event(
-                        "response.output_item.added",
-                        json!({ "type": "response.output_item.added", "output_index": self.message_output_index(),
-                                "item": { "type": "message", "id": "msg_himind_gateway", "status": "in_progress",
-                                          "role": "assistant", "content": [] } }),
-                    ));
-                    events.push(event(
-                        "response.content_part.added",
-                        json!({ "type": "response.content_part.added", "item_id": "msg_himind_gateway",
-                                "output_index": self.message_output_index(), "content_index": 0,
-                                "part": { "type": "output_text", "text": "", "annotations": [] } }),
-                    ));
-                }
-                self.message_text.push_str(text);
-                events.push(event(
-                    "response.output_text.delta",
-                    json!({ "type": "response.output_text.delta", "item_id": "msg_himind_gateway",
-                            "output_index": self.message_output_index(), "content_index": 0, "delta": text }),
-                ));
-            }
+            let text = self.content_sanitizer.push(text);
+            self.emit_text(&text, &mut events);
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in tool_calls {
@@ -701,6 +721,18 @@ impl ResponsesStream {
             _ => None,
         };
         let mut events = Vec::new();
+        let tail = self.content_sanitizer.finish();
+        self.emit_text(&tail, &mut events);
+        if self.content_sanitizer.removed() > 0 {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "本机网关已清洗上游推理控制标签：count={} model={}",
+                    self.content_sanitizer.removed(),
+                    self.model
+                ),
+            );
+        }
         let mut output = Vec::<Value>::new();
         if self.message_started {
             events.push(event(
@@ -1086,5 +1118,47 @@ mod tests {
         assert!(out.contains("event: response.function_call_arguments.delta"));
         assert!(out.contains(r#""call_id":"call_1""#));
         assert!(out.contains(r#""name":"read""#));
+    }
+
+    #[test]
+    fn response_strips_reasoning_tags_from_non_streaming_content() {
+        let chat = json!({
+            "id": "chatcmpl_tags",
+            "choices": [{ "message": { "role": "assistant", "content": "回答</thought></thought>" } }]
+        });
+        let response = response_to_responses(&chat, "m");
+        assert_eq!(response["output"][0]["content"][0]["text"], "回答");
+    }
+
+    #[test]
+    fn stream_strips_reasoning_tags_split_across_chunks() {
+        let mut stream = ResponsesStream::new("m".to_string());
+        let mut out = String::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"content":"回答</thou"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"ght>继续"}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ] {
+            out.push_str(&stream.push_line(line).concat());
+        }
+        out.push_str(&stream.finish().concat());
+        assert!(!out.contains("</thought>"), "out={out}");
+        assert!(!out.contains("</think>"), "out={out}");
+        assert!(out.contains("回答"), "out={out}");
+        assert!(out.contains("继续"), "out={out}");
+    }
+
+    #[test]
+    fn request_strips_reasoning_tags_from_assistant_history() {
+        let request = json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "回答</thought></thought>" }]
+            }]
+        });
+        let chat = request_to_chat(&request, "m").unwrap();
+        assert_eq!(chat["messages"][0]["content"], "回答");
     }
 }

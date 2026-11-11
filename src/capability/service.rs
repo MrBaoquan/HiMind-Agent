@@ -94,6 +94,13 @@ enum CapabilityHandler {
     EngineeringWorkspaceLeaseRelease,
     EngineeringWorkspaceLeaseList,
     EngineeringHandoffCreate,
+    MissionHandoffCreate,
+    MissionGet,
+    MissionEventsList,
+    MissionAssignmentOptions,
+    MissionAssignmentApply,
+    MissionControl,
+    MissionWorkflowExport,
     WorkflowCatalogList,
     WorkflowCatalogDescribe,
     WorkflowRunStart,
@@ -287,6 +294,17 @@ enum CapabilityHandler {
     MarketInstalled,
     MarketInstallPlan,
     MarketInstall,
+    /// 工作区登记表的 10 条能力，全部由 `crate::workspace_registry` 实现。
+    WorkspaceRegistryResolve,
+    WorkspaceRegistryContextGet,
+    WorkspaceRegistryProjectList,
+    WorkspaceRegistryProjectUpsert,
+    WorkspaceRegistryProjectDelete,
+    WorkspaceRegistryPathBind,
+    WorkspaceRegistryCandidateList,
+    WorkspaceRegistryCandidateAccept,
+    WorkspaceRegistryCandidateDismiss,
+    WorkspaceRegistryValidate,
 }
 
 #[derive(Clone)]
@@ -1882,6 +1900,134 @@ impl CapabilityGateway {
                 CapabilityHandler::EngineeringHandoffCreate,
             ),
             registration(
+                "mission.handoff.create",
+                "创建协作任务交接",
+                "从已审阅的方案创建待指派 Mission。只允许固定已安装 Workflow 的精确版本与内容摘要；不会确认计划、授权文件访问或启动执行。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "idempotency_key": {"type":"string","minLength":1,"maxLength":200},
+                        "source_client": {"type":"string","minLength":1},
+                        "source_reference": {"type":"string","minLength":1},
+                        "source_message_refs": {"type":"array","items":{"type":"string"},"maxItems":200},
+                        "context_summary": {"type":"string","maxLength":2000},
+                        "title": {"type":"string","minLength":1,"maxLength":240},
+                        "objective": {"type":"string","maxLength":2000},
+                        "workspace": {
+                            "type":"object",
+                            "properties": {
+                                "root":{"type":"string","minLength":1},
+                                "read_scope":{"type":"array","items":{"type":"string"}},
+                                "write_scope":{"type":"array","items":{"type":"string"}}
+                            },
+                            "required":["root"], "additionalProperties":false
+                        },
+                        "acceptance_criteria":{"type":"array","items":{"type":"string"}},
+                        "workflow": {
+                            "type":"object",
+                            "properties": {
+                                "workflow_id":{"type":"string","minLength":1},
+                                "workflow_version":{"type":"string","minLength":1},
+                                "workflow_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                                "entrypoint":{"type":"string"}
+                            },
+                            "required":["workflow_id","workflow_version","workflow_sha256"],
+                            "additionalProperties":false
+                        },
+                        "plan_mode":{"type":"string","enum":["imported","generated"]},
+                        "imported_plan":{"type":"object"}
+                    },
+                    "required":["idempotency_key","source_client","source_reference","title","workspace","workflow","plan_mode"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::MissionHandoffCreate,
+            ),
+            registration(
+                "mission.get",
+                "读取协作任务",
+                "读取 Mission 当前状态、计划摘要、角色指派和任务视图；不返回凭据或原始私密对话。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{"mission_id":{"type":"string","minLength":1}},
+                    "required":["mission_id"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionGet,
+            ),
+            registration(
+                "mission.events.list",
+                "读取协作任务事件",
+                "按游标读取 Mission 的用户可见事件与推进记录，用于跨客户端恢复和跟踪。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{"mission_id":{"type":"string","minLength":1},"after_sequence":{"type":"integer","minimum":0}},
+                    "required":["mission_id"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionEventsList,
+            ),
+            registration(
+                "mission.assignment.options",
+                "读取协作任务指派选项",
+                "返回固定 Workflow 的角色、推荐执行器/服务/模型和可用性；只读，不改变 Mission。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{"mission_id":{"type":"string","minLength":1}},
+                    "required":["mission_id"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionAssignmentOptions,
+            ),
+            registration(
+                "mission.assignment.apply",
+                "应用协作任务指派",
+                "保存角色与任务映射以及执行器/服务/模型绑定；不会确认计划、授权路径或启动执行。",
+                "local_write",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mission_id":{"type":"string","minLength":1},
+                        "input":{"type":"object"}
+                    },
+                    "required":["mission_id","input"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionAssignmentApply,
+            ),
+            registration(
+                "mission.workflow.export",
+                "沉淀协作工作流",
+                "从已完成 Mission 生成脱敏 workflow 候选并执行现有预检；不会提交审核、发布或覆盖已提交版本。",
+                "local_write",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mission_id":{"type":"string","minLength":1},
+                        "workflow_id":{"type":"string","minLength":1},
+                        "version":{"type":"string","minLength":1},
+                        "name":{"type":"string"},
+                        "entrypoint":{"type":"string"}
+                    },
+                    "required":["mission_id","workflow_id","version"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionWorkflowExport,
+            ),
+            registration(
+                "mission.control",
+                "暂停恢复或取消协作任务",
+                "控制已存在的协作任务；不支持通过模型确认计划或授权文件访问。",
+                "local_write",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mission_id":{"type":"string","minLength":1},
+                        "action":{"type":"string","enum":["pause","resume","cancel"]}
+                    },
+                    "required":["mission_id","action"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionControl,
+            ),
+            registration(
                 "workflow.catalog.list",
                 "Workflow 目录",
                 "列出本机已安装 Workflow，包含生命周期、入口、出口和可用状态。",
@@ -3270,6 +3416,209 @@ impl CapabilityGateway {
             media_registration("workbench.media.audio.transcribe", "语音转写（工作台）", "由 AI 工作台媒体通道转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
             media_registration("workbench.media.job.get", "查看工作台媒体任务", "查看工作台图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
             media_registration("workbench.media.job.cancel", "取消工作台媒体任务", "取消工作台上仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
+            // 工作区登记表：10 条能力全部由内核实现，并作为内置插件
+            // com.himind.workspace-registry 对外暴露。数据落 data/ 而不是
+            // plugin-data/，因为后者不进备份包（见 app::backup 与 ADR 0002）。
+            registration_versioned(
+                "workspace.registry.resolve",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "解析工作区",
+                "把路径解析成项目，并给出祖先、子项目、同级与工程上下文。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string", "minLength": 1, "description": "待解析的绝对路径；由调用方显式传入" }
+                    },
+                    "required": ["workspace_root"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryResolve,
+            ),
+            registration_versioned(
+                "workspace.registry.context.get",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "生成工作区摘要",
+                "生成项目上下文的短索引（≤500 字），供对话快速上手。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["workspace_root"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryContextGet,
+            ),
+            registration_versioned(
+                "workspace.registry.project.list",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "列出登记项目",
+                "读取项目树与全部路径绑定。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::WorkspaceRegistryProjectList,
+            ),
+            registration_versioned(
+                "workspace.registry.project.upsert",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "新建或修改项目",
+                "新建项目或修改名称、别名、上级与工程上下文。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "已存在项目 ID；留空按 name 匹配或新建" },
+                        "name": { "type": "string", "minLength": 1 },
+                        "aliases": { "type": "array", "items": { "type": "string" } },
+                        "kind": { "type": "string", "enum": ["aggregate", "product", "subproject", "delivery", "library", "docs", "sandbox", "other"] },
+                        "status": { "type": "string" },
+                        "parent_id": { "type": ["string", "null"], "description": "父项目 ID；显式传 null 表示提升为根" },
+                        "color": { "type": "string" },
+                        "description": { "type": "string" },
+                        "stack": { "type": "array", "items": { "type": "string" } },
+                        "commands": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "command": { "type": "string" },
+                                    "cwd": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "docs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "path": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "rules": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "path": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "notes": { "type": "string" },
+                        "work_log_project_id": { "type": "string" },
+                        "work_log_project_name": { "type": "string" },
+                        "workbench_project_id": { "type": "string" }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryProjectUpsert,
+            ),
+            registration_versioned(
+                "workspace.registry.project.delete",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "删除登记项目",
+                "删除项目；仍有子项目或路径绑定时不删，除非 force。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "minLength": 1 },
+                        "force": { "type": "boolean" }
+                    },
+                    "required": ["project_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryProjectDelete,
+            ),
+            registration_versioned(
+                "workspace.registry.path.bind",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "绑定工作区路径",
+                "把路径绑定到项目；解绑时传 unbind=true。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_ref": { "type": "string" },
+                        "path": { "type": "string", "minLength": 1 },
+                        "role": { "type": "string", "enum": ["root", "worktree", "mirror", "release", "source", "build"] },
+                        "source": { "type": "string", "enum": ["manual", "import", "manifest", "git", "session", "scan"] },
+                        "confidence": { "type": "string", "enum": ["exact", "inferred"] },
+                        "unbind": { "type": "boolean" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryPathBind,
+            ),
+            registration_versioned(
+                "workspace.registry.candidate.list",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "列出路径候选",
+                "列出待确认的路径候选。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["pending", "dismissed", "accepted", "all"] }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryCandidateList,
+            ),
+            registration_versioned(
+                "workspace.registry.candidate.accept",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "确认路径候选",
+                "把候选落成新项目或绑定到已有项目。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 },
+                        "mode": { "type": "string", "enum": ["create", "bind"] },
+                        "project_ref": { "type": "string" },
+                        "parent_ref": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryCandidateAccept,
+            ),
+            registration_versioned(
+                "workspace.registry.candidate.dismiss",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "忽略路径候选",
+                "忽略一条候选；只打标，不删除记录。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryCandidateDismiss,
+            ),
+            registration_versioned(
+                "workspace.registry.validate",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "检查登记表",
+                "检查父子环、别名冲突、重复绑定与已失效的路径。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::WorkspaceRegistryValidate,
+            ),
         ];
 
         for mut item in builtins {
@@ -3700,6 +4049,50 @@ impl CapabilityGateway {
                 crate::workspace_lease::list(&input)
             }
             CapabilityHandler::EngineeringHandoffCreate => crate::workflow_handoff::create(&input),
+            CapabilityHandler::MissionHandoffCreate => {
+                let request: crate::mission::MissionHandoffInput = serde_json::from_value(input)?;
+                let mission = crate::mission::MissionStore::open_default()?.create_handoff(&request)?;
+                let mut value = serde_json::to_value(&mission)?;
+                value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
+                Ok(value)
+            }
+            CapabilityHandler::MissionGet => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.get requires mission_id")?;
+                let mission = crate::mission::MissionStore::open_default()?.get(mission_id)?;
+                let mut value = serde_json::to_value(&mission)?;
+                value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
+                Ok(value)
+            }
+            CapabilityHandler::MissionEventsList => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.events.list requires mission_id")?;
+                let after_sequence = input.get("after_sequence").and_then(Value::as_u64).unwrap_or(0);
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.snapshot(mission_id, after_sequence)?)?)
+            }
+            CapabilityHandler::MissionAssignmentOptions => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.assignment.options requires mission_id")?;
+                Ok(serde_json::to_value(crate::app::mission_commands::mission_assignment_options_sync(mission_id)?)?)
+            }
+            CapabilityHandler::MissionAssignmentApply => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.assignment.apply requires mission_id")?;
+                let request: crate::mission::MissionAssignmentInput = serde_json::from_value(
+                    input.get("input").cloned().ok_or("mission.assignment.apply requires input")?
+                )?;
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.assign_roles(mission_id, &request)?)?)
+            }
+            CapabilityHandler::MissionControl => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.control requires mission_id")?;
+                let action = input.get("action").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.control requires action")?;
+                Ok(serde_json::to_value(crate::app::mission_dispatch::control_mission(mission_id, action)?)?)
+            }
+            CapabilityHandler::MissionWorkflowExport => {
+                crate::app::mission_commands::export_mission_workflow_for_mcp(self, &input)
+            }
             CapabilityHandler::WorkflowCatalogList => {
                 let store = crate::workflow::WorkflowStore::open_default()?;
                 let items = store
@@ -3710,6 +4103,7 @@ impl CapabilityGateway {
                             "id": item.package.id,
                             "name": item.package.name,
                             "version": item.package.version,
+                            "package_digest": item.package_digest,
                             "description": item.package.description,
                             "enabled": item.enabled,
                             "execution_policy": item.package.execution_policy,
@@ -3738,6 +4132,7 @@ impl CapabilityGateway {
                     "ok": true,
                     "enabled": item.enabled,
                     "previous_version": item.previous_version,
+                    "package_digest": item.package_digest,
                     "package": item.package,
                 }))
             }
@@ -4017,6 +4412,135 @@ impl CapabilityGateway {
                     &agent_id,
                     &input,
                     context.source,
+                )?)
+            }
+            // ---- 工作区登记表 ----
+            //
+            // `resolve` / `context.get` 会在未命中时产出候选，所以它们不只是读：
+            // 候选落盘是「发现」，项目与绑定落盘才是「决定」。技能按提示词
+            // 只把前者当副作用，不把后者在未确认时执行。
+            CapabilityHandler::WorkspaceRegistryResolve => {
+                crate::workspace_registry::capability_resolve(&input, true)
+            }
+            CapabilityHandler::WorkspaceRegistryContextGet => {
+                crate::workspace_registry::capability_context(&input, false)
+            }
+            CapabilityHandler::WorkspaceRegistryProjectList => {
+                let registry = crate::workspace_registry::Registry::load()?;
+                Ok(crate::workspace_registry::list_view(&registry))
+            }
+            CapabilityHandler::WorkspaceRegistryProjectUpsert => {
+                let project_input: crate::workspace_registry::ProjectInput =
+                    serde_json::from_value(input)?;
+                // `update` 返回的是整张表；这里要的是刚写进去的那条，
+                // 所以用闭包把结果带出来，不把整个列表回给模型。
+                let mut saved = None;
+                crate::workspace_registry::Registry::update(|registry| {
+                    let project =
+                        crate::workspace_registry::upsert_project(registry, project_input)?;
+                    saved = Some(project);
+                    Ok(())
+                })?;
+                Ok(serde_json::to_value(&saved.ok_or("项目已保存但结果丢失")?)?)
+            }
+            CapabilityHandler::WorkspaceRegistryProjectDelete => {
+                let project_id = input
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("project_id 必填")?
+                    .to_string();
+                let force = input.get("force").and_then(Value::as_bool).unwrap_or(false);
+                crate::workspace_registry::Registry::update(|registry| {
+                    crate::workspace_registry::delete_project(registry, &project_id, force)
+                })?;
+                Ok(json!({ "deleted": project_id }))
+            }
+            CapabilityHandler::WorkspaceRegistryPathBind => {
+                let bind_input: crate::workspace_registry::BindInput =
+                    serde_json::from_value(input)?;
+                let requested_path = bind_input.path.clone();
+                let unbind = bind_input.unbind;
+                let mut bound = None;
+                crate::workspace_registry::Registry::update(|registry| {
+                    bound = Some(crate::workspace_registry::bind_path(registry, bind_input)?);
+                    Ok(())
+                })?;
+                // 解绑时没有 workspace 可返回，给出被移除的路径即可。
+                Ok(if unbind {
+                    json!({ "unbound": requested_path })
+                } else {
+                    serde_json::to_value(&bound.ok_or("绑定已写入但结果丢失")?)?
+                })
+            }
+            CapabilityHandler::WorkspaceRegistryCandidateList => {
+                let registry = crate::workspace_registry::Registry::load()?;
+                let status = input
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(crate::workspace_registry::CANDIDATE_PENDING);
+                let items: Vec<_> = registry
+                    .candidates
+                    .iter()
+                    .filter(|candidate| status == "all" || candidate.status == status)
+                    .cloned()
+                    .collect();
+                Ok(json!({ "candidates": items, "status": status }))
+            }
+            CapabilityHandler::WorkspaceRegistryCandidateAccept => {
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mode = input
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let project_ref = input
+                    .get("project_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let parent_ref = input
+                    .get("parent_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut accepted = None;
+                crate::workspace_registry::Registry::update(|registry| {
+                    let (project, workspace) = crate::workspace_registry::accept_candidate(
+                        registry,
+                        &path,
+                        &mode,
+                        &project_ref,
+                        &parent_ref,
+                    )?;
+                    accepted = Some((project, workspace));
+                    Ok(())
+                })?;
+                let (project, workspace) = accepted.ok_or("候选已处理但结果丢失")?;
+                Ok(json!({ "project": project, "workspace": workspace }))
+            }
+            CapabilityHandler::WorkspaceRegistryCandidateDismiss => {
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                crate::workspace_registry::Registry::update(|registry| {
+                    crate::workspace_registry::dismiss_candidate(registry, &path)
+                })?;
+                Ok(json!({ "dismissed": path }))
+            }
+            CapabilityHandler::WorkspaceRegistryValidate => {
+                let registry = crate::workspace_registry::Registry::load()?;
+                Ok(serde_json::to_value(
+                    crate::workspace_registry::validate_registry(&registry),
                 )?)
             }
             CapabilityHandler::AIClientList => Ok(serde_json::to_value(

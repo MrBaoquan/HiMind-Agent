@@ -498,6 +498,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::plan_storage_migration,
             super::commands::queue_storage_migration,
             super::commands::cancel_storage_migration,
+            // 工作区登记：内核页面与插件视图共用同一套实现。
+            super::commands::get_workspace_registry,
+            super::commands::upsert_workspace_project,
+            super::commands::delete_workspace_project,
+            super::commands::bind_workspace_path,
+            super::commands::list_workspace_candidates,
+            super::commands::accept_workspace_candidate,
+            super::commands::dismiss_workspace_candidate,
+            super::commands::validate_workspace_registry,
             super::commands::dismiss_storage_migration_result,
             super::commands::restart_agent,
             super::commands::get_svn_connections,
@@ -569,6 +578,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_agent_task_history,
             super::commands::list_local_activity,
             super::mission_commands::create_mission,
+            super::mission_commands::control_mission,
             super::mission_commands::list_missions,
             super::mission_commands::get_mission,
             super::mission_commands::propose_mission_plan,
@@ -576,6 +586,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::mission_commands::add_mission_follow_up_tasks,
             super::mission_commands::get_mission_snapshot,
             super::mission_commands::list_mission_execution_options,
+            super::mission_commands::create_mission_handoff,
+            super::mission_commands::list_mission_assignment_options,
+            super::mission_commands::assign_mission_roles,
+            super::mission_commands::export_mission_workflow,
             super::mission_commands::update_mission_task_execution,
             super::mission_dispatch::dispatch_next_mission_task,
             super::mission_commands::generate_mission_plan,
@@ -743,7 +757,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                     webview_data_dir.display()
                 ),
             );
-            let main_window = match create_main_window(app.handle(), &webview_data_dir) {
+            let main_window = match create_main_window(app.handle(), &webview_data_dir, initial_open_target.as_ref()) {
                 Ok(window) => {
                     crate::app::crash::record_event("info", "主窗口对象创建成功");
                     window
@@ -764,7 +778,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                         );
                     }
                     let recovery_dir = fresh_webview_recovery_dir();
-                    match create_main_window(app.handle(), &recovery_dir) {
+                    match create_main_window(app.handle(), &recovery_dir, initial_open_target.as_ref()) {
                         Ok(window) => {
                             crate::app::crash::record_event(
                                 "warn",
@@ -870,12 +884,19 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
 fn create_main_window(
     app: &tauri::AppHandle,
     data_directory: &Path,
+    initial_open_target: Option<&crate::AgentOpenTarget>,
 ) -> Result<tauri::WebviewWindow<tauri::Wry>, tauri::Error> {
     if let Some(parent) = data_directory.parent() {
         std::fs::create_dir_all(parent).map_err(tauri::Error::from)?;
     }
     std::fs::create_dir_all(data_directory).map_err(tauri::Error::from)?;
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let mission_bootstrap = match initial_open_target {
+        Some(crate::AgentOpenTarget::MissionAssignment(mission_id)) => {
+            Some(serde_json::json!({ "mission_id": mission_id }).to_string())
+        }
+        _ => None,
+    };
+    let window_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("HiMind Agent")
         .inner_size(1280.0, 820.0)
         .min_inner_size(1024.0, 680.0)
@@ -883,7 +904,13 @@ fn create_main_window(
         .decorations(false)
         .resizable(true)
         .center()
-        .data_directory(data_directory.to_path_buf())
+        .data_directory(data_directory.to_path_buf());
+    let window_builder = if let Some(bootstrap) = mission_bootstrap {
+        window_builder.initialization_script(format!("window.__HIMIND_MISSION_OPEN__ = {bootstrap};"))
+    } else {
+        window_builder
+    };
+    window_builder
         // DSH renders links with target="_blank" inside its iframe. The injected
         // bridge and this native hook can both observe the same click, so both
         // go through one short-lived deduplicator before handing the URL to the
@@ -965,7 +992,7 @@ fn start_main_window_watchdog(
                 return;
             }
             let recovery_dir = fresh_webview_recovery_dir();
-            match create_main_window(&app, &recovery_dir) {
+            match create_main_window(&app, &recovery_dir, None) {
                 Ok(recovery_window) => {
                     page_state.store(0, Ordering::Release);
                     crate::app::crash::record_event(
@@ -1384,6 +1411,12 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn open_agent_open_target(app: &tauri::AppHandle, target: crate::AgentOpenTarget) {
     match target {
         crate::AgentOpenTarget::Main => show_main_window(app),
+        crate::AgentOpenTarget::MissionAssignment(mission_id) => {
+            show_main_window(app);
+            if let Err(error) = app.emit("himind:mission-navigate", serde_json::json!({ "mission_id": mission_id })) {
+                eprintln!("deep link open mission failed: {error}");
+            }
+        }
         crate::AgentOpenTarget::SettingsAi => {
             if let Err(error) = open_settings_window(app, Some("ai"), None, None, None) {
                 eprintln!("deep link open ai failed: {error}");

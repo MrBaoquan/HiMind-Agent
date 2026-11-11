@@ -33,6 +33,7 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0025](0025-release-binary-development-profile-acceptance.md) | Release binary acceptance runs against the development profile | accepted | 2026-11-03 |
 | [0026](0026-local-ui-read-audit-sampling.md) | Local UI reads stay out of the Agent Core run ledger | accepted | 2026-11-03 |
 | [0027](0027-application-capability-source.md) | Application capabilities use an explicit source without entering Agent Core | accepted | 2026-11-05 |
+| [0028](0028-host-owned-collaboration-mission-handoff.md) | Cross-client collaboration handoff creates a host-owned Mission | accepted | 2026-11-10 |
 
 ## How these relate
 
@@ -80,6 +81,14 @@ migration of the persisted selection to do it. It deliberately does not touch
 external clients, while 0023 owns the model HiMind's own capabilities use.
 
 0024–0027 were already developed in the working tree while 0022/0023 landed upstream. They keep their original decisions but use non-conflicting ADR numbers: 0024 plugin capability dependencies, 0025 release acceptance, 0026 local UI read sampling, 0027 application capability ownership.
+
+0028 defines the ownership boundary between client-side long-task continuation,
+host-owned collaboration Missions and reusable Workflow Packages. It builds on
+0016/0023's explicit service-and-model execution contract and 0027's application
+capability ownership boundary; it reuses the existing Mission, LocalRun and
+Workflow Runner substrate. The ADR records target architecture and implementation
+gates, not a claim that the handoff, assignment UI or persistent scheduler has
+already shipped.
 
 ## Adding a record
 

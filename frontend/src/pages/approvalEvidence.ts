@@ -100,6 +100,56 @@ export function buildApprovalEvidence(
     }
   }
 
+  // Explicit approval evidence from direct prerequisites (e.g. the immutable PLAN
+  // output). The approver must see the exact work packages before confirming them.
+  const approvalEvent = [...snapshot.events].reverse().find(
+    event => event.step_id === stepId && event.event_type === 'approval_requested',
+  );
+  const approvalPayload = approvalEvent?.payload as Record<string, unknown> | null | undefined;
+  const approvalEvidence = approvalPayload?.evidence;
+  if (approvalEvidence && typeof approvalEvidence === 'object' && !Array.isArray(approvalEvidence)) {
+    for (const [sourceStep, rawOutput] of Object.entries(approvalEvidence as Record<string, unknown>)) {
+      if (!rawOutput || typeof rawOutput !== 'object' || Array.isArray(rawOutput)) continue;
+      const output = rawOutput as Record<string, unknown>;
+      const summary = typeof output.summary === 'string' ? output.summary.trim() : '';
+      if (summary) {
+        items.push({
+          group: 'change',
+          title: sourceStep === 'PLAN' ? '拟整改计划' : `${sourceStep} 摘要`,
+          detail: summary,
+          tone: 'neutral',
+        });
+      }
+      const tasks = Array.isArray(output.tasks) ? output.tasks : [];
+      for (const [index, rawTask] of tasks.slice(0, 12).entries()) {
+        if (!rawTask || typeof rawTask !== 'object' || Array.isArray(rawTask)) continue;
+        const task = rawTask as Record<string, unknown>;
+        const taskId = typeof task.id === 'string' ? task.id.trim() : `任务 ${index + 1}`;
+        const title = typeof task.title === 'string' ? task.title.trim() : '';
+        const category = typeof task.category === 'string' ? task.category.trim() : '';
+        const assignee = typeof task.assignee === 'string' ? task.assignee.trim() : '';
+        const files = Array.isArray(task.files)
+          ? task.files.filter((file): file is string => typeof file === 'string').join('、')
+          : '';
+        const acceptance = Array.isArray(task.acceptance)
+          ? task.acceptance.filter((item): item is string => typeof item === 'string').join('；')
+          : '';
+        const details = [
+          category && `类别：${category}`,
+          assignee && `负责：${roleLabel(assignee)}`,
+          files && `文件：${files}`,
+          acceptance && `验收：${acceptance}`,
+        ].filter(Boolean);
+        items.push({
+          group: 'change',
+          title: `${taskId}${title ? ` · ${title}` : ''}`,
+          detail: details.join('　'),
+          tone: 'neutral',
+        });
+      }
+    }
+  }
+
   // 3) 结论：委派分支各自的产出。多角色协作里，这是「各方怎么说」的唯一来源。
   const branchEvents = snapshot.events.filter(
     (event: SnapshotEvent) => event.step_id === stepId && event.event_type === 'tool_completed',

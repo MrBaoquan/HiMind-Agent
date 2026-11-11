@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "location", "evidence", "recommendation", "severity"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^(IA|CRAFT|A11Y)-[0-9]{3}$" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "location": { "type": "string", "minLength": 1, "maxLength": 400 },
+          "evidence": { "type": "string", "minLength": 1, "maxLength": 1200 },
+          "recommendation": { "type": "string", "minLength": 1, "maxLength": 1200 },
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

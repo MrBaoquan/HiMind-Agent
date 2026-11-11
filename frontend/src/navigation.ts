@@ -1,4 +1,4 @@
-import { CalendarClock, Hammer, Home, Inbox, Library, ListTodo, MessageCircle, Store, Workflow, type LucideIcon } from 'lucide-react';
+import { CalendarClock, FolderTree, Hammer, Home, Inbox, Library, ListTodo, MessageCircle, Store, Workflow, type LucideIcon } from 'lucide-react';
 import type { PageKey } from './types';
 
 /**
@@ -43,6 +43,7 @@ export const navigationSections: NavigationSection[] = [
       { key: 'dashboard', icon: Home, label: '首页' },
       { key: 'tasks', icon: ListTodo, label: '我的任务' },
       { key: 'inbox', icon: Inbox, label: '待处理', badgeKey: 'inbox' },
+      { key: 'workspaces', icon: FolderTree, label: '工作区' },
     ],
   },
   {

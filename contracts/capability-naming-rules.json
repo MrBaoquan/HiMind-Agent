@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "spec": "ADR-0119",
-  "updated_at": "2026-10-12",
+  "updated_at": "2026-11-11",
   "id": {
     "maxLength": 48,
     "minSegments": 2,
@@ -23,6 +23,7 @@
     "skill",
     "plugin",
     "workflow",
+    "mission",
     "mcp",
     "market",
     "schedule",

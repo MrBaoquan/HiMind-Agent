@@ -1283,6 +1283,27 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             &["workbench.knowledge.search"],
             &["dashboard.knowledge.search", "oauth.delegated_user"],
         ),
+        // 工作区登记表：数据落 data/ 而不是 plugin-data/，因为后者不进备份包。
+        // 能力全部由内核实现，与扩展开发工具同一形态。
+        builtin_plugin(
+            "com.himind.workspace-registry",
+            "工作区登记工具",
+            crate::workspace_registry::CAPABILITY_VERSION,
+            "登记本机路径属于哪个项目，维护父子与聚合关系、别名和工程上下文，供 AI 在对话中解析工作区。",
+            &[
+                "workspace.registry.resolve",
+                "workspace.registry.context.get",
+                "workspace.registry.project.list",
+                "workspace.registry.project.upsert",
+                "workspace.registry.project.delete",
+                "workspace.registry.path.bind",
+                "workspace.registry.candidate.list",
+                "workspace.registry.candidate.accept",
+                "workspace.registry.candidate.dismiss",
+                "workspace.registry.validate",
+            ],
+            &[],
+        ),
     ]
 }
 
@@ -3308,6 +3329,34 @@ mod tests {
         );
         // 同一 ID 只允许一个身份：内置条目恒定胜出，外部同 ID 副本被忽略。
         assert_eq!(item.source, "builtin");
+    }
+
+    #[test]
+    fn workspace_registry_is_available_as_a_builtin_plugin() {
+        // 与扩展开发工具同一形态：注册表里有条目、能力由内核实现、
+        // 不受「哪些外部插件装了」影响。
+        let items = builtin_plugin_items();
+        let item = items
+            .iter()
+            .find(|item| item.id == "com.himind.workspace-registry")
+            .expect("内置工作区登记插件条目必须存在");
+        assert_eq!(item.source, "builtin");
+        assert_eq!(item.kind, "plugin");
+        assert_eq!(item.availability, "local");
+        assert_eq!(item.runtime, "builtin");
+        assert_eq!(item.version, crate::workspace_registry::CAPABILITY_VERSION);
+        assert_eq!(
+            item.capabilities.len(),
+            10,
+            "10 条 workspace.registry.* 能力都应在这个条目里"
+        );
+        for capability in &item.capabilities {
+            assert!(
+                capability.id.starts_with("workspace.registry."),
+                "能力必须落在声明的命名空间内：{}",
+                capability.id
+            );
+        }
     }
 
     #[test]

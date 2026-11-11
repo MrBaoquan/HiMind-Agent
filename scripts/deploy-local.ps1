@@ -115,7 +115,7 @@ function Copy-InstalledExeWithRetry([Parameter(Mandatory = $true)][string]$Sourc
 
 function Start-Agent {
     $arguments = @("--api", $ApiBase, "--local-app", "--local-port", "$LocalPort", "--show", "--state", $StatePath)
-    $process = Start-Process -FilePath $InstalledExe -ArgumentList $arguments -PassThru
+    $process = Start-Process -FilePath $InstalledExe -ArgumentList $arguments -PassThru -WindowStyle Hidden
     "已启动：pid=$($process.Id)"
     return $process
 }

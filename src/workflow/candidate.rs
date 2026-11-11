@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn current_candidate_identity(input: &Value) -> Result<Value, Box<dyn Error>> {
     let workspace = [
         "project_root",
         "repository_root",
@@ -22,12 +22,6 @@ pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
     .ok_or(
         "candidate freeze requires project_root, repository_root, workspace_root or source_root",
     )?;
-    let candidate_artifact_id = input
-        .get("candidate_artifact_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or("candidate freeze requires candidate_artifact_id")?;
     let allow_dirty = input
         .get("allow_dirty")
         .and_then(Value::as_bool)
@@ -102,6 +96,29 @@ pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
         "status_digest": status_digest,
         "frozen_at": unix_timestamp_string(),
     });
+    Ok(json!({
+        "ok": true,
+        "candidate": payload,
+    }))
+}
+
+pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
+    let candidate_artifact_id = input
+        .get("candidate_artifact_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("candidate freeze requires candidate_artifact_id")?;
+    let identity = current_candidate_identity(input)?;
+    let payload = identity
+        .get("candidate")
+        .cloned()
+        .ok_or("candidate identity is missing candidate payload")?;
+    let repository_root = payload
+        .get("repository_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("candidate identity is missing repository_root")?;
     let artifact_dir = repository_root
         .join(".himind")
         .join("artifacts")

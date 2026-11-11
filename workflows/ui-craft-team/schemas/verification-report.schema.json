@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["passed", "verified_task_ids", "failed_task_ids", "checks"],
+  "properties": {
+    "passed": { "type": "boolean" },
+    "verified_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "failed_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "checks": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "required": ["command", "exit_code", "detail"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "exit_code": { "type": "integer" },
+          "detail": { "type": "string", "maxLength": 1200 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "reasons": { "type": "array", "items": { "type": "string", "maxLength": 1000 } }
+  }
+}

@@ -717,7 +717,10 @@ impl WorkflowRunner {
                     &run,
                     &step,
                     RuntimeEventType::ApprovalRequested,
-                    serde_json::json!({"risk_level": step.risk_level}),
+                    serde_json::json!({
+                        "risk_level": step.risk_level,
+                        "evidence": approval_dependency_outputs(step, &condition_context),
+                    }),
                 )?;
                 return Ok(outcome(run, step.id.clone(), completed_steps));
             }
@@ -791,6 +794,11 @@ impl WorkflowRunner {
                     .execute(package, step, &step_input)
                     .map(WorkflowStepOutcome::Execution)
             };
+            if let Ok(WorkflowStepOutcome::Execution(execution)) = &result {
+                if execution.usage.is_some() {
+                    run.usage = execution.usage.clone();
+                }
+            }
             if let Some(current) = self.ledger.get_run(&run.run_id)? {
                 if current.status == LocalRunStatus::Canceled {
                     return Ok(outcome(current, String::new(), completed_steps));
@@ -891,9 +899,6 @@ impl WorkflowRunner {
                     )?;
                     for artifact in artifacts {
                         merge_artifact(&mut run.artifacts, artifact);
-                    }
-                    if execution.usage.is_some() {
-                        run.usage = execution.usage;
                     }
                     run_step.status = LocalStepStatus::Succeeded;
                     completed_steps.push(step.id.clone());
@@ -1265,7 +1270,7 @@ impl WorkflowRunner {
             ..package.clone()
         };
         // 子包是 strict 的单步骤包，不该继承父运行的入口/出口选择。
-        let child_input = without_execution_selection(workflow_input);
+        let child_input = workflow_child_input(workflow_input, parent_run, &self.ledger)?;
         let start_iteration = u32::try_from(history.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -1285,6 +1290,17 @@ impl WorkflowRunner {
                 "history": history.clone(),
                 "last_user_feedback": last_user_feedback,
             });
+            // Nested delegate children need the active iteration and its feedback too;
+            // pass it as an internal context seed so implementation agents do not lose
+            // the operator's correction at the next handoff.
+            let mut iteration_input = child_input.clone();
+            let mut parent_loops = iteration_input
+                .get("_workflow_parent_loops")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            parent_loops.insert(step.id.clone(), loop_context.clone());
+            iteration_input["_workflow_parent_loops"] = Value::Object(parent_loops);
             let child_run_id = format!("workflow_run_{request_id}");
             let child_run = if let Some(existing) = self.ledger.get_run(&child_run_id)? {
                 existing
@@ -1307,7 +1323,7 @@ impl WorkflowRunner {
                 self.run_ready_internal(
                     &child_package,
                     child_run,
-                    workflow_input,
+                    &iteration_input,
                     executor,
                     false,
                     Some(&loop_context),
@@ -1407,8 +1423,20 @@ impl WorkflowRunner {
         delegate: &super::WorkflowDelegate,
         is_canceled: &(dyn Fn() -> bool + Sync),
     ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
-        // 执行器若能跨线程共享就真并发跑，否则退回顺序执行。
-        // 「声明式地可以并发」而不是「一律并发」：测试里的执行器带 RefCell，并发会编译不过。
+        // 写工作区的 Agent 默认必须顺序执行：即便运行时能跨线程共享，多个
+        // 子进程同时改同一工作树仍会互相覆盖。只有包显式声明 parallel 时才扇出。
+        if delegate.strategy == "sequential" {
+            return self.execute_delegate_branches_sequential(
+                executor,
+                parent_run,
+                package,
+                step,
+                delegate,
+                workflow_input,
+                is_canceled,
+            );
+        }
+        // 执行器若不能跨线程共享，安全地退回顺序执行。
         match executor.as_shared() {
             Some(shared) => self.execute_delegate_branches_parallel(
                 shared,
@@ -1449,7 +1477,7 @@ impl WorkflowRunner {
         let mut succeeded = 0u32;
 
         for branch in &delegate.branches {
-            let (child_package, child_run) =
+            let (child_package, child_run, child_input) =
                 self.prepare_delegate_branch(package, parent_run, step, branch, workflow_input)?;
             let outcome = if child_run.status.is_terminal() {
                 WorkflowRunOutcome {
@@ -1461,7 +1489,7 @@ impl WorkflowRunner {
                 self.run_ready_internal(
                     &child_package,
                     child_run,
-                    workflow_input,
+                    &child_input,
                     executor,
                     false,
                     None,
@@ -1500,18 +1528,16 @@ impl WorkflowRunner {
         // 而不是一条一条冒出来。
         let mut prepared = Vec::new();
         for branch in &delegate.branches {
-            prepared.push((
-                branch,
-                self.prepare_delegate_branch(package, parent_run, step, branch, workflow_input)?,
-            ));
+            prepared.push((branch, self.prepare_delegate_branch(
+                package, parent_run, step, branch, workflow_input,
+            )?));
         }
 
         let collected = std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (branch, (child_package, child_run)) in prepared {
+            for (branch, (child_package, child_run, child_input)) in prepared {
                 let runner = self.clone_for_thread();
                 let shared = executor;
-                let input = workflow_input.clone();
                 handles.push((
                     branch,
                     scope.spawn(move || {
@@ -1534,7 +1560,7 @@ impl WorkflowRunner {
                                 .run_ready_internal(
                                     &child_package,
                                     child_run,
-                                    &input,
+                                    &child_input,
                                     shared,
                                     false,
                                     None,
@@ -1597,7 +1623,7 @@ impl WorkflowRunner {
         step: &WorkflowStep,
         branch: &super::WorkflowDelegateBranch,
         workflow_input: &Value,
-    ) -> Result<(WorkflowPackage, LocalRun), Box<dyn Error>> {
+    ) -> Result<(WorkflowPackage, LocalRun, Value), Box<dyn Error>> {
         // 父运行 id 已带 `workflow_run_` 前缀，直接拼会得到
         // `workflow_run_workflow_run_…`。剥掉一层再拼，子运行 id 才可读且可定位。
         let parent_suffix = parent_run
@@ -1643,6 +1669,7 @@ impl WorkflowRunner {
             exits: Vec::new(),
             ..package.clone()
         };
+        let child_input = workflow_child_input(workflow_input, parent_run, &self.ledger)?;
         let child_run = match self.ledger.get_run(&child_run_id)? {
             Some(existing) => existing,
             None => self.start_delegated(
@@ -1650,11 +1677,11 @@ impl WorkflowRunner {
                 &child_package,
                 &request_id,
                 // 同 loop：strict 单步骤子包不继承父运行的入口/出口选择。
-                &without_execution_selection(workflow_input),
+                &child_input,
                 &parent_run.run_id,
             )?,
         };
-        Ok((child_package, child_run))
+        Ok((child_package, child_run, child_input))
     }
 
     /// 收一条分支的结果：成功时取它的步骤输出，失败时带上错误。
@@ -2871,19 +2898,31 @@ fn workflow_context_value(
         })
         .map(|artifact| super::read_candidate(&artifact.uri))
         .transpose()?;
-    let mut loops = serde_json::Map::new();
+    let mut loops = workflow_input
+        .get("_workflow_parent_loops")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     if let Some(loop_context) = loop_context {
         if let Some(loop_id) = loop_context.get("id").and_then(Value::as_str) {
             loops.insert(loop_id.to_string(), loop_context.clone());
         }
     }
+    let mut public_input = workflow_input.clone();
+    let parent_steps = public_input
+        .as_object_mut()
+        .and_then(|input| input.remove("_workflow_parent_steps"))
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     Ok(serde_json::json!({
         "workflow": {
             "id": package.id,
             "version": package.version,
         },
-        "input": workflow_input,
+        "input": public_input,
         "steps": output_map,
+        // Loop / Delegate child runs get an explicit, immutable projection of completed
+        // parent steps. Keep it separate from this run's own `steps` namespace.
+        "parent_steps": parent_steps,
         "candidate": candidate,
         "loops": loops,
         "artifacts": run.artifacts,
@@ -2893,6 +2932,46 @@ fn workflow_context_value(
             "workspace_ref": run.workspace_ref,
         }
     }))
+}
+
+/// Child runs need the parent's completed outputs (review report / confirmed plan),
+/// but must not inherit execution selection or let caller-supplied reserved data win.
+fn workflow_child_input(
+    workflow_input: &Value,
+    parent_run: &LocalRun,
+    ledger: &LocalRunLedger,
+) -> Result<Value, Box<dyn Error>> {
+    let mut input = without_execution_selection(workflow_input);
+    let mut parent_steps = input
+        .as_object_mut()
+        .and_then(|object| object.remove("_workflow_parent_steps"))
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    for event in ledger.list_events(&parent_run.run_id)? {
+        if event.event_type != RuntimeEventType::ToolCompleted {
+            continue;
+        }
+        if let Some(output) = event.payload.get("output") {
+            parent_steps.insert(event.step_id, output.clone());
+        }
+    }
+    input["_workflow_parent_steps"] = Value::Object(parent_steps);
+    Ok(input)
+}
+
+/// Approval UI evidence is opt-in by dependency: only completed direct prerequisites
+/// of this approval step are exposed, never unrelated run outputs.
+fn approval_dependency_outputs(step: &WorkflowStep, context: &Value) -> Value {
+    let Some(outputs) = context.get("steps").and_then(Value::as_object) else {
+        return Value::Object(serde_json::Map::new());
+    };
+    let mut evidence = serde_json::Map::new();
+    for dependency in &step.depends_on {
+        if let Some(output) = outputs.get(dependency) {
+            evidence.insert(dependency.clone(), output.clone());
+        }
+    }
+    Value::Object(evidence)
 }
 
 fn execution_input_from_context(
@@ -2909,6 +2988,8 @@ fn execution_input_from_context(
         Value::Object(object) => object.clone(),
         _ => serde_json::Map::new(),
     };
+    input.remove("_workflow_parent_steps");
+    input.remove("_workflow_parent_loops");
     if let Some(step_input) = step.input.as_object() {
         for (name, value) in step_input {
             input.insert(
@@ -3529,6 +3610,42 @@ mod tests {
         assert_eq!(blocked.blocked_step_id, "APPROVE");
         assert_eq!(blocked.run.status, LocalRunStatus::Waiting);
         assert_eq!(executor.steps.borrow().as_slice(), &["STEP-1", "STEP-2"]);
+        let approval_event = runner
+            .ledger
+            .list_events(&blocked.run.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == RuntimeEventType::ApprovalRequested)
+            .expect("approval request must be persisted");
+        assert_eq!(
+            approval_event.payload["evidence"]["STEP-2"]["step"],
+            "STEP-2",
+            "approval must carry the declared direct prerequisite output"
+        );
+        assert!(
+            approval_event.payload["evidence"].get("STEP-1").is_none(),
+            "approval evidence must not include unrelated ancestors"
+        );
+        let child_input = workflow_child_input(
+            &serde_json::json!({
+                "workspace_root": "C:/workspace",
+                "execution": { "entrypoint": "ignored", "exitpoint": "ignored" }
+            }),
+            &blocked.run,
+            &runner.ledger,
+        )
+        .unwrap();
+        assert!(child_input.get("execution").is_none());
+        let child_context = workflow_context_value(
+            &package,
+            &blocked.run,
+            &child_input,
+            &runner.ledger,
+            None,
+        )
+        .unwrap();
+        assert_eq!(child_context["parent_steps"]["STEP-2"]["step"], "STEP-2");
+        assert!(child_context["input"].get("_workflow_parent_steps").is_none());
 
         let approved = runner.approve_step(blocked.run, "APPROVE").unwrap();
         let completed = runner
@@ -4700,6 +4817,7 @@ mod tests {
             runtime: None,
             delegate: Some(Box::new(super::super::WorkflowDelegate {
                 branches,
+                strategy: "parallel".to_string(),
                 min_succeeded,
             })),
             loop_config: None,
@@ -4766,6 +4884,78 @@ mod tests {
         assert!(roles.contains(&"software.role1"));
     }
 
+    #[test]
+    fn delegated_agents_receive_completed_parent_plan_outputs() {
+        use std::sync::{Arc, Mutex};
+
+        struct ParentOutputExecutor {
+            observed: Arc<Mutex<Vec<Value>>>,
+        }
+        impl super::super::SharedStepExecutor for ParentOutputExecutor {}
+        impl WorkflowStepExecutor for ParentOutputExecutor {
+            fn as_shared(&self) -> Option<&dyn super::super::SharedStepExecutor> {
+                Some(self)
+            }
+
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                step: &WorkflowStep,
+                input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                if step.id == "FIX-A" || step.id == "FIX-B" {
+                    self.observed.lock().unwrap().push(
+                        input["workflow_context"]["parent_steps"]["PLAN"].clone(),
+                    );
+                }
+                Ok(WorkflowStepExecution::output(if step.id == "PLAN" {
+                    serde_json::json!({"summary": "approved plan", "task_ids": ["UI-1"]})
+                } else {
+                    serde_json::json!({"ok": true})
+                }))
+            }
+        }
+
+        let ledger = ledger("delegate-parent-plan");
+        let runner = WorkflowRunner::with_ledger(ledger);
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.supported_runtimes = vec!["himind.fixture".to_string()];
+
+        let mut plan = package().steps[0].clone();
+        plan.id = "PLAN".to_string();
+        plan.title = "Plan".to_string();
+        plan.capability_id = "test.first".to_string();
+        plan.depends_on.clear();
+
+        let mut delegated = delegate_step(&workflow, 2, 2);
+        delegated.id = "FIX".to_string();
+        delegated.depends_on = vec!["PLAN".to_string()];
+        if let Some(delegate) = delegated.delegate.as_mut() {
+            delegate.branches[0].id = "FIX-A".to_string();
+            delegate.branches[1].id = "FIX-B".to_string();
+        }
+        workflow.steps = vec![plan, delegated];
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let executor = ParentOutputExecutor {
+            observed: observed.clone(),
+        };
+        let run = runner
+            .start("agent-1", &workflow, "delegate-plan", &serde_json::json!({}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&workflow, run, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2, "both delegated agents must receive the plan");
+        assert!(observed.iter().all(|plan| {
+            plan["summary"] == "approved plan" && plan["task_ids"][0] == "UI-1"
+        }));
+    }
+
     /// 并发验证：两个分支的执行区间必须重叠，而不是一前一后。
     /// 用两个挡板让分支互相等待——顺序执行会死锁，并发执行能通过。
     #[test]
@@ -4818,6 +5008,58 @@ mod tests {
         assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
         // 两个分支都真正进入过执行器 —— 说明它们是并发运行的。
         assert_eq!(executor.started.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn sequential_delegate_does_not_overlap_shared_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackingExecutor {
+            active: AtomicUsize,
+            maximum: AtomicUsize,
+        }
+        impl super::super::SharedStepExecutor for TrackingExecutor {}
+        impl WorkflowStepExecutor for TrackingExecutor {
+            fn as_shared(&self) -> Option<&dyn super::super::SharedStepExecutor> {
+                Some(self)
+            }
+
+            fn execute(
+                &self,
+                _package: &WorkflowPackage,
+                _step: &WorkflowStep,
+                _input: &Value,
+            ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.maximum.fetch_max(active, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(25));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(WorkflowStepExecution::output(serde_json::json!({"ok": true})))
+            }
+        }
+
+        let ledger = ledger("delegate-sequential");
+        let runner = WorkflowRunner::with_ledger(ledger);
+        let mut workflow = package();
+        workflow.candidate = None;
+        workflow.artifacts.clear();
+        workflow.supported_runtimes = vec!["himind.fixture".to_string()];
+        let mut step = delegate_step(&workflow, 3, 3);
+        step.delegate.as_mut().unwrap().strategy = "sequential".to_string();
+        workflow.steps = vec![step];
+
+        let executor = TrackingExecutor {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        };
+        let run = runner
+            .start("agent-1", &workflow, "delegate-sequential", &serde_json::json!({}))
+            .unwrap();
+        let outcome = runner
+            .run_ready(&workflow, run, &serde_json::json!({}), &executor)
+            .unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Succeeded);
+        assert_eq!(executor.maximum.load(Ordering::SeqCst), 1);
     }
 
     #[test]

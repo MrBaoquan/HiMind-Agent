@@ -169,6 +169,12 @@
       "additionalProperties": false,
       "required": ["branches"],
       "properties": {
+        "strategy": {
+          "description": "分支调度策略；共享可写工作区时使用 sequential。",
+          "type": "string",
+          "enum": ["parallel", "sequential"],
+          "default": "parallel"
+        },
         "branches": {
           "type": "array",
           "minItems": 2,

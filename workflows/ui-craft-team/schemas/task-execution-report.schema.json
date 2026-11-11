@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["completed_task_ids", "uncompleted_task_ids", "changes", "risks"],
+  "properties": {
+    "completed_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "uncompleted_task_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" } },
+    "changes": {
+      "type": "array",
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "required": ["task_id", "file", "before", "after"],
+        "properties": {
+          "task_id": { "type": "string", "pattern": "^(IA|CRAFT|A11Y|SHARED)-[0-9]{3}$" },
+          "file": { "type": "string", "minLength": 1, "maxLength": 400 },
+          "before": { "type": "string", "maxLength": 400 },
+          "after": { "type": "string", "maxLength": 400 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "risks": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+  }
+}

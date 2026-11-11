@@ -149,6 +149,8 @@ pub(crate) fn overview(days: i64) -> Value {
     }
 
     let mut totals = Totals::default();
+    let mut latencies = Vec::<u64>::new();
+    let mut recent_failures = Vec::<Value>::new();
     let mut unreported = 0_u64;
     let mut platform_metered = 0_u64;
     let mut daily: BTreeMap<String, Totals> = BTreeMap::new();
@@ -166,6 +168,20 @@ pub(crate) fn overview(days: i64) -> Value {
             continue;
         }
         totals.add(record);
+        latencies.push(record.latency_ms);
+        if record.status.eq_ignore_ascii_case("failure") {
+            recent_failures.push(json!({
+                "occurred_at": record.occurred_at,
+                "request_id": record.request_id,
+                "client": if record.client.trim().is_empty() { "未标注" } else { record.client.as_str() },
+                "service": if record.service.trim().is_empty() { "未标注" } else { record.service.as_str() },
+                "model": if record.model.trim().is_empty() { "未标注" } else { record.model.as_str() },
+                "protocol": record.protocol,
+                "status": record.status,
+                "latency_ms": record.latency_ms,
+                "usage_unreported": record.usage_unreported,
+            }));
+        }
         if record.usage_unreported {
             unreported = unreported.saturating_add(1);
         }
@@ -207,6 +223,13 @@ pub(crate) fn overview(days: i64) -> Value {
         .iter()
         .map(|label| daily.get(label).map(Totals::tokens).unwrap_or(0))
         .collect::<Vec<u64>>();
+    let p95_latency_ms = percentile(&mut latencies, 0.95);
+    recent_failures.sort_by(|left, right| {
+        let left = left.get("occurred_at").and_then(Value::as_str).unwrap_or_default();
+        let right = right.get("occurred_at").and_then(Value::as_str).unwrap_or_default();
+        right.cmp(left)
+    });
+    recent_failures.truncate(20);
 
     json!({
         "available": true,
@@ -219,6 +242,10 @@ pub(crate) fn overview(days: i64) -> Value {
         "date_to": today.to_string(),
         "has_trend": days > 1,
         "requests": totals.requests,
+        "failures": totals.failures,
+        "failure_rate": failure_rate(totals.failures, totals.requests),
+        "avg_latency_ms": totals.avg_latency_ms(),
+        "p95_latency_ms": p95_latency_ms,
         "input_tokens": totals.input,
         "output_tokens": totals.output,
         "cached_tokens": totals.cached,
@@ -229,6 +256,7 @@ pub(crate) fn overview(days: i64) -> Value {
         "labels": labels,
         "daily_requests": daily_requests,
         "daily_tokens": daily_tokens,
+        "recent_failures": recent_failures,
         "breakdowns": {
             "client": groups(by_client),
             "model": groups(by_model),
@@ -240,6 +268,8 @@ pub(crate) fn overview(days: i64) -> Value {
 #[derive(Default, Clone, Copy)]
 struct Totals {
     requests: u64,
+    failures: u64,
+    latency_total_ms: u64,
     input: u64,
     output: u64,
     cached: u64,
@@ -249,6 +279,10 @@ struct Totals {
 impl Totals {
     fn add(&mut self, record: &LocalUsageRecord) {
         self.requests = self.requests.saturating_add(1);
+        if record.status.eq_ignore_ascii_case("failure") {
+            self.failures = self.failures.saturating_add(1);
+        }
+        self.latency_total_ms = self.latency_total_ms.saturating_add(record.latency_ms);
         self.input = self.input.saturating_add(record.input_tokens);
         self.output = self.output.saturating_add(record.output_tokens);
         self.cached = self.cached.saturating_add(record.cached_tokens);
@@ -258,6 +292,32 @@ impl Totals {
     fn tokens(&self) -> u64 {
         self.input.saturating_add(self.output)
     }
+
+    fn avg_latency_ms(&self) -> u64 {
+        if self.requests == 0 {
+            0
+        } else {
+            self.latency_total_ms / self.requests
+        }
+    }
+}
+
+fn failure_rate(failures: u64, requests: u64) -> f64 {
+    if requests == 0 {
+        0.0
+    } else {
+        failures as f64 / requests as f64
+    }
+}
+
+/// 最近秩百分位；空样本返回 0。延迟样本不需要插值。
+fn percentile(values: &mut [u64], quantile: f64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let index = ((values.len() - 1) as f64 * quantile).round() as usize;
+    values[index.min(values.len() - 1)]
 }
 
 /// 构成表按 Token 倒序，与服务端的 Top-N 语义一致。
@@ -269,6 +329,9 @@ fn groups(items: BTreeMap<String, Totals>) -> Vec<Value> {
                 "key": label,
                 "label": label,
                 "requests": totals.requests,
+                "failures": totals.failures,
+                "failure_rate": failure_rate(totals.failures, totals.requests),
+                "avg_latency_ms": totals.avg_latency_ms(),
                 "input_tokens": totals.input,
                 "output_tokens": totals.output,
                 "tokens": totals.tokens(),
@@ -321,6 +384,24 @@ mod tests {
     }
 
     #[test]
+    fn failure_rate_and_percentile_are_reported() {
+        let mut failed = record("2026-10-05", "codex", 1, 0);
+        failed.status = "failure".to_string();
+        failed.latency_ms = 100;
+        let mut fast = record("2026-10-05", "codex", 1, 1);
+        fast.latency_ms = 10;
+        let mut totals = Totals::default();
+        totals.add(&failed);
+        totals.add(&fast);
+        assert_eq!(totals.failures, 1);
+        assert_eq!(failure_rate(totals.failures, totals.requests), 0.5);
+        let mut samples = vec![100, 10, 30];
+        assert_eq!(percentile(&mut samples, 0.95), 100);
+        let mut empty: Vec<u64> = Vec::new();
+        assert_eq!(percentile(&mut empty, 0.95), 0);
+    }
+
+    #[test]
     fn groups_sort_by_tokens_descending() {
         let mut items = BTreeMap::new();
         let mut small = Totals::default();
@@ -366,6 +447,27 @@ mod tests {
             Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
             None => std::env::remove_var("HIMIND_AGENT_HOME"),
         }
+    }
+
+    #[test]
+    fn overview_reports_recent_failures_and_latency() {
+        with_isolated_home(|| {
+            let day = chrono::Utc::now().date_naive().to_string();
+            let mut failed = record(&day, "codex", 1, 0);
+            failed.status = "failure".to_string();
+            failed.request_id = "req_failure_test".to_string();
+            failed.latency_ms = 100;
+            append(&failed).unwrap();
+            append(&record(&day, "codex", 1, 1)).unwrap();
+            let value = overview(1);
+            assert_eq!(value["failures"], 1);
+            assert_eq!(value["failure_rate"], 0.5);
+            assert_eq!(
+                value["recent_failures"][0]["request_id"],
+                "req_failure_test"
+            );
+            assert_eq!(value["recent_failures"][0]["latency_ms"], 100);
+        });
     }
 
     #[test]

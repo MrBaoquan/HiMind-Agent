@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const STORE_FILE: &str = "media-registry.json";
 /// 只保留最近的条目，避免登记表无限增长；文件本身仍然在磁盘上。
@@ -182,6 +182,25 @@ pub(crate) fn list(limit: usize) -> Result<Vec<MediaRecord>, Box<dyn Error>> {
     records.reverse();
     records.truncate(limit);
     Ok(records)
+}
+
+/// 清理网关媒体缓存后同步登记表：只动 `inference.media-normalize` 产生、
+/// 位于指定缓存目录下的记录；其它生成媒体不受影响。
+pub(crate) fn prune_missing_gateway_media(cache_dir: &Path) -> Result<usize, Box<dyn Error>> {
+    let mut records = load_all()?;
+    let before = records.len();
+    records.retain(|item| {
+        if item.capability != "inference.media-normalize" {
+            return true;
+        }
+        let path = Path::new(&item.path);
+        path.is_file() && path.starts_with(cache_dir)
+    });
+    let removed = before.saturating_sub(records.len());
+    if removed > 0 {
+        save_all(&records)?;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

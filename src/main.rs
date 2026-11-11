@@ -79,6 +79,7 @@ mod workflow;
 mod workflow_handoff;
 mod workspace_instructions;
 mod workspace_lease;
+mod workspace_registry;
 mod worktree_identity;
 
 use api::client::{is_task_canceled_error, TaskCancelGuard};
@@ -116,7 +117,7 @@ const AGENT_PROTOCOL_SCHEME: &str = "himind-agent";
 
 /// 深链 `himind-agent://open?...` 携带的落点。写通道②（工作台在 Agent 不可达
 /// 时经 `himind-agent://` 唤起工具中心）只使用下方「精确枚举」的值，见 ADR 0118。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentOpenTarget {
     /// 纯唤起：只把主窗口带到前台（历史行为）。
     Main,
@@ -124,6 +125,7 @@ pub(crate) enum AgentOpenTarget {
     SettingsAi,
     /// Open Settings → 账号与凭据.
     SettingsAccounts,
+    MissionAssignment(String),
 }
 
 impl AgentOpenTarget {
@@ -156,14 +158,32 @@ fn parse_protocol_open(args: &[String]) -> Option<AgentOpenTarget> {
     {
         return None;
     }
-    let mut target = AgentOpenTarget::Main;
+    let mut open: Option<String> = None;
+    let mut mission_id: Option<String> = None;
     for (key, raw) in url.query_pairs() {
-        if key != "open" {
+        match key.as_ref() {
+            "open" if open.is_none() => open = Some(raw.into_owned()),
+            "mission_id" if mission_id.is_none() => mission_id = Some(raw.into_owned()),
+            _ => return None,
+        }
+    }
+    let open = open.as_deref().unwrap_or("main");
+    if open == "main" {
+        if mission_id.is_some() { return None; }
+        return Some(AgentOpenTarget::Main);
+    }
+    if open == "mission" {
+        let mission_id = mission_id?;
+        if mission_id.is_empty()
+            || mission_id.len() > 160
+            || !mission_id.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+        {
             return None;
         }
-        target = AgentOpenTarget::from_query(raw.as_ref())?;
+        return Some(AgentOpenTarget::MissionAssignment(mission_id));
     }
-    Some(target)
+    if mission_id.is_some() { return None; }
+    AgentOpenTarget::from_query(open)
 }
 
 fn main() {
@@ -1177,6 +1197,21 @@ fn run_mission_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
             let proposal = mission::parse_plan_json(&outcome.text)?;
             println!("{}", serde_json::to_string_pretty(&store.propose_plan(mission_id, &proposal)?)?);
         }
+        [action, mission_id, plan_sha256, task_ids, approved_paths, absolute_read_paths, absolute_write_paths] if action == "confirm" => {
+            let store = mission::MissionStore::open_default()?;
+            let task_ids = task_ids.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
+            let approved_paths = if approved_paths.trim() == "-" {
+                Vec::new()
+            } else {
+                approved_paths.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()
+            };
+            let absolute_read_paths = absolute_read_paths.split(',').map(str::trim).filter(|value| !value.is_empty() && *value != "-").map(str::to_string).collect::<Vec<_>>();
+            let absolute_write_paths = absolute_write_paths.split(',').map(str::trim).filter(|value| !value.is_empty() && *value != "-").map(str::to_string).collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&store.confirm_plan(
+                mission_id, plan_sha256, &task_ids, &approved_paths,
+                &absolute_read_paths, &absolute_write_paths, "cli-user"
+            )?)?);
+        }
         [action, mission_id, plan_sha256, task_ids, approved_paths] if action == "confirm" => {
             let store = mission::MissionStore::open_default()?;
             let task_ids = task_ids.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>();
@@ -1186,8 +1221,16 @@ fn run_mission_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
                 approved_paths.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()
             };
             println!("{}", serde_json::to_string_pretty(&store.confirm_plan(
-                mission_id, plan_sha256, &task_ids, &approved_paths, "cli-user"
+                mission_id, plan_sha256, &task_ids, &approved_paths, &[], &[], "cli-user"
             )?)?);
+        }
+        [action, mission_id] if action == "generate-follow-up" => {
+            let mission = app::mission_commands::generate_mission_follow_up_sync(options, mission_id)
+                .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&mission)?);
+        }
+        [action, mission_id] if matches!(action.as_str(), "pause" | "resume" | "cancel") => {
+            println!("{}", serde_json::to_string_pretty(&app::mission_dispatch::control_mission(mission_id, action)?)?);
         }
         [action, mission_id] if action == "dispatch" => {
             let gateway = CapabilityGateway::new(
@@ -1198,7 +1241,7 @@ fn run_mission_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
                 &gateway, options, mission_id
             )?)?);
         }
-        _ => return Err("usage: himind-agent mission <list|create json|snapshot id|plan id proposal.json|generate-plan id|confirm id sha task_ids approved_paths|dispatch id>".into()),
+        _ => return Err("usage: himind-agent mission <list|create json|snapshot id|plan id proposal.json|generate-plan id|confirm id sha task_ids approved_paths absolute_read_paths absolute_write_paths|dispatch id>".into()),
     }
     Ok(())
 }
@@ -4087,6 +4130,18 @@ mod tests {
             Some(AgentOpenTarget::SettingsAccounts)
         );
 
+        let open_mission = vec![
+            "agent.exe".to_string(),
+            "--protocol-url".to_string(),
+            "himind-agent://open?open=mission&mission_id=mission_abc-123".to_string(),
+        ];
+        assert_eq!(
+            parse_protocol_open(&open_mission),
+            Some(AgentOpenTarget::MissionAssignment(
+                "mission_abc-123".to_string()
+            ))
+        );
+
         for value in [
             "himind-agent://open?command=exec",
             "himind-agent://open?open=unknown",
@@ -4097,6 +4152,12 @@ mod tests {
             "himind-agent://plugin/open",
             "https://open",
             "not-a-url",
+            "himind-agent://open?open=mission",
+            "himind-agent://open?open=mission&mission_id=",
+            "himind-agent://open?open=mission&mission_id=bad%2Fid",
+            "himind-agent://open?open=mission&mission_id=mission_abc&extra=1",
+            "himind-agent://open?open=main&mission_id=mission_abc",
+            "himind-agent://open?open=mission&mission_id=mission_abc&mission_id=mission_def",
         ] {
             let rejected = vec![
                 "agent.exe".to_string(),

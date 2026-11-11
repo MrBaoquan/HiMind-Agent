@@ -364,6 +364,10 @@ export function GatewayProfilesPanel({ profiles, aiServices, busy, onSave, onRem
         })}
         {!draft.routes.length ? <div className="gateway-route-empty">暂无模型</div> : null}
       </div>
+      <small className="gateway-route-hint">
+        同一模型可配多条路由，按健康状态切换；
+        完全相同的“别名 + 服务 + 上游模型”会被拒绝。
+      </small>
 
       <div className="gateway-profile-actions">
         <button type="button" className="btn" disabled={anyActionPending} onClick={addRoute}><Plus size={13} />添加模型</button>

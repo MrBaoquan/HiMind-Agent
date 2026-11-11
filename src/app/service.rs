@@ -144,6 +144,15 @@ pub(crate) fn start_background_services(
         capability_gateway.clone(),
         workflow_approval_manager,
     );
+    // Mission execution belongs to the persistent Agent host, not to the
+    // Tauri/MCP request that created or confirmed it. The supervisor only
+    // advances already-confirmed active Missions; per-Mission OS locks and
+    // workspace claims remain the final concurrency guard.
+    crate::app::mission_supervisor::start(
+        capability_gateway.clone(),
+        options.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
 
     // A VS Code update replaces its versioned product.json. Repair an existing
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
