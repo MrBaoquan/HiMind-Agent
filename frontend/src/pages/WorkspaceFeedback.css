@@ -1,0 +1,5 @@
+.workspace-feedback { min-width: 0; padding: var(--space-3); border: 1px solid var(--danger); border-radius: var(--radius); background: var(--danger-soft); font-size: var(--fs-body); }
+.workspace-feedback p { display: flex; align-items: flex-start; gap: var(--space-2); margin: 0; color: var(--danger); overflow-wrap: anywhere; }
+.workspace-feedback p svg { flex-shrink: 0; }
+.workspace-feedback .btn, .workspace-feedback details { margin-top: var(--space-2); }
+.workspace-feedback pre { max-width: 100%; margin: var(--space-2) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: var(--fs-meta); color: var(--text); user-select: text; }

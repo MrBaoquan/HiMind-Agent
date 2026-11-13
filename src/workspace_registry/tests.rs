@@ -6,17 +6,58 @@
 
 use super::*;
 
+#[test]
+fn chinese_display_name_is_explicit_or_unambiguous() {
+    let mut project = RegistryProject { name: "IOStudio".into(), aliases: vec!["设备配置与编排".into()], ..Default::default() };
+    assert_eq!(project.display_name(), "设备配置与编排");
+    project.aliases.push("编辑器".into());
+    assert_eq!(project.display_name(), "IOStudio");
+    project.name = "设备配置与编排".into();
+    assert_eq!(project.display_name(), "设备配置与编排");
+}
+
+#[test]
+fn renaming_preserves_technical_lookup_and_rejects_another_identity() {
+    let mut registry = Registry::default();
+    let original = upsert_project(&mut registry, ProjectInput { name: "IOStudio".into(), ..Default::default() }).unwrap();
+    let renamed = upsert_project(&mut registry, ProjectInput { id: original.id.clone(), name: "设备配置与编排".into(), ..Default::default() }).unwrap();
+    assert_eq!(renamed.id, original.id);
+    assert_eq!(registry.find_project("IOStudio").unwrap().id, original.id);
+    let other = upsert_project(&mut registry, ProjectInput { name: "其他项目".into(), ..Default::default() }).unwrap();
+    assert!(upsert_project(&mut registry, ProjectInput { id: other.id, name: "IOStudio".into(), ..Default::default() }).is_err());
+}
+
 /// 建一个临时目录 + 登记表路径。返回值里的 `PathBuf` 是目录，调用方
 /// 在测试结束时靠它清理；仓里没有 `tempfile` 依赖，沿用 `workspace_lease`
 /// 的 `std::env::temp_dir()` 写法。
+///
+/// **必须能回退**：有些机器的 `%TEMP%` 带着 DSH 沙箱留下的 capability-SID
+/// ACE，Rust 进程在那里 `create_dir` 会拿到 `拒绝访问`，而同一台机器上用别的
+/// 运行时（Python/Node）却能建出来。那是环境状态，不是被测代码的行为——
+/// 遇到就换到工作区的 `.himind/` 下，而不是让 20 个用例一起变红。
 fn temp_registry() -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
+    let name = format!(
         "himind-workspace-registry-{}-{}",
         std::process::id(),
         NEXT_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    (dir.clone(), dir.join("workspace-registry.json"))
+    );
+    let candidates = [
+        std::env::temp_dir().join(&name),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".himind")
+            .join("test-tmp")
+            .join(&name),
+    ];
+    for dir in candidates {
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => return (dir.clone(), dir.join("workspace-registry.json")),
+            Err(error) => eprintln!(
+                "temp_registry: {} 不可用（{error}），换下一个落点",
+                dir.display()
+            ),
+        }
+    }
+    panic!("没有可写的临时目录：%TEMP% 与 <工作区>/.himind/test-tmp 都建不出来");
 }
 
 static NEXT_TEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -462,15 +503,12 @@ fn candidate_flow_records_and_accepts() {
     let (root_id, _sub_id) = seed(&path);
 
     // 造一个真的带 .git 的目录，让 suggest 能推断出来。
-    let work_dir = std::env::temp_dir().join(format!(
-        "himind-workspace-registry-project-{}-{}",
-        std::process::id(),
-        NEXT_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&work_dir).unwrap();
+    // 落点同样走可回退选择：这条用例要读真实目录，不能只靠内存里的路径。
+    let (work_dir, registry_path) = temp_registry();
     let project_dir = work_dir.join("new-thing");
     fs::create_dir_all(project_dir.join(".git")).unwrap();
     let project_path = normalize_path(&project_dir.to_string_lossy()).unwrap();
+    drop(registry_path);
 
     Registry::update_at(&path, |registry| {
         let suggestions = suggest_candidates(registry, &project_path);

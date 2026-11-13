@@ -1,0 +1,110 @@
+/* WUI-04/05: history responds to its own width, including narrow detail columns. */
+.workspace-session-history { container: workspace-history / inline-size; min-width: 0; min-height: 0; display: flex; flex-direction: column; flex: 1 1 0; }
+.workspace-session-history > :not(.workspace-session-history-results, .workspace-session-history-preview) { flex-shrink: 0; }
+.workspace-session-history-results { min-height: calc(100px + var(--control-h) + var(--space-3)); display: flex; flex-direction: column; flex: 1 1 0; }
+.workspace-session-history-source-details { color: var(--text-muted); font-size: var(--fs-meta); margin-bottom: var(--space-2); }
+.workspace-session-history-source-details > summary { min-height: var(--control-h-sm); cursor: pointer; }
+/* A fixed 180px diagnostic box consumed the entire list in a 680px window. */
+.workspace-session-history-source-details[open] { min-height: var(--control-h-sm); max-height: min(180px, 18%); flex-shrink: 1; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-padding-top: var(--control-h-sm); }
+.workspace-session-history-source-details[open] > summary { position: sticky; top: 0; z-index: 1; background: var(--surface); }
+.workspace-session-history [hidden] { display: none !important; }
+.workspace-session-history-head, .workspace-session-history-title, .workspace-session-history-pagination, .workspace-session-history-pagination > div { min-width: 0; display: flex; align-items: center; }
+.workspace-session-history-head { flex-wrap: wrap; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); }
+.workspace-session-history-title { gap: var(--space-2); }
+.workspace-session-history-title > svg { color: var(--primary); }
+.workspace-session-history-title .btn-icon { width: var(--control-h-sm); height: var(--control-h-sm); min-height: var(--control-h-sm); padding: var(--space-1); }
+.workspace-session-history-title .btn-icon::after { content: none; }
+.workspace-session-history-title h4 { margin: 0; font-size: var(--fs-title); }
+.workspace-session-history-total { color: var(--text-muted); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; }
+.workspace-session-history-tools { min-width: 0; width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) var(--control-h); align-items: center; gap: var(--space-2); }
+.workspace-session-history-search { grid-column: 1 / -1; min-width: 0; min-height: var(--control-h); display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-2); border: 1px solid var(--control-border); border-radius: var(--radius); color: var(--text-muted); background: var(--surface); }
+.workspace-session-history-search svg { flex-shrink: 0; }
+.workspace-session-history-search:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.workspace-session-history-search input { width: 100%; min-width: 0; padding: 0; border: 0; outline: 0; color: var(--text); background: transparent; font: inherit; font-size: var(--fs-body); }
+.workspace-session-history-search input::placeholder { color: var(--text-muted); }
+.workspace-session-history-tools .btn-icon { width: var(--control-h); height: var(--control-h); min-height: var(--control-h); }
+/* The 32px control already meets the target size; extending its hit box creates horizontal scroll. */
+.workspace-session-history-tools .btn-icon::after { content: none; }
+.workspace-session-history-filter { min-width: 0; }
+.workspace-session-history-filter select { width: 100%; min-width: 0; height: var(--control-h); padding: 0 var(--space-1); border: 1px solid var(--control-border); border-radius: var(--radius); color: var(--text); background: var(--surface); font: inherit; font-size: var(--fs-body); }
+.workspace-session-history-sources { min-width: 0; display: flex; flex-wrap: wrap; gap: var(--space-2); margin: var(--space-2) 0; }
+.workspace-session-history-source-state { min-height: var(--space-5); display: inline-flex; align-items: center; gap: var(--space-1); padding: var(--space-1) var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-secondary); background: var(--surface-muted); font-size: var(--fs-meta); }
+.workspace-session-history-source-state svg { flex: 0 0 auto; }
+.workspace-session-history-source-state.available { color: var(--success-strong); }
+.workspace-session-history-source-state.partial { color: var(--warning-strong); }
+.workspace-session-history-source-state.unavailable, .workspace-session-history-source-state.error { color: var(--text-muted); }
+.workspace-session-history-loading { padding: var(--space-4) var(--space-1); color: var(--text-muted); font-size: var(--fs-body); }
+.workspace-session-history-list { min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; list-style: none; margin: 0; padding: 0; }
+.workspace-session-history-list:focus-visible, .workspace-session-history-messages:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.workspace-session-history-list > li { min-width: 0; border-top: 1px solid var(--border); }
+.workspace-session-history-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-1); }
+.workspace-session-history-row.selected { background: var(--surface-muted); }
+.workspace-session-history-row-main { min-width: 0; grid-column: 1 / -1; display: grid; gap: var(--space-1); }
+.workspace-session-history-row-main strong { overflow: hidden; color: var(--text); font-size: var(--fs-body); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-session-history-row-main code { min-width: 0; display: block; overflow: hidden; color: var(--text-muted); font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-meta); text-overflow: ellipsis; white-space: nowrap; }
+.workspace-session-history-row-main code svg { vertical-align: middle; margin-right: var(--space-1); }
+.workspace-session-history-row-meta { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-session-history-row-meta > span { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-1); overflow-wrap: anywhere; }
+.workspace-session-history-row-meta svg { flex-shrink: 0; }
+.workspace-session-history-source { color: var(--primary); }
+.workspace-session-history-row-actions { display: flex; justify-content: flex-end; }
+.workspace-session-history-row-actions .btn, .workspace-session-history-pagination .btn { min-height: var(--control-h-sm); display: inline-flex; align-items: center; gap: var(--space-1); padding: var(--space-1) var(--space-2); font-size: var(--fs-body); }
+.workspace-session-history-row-actions > span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-session-history-pagination { flex-wrap: wrap; justify-content: space-between; gap: var(--space-2); padding-top: var(--space-3); color: var(--text-muted); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; }
+.workspace-session-history-pagination > div { flex-wrap: wrap; gap: var(--space-2); }
+.workspace-session-history-empty { min-height: 68px; display: flex; align-items: center; justify-content: center; gap: var(--space-2); border-top: 1px solid var(--border); color: var(--text-muted); font-size: var(--fs-body); }
+/* WUI-03: detail replaces the list; keyboard return restores the exact trigger and scroll. */
+.workspace-session-history-preview { min-width: 0; min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.workspace-session-history-preview > :not(.workspace-session-history-messages) { flex-shrink: 0; }
+.workspace-session-history-preview-head { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--border); }
+.workspace-session-history-preview-head > div { min-width: 0; flex: 1 1 140px; display: flex; align-items: center; gap: var(--space-2); }
+.workspace-session-history-preview-head h5 { min-width: 0; margin: 0; color: var(--text); font-size: var(--fs-title); overflow-wrap: anywhere; scroll-margin-block-start: var(--space-4); }
+.workspace-session-history-preview-head svg { flex: 0 0 auto; color: var(--primary); }
+.workspace-session-history-messages { min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; list-style: none; margin: 0; padding: var(--space-3); }
+.workspace-session-history-message { min-width: 0; padding: var(--space-2); border-left: 2px solid var(--border); }
+.workspace-session-history-message + .workspace-session-history-message { margin-top: var(--space-2); }
+.workspace-session-history-message.assistant { border-left-color: var(--primary); }
+.workspace-session-history-message > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-2); color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-session-history-message > div strong { color: var(--text-secondary); font-weight: 600; }
+.workspace-session-history-message pre { min-width: 0; margin: var(--space-1) 0 0; color: var(--text); font: inherit; font-size: var(--fs-body); line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.workspace-session-history-preview .workspace-session-history-pagination { margin: 0 var(--space-3) var(--space-3); padding-top: var(--space-2); border-top: 1px solid var(--border); }
+.workspace-session-history-preview .workspace-session-history-empty { border-top: 0; }
+.workspace-session-history-recovery { margin-block: var(--space-2); color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-session-history-recovery ul { padding-left: var(--space-4); }
+.workspace-session-history-recovery pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; user-select: text; }
+@container workspace-history (min-width: 620px) {
+  .workspace-session-history-tools { grid-template-columns: minmax(0, 1fr) minmax(0, 140px) minmax(0, 120px) var(--control-h); }
+  .workspace-session-history-search { grid-column: auto; }
+  .workspace-session-history-row { grid-template-columns: minmax(0, 1fr) minmax(0, 220px) auto; }
+  .workspace-session-history-row-main { grid-column: auto; }
+}
+@container workspace-history (max-width: 280px) {
+  .workspace-session-history-row { grid-template-columns: minmax(0, 1fr); }
+  .workspace-session-history-row-actions { justify-content: flex-start; }
+}
+/* WHC-01: discovery replaces the reading pane and owns one bounded scroll region. */
+.workspace-session-history > .workspace-history-inspector-slot { flex: 1 1 0; min-height: 0; min-width: 0; display: flex; }
+.workspace-history-inspector { min-height: 0; min-width: 0; flex: 1 1 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.workspace-history-inspector > :not(.workspace-history-inspector-list) { flex-shrink: 0; }
+.workspace-history-inspector-head, .workspace-history-query, .workspace-history-inspector-status, .workspace-history-entry, .workspace-history-actions { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.workspace-history-inspector-head, .workspace-history-inspector-status { justify-content: space-between; }
+.workspace-history-query input { min-width: 0; flex: 1 1 120px; height: var(--control-h); border: 1px solid var(--control-border); border-radius: var(--radius); padding: var(--space-2); background: var(--surface); color: var(--text); font: inherit; font-size: var(--fs-body); }
+.workspace-history-entry { margin-bottom: var(--space-2); }
+.workspace-history-inspector .btn, .workspace-history-entry .btn, .workspace-history-actions .btn, .workspace-session-history-message .btn { min-height: var(--control-h-sm); font-size: var(--fs-body); padding: var(--space-1) var(--space-2); }
+.workspace-history-inspector-status, .workspace-history-inspector-hint, .workspace-history-inspector-warning, .workspace-history-actions, .workspace-history-preview-tools { color: var(--text-muted); font-size: var(--fs-meta); overflow-wrap: anywhere; }
+.workspace-history-inspector-hint, .workspace-history-inspector-warning { margin: 0; }
+.workspace-history-inspector-warning { max-height: 100px; overflow: auto; overscroll-behavior: contain; color: var(--warning-strong); }
+.workspace-history-inspector-list { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 0; list-style: none; }
+.workspace-history-inspector-list li > button { display: flex; flex-direction: column; gap: var(--space-1); width: 100%; min-width: 0; text-align: left; padding: var(--space-3); border: 0; border-bottom: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; font-size: var(--fs-body); cursor: pointer; overflow-wrap: anywhere; }
+.workspace-history-inspector-list li > button span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-history-inspector-list li > button.selected { background: var(--surface-muted); }
+.workspace-history-inspector-list li > button:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.workspace-history-preview-tools { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); }
+.workspace-history-preview-tools .workspace-history-entry { margin: 0; }
+.workspace-session-history-message.located { outline: 2px solid var(--primary); outline-offset: -2px; }
+.workspace-session-history-message > div .btn { margin-left: auto; }
+.workspace-history-file { margin-top: var(--space-2); font-size: var(--fs-meta); color: var(--text-secondary); overflow-wrap: anywhere; }
+.workspace-history-file summary { cursor: pointer; min-height: var(--control-h-sm); }
+.workspace-history-file pre { padding: var(--space-2); background: var(--surface-muted); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.workspace-history-file .workspace-history-diff-before { border-left: 2px solid var(--danger); }
+.workspace-history-file .workspace-history-diff-after { border-left: 2px solid var(--success-strong); }

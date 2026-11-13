@@ -188,6 +188,27 @@ pub(crate) struct RegistryProject {
     pub updated_at: String,
 }
 
+fn contains_chinese(value: &str) -> bool {
+    value.chars().any(|ch| matches!(ch as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af))
+}
+
+impl RegistryProject {
+    /// A Chinese primary name wins; a unique Chinese alias is a compatible fallback.
+    /// Multiple aliases need an explicit primary name instead of relying on list order.
+    pub(crate) fn display_name(&self) -> &str {
+        if contains_chinese(&self.name) {
+            return self.name.trim();
+        }
+        let mut aliases = self.aliases.iter().map(|alias| alias.trim())
+            .filter(|alias| contains_chinese(alias));
+        match aliases.next() {
+            Some(first) if aliases.all(|alias| alias == first) => first,
+            _ => self.name.trim(),
+        }
+    }
+}
+
 /// 物理路径绑定；一个项目可以有多条。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +291,24 @@ pub(crate) fn registry_path() -> PathBuf {
 }
 
 impl Registry {
+    pub(crate) fn revision(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(serde_json::to_vec(self).unwrap_or_default()))
+    }
+
+    pub(crate) fn scope_ids(&self, project_id: &str, descendants: bool) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::from([project_id.to_string()]);
+        if descendants {
+            loop {
+                let mut changed = false;
+                for project in &self.projects {
+                    if ids.contains(&project.parent_id) && ids.insert(project.id.clone()) { changed = true; }
+                }
+                if !changed { break; }
+            }
+        }
+        ids
+    }
     pub(crate) fn project(&self, id: &str) -> Option<&RegistryProject> {
         self.projects.iter().find(|project| project.id == id)
     }
@@ -895,6 +934,12 @@ pub(crate) fn upsert_project(
         }
     };
 
+    let previous_name = existing_index.map(|index| registry.projects[index].name.clone());
+    if let Some(owner) = registry.find_project(&name) {
+        if Some(owner.id.as_str()) != existing_index.map(|index| registry.projects[index].id.as_str()) {
+            return Err(format!("{ERR_ALIAS_CONFLICT}: 名称 {name:?} 已属于 {}", owner.name).into());
+        }
+    }
     let project_id = match existing_index {
         Some(index) => registry.projects[index].id.clone(),
         None => {
@@ -913,7 +958,8 @@ pub(crate) fn upsert_project(
     let mut cleaned_aliases = Vec::new();
     let mut seen_alias = std::collections::HashSet::new();
     seen_alias.insert(name.to_lowercase());
-    for alias in &input.aliases {
+    // Renaming the display name must preserve lookup by the former technical name.
+    for alias in previous_name.iter().chain(input.aliases.iter()) {
         let alias = alias.trim().to_string();
         if alias.is_empty() {
             continue;
@@ -1661,6 +1707,7 @@ pub(crate) fn validate_registry(registry: &Registry) -> RegistryValidation {
 /// 列表视图的返回：树 + 平铺项目 + 绑定 + 更新时间。
 pub(crate) fn list_view(registry: &Registry) -> Value {
     serde_json::json!({
+        "revision": registry.revision(),
         "tree": build_tree(registry),
         "projects": registry.projects,
         "workspaces": registry.workspaces,
@@ -1725,3 +1772,5 @@ fn workspace_root_arg(input: &Value) -> Result<String, Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod hierarchy;

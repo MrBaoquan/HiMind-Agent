@@ -1284,6 +1284,20 @@ export type WorkspaceRegistryProject = {
   updated_at?: string;
 };
 
+export type WorkspaceSubprojectInput = {
+  parent_id: string;
+  expected_revision: string;
+  parent_name?: string;
+  entries: Array<{ workspace_id: string; name: string; aliases: string[]; kind: string }>;
+};
+export type WorkspaceSubprojectPreview = {
+  revision: string;
+  parent: WorkspaceRegistryProject;
+  changes: Array<{ workspace_id: string; path: string; previous_project_id: string; project: WorkspaceRegistryProject }>;
+  rollback_revision?: string | null;
+  applied_revision?: string | null;
+};
+
 export type WorkspaceRegistryBinding = {
   id: string;
   project_id: string;
@@ -1312,6 +1326,7 @@ export type WorkspaceRegistryTree = {
 };
 
 export type WorkspaceRegistrySnapshot = {
+  revision?: string;
   tree: WorkspaceRegistryTree[];
   projects: WorkspaceRegistryProject[];
   workspaces: WorkspaceRegistryBinding[];
@@ -1324,6 +1339,93 @@ export type WorkspaceRegistryValidation = {
   missing_paths: string[];
   project_count: number;
   workspace_count: number;
+};
+
+export type SessionHistorySource = 'dsh' | 'acp' | 'claude_code' | 'codex' | 'opencode';
+export type WorkspaceSessionHistorySort = 'recent' | 'oldest' | 'title';
+
+export type WorkspaceSessionSummary = {
+  id: string;
+  source: SessionHistorySource;
+  native_id: string;
+  project_id?: string | null;
+  project_name?: string | null;
+  working_directory: string;
+  title: string;
+  updated_at?: string | null;
+  message_count?: number | null;
+  capabilities: {
+    can_preview: boolean;
+    can_open_original: boolean;
+    can_resume: boolean;
+  };
+};
+
+export type WorkspaceSessionHistory = {
+  sessions: WorkspaceSessionSummary[];
+  sources: Array<{
+    source: SessionHistorySource;
+    availability: 'available' | 'partial' | 'unavailable' | 'error';
+    session_count: number;
+    error_code?: string | null;
+  }>;
+  total: number;
+  next_cursor?: string | null;
+};
+
+export type WorkspaceSessionTranscriptMessage = {
+  id: string;
+  role: 'user' | 'assistant' | string;
+  content: string;
+  timestamp?: string | null;
+  files?: WorkspaceHistoryFile[];
+};
+
+export type WorkspaceHistoryFile = {
+  path: string;
+  operation: string;
+  kind: 'fragment' | 'patch' | 'reference' | 'recorded_content';
+  before?: string | null;
+  after?: string | null;
+  patch?: string | null;
+  truncated: boolean;
+};
+
+export type WorkspaceHistoryHit = {
+  session: WorkspaceSessionSummary;
+  message_id: string;
+  cursor?: string | null;
+  previous: Array<string | null>;
+  excerpt: string;
+  paths: string[];
+};
+
+export type WorkspaceHistoryInspection = {
+  token: string;
+  hits: WorkspaceHistoryHit[];
+  sources: WorkspaceSessionHistory['sources'];
+  scanned_pages: number;
+  scanned_sessions: number;
+  total_sessions: number;
+  done: boolean;
+  limited: boolean;
+  cancelled: boolean;
+  issues: string[];
+};
+
+export type WorkspaceSessionResumePlan = {
+  session_id: string;
+  client: string;
+  working_directory: string;
+  command: string;
+  available: boolean;
+};
+
+export type WorkspaceSessionTranscriptPage = {
+  session_id: string;
+  through_seq: number | null;
+  messages: WorkspaceSessionTranscriptMessage[];
+  next_cursor?: string | null;
 };
 
 export type AgentStorageCleanup = {
@@ -4134,6 +4236,29 @@ export const agentApi = {
     openAgentDirectory: () => invoke('open_agent_directory'),
     storageReport: (keep?: number) => invoke<{ report: AgentStorageReport }>('get_agent_storage_report', { keep: keep ?? null }),
     workspaceRegistry: () => invoke<WorkspaceRegistrySnapshot>('get_workspace_registry'),
+    planWorkspaceSubprojects: (input: WorkspaceSubprojectInput) => invoke<WorkspaceSubprojectPreview>('plan_workspace_subprojects', { input }),
+    applyWorkspaceSubprojects: (input: WorkspaceSubprojectInput) => invoke<WorkspaceSubprojectPreview>('apply_workspace_subprojects', { input }),
+    restoreWorkspaceSubprojects: (beforeRevision: string, expectedRevision: string) => invoke<void>('restore_workspace_subprojects', { beforeRevision, expectedRevision }),
+    listWorkspaceSessionHistory: (projectId: string, cursor?: string, query?: string, source?: SessionHistorySource, sort?: WorkspaceSessionHistorySort, includeChildren = false) =>
+      invoke<WorkspaceSessionHistory>('list_workspace_session_history', {
+        projectId,
+        cursor: cursor ?? null,
+        query: query ?? null,
+        source: source ?? null,
+        sort: sort ?? 'recent',
+        includeChildren,
+      }),
+    getWorkspaceSessionTranscriptPage: (projectId: string, sessionId: string, cursor?: string) =>
+      invoke<WorkspaceSessionTranscriptPage>('get_workspace_session_transcript_page', {
+        projectId,
+        sessionId,
+        cursor: cursor ?? null,
+      }),
+    getWorkspaceSessionResumePlan: (projectId: string, sessionId: string) => invoke<WorkspaceSessionResumePlan>('get_workspace_session_resume_plan', { projectId, sessionId }),
+    resumeWorkspaceSession: (projectId: string, sessionId: string) => invoke<void>('resume_workspace_session', { projectId, sessionId }),
+    startWorkspaceSessionInspection: (projectId: string, sessionId: string | undefined, query: string, mode: 'text' | 'prompts' | 'files', source?: SessionHistorySource, includeChildren = false) => invoke<string>('start_workspace_session_inspection', { projectId, sessionId: sessionId ?? null, query, mode, source: source ?? null, includeChildren }),
+    stepWorkspaceSessionInspection: (projectId: string, token: string) => invoke<WorkspaceHistoryInspection>('step_workspace_session_inspection', { projectId, token }),
+    cancelWorkspaceSessionInspection: (projectId: string, token: string) => invoke<void>('cancel_workspace_session_inspection', { projectId, token }),
     upsertWorkspaceProject: (input: Record<string, unknown>) => invoke<WorkspaceRegistryProject>('upsert_workspace_project', { input }),
     deleteWorkspaceProject: (projectId: string, force = false) => invoke<{ deleted: string }>('delete_workspace_project', { projectId, force }),
     bindWorkspacePath: (input: Record<string, unknown>) => invoke<unknown>('bind_workspace_path', { input }),

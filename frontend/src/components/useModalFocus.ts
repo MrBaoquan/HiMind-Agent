@@ -37,6 +37,9 @@ export function useModalFocus(
     initial.focus({ preventScroll: true });
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // A native confirmation dialog owns the top layer above this legacy modal.
+      const nativeModal = document.activeElement?.closest('dialog:modal');
+      if (nativeModal && nativeModal !== dialog && !dialog.contains(nativeModal)) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();

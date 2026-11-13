@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+import { chineseProjectAliases, descendantProjectIds, projectAncestors, projectDisplayName, projectQualifiedName, projectSearchText, projectTechnicalName } from '../src/pages/workspaceProjectModel.ts';
+
+const root = { id: 'platform', name: 'IODevice', aliases: ['IO 设备平台'] };
+const studio = { id: 'studio', name: '设备配置与编排', aliases: ['IOStudio'], parent_id: root.id };
+const child = { id: 'tools', name: '工具', parent_id: studio.id };
+assert.equal(projectDisplayName(root), 'IO 设备平台');
+assert.equal(projectDisplayName({ name: 'CinemaControl', aliases: ['影院播控', '动感影院播控'] }), 'CinemaControl');
+assert.equal(projectDisplayName({ name: '主名', aliases: ['别名一', '别名二'] }), '主名');
+assert.equal(projectDisplayName({ name: 'SDK', aliases: [] }), 'SDK');
+assert.equal(projectDisplayName({ name: 'SDK', aliases: ['工具', ' 工具 '] }), '工具');
+assert.deepEqual(chineseProjectAliases({ aliases: ['SDK', '工具', ' 工具 '] }), ['工具']);
+assert.equal(projectTechnicalName(root), 'IODevice');
+assert.equal(projectTechnicalName(studio), 'IOStudio');
+assert.equal(projectTechnicalName({ name: '平台', aliases: ['owner/repo', 'IODevice'] }), 'IODevice');
+assert.match(projectSearchText(studio), /iostudio/);
+assert.match(projectSearchText(studio), /设备配置/);
+assert.equal(projectQualifiedName([root, studio, child], child), 'IO 设备平台 / 设备配置与编排 / 工具');
+assert.deepEqual([...descendantProjectIds([root, studio, child, { id: 'other', name: '其他' }], root.id)], ['platform', 'studio', 'tools']);
+assert.deepEqual(projectAncestors([{ id: 'a', name: 'A', parent_id: 'b' }, { id: 'b', name: 'B', parent_id: 'a' }], 'a').map(p => p.id), ['b']);
+console.log('workspace project model: 14 assertions passed');
