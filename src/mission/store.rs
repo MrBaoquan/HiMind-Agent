@@ -12,7 +12,7 @@ use super::contract::{
     apply_assignment_to_plan, validate_assignment, validate_create, validate_handoff_input,
     validate_proposal, validate_task_paths, validate_selection_with_scopes, validate_task_graph,
     MissionAssignment, MissionAssignmentInput, MissionConfirmation, MissionCreateInput,
-    MissionBudgetIncrease, MissionFeedbackInput, MissionVerificationRetry, MissionEvent, MissionHandoff, MissionHandoffInput, MissionPlanMode, MissionPlanProposal,
+    MissionBudgetIncrease, MissionFeedbackInput, MissionLegacyVerificationOverride, MissionVerificationRetry, MissionEvent, MissionHandoff, MissionHandoffInput, MissionPlanMode, MissionPlanProposal,
     MissionStatus, MissionTaskSpec, MissionTaskView, MissionView, MissionWorkflowPin, TaskStatus,
 };
 
@@ -604,12 +604,19 @@ impl MissionStore {
                 return Err(reason.into());
             }
         }
+        let mut runtime_retry_wait = false;
+        if action == "pause" && mission.status == MissionStatus::Waiting {
+            for task in &mission.tasks {
+                runtime_retry_wait |= waiting_runtime_verification_retry_on(&transaction, &mission, task)?;
+            }
+        }
         let next = match (action, mission.status) {
             ("pause", MissionStatus::Active) => MissionStatus::Waiting,
             ("resume", MissionStatus::Waiting) => MissionStatus::Active,
             ("cancel", status) if !matches!(status, MissionStatus::Completed | MissionStatus::Canceled) => MissionStatus::Canceled,
             ("resume", MissionStatus::Active) if mission.tasks.iter().any(|task| task.status == TaskStatus::Failed)
                 && !mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Running | TaskStatus::AwaitingVerification)) => MissionStatus::Active,
+            ("pause", MissionStatus::Waiting) if runtime_retry_wait => MissionStatus::Waiting,
             ("pause", MissionStatus::Waiting) | ("resume", MissionStatus::Active) | ("cancel", MissionStatus::Canceled) => {
                 transaction.commit()?; return self.get(mission_id);
             }
@@ -684,8 +691,32 @@ impl MissionStore {
         if mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::AwaitingVerification)) {
             return Err("mission still has a running task or pending verification; wait for it to stop before continuing".into());
         }
+        let verification_retry_time_only = input.additional_rounds == 0
+            && input.additional_minutes > 0
+            && input.additional_repair_attempts == 0
+            && input.additional_tokens.is_none()
+            && !input.unlimited_tokens
+            && input.additional_cost.is_none();
+        let legacy_override_valid = if let Some(override_ids) = input.legacy_verification_override.as_ref() {
+            if !verification_retry_time_only {
+                return Err("legacy verification override permits only a time-only increase".into());
+            }
+            mission.tasks.iter().try_fold(false, |found, task| {
+                if found { Ok(true) }
+                else { legacy_verification_retry_override_on(&transaction, &mission, task, override_ids) }
+            })?
+        } else { false };
+        if input.legacy_verification_override.is_some() && !legacy_override_valid {
+            return Err("legacy verification override does not match the current failure events".into());
+        }
+        let verification_retry_time_only = verification_retry_time_only && (legacy_override_valid
+            || mission.tasks.iter().try_fold(false, |found, task| {
+                if found { Ok(true) }
+                else { waiting_runtime_verification_retry_on(&transaction, &mission, task) }
+            })?);
         let reason = budget_exhaustion_reason_on(&transaction, &mission)?
-            .or_else(|| mission.budget.as_ref().and_then(|budget| repair_exhaustion_reason(&mission, budget)))
+            .or_else(|| if verification_retry_time_only { None }
+                else { mission.budget.as_ref().and_then(|budget| repair_exhaustion_reason(&mission, budget)) })
             .unwrap_or_else(|| "用户主动增加后续执行预算".to_string());
         let mut budget = mission.budget.clone().ok_or("mission has no declared budget")?;
         let previous_budget = budget.clone();
@@ -715,13 +746,19 @@ impl MissionStore {
         if budget == previous_budget {
             return Err("provide at least one budget increase".into());
         }
-        if let Some(remaining_reason) = budget_exhaustion_reason_with_budget(&transaction, &mission, &budget)?
-            .or_else(|| repair_exhaustion_reason(&mission, &budget)) {
+        let remaining_reason = if verification_retry_time_only {
+            resource_budget_exhaustion_reason_with_budget(&transaction, &mission, &budget)?
+        } else {
+            budget_exhaustion_reason_with_budget(&transaction, &mission, &budget)?
+                .or_else(|| repair_exhaustion_reason(&mission, &budget))
+        };
+        if let Some(remaining_reason) = remaining_reason {
             return Err(format!("the increased budget still does not allow continuation: {remaining_reason}").into());
         }
 
         let remains_waiting = runtime_blocked_on(&transaction, &mission)?
-            || manually_paused_on(&transaction, &mission)?;
+            || manually_paused_on(&transaction, &mission)?
+            || verification_retry_time_only;
         let now = now_stamp();
         transaction.execute(
             "UPDATE mission_runs SET budget_json = ?2, status = ?3, updated_at = ?4 WHERE mission_id = ?1",
@@ -730,7 +767,8 @@ impl MissionStore {
         )?;
         append_event_tx(
             &transaction, mission_id, "budget_extended", "",
-            if remains_waiting { format!("预算已增加，任务保持等待（{reason}）") }
+            if remains_waiting && legacy_override_valid { format!("已按用户明确授权为旧版同交付核验补充时限，任务继续等待显式重试（{reason}）") }
+            else if remains_waiting { format!("预算已增加，任务保持等待（{reason}）") }
             else { format!("预算已增加，任务从“{reason}”恢复执行") },
             serde_json::json!({
                 "request_id": input.request_id,
@@ -2008,11 +2046,17 @@ impl MissionStore {
                 tx.commit()?;
                 return self.get(mission_id);
         }
-        if mission.status != MissionStatus::Active || mission.confirmation.as_ref()
+        if !matches!(mission.status, MissionStatus::Active | MissionStatus::Waiting) || mission.confirmation.as_ref()
             .is_none_or(|value| value.plan_sha256 != input.expected_plan_sha256)
             || mission.plan_sha256 != input.expected_plan_sha256
-        { return Err("recheck requires the active confirmed plan".into()); }
-        if let Some(reason) = budget_exhaustion_reason_on(&tx, &mission)? {
+        { return Err("recheck requires the current confirmed plan".into()); }
+        if runtime_blocked_on(&tx, &mission)? {
+            return Err("resolve the runtime workspace block before rechecking".into());
+        }
+        // Reuse an already dispatched delivery: no new implementation round or
+        // repair is admitted. Time, tokens and trustworthy cost remain strict.
+        if let Some(reason) = mission.budget.as_ref().map(|budget|
+            resource_budget_exhaustion_reason_with_budget(&tx, &mission, budget)).transpose()?.flatten() {
             return Err(format!("increase the exhausted budget before rechecking: {reason}").into());
         }
         if mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Ready | TaskStatus::AwaitingVerification)) {
@@ -2022,6 +2066,19 @@ impl MissionStore {
         if task.status != TaskStatus::Failed || task.verification_passed != Some(false)
             || task.verification_run_id != input.expected_verification_run_id || task.attempt_run_id.is_empty()
         { return Err("recheck requires the latest failed independent verification".into()); }
+        let automatic_retry = waiting_runtime_verification_retry_on(&tx, &mission, task)?;
+        let legacy_override = if let Some(expected) = input.legacy_verification_override.as_ref() {
+            legacy_verification_retry_override_on(&tx, &mission, task, expected)?
+        } else { false };
+        if input.legacy_verification_override.is_some() && !legacy_override {
+            return Err("legacy verification override does not match the current failure events".into());
+        }
+        if mission.status == MissionStatus::Waiting && !automatic_retry && !legacy_override {
+            return Err("waiting recheck requires the latest runtime verification failure; manual pause must be resumed explicitly".into());
+        }
+        if mission.status != MissionStatus::Waiting && input.legacy_verification_override.is_some() {
+            return Err("legacy verification override applies only to an ambiguous waiting Mission".into());
+        }
         if mission.tasks.iter().any(|child| child.spec.repair_of == task_id && child.status != TaskStatus::Canceled) {
             return Err("recheck the latest repair task instead of its ancestor".into());
         }
@@ -2056,12 +2113,63 @@ impl MissionStore {
             VALUES (?1, ?2, ?3, ?4, ?5)", params![workspace_claim_key(&mission.workspace.root), mission_id, task_id, task.attempt_run_id, now])?;
         tx.execute("UPDATE mission_tasks SET status = 'awaiting_verification', verification_run_id = '',
             verification_passed = NULL, updated_at = ?3 WHERE mission_id = ?1 AND task_id = ?2", params![mission_id, task_id, now])?;
-        tx.execute("UPDATE mission_runs SET updated_at = ?2 WHERE mission_id = ?1", params![mission_id, now])?;
+        tx.execute("UPDATE mission_runs SET status = 'active', updated_at = ?2 WHERE mission_id = ?1", params![mission_id, now])?;
+        if legacy_override {
+            let expected = input.legacy_verification_override.as_ref().expect("validated legacy override");
+            append_event_tx(&tx, mission_id, "verification_retry_override_authorized", task_id,
+                "已按用户明确授权覆盖旧版暂停归属缺失；仅重试同一交付核验",
+                serde_json::json!({"request_id":input.request_id,"plan_sha256":input.expected_plan_sha256,
+                    "implementation_run_id":task.attempt_run_id,"verification_run_id":task.verification_run_id,
+                    "expected_pause_event_id":expected.expected_pause_event_id,
+                    "expected_runtime_failure_event_id":expected.expected_runtime_failure_event_id}), &now)?;
+        }
+        if mission.status == MissionStatus::Waiting {
+            append_event_tx(&tx, mission_id, "mission_resume", "",
+                "用户显式重试同一交付核验；原子恢复并持有工作区 claim",
+                serde_json::json!({"action":"resume","recovery_action":"mission.verification.retry",
+                    "request_id":input.request_id,"task_id":task_id,
+                    "legacy_verification_override":input.legacy_verification_override}), &now)?;
+        }
         append_event_tx(&tx, mission_id, "verification_retry_requested", task_id,
-            "已补充核验证据，重新检查同一实现；不增加代码返工次数",
+            if legacy_override { "已按用户明确授权覆盖旧版暂停归属缺失，重试同一实现核验；不增加代码返工次数" }
+                else { "已补充核验证据，重新检查同一实现；不增加代码返工次数" },
             serde_json::json!({"request_id": input.request_id, "request_sha256": digest,
                 "previous_verification_run_id": input.expected_verification_run_id,
-                "plan_sha256": input.expected_plan_sha256, "protected_baseline": baseline}), &now)?;
+                "plan_sha256": input.expected_plan_sha256, "protected_baseline": baseline,
+                "legacy_verification_override": input.legacy_verification_override}), &now)?;
+        tx.commit()?;
+        self.get(mission_id)
+    }
+
+    pub(crate) fn pause_failed_verification_runtime(
+        &self, mission_id: &str, task_id: &str, verification_run_id: &str, reason: &str,
+    ) -> Result<MissionView, Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission not found")?;
+        let task = mission.tasks.iter().find(|task| task.spec.id == task_id).ok_or("task not found")?;
+        if task.status != TaskStatus::Failed || task.verification_passed != Some(false)
+            || task.verification_run_id != verification_run_id
+            || !matches!(mission.status, MissionStatus::Active | MissionStatus::Waiting) {
+            return Err("runtime failure must bind the current failed verification".into());
+        }
+        if decision_event(&tx,
+            "mission_id=?1 AND task_id=?2 AND event_type='verification_runtime_failed' AND json_extract(payload_json,'$.verification_run_id')=?3",
+            params![mission_id,task_id,verification_run_id], true)?.is_some() {
+            tx.commit()?; return self.get(mission_id);
+        }
+        let automatic_pause = mission.status == MissionStatus::Active;
+        let now = now_stamp();
+        if automatic_pause {
+            tx.execute("UPDATE mission_runs SET status='waiting', updated_at=?2 WHERE mission_id=?1", params![mission_id,now])?;
+            append_event_tx(&tx, mission_id, "mission_pause", "", "核验执行器未完成，暂停后续派发",
+                serde_json::json!({"action":"pause","verification_run_id":verification_run_id}), &now)?;
+        }
+        append_event_tx(&tx, mission_id, "verification_runtime_failed", task_id,
+            "核验执行器未完成；修复运行环境后可显式重试同一交付核验",
+            serde_json::json!({"error":reason,"verification_run_id":verification_run_id,
+                "implementation_run_id":task.attempt_run_id,"plan_sha256":mission.plan_sha256,
+                "automatic_pause":automatic_pause,"recovery_action":"mission.verification.retry"}), &now)?;
         tx.commit()?;
         self.get(mission_id)
     }
@@ -2512,21 +2620,28 @@ fn budget_exhaustion_reason_with_budget(
     mission: &MissionView,
     budget: &crate::mission::MissionBudget,
 ) -> Result<Option<String>, Box<dyn Error>> {
-        let Some(confirmation) = mission.confirmation.as_ref() else { return Ok(None); };
+        if mission.confirmation.is_none() { return Ok(None); }
         let rounds: i64 = connection.query_row(
             "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'task_dispatched'",
             params![mission.mission_id],
             |row| row.get(0),
         )?;
+        if rounds >= budget.max_rounds as i64 {
+            return Ok(Some(format!("达到轮次上限：已派发 {rounds}/{} 轮", budget.max_rounds)));
+        }
+        resource_budget_exhaustion_reason_with_budget(connection, mission, budget)
+}
+
+fn resource_budget_exhaustion_reason_with_budget(
+    connection: &Connection, mission: &MissionView, budget: &crate::mission::MissionBudget,
+) -> Result<Option<String>, Box<dyn Error>> {
+        let Some(confirmation) = mission.confirmation.as_ref() else { return Ok(None); };
         let confirmed_at = chrono::DateTime::parse_from_rfc3339(&confirmation.confirmed_at)
             .map_err(|error| format!("invalid confirmation timestamp: {error}"))?;
         let elapsed_minutes = Utc::now()
             .signed_duration_since(confirmed_at.with_timezone(&Utc))
             .num_minutes()
             .max(0) as u64;
-        if rounds >= budget.max_rounds as i64 {
-            return Ok(Some(format!("达到轮次上限：已派发 {rounds}/{} 轮", budget.max_rounds)));
-        }
         if elapsed_minutes >= budget.max_minutes as u64 {
             return Ok(Some(format!("达到时限上限：已运行 {elapsed_minutes}/{} 分钟", budget.max_minutes)));
         }
@@ -2887,6 +3002,88 @@ fn effective_wait_on(connection: &Connection, mission: &MissionView) -> Result<s
     })
 }
 
+// Waiting is recoverable only for the current runtime failure, never a
+// later manual pause/budget stop. Query the ledger, not a paginated UI snapshot.
+fn waiting_runtime_verification_retry_on(
+    connection: &Connection, mission: &MissionView, task: &MissionTaskView,
+) -> Result<bool, Box<dyn Error>> {
+    if mission.status != MissionStatus::Waiting || task.status != TaskStatus::Failed
+        || task.verification_passed != Some(false) || task.attempt_run_id.is_empty() { return Ok(false); }
+    let Some(runtime) = decision_event(connection,
+        "mission_id=?1 AND event_type IN ('mission_pause','mission_resume','budget_exhausted','verification_runtime_failed')",
+        params![mission.mission_id], true)? else { return Ok(false); };
+    if runtime.event_type != "verification_runtime_failed" || runtime.task_id != task.spec.id
+        || runtime.payload["verification_run_id"] != task.verification_run_id
+        || runtime.payload["recovery_action"] != "mission.verification.retry" { return Ok(false); }
+    let Some(pause) = decision_event(connection,
+        "mission_id=?1 AND sequence<?2 AND event_type IN ('mission_pause','mission_resume','budget_exhausted')",
+        params![mission.mission_id,runtime.sequence as i64], true)? else { return Ok(false); };
+    if pause.event_type != "mission_pause" { return Ok(false); }
+    let Some(failure) = decision_event(connection,
+        "mission_id=?1 AND task_id=?2 AND event_type='verification_failed'",
+        params![mission.mission_id,task.spec.id], true)? else { return Ok(false); };
+    if failure.sequence >= pause.sequence || failure.payload["implementation_run_id"] != task.attempt_run_id
+        || failure.payload["verification_run_id"] != task.verification_run_id { return Ok(false); }
+    Ok(runtime.payload["automatic_pause"] == true
+        && runtime.payload["implementation_run_id"] == task.attempt_run_id
+        && runtime.payload["plan_sha256"] == mission.plan_sha256
+        && pause.payload["verification_run_id"] == task.verification_run_id)
+}
+
+fn legacy_verification_retry_override_on(
+    connection: &Connection,
+    mission: &MissionView,
+    task: &MissionTaskView,
+    expected: &MissionLegacyVerificationOverride,
+) -> Result<bool, Box<dyn Error>> {
+    if mission.status != MissionStatus::Waiting || task.status != TaskStatus::Failed
+        || task.verification_passed != Some(false) || task.attempt_run_id.is_empty()
+        || task.verification_run_id.is_empty() { return Ok(false); }
+    let Some(pause) = decision_event(connection,
+        "mission_id=?1 AND event_id=?2 AND event_type='mission_pause'",
+        params![mission.mission_id, expected.expected_pause_event_id], false)? else { return Ok(false); };
+    let Some(runtime) = decision_event(connection,
+        "mission_id=?1 AND event_id=?2 AND event_type='verification_runtime_failed'",
+        params![mission.mission_id, expected.expected_runtime_failure_event_id], false)? else { return Ok(false); };
+    let Some(failure) = decision_event(connection,
+        "mission_id=?1 AND task_id=?2 AND event_type='verification_failed'",
+        params![mission.mission_id, task.spec.id], true)? else { return Ok(false); };
+    if runtime.task_id != task.spec.id || runtime.payload["verification_run_id"] != task.verification_run_id
+        || runtime.payload["recovery_action"] != "mission.verification.retry"
+        || runtime.payload.get("automatic_pause").is_some()
+        || runtime.payload.get("implementation_run_id").is_some()
+        || runtime.payload.get("plan_sha256").is_some()
+        || pause.payload["action"] != "pause" || pause.payload.get("verification_run_id").is_some()
+        || failure.payload["implementation_run_id"] != task.attempt_run_id
+        || failure.payload["verification_run_id"] != task.verification_run_id
+        || failure.sequence.checked_add(1) != Some(pause.sequence)
+        || pause.sequence.checked_add(1) != Some(runtime.sequence) { return Ok(false); }
+
+    // Every event since the bound failure must remain a time-only extension of
+    // that exact recovery. Read the full ledger: repeated top-ups cannot hide a
+    // new pause/failure, nor depend on a UI page or globally consecutive IDs.
+    let mut statement = connection.prepare(
+        "SELECT event_type,payload_json FROM mission_events WHERE mission_id=?1 AND sequence>?2 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(params![mission.mission_id,runtime.sequence as i64],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+    let expected_ids = serde_json::to_value(expected)?;
+    for row in rows {
+        let (kind, raw) = row?;
+        let payload: serde_json::Value = serde_json::from_str(&raw)?;
+        let increase = &payload["increase"];
+        if kind != "budget_extended" || payload["plan_sha256"] != mission.plan_sha256
+            || increase["legacy_verification_override"] != expected_ids
+            || increase["additional_rounds"] != 0
+            || increase["additional_minutes"].as_u64().unwrap_or(0) == 0
+            || increase["additional_repair_attempts"] != 0
+            || !increase["additional_tokens"].is_null()
+            || increase["unlimited_tokens"] != false
+            || !increase["additional_cost"].is_null() { return Ok(false); }
+    }
+    Ok(true)
+}
+
 fn manually_paused_on(connection: &Connection, mission: &MissionView) -> Result<bool, Box<dyn Error>> {
     // Follow-ups, progress and budget increases do not express resume intent.
     // An explicit resume blocked by budget records budget_exhausted instead of
@@ -3045,6 +3242,7 @@ mod tests {
             request_id: "paused-follow-up-budget".into(), expected_plan_sha256: added.plan_sha256.clone(),
             additional_rounds: 1, additional_minutes: 120, additional_repair_attempts: 1,
             additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+            legacy_verification_override: None,
         };
         let increased = store.increase_budget(id, &request, "test-user").unwrap();
         assert_eq!(increased.status, MissionStatus::Waiting, "a budget increase must not resume a user-paused Mission");
@@ -4512,6 +4710,7 @@ mod tests {
             additional_repair_attempts: 0,
             request_id:"runtime-extra-time".into(), expected_plan_sha256:before.plan_sha256.clone(),
             additional_minutes: 4320, additional_rounds:0, additional_tokens:None, unlimited_tokens:false, additional_cost:None,
+            legacy_verification_override: None,
         }, "test-user").unwrap();
         assert_eq!(resumed.status, MissionStatus::Active);
         assert!(store.runtime_files_only(&created.mission_id, &before.plan_sha256).unwrap());
@@ -4678,6 +4877,469 @@ mod tests {
         assert_eq!(updated.tasks.iter().find(|task| task.spec.id == "repair").unwrap().status, TaskStatus::Ready);
     }
 
+    // Native Store transitions only; no executor or paid retry is run.
+    fn runtime_retry_fixture() -> (MissionStore, MissionView, MissionVerificationRetry, PathBuf) {
+        let store = store("runtime-retry");
+        let root = store.path.parent().unwrap().join("workspace");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("readonly.txt"), "protected").unwrap();
+        let mut input = create_input();
+        input.workspace = MissionWorkspace { root: root.to_string_lossy().into_owned(),
+            permission_mode: String::new(), read_scope: vec!["readonly.txt".into()], write_scope: vec!["src".into()] };
+        let created = store.create(&input).unwrap();
+        let mut plan = proposal(); plan.tasks.truncate(1);
+        plan.tasks[0].read_paths = vec!["readonly.txt".into()];
+        plan.tasks[0].write_paths = vec!["src".into()];
+        plan.budget.max_rounds = 4; plan.budget.max_repair_attempts = 2;
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        let id = &created.mission_id;
+        store.confirm_plan(id, &planned.plan_sha256, &["fix".into()], &["src".into()], &[], &[], "test").unwrap();
+        let mut parent = "fix".to_string();
+        for n in 0..4 {
+            let run = format!("implementation-{n}");
+            store.begin_task_attempt(id, &parent, &run).unwrap();
+            if n == 3 {
+                let files = super::super::protected_files(&root, &plan.tasks[0]).unwrap();
+                store.append_event(id, "task_baseline_captured", &parent, "host baseline",
+                    serde_json::json!({"implementation_run_id":run,"plan_sha256":planned.plan_sha256,
+                        "protected_baseline":{"provenance":"host_before_execution","files":files}})).unwrap();
+                store.await_task_verification(id, &parent, &run, "delivered").unwrap();
+                store.begin_verification_attempt(id, &parent, "verify-failed").unwrap();
+                store.record_verification_result(id, &parent, &run, "verify-failed", false,
+                    &["local-run:verify-failed".into()], "upstream_service_unavailable").unwrap();
+            } else {
+                store.complete_task_attempt(id, &parent, &run, false, &[], "prior failure").unwrap();
+                if n == 2 {
+                    store.control(id, "pause").unwrap();
+                    let increase = serde_json::from_value(serde_json::json!({"request_id":"bounded-third-repair",
+                        "expected_plan_sha256":planned.plan_sha256,"additional_rounds":0,"additional_minutes":0,
+                        "additional_repair_attempts":1})).unwrap();
+                    store.increase_budget(id, &increase, "test").unwrap();
+                    store.control(id, "resume").unwrap();
+                }
+                let mut repair = plan.tasks[0].clone(); repair.id = format!("repair-{}",n+1);
+                repair.repair_of = parent; repair.depends_on.clear();
+                parent = repair.id.clone();
+                store.add_follow_up_tasks(id, &[repair], "bounded repair").unwrap();
+            }
+        }
+        store.pause_failed_verification_runtime(id, &parent, "verify-failed", "runtime failure").unwrap();
+        let mission = store.get(id).unwrap();
+        let request = MissionVerificationRetry { request_id:"explicit-retry".into(), expected_plan_sha256:planned.plan_sha256,
+            expected_verification_run_id:"verify-failed".into(), source_baseline:None, legacy_verification_override:None };
+        (store, mission, request, root)
+    }
+
+    #[test]
+    fn legacy_runtime_failure_without_pause_ownership_fails_closed() {
+        let (store, mission, mut request, _) = runtime_retry_fixture();
+        let id = &mission.mission_id;
+        let db = store.connection().unwrap();
+        db.execute(r#"UPDATE mission_events SET payload_json='{"action":"pause"}'
+            WHERE mission_id=?1 AND event_type='mission_pause'"#, params![id]).unwrap();
+        db.execute(r#"UPDATE mission_events SET payload_json=json_remove(payload_json,
+            '$.automatic_pause','$.implementation_run_id','$.plan_sha256')
+            WHERE mission_id=?1 AND task_id='repair-3' AND event_type='verification_runtime_failed'"#, params![id]).unwrap();
+        assert!(store.retry_verification(id, "repair-3", &request).unwrap_err().to_string()
+            .contains("latest runtime verification failure"));
+        let increase = MissionBudgetIncrease { request_id:"legacy-no-owner-budget".into(),
+            expected_plan_sha256:mission.plan_sha256.clone(), additional_rounds:0, additional_minutes:120,
+            additional_repair_attempts:0, additional_tokens:None, unlimited_tokens:false, additional_cost:None,
+            legacy_verification_override: None };
+        assert!(store.increase_budget(id, &increase, "test-user").is_err());
+        assert_eq!(store.get(id).unwrap().status, MissionStatus::Waiting);
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none());
+
+        let mut confirmation = mission.confirmation.clone().unwrap();
+        confirmation.confirmed_at = (Utc::now()-chrono::Duration::minutes(121)).to_rfc3339();
+        db.execute("UPDATE mission_runs SET confirmation_json=?2 WHERE mission_id=?1",
+            params![id,serde_json::to_string(&confirmation).unwrap()]).unwrap();
+        let legacy_events = store.snapshot(id, 0).unwrap().events;
+        let pause = legacy_events.iter().rev().find(|event| event.event_type == "mission_pause").unwrap();
+        let runtime = legacy_events.iter().rev().find(|event| event.event_type == "verification_runtime_failed").unwrap();
+        let override_ids = MissionLegacyVerificationOverride {
+            expected_pause_event_id: pause.event_id.clone(),
+            expected_runtime_failure_event_id: runtime.event_id.clone(),
+        };
+        let mut stale_increase = increase.clone();
+        stale_increase.legacy_verification_override = Some(MissionLegacyVerificationOverride {
+            expected_pause_event_id: "stale-event".into(),
+            expected_runtime_failure_event_id: runtime.event_id.clone(),
+        });
+        let before_stale = store.snapshot(id, 0).unwrap();
+        assert!(store.increase_budget(id, &stale_increase, "test-user").is_err());
+        assert_eq!(store.snapshot(id, 0).unwrap(), before_stale, "a mismatched override is read-only");
+
+        let mut approved_increase = increase;
+        approved_increase.legacy_verification_override = Some(override_ids.clone());
+        let extended = store.increase_budget(id, &approved_increase, "test-user").unwrap();
+        assert_eq!(extended.status, MissionStatus::Waiting, "time extension never dispatches work");
+        assert_eq!(extended.budget.as_ref().unwrap().max_rounds, mission.budget.as_ref().unwrap().max_rounds);
+        assert_eq!(extended.budget.as_ref().unwrap().max_repair_attempts, 3);
+        assert_eq!(extended.budget.as_ref().unwrap().max_minutes, 240);
+        request.legacy_verification_override = Some(override_ids.clone());
+        let admitted = store.retry_verification(id, "repair-3", &request).unwrap();
+        assert_eq!(admitted.status, MissionStatus::Active);
+        assert_eq!(admitted.tasks.iter().find(|task| task.spec.id == "repair-3").unwrap().attempt_run_id,
+            "implementation-3", "override retries the delivered implementation without a repair");
+        let events = store.snapshot(id, 0).unwrap().events;
+        assert!(events.iter().any(|event| event.event_type == "verification_retry_override_authorized"
+            && event.payload["expected_pause_event_id"] == override_ids.expected_pause_event_id
+            && event.payload["expected_runtime_failure_event_id"] == override_ids.expected_runtime_failure_event_id));
+        assert_eq!(events.iter().filter(|event| event.event_type == "task_dispatched").count(), 4);
+    }
+
+    #[test]
+    fn legacy_retry_preserves_consecutive_and_concurrent_time_extensions() {
+        for concurrent in [false,true] {
+            let (store, mission, mut retry, _) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            let db = store.connection().unwrap();
+            db.execute(r#"UPDATE mission_events SET payload_json='{"action":"pause"}'
+                WHERE mission_id=?1 AND event_type='mission_pause'"#, params![id]).unwrap();
+            db.execute(r#"UPDATE mission_events SET payload_json=json_remove(payload_json,
+                '$.automatic_pause','$.implementation_run_id','$.plan_sha256')
+                WHERE mission_id=?1 AND event_type='verification_runtime_failed'"#, params![id]).unwrap();
+            let events = store.snapshot(id,0).unwrap().events;
+            let prior_extensions = events.iter().filter(|e|e.event_type=="budget_extended").count();
+            retry.legacy_verification_override = Some(MissionLegacyVerificationOverride {
+                expected_pause_event_id: events.iter().rev().find(|e| e.event_type=="mission_pause").unwrap().event_id.clone(),
+                expected_runtime_failure_event_id: events.iter().rev().find(|e| e.event_type=="verification_runtime_failed").unwrap().event_id.clone(),
+            });
+            let increase = MissionBudgetIncrease { request_id:"legacy-topup-1".into(),
+                expected_plan_sha256:mission.plan_sha256.clone(),additional_rounds:0,additional_minutes:10,
+                additional_repair_attempts:0,additional_tokens:None,unlimited_tokens:false,additional_cost:None,
+                legacy_verification_override:retry.legacy_verification_override.clone() };
+            let mut second = increase.clone(); second.request_id="legacy-topup-2".into();
+            if concurrent {
+                let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));
+                let mut workers=Vec::new();
+                for request in [increase.clone(),second.clone()] {
+                    let store=store.clone();let id=id.clone();let barrier=barrier.clone();
+                    workers.push(std::thread::spawn(move||{barrier.wait();store.increase_budget(&id,&request,"test-user").map(|v|v.status).map_err(|e|e.to_string())}));
+                }
+                for worker in workers { assert_eq!(worker.join().unwrap().unwrap(),MissionStatus::Waiting); }
+            } else {
+                store.increase_budget(id,&increase,"test-user").unwrap();
+                store.increase_budget(id,&second,"test-user").unwrap();
+            }
+            let extended=store.get(id).unwrap();
+            assert_eq!(extended.status,MissionStatus::Waiting);
+            assert_eq!(extended.budget.as_ref().unwrap().max_minutes,mission.budget.as_ref().unwrap().max_minutes+20);
+            assert_eq!(extended.budget.as_ref().unwrap().max_rounds,mission.budget.as_ref().unwrap().max_rounds);
+            assert_eq!(extended.budget.as_ref().unwrap().max_repair_attempts,mission.budget.as_ref().unwrap().max_repair_attempts);
+            assert_eq!(store.snapshot(id,0).unwrap().events.iter().filter(|e|e.event_type=="budget_extended").count(),prior_extensions+2);
+            assert_eq!(store.retry_verification(id,"repair-3",&retry).unwrap().status,MissionStatus::Active);
+        }
+    }
+
+    #[test]
+    fn legacy_retry_rejects_invalid_interior_time_extension_events_without_mutation() {
+        for case in ["manual-pause", "wrong-plan", "wrong-pause-event", "wrong-runtime-failure-event"] {
+            let (store, mission, mut retry, _) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            let db = store.connection().unwrap();
+            db.execute(r#"UPDATE mission_events SET payload_json='{"action":"pause"}'
+                WHERE mission_id=?1 AND event_type='mission_pause'"#, params![id]).unwrap();
+            db.execute(r#"UPDATE mission_events SET payload_json=json_remove(payload_json,
+                '$.automatic_pause','$.implementation_run_id','$.plan_sha256')
+                WHERE mission_id=?1 AND event_type='verification_runtime_failed'"#, params![id]).unwrap();
+            let events = store.snapshot(id, 0).unwrap().events;
+            retry.legacy_verification_override = Some(MissionLegacyVerificationOverride {
+                expected_pause_event_id: events.iter().rev().find(|event| event.event_type == "mission_pause")
+                    .unwrap().event_id.clone(),
+                expected_runtime_failure_event_id: events.iter().rev().find(|event| event.event_type == "verification_runtime_failed")
+                    .unwrap().event_id.clone(),
+            });
+            let mut increase = MissionBudgetIncrease {
+                request_id: format!("legacy-chain-{case}-first"),
+                expected_plan_sha256: mission.plan_sha256.clone(),
+                additional_rounds: 0, additional_minutes: 10, additional_repair_attempts: 0,
+                additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+                legacy_verification_override: retry.legacy_verification_override.clone(),
+            };
+            store.increase_budget(id, &increase, "test-user").unwrap();
+            let first = store.snapshot(id, 0).unwrap().events.into_iter()
+                .find(|event| event.event_type == "budget_extended" && event.payload["request_id"] == increase.request_id)
+                .unwrap();
+            increase.request_id = format!("legacy-chain-{case}-second");
+            store.increase_budget(id, &increase, "test-user").unwrap();
+
+            // Corrupt an interior entry while keeping the latest top-up valid:
+            // checking only the final event must not authorize this recovery.
+            let mut kind = "budget_extended";
+            let mut payload = first.payload.clone();
+            match case {
+                "manual-pause" => {
+                    kind = "mission_pause";
+                    payload = serde_json::json!({"action": "pause"});
+                },
+                "wrong-plan" => payload["plan_sha256"] = serde_json::json!("f".repeat(64)),
+                "wrong-pause-event" => payload["increase"]["legacy_verification_override"]["expected_pause_event_id"]
+                    = serde_json::json!("stale-pause-event"),
+                "wrong-runtime-failure-event" => payload["increase"]["legacy_verification_override"]["expected_runtime_failure_event_id"]
+                    = serde_json::json!("stale-runtime-failure-event"),
+                _ => unreachable!(),
+            }
+            assert_eq!(db.execute("UPDATE mission_events SET event_type=?3, payload_json=?4
+                WHERE mission_id=?1 AND event_id=?2",
+                params![id, first.event_id, kind, serde_json::to_string(&payload).unwrap()]).unwrap(), 1);
+            let before = store.snapshot(id, 0).unwrap();
+            let latest = before.events.last().unwrap();
+            assert!(latest.sequence > first.sequence, "{case}: the invalid entry must be interior");
+            assert_eq!(latest.event_type, "budget_extended");
+            assert_eq!(latest.payload["request_id"], increase.request_id);
+            assert_eq!(before.mission.status, MissionStatus::Waiting);
+            let claim = store.workspace_claim(&mission.workspace.root).unwrap();
+            assert!(claim.is_none());
+
+            increase.request_id = format!("legacy-chain-{case}-rejected");
+            let error = store.increase_budget(id, &increase, "test-user").unwrap_err().to_string();
+            assert!(error.contains("legacy verification override does not match the current failure events"),
+                "{case}: {error}");
+            assert_eq!(store.snapshot(id, 0).unwrap(), before, "{case}: rejected top-up must preserve the snapshot");
+            assert_eq!(store.workspace_claim(&mission.workspace.root).unwrap(), claim,
+                "{case}: rejected top-up must preserve the claim");
+
+            let error = store.retry_verification(id, "repair-3", &retry).unwrap_err().to_string();
+            assert!(error.contains("legacy verification override does not match the current failure events"),
+                "{case}: {error}");
+            assert_eq!(store.snapshot(id, 0).unwrap(), before, "{case}: rejected retry must preserve the snapshot");
+            assert_eq!(store.workspace_claim(&mission.workspace.root).unwrap(), claim,
+                "{case}: rejected retry must preserve the claim");
+        }
+    }
+
+    #[test]
+    fn waiting_runtime_retry_atomically_reuses_delivery_at_repair_and_round_cap() {
+        let (store, before, request, _) = runtime_retry_fixture();
+        let id = &before.mission_id;
+        assert_eq!(before.status, MissionStatus::Waiting);
+        assert_eq!(before.tasks.iter().filter(|t| !t.spec.repair_of.is_empty()).count(), 3);
+        assert!(store.follow_up_budget_exhaustion_reason(&before).unwrap().is_some());
+        let admitted = store.retry_verification(id, "repair-3", &request).unwrap();
+        assert_eq!(admitted.status, MissionStatus::Active);
+        assert_eq!(admitted.plan_sha256, before.plan_sha256);
+        assert_eq!(admitted.budget, before.budget);
+        assert_eq!(admitted.confirmation, before.confirmation);
+        assert_eq!(admitted.tasks.len(), 4);
+        let task = admitted.tasks.iter().find(|t| t.spec.id == "repair-3").unwrap();
+        assert_eq!(task.status, TaskStatus::AwaitingVerification);
+        assert_eq!(task.attempt_run_id, "implementation-3");
+        assert!(task.verification_run_id.is_empty());
+        assert_eq!(store.workspace_claim(&before.workspace.root).unwrap().unwrap(),
+            (id.clone(), "repair-3".into(), "implementation-3".into()));
+        assert!(store.next_ready_task(id).unwrap().is_none());
+        // A stale supervisor budget decision must not steal the admitted verification.
+        store.record_budget_exhausted(id, "stale cap observation").unwrap();
+        assert_eq!(store.get(id).unwrap().status, MissionStatus::Active);
+        store.begin_verification_attempt(id, "repair-3", "verify-retry").unwrap();
+        let events = store.snapshot(id, 0).unwrap().events;
+        assert_eq!(events.iter().filter(|e| e.event_type == "task_dispatched").count(), 4);
+        assert_eq!(events.iter().filter(|e| e.event_type == "verification_failed").count(), 1);
+        assert_eq!(events.iter().filter(|e| e.event_type == "verification_retry_requested").count(), 1);
+        let cursor = events.last().unwrap().sequence;
+        store.retry_verification(id, "repair-3", &request).unwrap();
+        assert!(store.snapshot(id, cursor).unwrap().events.is_empty());
+        store.control(id, "pause").unwrap();
+        store.retry_verification(id, "repair-3", &request).unwrap();
+        assert_eq!(store.get(id).unwrap().status, MissionStatus::Waiting, "replay is read-only even after later pause");
+    }
+
+    #[test]
+    fn runtime_verification_retry_accepts_time_only_extension_at_repair_and_round_caps() {
+        let (store, before, retry, _) = runtime_retry_fixture();
+        let id = &before.mission_id;
+        let mut confirmation = before.confirmation.clone().unwrap();
+        confirmation.confirmed_at = (Utc::now()-chrono::Duration::minutes(121)).to_rfc3339();
+        store.connection().unwrap().execute("UPDATE mission_runs SET confirmation_json=?2 WHERE mission_id=?1",
+            params![id,serde_json::to_string(&confirmation).unwrap()]).unwrap();
+        let expired = store.get(id).unwrap();
+        assert_eq!(expired.status, MissionStatus::Waiting);
+        assert!(store.follow_up_budget_exhaustion_reason(&expired).unwrap().is_some());
+
+        let increase = MissionBudgetIncrease {
+            request_id: "runtime-retry-time-only".into(),
+            expected_plan_sha256: expired.plan_sha256.clone(),
+            additional_rounds: 0,
+            additional_minutes: 120,
+            additional_repair_attempts: 0,
+            additional_tokens: None,
+            unlimited_tokens: false,
+            additional_cost: None,
+            legacy_verification_override: None,
+        };
+        let extended = store.increase_budget(id, &increase, "test-user").unwrap();
+        assert_eq!(extended.status, MissionStatus::Waiting, "budget extension cannot dispatch work");
+        assert_eq!(extended.plan_sha256, before.plan_sha256);
+        assert_eq!(extended.confirmation.as_ref().unwrap().confirmed_at, confirmation.confirmed_at);
+        let budget = extended.budget.as_ref().unwrap();
+        assert_eq!(budget.max_rounds, before.budget.as_ref().unwrap().max_rounds);
+        assert_eq!(budget.max_repair_attempts, 3);
+        assert_eq!(budget.max_minutes, 240);
+        assert_eq!(store.next_ready_task(id).unwrap(), None);
+        assert_eq!(store.workspace_claim(&before.workspace.root).unwrap(), None);
+
+        let admitted = store.retry_verification(id, "repair-3", &retry).unwrap();
+        assert_eq!(admitted.status, MissionStatus::Active);
+        assert_eq!(admitted.tasks.iter().filter(|task| !task.spec.repair_of.is_empty()).count(), 3);
+        assert_eq!(admitted.budget.as_ref().unwrap().max_rounds, 4);
+        let events = store.snapshot(id, 0).unwrap().events;
+        assert_eq!(events.iter().filter(|event| event.event_type == "task_dispatched").count(), 4);
+        assert_eq!(events.iter().filter(|event| event.event_type == "verification_retry_requested").count(), 1);
+        assert!(events.iter().any(|event| event.event_type == "budget_extended"
+            && event.payload["increase"]["additional_minutes"] == 120
+            && event.payload["increase"]["additional_rounds"] == 0
+            && event.payload["increase"]["additional_repair_attempts"] == 0));
+    }
+
+    #[test]
+    fn runtime_retry_time_extension_rejects_manual_pause_extra_rounds_and_token_overrun() {
+        for case in ["manual-pause", "extra-round", "token-overrun"] {
+            let (store, mission, _, _) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            let mut confirmation = mission.confirmation.clone().unwrap();
+            confirmation.confirmed_at = (Utc::now()-chrono::Duration::minutes(121)).to_rfc3339();
+            store.connection().unwrap().execute("UPDATE mission_runs SET confirmation_json=?2 WHERE mission_id=?1",
+                params![id,serde_json::to_string(&confirmation).unwrap()]).unwrap();
+            let mut input = MissionBudgetIncrease {
+                request_id: format!("runtime-retry-time-negative-{case}"),
+                expected_plan_sha256: mission.plan_sha256.clone(),
+                additional_rounds: 0,
+                additional_minutes: 120,
+                additional_repair_attempts: 0,
+                additional_tokens: None,
+                unlimited_tokens: false,
+                additional_cost: None,
+                legacy_verification_override: None,
+            };
+            match case {
+                "manual-pause" => { store.control(id, "pause").unwrap(); },
+                "extra-round" => input.additional_rounds = 1,
+                "token-overrun" => {
+                    let mut budget = mission.budget.clone().unwrap();
+                    budget.max_total_tokens = Some(10);
+                    store.connection().unwrap().execute("UPDATE mission_runs SET budget_json=?2 WHERE mission_id=?1",
+                        params![id,serde_json::to_string(&budget).unwrap()]).unwrap();
+                    store.record_run_usage(id, "repair-3", "implementation-3", &crate::agent_core_contracts::LocalRunUsage {
+                        input_tokens: 10, output_tokens: 0, estimated_cost: 0.0, currency: String::new(), billing_owner: "local".into(),
+                    }).unwrap();
+                },
+                _ => unreachable!(),
+            }
+            let before = store.snapshot(id, 0).unwrap();
+            assert!(store.increase_budget(id, &input, "test-user").is_err(), "{case}");
+            assert_eq!(serde_json::to_value(store.snapshot(id, 0).unwrap()).unwrap(), serde_json::to_value(before).unwrap(),
+                "{case}: rejected extension is read-only");
+            assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn waiting_runtime_retry_rejects_manual_pause_stale_plan_blocks_work_and_baseline_changes() {
+        for case in ["manual-pause", "stale-plan", "stale-verifier", "runtime-block", "ready", "running",
+            "awaiting-verification", "foreign-claim", "baseline", "canceled", "wrong-runtime-run", "newer-budget-stop"] {
+            let (store, mission, mut request, root) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            match case {
+                "manual-pause" => { store.control(id,"pause").unwrap(); },
+                "stale-plan" => request.expected_plan_sha256 = "f".repeat(64),
+                "stale-verifier" => request.expected_verification_run_id = "stale-verifier".into(),
+                "runtime-block" => { store.append_event(id,"runtime_workspace_blocked","repair-3","blocked",
+                    serde_json::json!({"plan_sha256":mission.plan_sha256})).unwrap(); },
+                "ready" | "running" | "awaiting-verification" => {
+                    store.connection().unwrap().execute("UPDATE mission_tasks SET status=?2 WHERE mission_id=?1 AND task_id='fix'",
+                        params![id,case.replace('-',"_")]).unwrap();
+                },
+                "foreign-claim" => {
+                    let foreign=store.create(&create_input()).unwrap();
+                    store.connection().unwrap().execute(
+                        "INSERT INTO mission_workspace_claims(workspace_key,mission_id,task_id,run_id,acquired_at) VALUES(?1,?2,'task','run','now')",
+                        params![workspace_claim_key(&mission.workspace.root),foreign.mission_id]).unwrap();
+                },
+                "baseline" => fs::write(root.join("readonly.txt"),"changed").unwrap(),
+                "canceled" => { store.control(id,"cancel").unwrap(); },
+                "wrong-runtime-run" => { store.append_event(id,"verification_runtime_failed","repair-3","wrong verifier",
+                    serde_json::json!({"verification_run_id":"other","recovery_action":"mission.verification.retry"})).unwrap(); },
+                "newer-budget-stop" => { store.append_event(id,"budget_exhausted","","budget stop",serde_json::json!({})).unwrap(); },
+                _ => unreachable!(),
+            }
+            let before = store.snapshot(id,0).unwrap();
+            let claim = store.workspace_claim(&mission.workspace.root).unwrap();
+            assert!(store.retry_verification(id,"repair-3",&request).is_err(),"{case}");
+            let after = store.snapshot(id,0).unwrap();
+            assert_eq!(serde_json::to_value(&after).unwrap(),serde_json::to_value(&before).unwrap(),"{case}: rejection is read-only");
+            assert_eq!(store.workspace_claim(&mission.workspace.root).unwrap(),claim,"{case}: foreign claims are not stolen");
+        }
+    }
+
+    #[test]
+    fn waiting_runtime_retry_keeps_real_time_token_and_cost_limits() {
+        for case in ["time", "tokens", "cost", "unknown-cost"] {
+            let (store, mission, request, _) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            let mut budget = mission.budget.clone().unwrap();
+            let db = store.connection().unwrap();
+            if case == "time" {
+                let mut confirmation = mission.confirmation.clone().unwrap();
+                confirmation.confirmed_at = (Utc::now()-chrono::Duration::minutes(121)).to_rfc3339();
+                db.execute("UPDATE mission_runs SET confirmation_json=?2 WHERE mission_id=?1",
+                    params![id,serde_json::to_string(&confirmation).unwrap()]).unwrap();
+            } else {
+                if case == "tokens" {budget.max_total_tokens=Some(10);} else {budget.max_cost=Some(1.0); budget.currency=Some("USD".into());}
+                db.execute("UPDATE mission_runs SET budget_json=?2 WHERE mission_id=?1",params![id,serde_json::to_string(&budget).unwrap()]).unwrap();
+                store.record_run_usage(id,"repair-3","implementation-3", &crate::agent_core_contracts::LocalRunUsage {
+                    input_tokens:10,output_tokens:0,estimated_cost:1.0,
+                    currency:if case=="unknown-cost" {"".into()} else {"USD".into()},billing_owner:"local".into(),
+                }).unwrap();
+            }
+            let error = store.retry_verification(id,"repair-3",&request).unwrap_err().to_string();
+            assert!(error.contains(match case {"time"=>"时限","tokens"=>"Token",_=>"成本"}),"{case}: {error}");
+            assert_eq!(store.get(id).unwrap().status,MissionStatus::Waiting);
+            assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_failure_pause_ownership_is_atomic_and_never_relabels_a_manual_pause() {
+        for manual in [false,true] {
+            let (store, mission, request, _) = runtime_retry_fixture();
+            let id = &mission.mission_id;
+            store.retry_verification(id,"repair-3",&request).unwrap();
+            store.begin_verification_attempt(id,"repair-3","verify-second").unwrap();
+            if manual {store.control(id,"pause").unwrap();}
+            store.record_verification_result(id,"repair-3","implementation-3","verify-second",false,
+                &["local-run:verify-second".into()],"upstream unavailable").unwrap();
+            store.pause_failed_verification_runtime(id,"repair-3","verify-second","upstream unavailable").unwrap();
+            let snapshot=store.snapshot(id,0).unwrap();
+            let failure=snapshot.events.iter().rev().find(|e|e.event_type=="verification_runtime_failed").unwrap();
+            assert_eq!(failure.payload["automatic_pause"],!manual);
+            store.pause_failed_verification_runtime(id,"repair-3","verify-second","upstream unavailable").unwrap();
+            assert!(store.snapshot(id,snapshot.cursor).unwrap().events.is_empty(),"duplicate failure must not change pause ownership");
+            let mut second=request.clone();second.request_id="second-explicit".into();second.expected_verification_run_id="verify-second".into();
+            let result=store.retry_verification(id,"repair-3",&second);
+            if manual {assert!(result.is_err());} else {assert_eq!(result.unwrap().status,MissionStatus::Active);}
+        }
+    }
+
+    #[test]
+    fn concurrent_explicit_runtime_retries_admit_only_one_claim_and_request() {
+        let (store,mission,request,_) = runtime_retry_fixture();
+        let barrier=std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers=Vec::new();
+        for n in 0..2 {
+            let store=store.clone();let id=mission.mission_id.clone();let mut request=request.clone();
+            request.request_id=format!("concurrent-{n}"); let barrier=barrier.clone();
+            workers.push(std::thread::spawn(move||{barrier.wait();store.retry_verification(&id,"repair-3",&request).is_ok()}));
+        }
+        barrier.wait();
+        assert_eq!(workers.into_iter().filter_map(|w|w.join().ok()).filter(|v|*v).count(),1);
+        let snapshot=store.snapshot(&mission.mission_id,0).unwrap();
+        assert_eq!(snapshot.events.iter().filter(|e|e.event_type=="verification_retry_requested").count(),1);
+        assert_eq!(snapshot.mission.status,MissionStatus::Active);
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_some());
+    }
+
     #[test]
     fn recheck_preserves_failures_requires_baseline_and_is_idempotent() {
         let store = store("recheck-baseline");
@@ -4701,7 +5363,7 @@ mod tests {
         store.begin_verification_attempt(&created.mission_id, "fix", "verify1").unwrap();
         store.record_verification_result(&created.mission_id, "fix", "impl", "verify1", false, &["local-run:verify1".into()], "missing baseline").unwrap();
         let mut input = MissionVerificationRetry { request_id: "retry1".into(), expected_plan_sha256: planned.plan_sha256.clone(),
-            expected_verification_run_id: "verify1".into(), source_baseline: None };
+            expected_verification_run_id: "verify1".into(), source_baseline: None, legacy_verification_override: None };
         assert!(store.retry_verification(&created.mission_id, "fix", &input).unwrap_err().to_string().contains("baseline"));
         let files = super::super::protected_files(&root, &plan.tasks[0]).unwrap();
         let mut source = super::super::MissionSourceBaseline {
@@ -4872,6 +5534,7 @@ mod tests {
             additional_tokens: None,
             unlimited_tokens: true,
             additional_cost: None,
+            legacy_verification_override: None,
         };
 
         // Progress and diagnostic events do not replace the effective budget state.
@@ -4909,6 +5572,7 @@ mod tests {
             additional_tokens: None,
             unlimited_tokens: false,
             additional_cost: None,
+            legacy_verification_override: None,
         };
         assert_eq!(paused.status, MissionStatus::Waiting);
         let increased = store.increase_budget(&created.mission_id, &input, "test-user").unwrap();
@@ -4937,6 +5601,7 @@ mod tests {
             expected_plan_sha256: "0".repeat(64),
             additional_rounds: 1, additional_minutes: 0,
             additional_tokens: Some(1), unlimited_tokens: false, additional_cost: None,
+            legacy_verification_override: None,
         };
         assert!(store.increase_budget(&exhausted.mission_id, &stale, "test-user")
             .unwrap_err().to_string().contains("plan changed"));
@@ -4951,6 +5616,7 @@ mod tests {
             request_id: "proactive-guards".into(), expected_plan_sha256: confirmed.plan_sha256.clone(),
             additional_rounds: 1, additional_minutes: 0, additional_repair_attempts: 0,
             additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+            legacy_verification_override: None,
         };
         store.begin_task_attempt(&created.mission_id, "fix", "run-inflight").unwrap();
         store.control(&created.mission_id, "pause").unwrap();
@@ -5014,6 +5680,7 @@ mod tests {
             additional_tokens: None,
             unlimited_tokens: true,
             additional_cost: None,
+            legacy_verification_override: None,
         }, "test-user").unwrap();
         assert_eq!(resumed.status, MissionStatus::Active);
         assert_eq!(resumed.budget.unwrap().max_total_tokens, None);
@@ -5455,6 +6122,7 @@ mod tests {
             request_id: "review-feedback-budget".into(), expected_plan_sha256: planned.plan_sha256.clone(),
             additional_rounds: 0, additional_minutes: 0, additional_repair_attempts: 6,
             additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+            legacy_verification_override: None,
         }, "test-user").unwrap();
         assert_eq!(store.get(&created.mission_id).unwrap().status, MissionStatus::Waiting);
         store.control(&created.mission_id, "resume").unwrap();

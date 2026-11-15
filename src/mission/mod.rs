@@ -21,7 +21,7 @@ mod store;
 
 pub(crate) use contract::{
     ExecutionBinding, MissionExpertPin, MissionAssignment, MissionAssignmentInput, MissionAssignmentOptions,
-    MissionBudget, MissionBudgetIncrease, MissionFeedbackInput, MissionFeedbackSubmit, MissionVerificationRetry, MissionSourceBaseline, MissionConfirmation, MissionCreateInput, MissionEvent, MissionHandoff,
+    MissionBudget, MissionBudgetIncrease, MissionFeedbackInput, MissionFeedbackSubmit, MissionLegacyVerificationOverride, MissionVerificationRetry, MissionSourceBaseline, MissionConfirmation, MissionCreateInput, MissionEvent, MissionHandoff,
     MissionHandoffInput, MissionPlanMode, MissionPlanProposal, MissionRoleAssignment,
     MissionRoleOption, MissionStatus, MissionTaskRoleMapping, MissionTaskSpec, MissionTaskView,
     MissionView, MissionWorkflowPin, MissionWorkspace, TaskStatus, validate_execution_binding,

@@ -80,12 +80,12 @@ try {
  await page.getByRole('button',{name:'返回我的任务',exact:true}).click();
  await page.getByRole('button',{name:'待验收任务',exact:true}).click();
  assert.equal(await page.locator('.mission-detail-head .collaboration-task-status').textContent(),'待核验');
- await page.getByText(/实现专家已提交结果；系统将运行必需检查/).waitFor();
+ await page.getByText(/系统将运行必需检查并由另一位专家核对/).waitFor();
  assert.equal(await page.locator('.mission-stage-rail [aria-current="step"] strong').textContent(),'独立验收');
  assert.equal(await page.getByRole('button',{name:'查看验收详情',exact:true}).count(),1);
  await page.getByRole('button',{name:'查看验收详情',exact:true}).click();
  assert.equal(await page.getByRole('button',{name:'立即检查验收',exact:true}).count(),1);
- assert.equal(await page.getByText('宿主会自动派发独立验收。需要立即检查或恢复时可继续；此操作只核对已提交结果并运行必需检查，不会重新执行实现任务。',{exact:true}).count(),1);
+ assert.equal(await page.getByText('宿主会自动派发独立验收。可立即检查已提交结果并运行必需检查，不重做实现。',{exact:true}).count(),1);
  assert.equal(await page.getByText('已确认',{exact:true}).count(),1);
  await page.screenshot({path:resolve(evidence,'mission-awaiting-verification-desktop.png')});
  await page.setViewportSize({width:390,height:844});

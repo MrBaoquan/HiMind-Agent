@@ -65,7 +65,7 @@ export function missionResumeAction(mission: MissionView, activities: AgentActiv
     const optional = wait.reason === 'manual_pause';
     return {kind: 'verification' as const, label: '续跑待核验', optional,
       responsibility: optional ? '由你决定何时继续 · 当前无需处理' : '需要你手动续跑 · 系统随后检查与独立核验',
-      explanation: '任务当前已暂停，系统不会自动推进。请手动续跑待核验；系统继续已提交结果的必需检查与独立核验，不重复执行已完成的实现。'};
+      explanation: '任务已暂停。请手动续跑待核验；系统检查已提交结果并独立核验，不重做实现。'};
   }
   if (!pending && wait.reason === 'manual_pause' && wait.actor === 'user') {
     return {kind: 'tasks' as const, label: '续跑未完成任务', optional: true,
@@ -208,15 +208,20 @@ export function missionStatusLabel(mission: MissionView, _events: MissionEvent[]
 export function missionVerificationExplanation(mission: MissionView, _events: MissionEvent[] = [], activities: AgentActivityItem[] = []) {
   if (!mission.tasks.some(task => task.status === 'awaiting_verification')) return '';
   if (missionRunningVerifications(mission, activities).length) return mission.status === 'waiting'
-    ? '关联的独立核验仍在运行，当前步骤可收尾；后续派发已暂停，不会启动新核验，也不重复执行已完成的实现。暂停不代表恢复自动派发。'
+    ? '独立核验仍在运行，可完成当前步骤。后续派发已暂停，不启动新核验或重做实现。'
     : '关联的独立核验正在运行；请查看核验详情，不重复启动核验或执行已完成的实现。';
   const resume = missionResumeAction(mission, activities);
   if (resume?.kind === 'verification') return resume.explanation;
-  if (mission.status === 'waiting') return '实现结果已提交，任务当前仍在暂停或等待。恢复资格尚未确认时，不推断系统正在运行核验；不重复执行已完成的实现。检查与独立验收记录分别保留。';
-  return '实现专家已提交结果；系统将运行必需检查，并安排另一位专家核对。检查与独立验收分别记录，通过后交付才算完成。已派发不代表仍在运行；运行状态未上报时不推断进度。';
+  if (mission.status === 'waiting') return '实现已提交，任务仍在暂停或等待。未确认恢复前不重做实现；检查与独立验收分别记录。';
+  return '系统将运行必需检查并由另一位专家核对。均通过后才算交付；未报告运行状态时不推断进度。';
 }
 
 export function eventLabel(event: MissionEvent) {
+  const increase = event.payload?.increase;
+  const increaseRecord = increase && typeof increase === 'object' ? increase as Record<string, unknown> : null;
+  if (event.event_type === 'budget_extended' && parseLegacyVerificationOverride(increaseRecord?.legacy_verification_override)) {
+    return '补充核验时限，任务保持等待';
+  }
   const labels: Record<string, string> = {
     mission_created: '创建任务',
     mission_feedback_submitted: '收到审查意见，供后续执行参考',
@@ -227,6 +232,7 @@ export function eventLabel(event: MissionEvent) {
     plan_confirmed: '确认计划',
     task_dispatched: '派发任务',
     task_baseline_captured: '记录执行前文件基线',
+    verification_retry_override_authorized: '确认本次旧记录人工恢复授权',
     verification_retry_requested: '重新核验同一实现',
     task_dispatch_deferred: '等待执行恢复',
     mission_supervisor_error: '系统暂时无法推进',
@@ -306,4 +312,116 @@ export function missionNextAction(mission: MissionView, _events: MissionEvent[] 
     case 'failed': return '查看失败原因';
     case 'canceled': return '任务已取消';
   }
+}
+
+function parseLegacyVerificationOverride(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const override = value as Record<string, unknown>;
+  if (typeof override.expected_pause_event_id !== 'string' || !override.expected_pause_event_id
+      || typeof override.expected_runtime_failure_event_id !== 'string' || !override.expected_runtime_failure_event_id) return null;
+  return {
+    expected_pause_event_id: override.expected_pause_event_id,
+    expected_runtime_failure_event_id: override.expected_runtime_failure_event_id,
+  };
+}
+
+/** Return the exact old-event pair only while this Mission is at that recovery decision. */
+export function legacyVerificationOverrideForTask(
+  mission: MissionView,
+  events: MissionEvent[],
+  task: MissionView['tasks'][number],
+) {
+  const wait = missionWait(mission);
+  if (!wait || mission.status !== 'waiting' || task.status !== 'failed' || task.verification_passed !== false
+      || !task.attempt_run_id || !task.verification_run_id || missionRuntimeBlocked(mission, events)
+      || mission.confirmation?.plan_sha256 !== mission.plan_sha256
+      || mission.tasks.some(item => ['running','ready','awaiting_verification'].includes(item.status))
+      || mission.tasks.some(child => child.spec.repair_of === task.spec.id && child.status !== 'canceled')) return null;
+
+  const ordered = [...events].sort((a,b) => a.sequence - b.sequence);
+  const latest = ordered[ordered.length - 1];
+  if (!latest || latest.sequence !== wait.cursor) return null;
+
+  let expected: ReturnType<typeof parseLegacyVerificationOverride> = null;
+  if (latest.event_type === 'verification_runtime_failed') {
+    const pause = ordered.find(event => event.sequence + 1 === latest.sequence);
+    if (!pause || pause.event_type !== 'mission_pause') return null;
+    expected = {
+      expected_pause_event_id: pause.event_id,
+      expected_runtime_failure_event_id: latest.event_id,
+    };
+  } else if (latest.event_type === 'budget_extended') {
+    const increase = latest.payload?.increase;
+    const record = increase && typeof increase === 'object' ? increase as Record<string, unknown> : null;
+    expected = parseLegacyVerificationOverride(record?.legacy_verification_override);
+    if (!expected || record?.additional_rounds !== 0 || !Number.isSafeInteger(record.additional_minutes)
+        || Number(record.additional_minutes) <= 0 || record.additional_repair_attempts !== 0
+        || record.additional_tokens != null || record.unlimited_tokens !== false || record.additional_cost != null) return null;
+  } else return null;
+
+  if (!expected) return null;
+  const pause = ordered.find(event => event.event_id === expected?.expected_pause_event_id);
+  const runtime = ordered.find(event => event.event_id === expected?.expected_runtime_failure_event_id);
+  const failures = ordered.filter(event => event.task_id === task.spec.id && event.event_type === 'verification_failed');
+  const failure = failures[failures.length - 1];
+  if (!pause || !runtime || runtime.event_type !== 'verification_runtime_failed' || runtime.task_id !== task.spec.id
+      || runtime.sequence !== pause.sequence + 1 || !failure || failure.sequence + 1 !== pause.sequence
+      || pause.payload?.action !== 'pause' || Object.prototype.hasOwnProperty.call(pause.payload || {}, 'verification_run_id')
+      || Object.prototype.hasOwnProperty.call(runtime.payload || {}, 'automatic_pause')
+      || Object.prototype.hasOwnProperty.call(runtime.payload || {}, 'implementation_run_id')
+      || Object.prototype.hasOwnProperty.call(runtime.payload || {}, 'plan_sha256')
+      || runtime.payload?.verification_run_id !== task.verification_run_id
+      || runtime.payload?.recovery_action !== 'mission.verification.retry'
+      || failure.payload?.implementation_run_id !== task.attempt_run_id
+      || failure.payload?.verification_run_id !== task.verification_run_id) return null;
+  for (const event of ordered.filter(event => event.sequence > runtime.sequence)) {
+    const increase = event.payload?.increase as Record<string, unknown> | undefined;
+    const ids = parseLegacyVerificationOverride(increase?.legacy_verification_override);
+    if (event.event_type !== 'budget_extended' || event.payload?.plan_sha256 !== mission.plan_sha256
+        || ids?.expected_pause_event_id !== expected.expected_pause_event_id
+        || ids?.expected_runtime_failure_event_id !== expected.expected_runtime_failure_event_id
+        || increase?.additional_rounds !== 0 || !Number.isSafeInteger(increase.additional_minutes)
+        || Number(increase.additional_minutes) <= 0 || increase.additional_repair_attempts !== 0
+        || increase.additional_tokens != null || increase.unlimited_tokens !== false || increase.additional_cost != null) return null;
+  }
+  return expected;
+}
+
+/** UI affordance only; the Store re-reads the full ledger under its write lock. */
+export function canRetryWaitingVerification(mission: MissionView, events: MissionEvent[], task: MissionView['tasks'][number]) {
+  if (mission.status !== 'waiting' || task.status !== 'failed' || task.verification_passed !== false
+    || !task.attempt_run_id || !task.verification_run_id || missionRuntimeBlocked(mission, events)
+    || mission.confirmation?.plan_sha256 !== mission.plan_sha256
+    || mission.tasks.some(item => ['running','ready','awaiting_verification'].includes(item.status))
+    || mission.tasks.some(child => child.spec.repair_of === task.spec.id && child.status !== 'canceled')) return false;
+  const legacyOverride = legacyVerificationOverrideForTask(mission, events, task);
+  const ordered = [...events].sort((a,b) => b.sequence-a.sequence);
+  const manualRetryReady = Boolean(legacyOverride
+    && (ordered[0]?.event_type === 'budget_extended' || missionWait(mission)?.budget_reason == null));
+  const runtime = ordered.find(event => ['mission_pause','mission_resume','budget_exhausted','verification_runtime_failed'].includes(event.event_type));
+  if (!runtime || runtime.event_type !== 'verification_runtime_failed' || runtime.task_id !== task.spec.id
+    || runtime.payload?.verification_run_id !== task.verification_run_id
+    || runtime.payload?.recovery_action !== 'mission.verification.retry') return manualRetryReady;
+  const pause = ordered.find(event => event.sequence < runtime.sequence && ['mission_pause','mission_resume','budget_exhausted'].includes(event.event_type));
+  const failure = ordered.find(event => event.task_id === task.spec.id && event.event_type === 'verification_failed');
+  if (!pause || pause.event_type !== 'mission_pause' || !failure || failure.sequence >= pause.sequence
+    || failure.payload?.implementation_run_id !== task.attempt_run_id
+    || failure.payload?.verification_run_id !== task.verification_run_id) return false;
+  return (runtime.payload?.automatic_pause === true
+    && runtime.payload.implementation_run_id === task.attempt_run_id && runtime.payload.plan_sha256 === mission.plan_sha256
+    && pause.payload?.verification_run_id === task.verification_run_id) || manualRetryReady;
+}
+
+export function legacyBudgetExtensionAction(isLegacyRecovery: boolean, authorized: boolean) {
+  if (!isLegacyRecovery) return { disabled: false, label: '确认并继续', description: '' };
+  if (!authorized) return {
+    disabled: true,
+    label: '请先确认人工授权',
+    description: '旧记录缺少暂停归属。本次只允许单独补充核验时限；不授权时不会提交增额。',
+  };
+  return {
+    disabled: false,
+    label: '补充时限并保持等待',
+    description: '本次只增加核验时限，任务仍保持等待；之后需单独确认重试同一交付核验。',
+  };
 }

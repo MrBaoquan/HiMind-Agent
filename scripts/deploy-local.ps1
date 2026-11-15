@@ -62,6 +62,14 @@ $RuntimeRelease = Resolve-RuntimeReleaseDirectory -RequestedDirectory $RuntimeRe
 
 $Cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
 if (-not (Test-Path $Cargo)) { $Cargo = "cargo" }
+# Resolve Cargo's effective output directory before building. This honors both
+# CARGO_TARGET_DIR and workspace configuration, including external build disks.
+$cargoMetadata = & $Cargo metadata --no-deps --format-version 1 --manifest-path $CargoManifest
+if ($LASTEXITCODE -ne 0) { throw "无法解析 Cargo 构建目录，未停止现有 Agent" }
+$CargoTargetDirectory = [string](($cargoMetadata | ConvertFrom-Json).target_directory)
+if (-not [IO.Path]::IsPathRooted($CargoTargetDirectory)) {
+    throw "Cargo 未返回绝对构建目录，未停止现有 Agent"
+}
 
 function Get-ListenerPid([int]$port) {
     $connection = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
@@ -267,9 +275,9 @@ finally {
     Pop-Location
 }
 
-$BuiltExe = Join-Path $RepoRoot "target\release\himind-agent.exe"
-$BuiltMcp = Join-Path $RepoRoot "target\release\himind-agent-mcp.exe"
-$BuiltLauncher = Join-Path $RepoRoot "target\release\himind-agent-launcher.exe"
+$BuiltExe = Join-Path $CargoTargetDirectory "release\himind-agent.exe"
+$BuiltMcp = Join-Path $CargoTargetDirectory "release\himind-agent-mcp.exe"
+$BuiltLauncher = Join-Path $CargoTargetDirectory "release\himind-agent-launcher.exe"
 foreach ($built in @($BuiltExe, $BuiltMcp, $BuiltLauncher)) {
     if (-not (Test-Path -LiteralPath $built)) { throw "找不到构建产物：$built" }
 }

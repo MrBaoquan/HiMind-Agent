@@ -261,6 +261,10 @@ export type MissionBudgetIncrease = {
     additional_tokens: number | null;
     unlimited_tokens: boolean;
     additional_cost: number | null;
+    legacy_verification_override?: {
+        expected_pause_event_id: string;
+        expected_runtime_failure_event_id: string;
+    } | null;
 };
 
 export type MissionPlanProposal = {
@@ -3854,7 +3858,7 @@ export const agentApi = {
     resolveRuntimeWorkspace: (input: { workspace: string; expected_fingerprint: string; action: 'full_access' | 'repair' | 'retry' | 'files_only'; mission_id: string; expected_plan_sha256: string }) =>
         invoke<{ resolved: boolean; mission: MissionView | null }>('resolve_runtime_workspace', { input }),
     controlMission: (missionId: string, action: 'pause' | 'resume' | 'cancel') => invoke<MissionView>('control_mission', { missionId, action }),
-    retryMissionVerification: (missionId: string, taskId: string, input: { request_id: string; expected_plan_sha256: string; expected_verification_run_id: string }) =>
+    retryMissionVerification: (missionId: string, taskId: string, input: { request_id: string; expected_plan_sha256: string; expected_verification_run_id: string; legacy_verification_override?: { expected_pause_event_id: string; expected_runtime_failure_event_id: string } | null }) =>
         invoke<MissionView>('retry_mission_verification', { missionId, taskId, input }),
     increaseMissionBudget: (missionId: string, input: MissionBudgetIncrease) =>
         invoke<MissionView>('increase_mission_budget', { missionId, input }),

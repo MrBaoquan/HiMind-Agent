@@ -84,7 +84,7 @@ assert.equal(projectTasks([], [run('root',{status:'canceled'}),run('child',{pare
 assert.equal(executionTodoId('r1','s1','feedback'),'run:r1:s1:feedback');
 
 // B08: all surfaces consume the same associated reason, actor, eligibility/cursor.
-import {missionWait, missionDeliveries, missionResponsibility, eventLabel} from '../src/pages/missionView.ts';
+import {missionWait, missionDeliveries, missionResponsibility, eventLabel, legacyVerificationOverrideForTask, legacyBudgetExtensionAction} from '../src/pages/missionView.ts';
 import {retainBudgetRequest,clearBudgetRequest,pendingBudgetRequest} from '../src/pages/missionBudgetRequest.ts';
 const waitDto = {contract_version:'mission.wait.v1',plan_sha256:'hash',cursor:5,reason:'budget_exhausted',actor:'user',budget_reason:'Token 100/100',environment_blocked:false,can_increase_budget:true,can_resume:false};
 const waitingBudget=mission('waiting',{confirmation:{plan_sha256:'hash'},effective_wait:waitDto});
@@ -121,6 +121,8 @@ assert.notEqual(retainBudgetRequest('m1',{...input,additional_tokens:60}).reques
 clearBudgetRequest('m1','hash');assert.equal(pendingBudgetRequest('m1','hash'),null);
 assert.match(eventLabel({event_type:'mission_feedback_submitted'} as never),/审查意见/);
 assert.match(eventLabel({event_type:'mission_follow_up_format_retry'} as never),/重试/);
+assert.match(eventLabel({event_type:'verification_retry_override_authorized'} as never),/人工恢复授权/);
+assert.match(eventLabel({event_type:'budget_extended',payload:{increase:{legacy_verification_override:{expected_pause_event_id:'m1:1227',expected_runtime_failure_event_id:'m1:1228'}}}} as never),/保持等待/);
 console.log('B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity');
 
 // QA-LEGACY-01: authoritative resume admission must agree with the user action.
@@ -151,3 +153,61 @@ const pageRequests:number[]=[];
 const paged=await readMissionSnapshot(async after=>{pageRequests.push(after);return {mission:{...waitingBudget,effective_wait:{...waitDto,cursor:12}},cursor:after===0?4:12,requires_snapshot:after===0,events:after===0?[{event_id:'e4',sequence:4}]:[{event_id:'e12',sequence:12}] } as never;},0);
 assert.deepEqual(pageRequests,[0,4]);assert.equal(paged.snapshot.cursor,12);assert.equal(paged.snapshot.events.length,2);assert.equal(paged.replace,true);
 await assert.rejects(readMissionSnapshot(async()=>({mission:{...waitingBudget,effective_wait:{...waitDto,cursor:12}},cursor:4,events:[]} as never),0),/分页未推进/);
+
+// Explicit Waiting retry is separate from Active-only follow-up and never pre-resumes.
+import {canRetryWaitingVerification} from '../src/pages/missionView.ts';
+const retryTask = {spec:{id:'repair-3',repair_of:'repair-2'},status:'failed',attempt_run_id:'impl-3',verification_run_id:'verify-3',verification_passed:false} as MissionView['tasks'][number];
+const retryWait = {...waitDto,cursor:1228,reason:'unknown',actor:'unknown',budget_reason:null,can_resume:false};
+const retryMission = mission('waiting',{tasks:[retryTask],confirmation:{plan_sha256:'hash'},effective_wait:retryWait});
+const retryEvents = [
+ {event_id:'m1:1226',sequence:1226,event_type:'verification_failed',task_id:'repair-3',payload:{implementation_run_id:'impl-3',verification_run_id:'verify-3'}},
+ {event_id:'m1:1227',sequence:1227,event_type:'mission_pause',task_id:'',payload:{action:'pause',verification_run_id:'verify-3'}},
+ {event_id:'m1:1228',sequence:1228,event_type:'verification_runtime_failed',task_id:'repair-3',payload:{verification_run_id:'verify-3',recovery_action:'mission.verification.retry',automatic_pause:true,implementation_run_id:'impl-3',plan_sha256:'hash'}},
+] as Parameters<typeof canRetryWaitingVerification>[1];
+assert.equal(canRetryWaitingVerification(retryMission,retryEvents,retryTask),true);
+const legacyRetryEvents=retryEvents.map(event=>event.event_type==='mission_pause'
+ ? {...event,payload:{action:'pause'}} : event.event_type==='verification_runtime_failed'
+ ? {...event,payload:{verification_run_id:'verify-3',recovery_action:'mission.verification.retry'}} : event);
+const legacyOverride=legacyVerificationOverrideForTask(retryMission,legacyRetryEvents,retryTask);
+assert.deepEqual(legacyOverride,{expected_pause_event_id:'m1:1227',expected_runtime_failure_event_id:'m1:1228'});
+assert.equal(canRetryWaitingVerification(retryMission,legacyRetryEvents,retryTask),true,
+ 'an explicit same-delivery UI action can submit the exact legacy event pair');
+const legacyBudgetEvent={event_id:'m1:1229',sequence:1229,event_type:'budget_extended',task_id:'',payload:{plan_sha256:'hash',increase:{
+ additional_rounds:0,additional_minutes:120,additional_repair_attempts:0,additional_tokens:null,unlimited_tokens:false,additional_cost:null,
+ legacy_verification_override:legacyOverride,
+}}} as typeof retryEvents[number];
+const afterLegacyBudget=mission('waiting',{tasks:[retryTask],confirmation:{plan_sha256:'hash'},effective_wait:{...retryWait,cursor:1229,budget_reason:'repair limit reached'}});
+assert.deepEqual(legacyVerificationOverrideForTask(afterLegacyBudget,[...legacyRetryEvents,legacyBudgetEvent],retryTask),legacyOverride);
+assert.equal(canRetryWaitingVerification(afterLegacyBudget,[...legacyRetryEvents,legacyBudgetEvent],retryTask),true);
+const secondBudgetEvent={...legacyBudgetEvent,event_id:'m1:1231',sequence:1231};
+const twiceExtended=mission('waiting',{tasks:[retryTask],confirmation:{plan_sha256:'hash'},effective_wait:{...retryWait,cursor:1231,budget_reason:'repair limit reached'}});
+assert.deepEqual(legacyVerificationOverrideForTask(twiceExtended,[...legacyRetryEvents,legacyBudgetEvent,secondBudgetEvent],retryTask),legacyOverride);
+assert.equal(canRetryWaitingVerification(twiceExtended,[...legacyRetryEvents,legacyBudgetEvent,secondBudgetEvent],retryTask),true);
+assert.equal(legacyVerificationOverrideForTask(twiceExtended,[...legacyRetryEvents,legacyBudgetEvent,
+ {event_id:'m1:1230',sequence:1230,event_type:'mission_pause',task_id:'',payload:{}},secondBudgetEvent] as never,retryTask),null);
+const nonTimeOnlyLegacyBudget={...legacyBudgetEvent,payload:{increase:{...legacyBudgetEvent.payload.increase,additional_rounds:1}}};
+assert.equal(legacyVerificationOverrideForTask(afterLegacyBudget,[...legacyRetryEvents,nonTimeOnlyLegacyBudget],retryTask),null);
+const exhaustedLegacy=mission('waiting',{tasks:[retryTask],confirmation:{plan_sha256:'hash'},effective_wait:{...retryWait,budget_reason:'time limit'}});
+assert.equal(canRetryWaitingVerification(exhaustedLegacy,legacyRetryEvents,retryTask),false,
+ 'a same-delivery retry remains unavailable until exhausted resources are addressed');
+for (const extra of [
+ {sequence:1229,event_type:'mission_pause',task_id:'',payload:{}},
+ {sequence:1229,event_type:'budget_exhausted',task_id:'',payload:{}},
+ {sequence:1229,event_type:'verification_runtime_failed',task_id:'repair-3',payload:{verification_run_id:'wrong',recovery_action:'mission.verification.retry'}},
+]) assert.equal(canRetryWaitingVerification(retryMission,[...retryEvents,extra] as typeof retryEvents,retryTask),false);
+assert.equal(canRetryWaitingVerification({...retryMission,status:'active'},retryEvents,retryTask),false);
+assert.equal(canRetryWaitingVerification({...retryMission,confirmation:null},retryEvents,retryTask),false);
+const unauthorizedLegacyBudget=legacyBudgetExtensionAction(true,false);
+assert.equal(unauthorizedLegacyBudget.disabled,true);
+assert.match(unauthorizedLegacyBudget.label,/人工授权/);
+assert.match(unauthorizedLegacyBudget.description,/不会提交增额/);
+const authorizedLegacyBudget=legacyBudgetExtensionAction(true,true);
+assert.equal(authorizedLegacyBudget.disabled,false);
+assert.match(authorizedLegacyBudget.label,/保持等待/);
+assert.match(authorizedLegacyBudget.description,/单独确认重试同一交付核验/);
+const ownedEvents = retryEvents;
+assert.equal(canRetryWaitingVerification(retryMission,ownedEvents,retryTask),true);
+assert.equal(canRetryWaitingVerification(retryMission,ownedEvents.map(event=>event.event_type==='verification_runtime_failed'
+ ? {...event,payload:{...event.payload,automatic_pause:false}} : event),retryTask),false);
+assert.equal(canRetryWaitingVerification({...retryMission,tasks:[retryTask,{...retryTask,spec:{...retryTask.spec,id:'child',repair_of:'repair-3'}}]},retryEvents,retryTask),false);
+console.log('Explicit same-delivery Waiting retry/manual pause guards passed');

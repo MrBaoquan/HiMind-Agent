@@ -201,13 +201,30 @@ pub(crate) fn control_mission(mission_id: &str, action: &str) -> Result<crate::m
                 }
             }
         }
-        let root = crate::store::paths::agent_home().join("mission-dispatch-locks");
-        std::fs::create_dir_all(&root)?;
-        let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
-            .open(root.join(format!("{mission_id}.lock")))?;
-        if file.try_lock_exclusive()? { store.release_canceled_claims(mission_id)?; }
+        release_canceled_claims_after_dispatch(&store, mission_id)?;
     }
     Ok(mission)
+}
+
+fn release_canceled_claims_after_dispatch(store: &MissionStore, mission_id: &str) -> Result<(), Box<dyn Error>> {
+    let root = crate::store::paths::agent_home().join("mission-dispatch-locks");
+    std::fs::create_dir_all(&root)?;
+    let path = root.join(format!("{mission_id}.lock"));
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+    if file.try_lock_exclusive()? {
+        store.release_canceled_claims(mission_id)?;
+        return Ok(());
+    }
+
+    let store = store.clone();
+    let mission_id = mission_id.to_string();
+    std::thread::spawn(move || {
+        let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path) else { return; };
+        if file.lock_exclusive().is_ok() {
+            let _ = store.release_canceled_claims(&mission_id);
+        }
+    });
+    Ok(())
 }
 
 struct CanceledClaimCleanup { store: MissionStore, mission_id: String }
@@ -543,6 +560,18 @@ pub(crate) fn retry_verification(
 ) -> Result<crate::mission::MissionView, Box<dyn Error>> {
     let store = MissionStore::open_default()?;
     let mission = store.get(mission_id)?;
+    // Share the dispatcher's OS lock: do not re-admit while its previous
+    // verifier is still draining/finalizing, nor race a stale dispatch scan.
+    let lock_root = crate::store::paths::agent_home().join("mission-dispatch-locks");
+    std::fs::create_dir_all(&lock_root)?;
+    let dispatch_lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(lock_root.join(format!("{}.lock", mission.mission_id)))?;
+    if !dispatch_lock.try_lock_exclusive()? {
+        return Err("mission dispatch is already active; wait for it to drain before rechecking".into());
+    }
+    // Cancellation may commit while this short admission lock is held. The
+    // cleanup runs before lock release and clears any claim from that race.
+    let _cancel_cleanup = CanceledClaimCleanup { store: store.clone(), mission_id: mission.mission_id.clone() };
     let task = mission.tasks.iter().find(|task| task.spec.id == task_id).ok_or("task not found")?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
     let run = ledger.get_run(&task.attempt_run_id)?.ok_or("implementation run missing")?;
@@ -872,12 +901,7 @@ fn run_verification_with_executor(
     let updated = if !run_succeeded && !negative_review {
         // A verifier that never ran is a runtime failure, not a request for the
         // implementation expert to rewrite an already valid delivery.
-        let paused = store.control(&mission.mission_id, "pause")?;
-        store.append_event(&mission.mission_id, "verification_runtime_failed", &task.id,
-            "核验执行器未完成，任务已暂停；修复运行环境后可重试同一交付的核验",
-            json!({"error":reason,"verification_run_id":outcome.run.run_id,
-                "recovery_action":"mission.verification.retry"}))?;
-        paused
+        store.pause_failed_verification_runtime(&mission.mission_id, &task.id, &outcome.run.run_id, &reason)?
     } else { updated };
     Ok(json!({
         "dispatched": true,
@@ -1801,6 +1825,80 @@ mod tests {
                 assert!(!runtime.prompt.contains("允许 exec_command"));
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_runtime_retry_requires_succeeded_implementation_and_drained_dispatch_lock() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        let (store, mission, pending) = boundary_fixture(&env.root, false, false);
+        let id = &mission.mission_id;
+        store.begin_verification_attempt(id, "work", "failed-verifier").unwrap();
+        store.record_verification_result(id, "work", &pending.attempt_run_id, "failed-verifier", false,
+            &["local-run:failed-verifier".into()], "upstream unavailable").unwrap();
+        store.pause_failed_verification_runtime(id, "work", "failed-verifier", "upstream unavailable").unwrap();
+        let request = serde_json::from_value(json!({"request_id":"explicit-only",
+            "expected_plan_sha256":mission.plan_sha256,"expected_verification_run_id":"failed-verifier"})).unwrap();
+        let ledger=crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let original=ledger.get_run(&pending.attempt_run_id).unwrap().unwrap();
+        let db=rusqlite::Connection::open(crate::store::paths::agent_home().join("mission-runs.sqlite3")).unwrap();
+        for (n,status) in [crate::agent_core_contracts::LocalRunStatus::Failed,
+            crate::agent_core_contracts::LocalRunStatus::Canceled,crate::agent_core_contracts::LocalRunStatus::Running].into_iter().enumerate() {
+            // Fresh private ledger records: never rewrite a terminal implementation.
+            let mut run=original.clone();run.run_id=format!("non-succeeded-{n}");run.status=status;
+            ledger.save_run(&run).unwrap();
+            db.execute("UPDATE mission_tasks SET attempt_run_id=?2 WHERE mission_id=?1 AND task_id='work'",
+                rusqlite::params![id,run.run_id]).unwrap();
+            assert!(super::retry_verification(id,"work",&request).unwrap_err().to_string().contains("implementation did not succeed"));
+            assert_eq!(store.get(id).unwrap().status,crate::mission::MissionStatus::Waiting);
+            assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none());
+        }
+        db.execute("UPDATE mission_tasks SET attempt_run_id=?2 WHERE mission_id=?1 AND task_id='work'",
+            rusqlite::params![id,pending.attempt_run_id]).unwrap();
+        let lock_root=crate::store::paths::agent_home().join("mission-dispatch-locks");
+        let busy=std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(lock_root.join(format!("{id}.lock"))).unwrap();
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&busy).unwrap());
+        assert!(super::retry_verification(id,"work",&request).unwrap_err().to_string().contains("dispatch is already active"));
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none());
+        drop(busy);
+        let retried=super::retry_verification(id,"work",&request).unwrap();
+        assert_eq!(retried.status,crate::mission::MissionStatus::Active);
+        assert_eq!(retried.tasks[0].status,crate::mission::TaskStatus::AwaitingVerification);
+        assert_eq!(retried.tasks[0].attempt_run_id,pending.attempt_run_id);
+        assert!(retried.tasks[0].verification_run_id.is_empty(),"admission itself never runs a paid verifier");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canceled_claim_cleanup_waits_for_retry_admission_lock() {
+        use crate::runtime::process::codex_test_support::Environment;
+        use fs4::fs_std::FileExt;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        let root = env.root.join("cancel-cleanup-workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let (store, mission, _) = boundary_fixture(&root, false, false);
+        let id = &mission.mission_id;
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_some());
+        store.control(id, "cancel").unwrap();
+
+        let lock_path = crate::store::paths::agent_home().join("mission-dispatch-locks").join(format!("{id}.lock"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).unwrap();
+        assert!(FileExt::try_lock_exclusive(&held).unwrap());
+        super::release_canceled_claims_after_dispatch(&store, id).unwrap();
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_some());
+        drop(held);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while store.workspace_claim(&mission.workspace.root).unwrap().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(store.workspace_claim(&mission.workspace.root).unwrap().is_none(),
+            "cancellation must release claims once retry admission releases the shared lock");
     }
 
     #[test]

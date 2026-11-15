@@ -172,7 +172,8 @@ export function AcpProfilesPanel({ snapshot, busyAction, onSave, onSetEnabled, o
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">运行环境</span>
             <strong>{readyCount ? `${readyCount} 个可用` : '还没有可用的运行环境'}</strong>
-            <span>这里只表示运行环境可用性，不改变任务显式选择；远程任务默认执行工具在设置中配置，已有任务不受影响。</span>
+            <span>这里只显示运行环境可用性，不改变任务显式选择。</span>
+            <span>远程任务默认执行工具在设置中配置，已有任务不受影响。</span>
           </div>
         </div>
         <div className="ai-overview-stats" aria-label="运行环境统计">

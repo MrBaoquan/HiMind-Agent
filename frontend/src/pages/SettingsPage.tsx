@@ -789,7 +789,7 @@ export function SettingsPage({
                     <option value="full_access">允许访问本机全部文件（高风险）</option>
                   </select>
                 </SettingRow>
-                <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '仅作为新远程任务未显式选择时的默认；不覆盖已有任务。自动模式选择本机可用的 AI 工具，未解析时不代表已选定。' : '启用远程任务后生效；不覆盖任务显式选择'}>
+                <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '新任务的默认值；自动模式需解析可用工具' : '启用远程任务后生效；不覆盖任务显式选择'}>
                   <select aria-label="远程任务执行工具" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.default_provider} onChange={event => updateRemoteExecution({ default_provider: event.target.value as RemoteExecutionSettings['default_provider'] })}>
                     <option value="himind.builtin">{localRuntimeMeta('himind.builtin').name}（推荐）</option><option value="auto">自动选择可用工具</option><option value="personal.codex">{localRuntimeMeta('personal.codex').name}</option><option value="personal.github-copilot">{localRuntimeMeta('personal.github-copilot').name}</option>
                   </select>

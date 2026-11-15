@@ -20,5 +20,8 @@ export function MissionBudgetSummary({mission, events, historyComplete = false, 
     <div><dt>返工次数</dt><dd>{remaining(budget.max_repair_attempts, repairs)}</dd></div>
     <div><dt>Token（按已报用量）</dt><dd>{remaining(budget.max_total_tokens, tokens)}{tokens !== null ? ` · 已报 ${tokens.toLocaleString()}` : ' · 用量未报告'}</dd></div>
     <div><dt>成本{currency ? `（${currency}）` : ''}</dt><dd>{budget.max_cost == null ? '不限' : remaining(budget.max_cost, measured ?? null)}{budget.max_cost != null && !currency ? ' · 币种未提供，无法比较' : ''}</dd></div>
-  </dl><p>已报告成本：{cost && Object.keys(cost.buckets).length ? Object.entries(cost.buckets).map(([unit,value]) => `${value} ${unit}`).join('；') : '未知'}{cost?.unknown_runs ? `；${cost.unknown_runs} 次运行成本不完整` : ''}。不同币种不合计；未上报用量不补零。时限从确认至当前按整分钟累计，包含暂停、环境、预算和核验等待；达到上限即耗尽。{['completed','failed','canceled'].includes(mission.status) ? '任务已结束，此处仍为确认至今的累计时间，不代表结算运行耗时。' : ''}本机时钟仅供展示，最终资格由系统复核。</p></section>;
+  </dl><p>已报告成本：{cost && Object.keys(cost.buckets).length ? Object.entries(cost.buckets).map(([unit,value]) => `${value} ${unit}`).join('；') : '未知'}{cost?.unknown_runs ? `；${cost.unknown_runs} 次运行成本不完整` : ''}。不同币种不合计；未上报用量不补零。</p>
+    <p>时限从确认至今按整分钟累计，达到上限即耗尽。<br />暂停、环境、预算和核验等待均计入时限。</p>
+    {['completed','failed','canceled'].includes(mission.status) ? <p>任务已结束，仍显示确认至今的累计时间，并非结算运行耗时。</p> : null}
+    <p>本机时钟仅供展示，最终资格由系统复核。</p></section>;
 }

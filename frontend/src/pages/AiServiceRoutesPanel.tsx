@@ -210,7 +210,7 @@ export function AiServiceRoutesPanel({
           {/* 页签已经写了「能力路由」，页头不再重复一遍 eyebrow；
               说明句收进标题的 title：它是解释，不是每次都要读的正文。 */}
           <h3 id="ai-routes-title" title="每个能力可以分别指定服务与模型；仅在同能力内降级">默认服务与备用顺序</h3>
-          <p className="ai-service-hint">这里是未显式选择时的 AI 服务默认与备用；任务显式选择优先，不覆盖已有任务。空模型跟随服务默认，无解析结果显示未解析。</p>
+          <p className="ai-service-hint">未显式选择时，使用这里的 AI 服务默认与备用。<br />任务显式选择优先，不覆盖已有任务。<br />空模型跟随服务默认，无解析结果显示“未解析”。</p>
         </div>
         <button className="btn" onClick={onOpenServices}><Settings2 size={14} />管理 AI 服务</button>
       </header>

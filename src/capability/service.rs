@@ -2114,6 +2114,10 @@ impl CapabilityGateway {
                             "files":{"type":"object","minProperties":1,"maxProperties":10000,
                                 "additionalProperties":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"}}
                         }, "required":["source_reference","captured_at","artifact_sha256","files"], "additionalProperties":false}
+                        ,"legacy_verification_override":{"type":"object","properties":{
+                            "expected_pause_event_id":{"type":"string","minLength":1,"maxLength":240},
+                            "expected_runtime_failure_event_id":{"type":"string","minLength":1,"maxLength":240}
+                        },"required":["expected_pause_event_id","expected_runtime_failure_event_id"],"additionalProperties":false}
                     }, "required":["request_id","expected_plan_sha256","expected_verification_run_id"],"additionalProperties":false}
                 }, "required":["mission_id","task_id","input"],"additionalProperties":false}),
                 CapabilityHandler::MissionVerificationRetry,
@@ -2121,7 +2125,7 @@ impl CapabilityGateway {
             registration(
                 "mission.budget.extend",
                 "增加协作任务预算并继续",
-                "对已停止执行和核验、正在等待的已确认任务增加额度并继续调度，支持预算耗尽后续跑或主动增额；保留计划版本、已批准访问范围及未解除的环境阻断，需要高风险审批。",
+                "对已停止执行和核验、正在等待的已确认任务增加额度并继续调度，支持预算耗尽后续跑或主动增额；旧记录人工覆盖仅允许单独增加核验时限，增额后仍保持等待，需另行调用 mission.verification.retry；保留计划版本、已批准访问范围及未解除的环境阻断，需要高风险审批。",
                 "local_write",
                 json!({
                     "type":"object",
@@ -2135,10 +2139,23 @@ impl CapabilityGateway {
                                 "additional_rounds":{"type":"integer","minimum":0,"maximum":4294967295u64},
                                 "additional_minutes":{"type":"integer","minimum":0,"maximum":525600},
                                 "additional_repair_attempts":{"type":"integer","minimum":0,"maximum":4294967295u64},
-                                "additional_tokens":{"type":"integer","minimum":1,"maximum":9000000000000000u64},
+                                "additional_tokens":{"type":["integer","null"],"minimum":1,"maximum":9000000000000000u64},
                                 "unlimited_tokens":{"type":"boolean"},
-                                "additional_cost":{"type":"number","exclusiveMinimum":0}
+                                "additional_cost":{"type":["number","null"],"exclusiveMinimum":0},
+                                "legacy_verification_override":{"type":"object","properties":{
+                                    "expected_pause_event_id":{"type":"string","minLength":1,"maxLength":240},
+                                    "expected_runtime_failure_event_id":{"type":"string","minLength":1,"maxLength":240}
+                                },"required":["expected_pause_event_id","expected_runtime_failure_event_id"],"additionalProperties":false,
+                                    "description":"仅在用户明确覆盖旧版暂停归属缺失时提供；只能单独增加核验时限（additional_rounds=0、additional_minutes>0、additional_repair_attempts=0、additional_tokens=null、unlimited_tokens=false、additional_cost=null）。增额后 Mission 仍保持等待，必须另行确认 mission.verification.retry；不会重做实现或增加返工次数。"}
                             },
+                            "allOf":[{"if":{"required":["legacy_verification_override"]},"then":{"properties":{
+                                "additional_rounds":{"const":0},
+                                "additional_minutes":{"minimum":1},
+                                "additional_repair_attempts":{"const":0},
+                                "additional_tokens":{"type":"null"},
+                                "unlimited_tokens":{"const":false},
+                                "additional_cost":{"type":"null"}
+                            }}}],
                             "required":["request_id","expected_plan_sha256","additional_rounds","additional_minutes","unlimited_tokens"],
                             "additionalProperties":false
                         }

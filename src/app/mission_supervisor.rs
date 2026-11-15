@@ -475,7 +475,8 @@ mod tests {
             assert_eq!(pending.confirmation, confirmed.confirmation);
             let input = crate::mission::MissionBudgetIncrease { request_id: "boundary-extension".into(),
                 expected_plan_sha256: planned.plan_sha256.clone(), additional_rounds: 0, additional_minutes: 0,
-                additional_repair_attempts: 0, additional_tokens: Some(100), unlimited_tokens: false, additional_cost: None };
+                additional_repair_attempts: 0, additional_tokens: Some(100), unlimited_tokens: false, additional_cost: None,
+                legacy_verification_override: None };
             // Explicit pause remains paused; it does not lose the admitted
             // verifier or allow inflight budget extension. Only user resume
             // with this confirmed claim may finish the same verification.

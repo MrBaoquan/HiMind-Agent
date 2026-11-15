@@ -179,6 +179,8 @@ pub(crate) struct MissionBudgetIncrease {
     pub unlimited_tokens: bool,
     #[serde(default)]
     pub additional_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_verification_override: Option<MissionLegacyVerificationOverride>,
 }
 
 /// Observations only. Evidence references are opaque strings, never path grants.
@@ -281,6 +283,13 @@ pub(crate) struct MissionSourceBaseline {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionLegacyVerificationOverride {
+    pub expected_pause_event_id: String,
+    pub expected_runtime_failure_event_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionVerificationRetry {
@@ -289,6 +298,8 @@ pub(crate) struct MissionVerificationRetry {
     pub expected_verification_run_id: String,
     #[serde(default)]
     pub source_baseline: Option<MissionSourceBaseline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_verification_override: Option<MissionLegacyVerificationOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

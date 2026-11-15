@@ -16,6 +16,9 @@ import { CollaborationDialog } from './CollaborationDialog';
 import { assignmentProblem, bindExpert, changeExecutor, changeService, expertKey, serviceOptions } from './missionAssignment';
 import {
   eventLabel,
+  canRetryWaitingVerification,
+  legacyBudgetExtensionAction,
+  legacyVerificationOverrideForTask,
   missionNextAction,
   missionRunningVerifications,
   missionWait,
@@ -52,7 +55,7 @@ function MissionPermissionPanel({ mission, events, onSaved }: { mission: Mission
   }
   return <section className="mission-detail-panel"><h3>执行权限</h3>
     {editable ? <label><span>任务访问模式</span><select value={full ? 'full_access' : 'workspace_write'} disabled={busy} onChange={event => void save(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label> : <strong>{full ? '完全访问' : recovery?.payload?.mode === 'files_only' ? '仅文件工具' : '工作区访问'}</strong>}
-    <p>{full ? '执行器按当前系统用户权限运行，可访问工作区外文件。ACP 工具请求由宿主自动批准，无需逐次确认。任务目标与验收标准继续有效。' : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身的访问控制。环境受阻时可调整本任务的执行权限。'}</p>
+    <p>{full ? '按当前用户权限访问工作区外文件；ACP 请求自动批准。目标与验收标准仍有效。' : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身访问控制。受阻时可调整权限。'}</p>
     {editable ? <small>随计划确认后生效，后续执行无需重复确认；不会自动提权为管理员。</small> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
   </section>;
@@ -338,7 +341,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
     }
   }
 
-  async function recheckTask(taskId: string, runId: string) {
+  async function recheckTask(taskId: string, runId: string, legacyOverride?: { expected_pause_event_id: string; expected_runtime_failure_event_id: string } | null) {
     if (!mission || rechecking) return;
     setRechecking(taskId);
     setError('');
@@ -346,6 +349,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       await agentApi.retryMissionVerification(missionId, taskId, {
         request_id: `agent-ui:recheck:${taskId}:${runId}`,
         expected_plan_sha256: mission.plan_sha256, expected_verification_run_id: runId,
+        ...(legacyOverride ? { legacy_verification_override: legacyOverride } : {}),
       });
       await poll(true);
       await onRefresh();
@@ -356,6 +360,9 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const todo = missionTodo(mission, relatedActivities);
   const userRuns = relatedActivities.filter(item=>!ENDED_STATUSES.has(mission.status) && item.status==='waiting' && ['approval','feedback','form','evidence'].includes(item.pause_kind||''));
   const budgetExhausted = mission.status === 'waiting' && wait?.reason === 'budget_exhausted';
+  const legacyCandidates = mission.tasks.map(task => ({ task, override: legacyVerificationOverrideForTask(mission, events, task) }))
+    .filter(item => item.override !== null);
+  const legacyRetry = legacyCandidates.find(item => canRetryWaitingVerification(mission, events, item.task));
   return (
     <section className="mission-detail" data-mission-id={mission.mission_id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, relatedActivities)}>
       <div className="mission-detail-head"><button type="button" className="btn" onClick={onBack}>返回我的任务</button><span className={'collaboration-task-status status-'+mission.status}>{detailStatusLabel}</span></div>
@@ -379,13 +386,14 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         : (verificationRunLive || mission.status==='active') && progress.awaitingVerification > 0 ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>查看验收详情</button>
         : missionStalled(mission) ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>查看失败原因</button>
         : runtimeBlocked ? <button className="btn btn-primary" onClick={()=>setRuntimeWorkspaceOpen(true)}>处理命令环境</button>
-        : mission.status==='waiting' && budgetExhausted && wait?.can_increase_budget ? <button className="btn btn-primary" onClick={()=>setBudgetExtensionOpen(true)}><Plus size={14}/>增加预算并继续</button>
+        : legacyRetry ? <button className="btn btn-primary" disabled={Boolean(rechecking)} onClick={()=>void recheckTask(legacyRetry.task.spec.id, legacyRetry.task.verification_run_id, legacyRetry.override)}>{rechecking === legacyRetry.task.spec.id ? '提交中' : '确认覆盖并重试核验'}</button>
+        : mission.status==='waiting' && budgetExhausted && wait?.can_increase_budget ? <button className="btn btn-primary" onClick={()=>setBudgetExtensionOpen(true)}><Plus size={14}/>{legacyCandidates.length ? '补充核验时限' : '增加预算并继续'}</button>
         : resumeAction ? <button className={resumeAction.kind === 'verification' ? 'btn btn-primary' : 'btn'} disabled={controlling} onClick={()=>void controlMission('resume')}>{resumeAction.label}</button>
         : mission.status==='completed' ? <button className="btn" onClick={()=>setTab('overview')}>查看交付结果</button>
         : mission.status==='failed' ? <button className="btn" onClick={()=>setTab('activity')}>查看失败原因</button> : null}
         <details className="mission-more-actions"><summary>任务操作</summary>
           {pendingBudget || wait?.can_increase_budget ? <button className="btn" onClick={()=>setBudgetExtensionOpen(true)}>{pendingBudget ? '重试原增额申请' : '主动增加预算并续跑'}</button> : null}
-          <p>续跑：继续未完成任务。重核：只重跑同一实现的检查与独立验收。重做：按跟进方案再次修改对应交付，历史结果保留。</p>
+          <p>续跑继续未完成任务；重核只检查同一实现；重做按方案修改交付。历史结果保留。</p>
           {mission.status==='active'?<button className="btn" disabled={controlling} onClick={()=>void controlMission('pause')}>暂停后续执行</button>:null}
           {COLLAB_ACTIVE_STATUSES.has(mission.status)?<button className="btn" disabled={controlling} onClick={()=>void controlMission('cancel')}>取消任务</button>:null}
           <button className="btn" onClick={()=>{setBusy(true);void poll(true).finally(()=>setBusy(false));}}>{busy?'刷新中':'刷新任务'}</button>
@@ -453,6 +461,8 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
                     : mission.status === 'waiting' ? '后续派发已暂停；未确认关联核验仍在运行，不启动新核验。'
                     : task.verification_run_id ? '实现专家已提交结果；已派发检查与独立核验，尚需读取运行状态。'
                       : '实现专家已提交结果；系统将运行必需检查，并安排另一位专家核对。';
+                const legacyOverride = legacyVerificationOverrideForTask(mission, events, task);
+                const retryAvailable = canRetryWaitingVerification(mission, events, task);
                 return (
                   <div className={`mission-task-row task-${task.status}`} key={task.spec.id} data-mission-task-id={task.spec.id}>
                     <span className="mission-task-status">{verificationStatus || MISSION_TASK_STATUS_LABELS[task.status]}</span>
@@ -463,10 +473,10 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
                       {statusHelp ? <em>{statusHelp}</em> : null}
                       {task.status === 'failed' ? <em>{taskFailureReason(events, task.spec.id) || '执行或核验未通过，请查看活动记录。'}</em> : null}
                       <MissionTaskEvidence mission={mission} task={task} events={events}/>
-                      {canRevisit && task.verification_passed === false
+                      {(canRevisit || retryAvailable) && task.verification_passed === false
                         && !mission.tasks.some(child => child.spec.repair_of === task.spec.id && child.status !== 'canceled')
                         && events.some(event => event.task_id === task.spec.id && ['task_baseline_captured', 'verification_retry_requested'].includes(event.event_type))
-                        ? <button className="btn" disabled={Boolean(rechecking)} title="只重跑同一实现的必需检查与独立验收，不重做实现" onClick={()=>void recheckTask(task.spec.id, task.verification_run_id)}>{rechecking === task.spec.id ? '提交中' : '重新核验同一实现'}</button> : null}
+                        ? <button className="btn" disabled={Boolean(rechecking)} title={legacyOverride ? '本次明确覆盖只绑定已记录的暂停和运行失败事件；只重试同一实现的检查与独立核验' : '只重跑同一实现的必需检查与独立验收，不重做实现'} onClick={()=>void recheckTask(task.spec.id, task.verification_run_id, legacyOverride)}>{rechecking === task.spec.id ? '提交中' : legacyOverride ? '确认覆盖并重试核验' : mission.status === 'waiting' ? '重试核验并继续' : '重新核验同一实现'}</button> : null}
                     </div>
                   </div>
                 );
@@ -479,7 +489,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       {mission.status === 'active' && !verificationRunLive && mission.tasks.some(task => task.status === 'running' || task.status === 'awaiting_verification') ? (
         <div className="mission-recovery-control">
           <p>{mission.tasks.some(task => task.status === 'awaiting_verification')
-            ? '宿主会自动派发独立验收。需要立即检查或恢复时可继续；此操作只核对已提交结果并运行必需检查，不会重新执行实现任务。'
+            ? '宿主会自动派发独立验收。可立即检查已提交结果并运行必需检查，不重做实现。'
             : '继续原运行，避免重复执行。'}</p>
           <button type="button" className="btn" disabled={dispatching} onClick={() => void dispatchNext()}>
             {dispatching ? <BusyIndicator size={14} /> : <Activity size={14} />}
@@ -525,8 +535,13 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
   const [additionalCost, setAdditionalCost] = useState(saved?.additional_cost == null ? '' : String(saved.additional_cost));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [authorizeLegacyRecovery, setAuthorizeLegacyRecovery] = useState(Boolean(saved?.legacy_verification_override));
   const tokenLimited = mission.budget?.max_total_tokens !== null && mission.budget?.max_total_tokens !== undefined;
   const costLimited = mission.budget?.max_cost !== null && mission.budget?.max_cost !== undefined;
+  const legacyOverrideCandidate = historyComplete
+    ? mission.tasks.map(task => legacyVerificationOverrideForTask(mission, events, task)).find(value => value !== null) || null
+    : null;
+  const budgetAction = legacyBudgetExtensionAction(Boolean(legacyOverrideCandidate), authorizeLegacyRecovery);
 
   async function submit() {
     if (busy || !mission.budget) return;
@@ -538,22 +553,31 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
         if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > maximum) throw new Error(`${label}必须是有效的非负整数`);
         return parsed;
       };
-      const rounds = parseInteger(additionalRounds, '追加轮次', 4_294_967_295);
+      if (legacyOverrideCandidate && !authorizeLegacyRecovery) {
+        throw new Error('请明确授权本次覆盖旧版暂停归属缺失');
+      }
+      const legacyTimeOnly = Boolean(legacyOverrideCandidate);
+      const rounds = legacyTimeOnly ? 0 : parseInteger(additionalRounds, '追加轮次', 4_294_967_295);
       const minutes = parseInteger(additionalMinutes, '追加时长', 525_600);
-      const repairs = parseInteger(additionalRepairs, '追加返工次数', 4_294_967_295);
-      const tokens = !unlimitedTokens && additionalTokens.trim() ? parseInteger(additionalTokens, '追加 Token', 9_000_000_000_000_000) : null;
-      const cost = additionalCost.trim() ? Number(additionalCost) : null;
+      const repairs = legacyTimeOnly ? 0 : parseInteger(additionalRepairs, '追加返工次数', 4_294_967_295);
+      const tokens = legacyTimeOnly ? null : !unlimitedTokens && additionalTokens.trim() ? parseInteger(additionalTokens, '追加 Token', 9_000_000_000_000_000) : null;
+      const cost = legacyTimeOnly ? null : additionalCost.trim() ? Number(additionalCost) : null;
       if (cost !== null && (!Number.isFinite(cost) || cost <= 0)) throw new Error('追加成本额度必须是大于 0 的有效数字');
       if (unlimitedTokens && tokens !== null) throw new Error('请选择追加 Token 或不限 Token');
       if (!rounds && !minutes && !repairs && !tokens && !unlimitedTokens && !cost) throw new Error('请至少增加一项预算');
+      const timeOnly = rounds === 0 && minutes > 0 && repairs === 0 && tokens === null && !unlimitedTokens && cost === null;
+      if (authorizeLegacyRecovery && (!legacyOverrideCandidate || !timeOnly)) {
+        throw new Error('旧记录人工覆盖只允许在完整事件记录下单独增加核验时限');
+      }
       const input = retainBudgetRequest(mission.mission_id, {
         expected_plan_sha256: mission.plan_sha256,
         additional_rounds: rounds,
         additional_minutes: minutes,
         additional_repair_attempts: repairs,
         additional_tokens: tokens,
-        unlimited_tokens: unlimitedTokens,
+        unlimited_tokens: legacyTimeOnly ? false : unlimitedTokens,
         additional_cost: cost,
+        ...(authorizeLegacyRecovery && legacyOverrideCandidate ? { legacy_verification_override: legacyOverrideCandidate } : {}),
       });
       const next = await agentApi.increaseMissionBudget(mission.mission_id, input);
       clearBudgetRequest(mission.mission_id, mission.plan_sha256);
@@ -567,11 +591,12 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
 
   return <CollaborationDialog titleId="mission-budget-title" onClose={onClose}>
     <section className="collaboration-create-dialog collaboration-budget-dialog">
-      <header><div><span>{missionWait(mission)?.reason === 'budget_exhausted' ? '预算已用尽' : '主动调整本任务预算'}</span><h2 id="mission-budget-title">增加预算并继续</h2></div><button type="button" className="btn" onClick={onClose}>关闭</button></header>
+      <header><div><span>{missionWait(mission)?.reason === 'budget_exhausted' ? '预算已用尽' : '主动调整本任务预算'}</span><h2 id="mission-budget-title">{legacyOverrideCandidate ? '补充核验时限' : '增加预算并继续'}</h2></div><button type="button" className="btn" onClick={onClose}>关闭</button></header>
       <p className="mission-budget-reason">{reason || '仅追加你明确填写的额度；系统将复核所有限制及环境，成功后仍可能等待处理。'}</p>
       <MissionBudgetSummary mission={mission} events={events} historyComplete={historyComplete} now={now}/>
-      {saved ? <p role="status">有待确认的增额申请。相同参数会使用原申请号重试；更改参数是一次新的增额，请先刷新任务核对上次额度。</p> : null}
+      {saved ? <p role="status">有待确认的增额申请。原参数可重试；改参数会新增额度，请先刷新核对上次结果。</p> : null}
       <div className="collaboration-create-fields mission-budget-fields">
+        {legacyOverrideCandidate ? <label><span>追加时长（分钟）</span><input type="number" min="1" max="525600" step="1" value={additionalMinutes} onChange={event => setAdditionalMinutes(event.target.value)} /></label> : <>
         <label><span>追加派发轮次</span><input type="number" min="0" step="1" value={additionalRounds} onChange={event => setAdditionalRounds(event.target.value)} /></label>
         <label><span>追加返工次数</span><input type="number" min="0" step="1" value={additionalRepairs} onChange={event => setAdditionalRepairs(event.target.value)} /></label>
         <label><span>追加时长（分钟）</span><input type="number" min="0" max="525600" step="1" value={additionalMinutes} onChange={event => setAdditionalMinutes(event.target.value)} /></label>
@@ -580,9 +605,14 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
           <label className="mission-budget-toggle"><input type="checkbox" checked={unlimitedTokens} onChange={event => setUnlimitedTokens(event.target.checked)} /><span>移除 Token 上限</span></label>
         </> : null}
         {costLimited ? <label><span>追加成本额度</span><input type="number" min="0.000001" step="any" value={additionalCost} onChange={event => setAdditionalCost(event.target.value)} placeholder="留空表示不追加" /></label> : null}
+        </>}
       </div>
+      {legacyOverrideCandidate ? <>
+        <label className="mission-budget-toggle"><input type="checkbox" checked={authorizeLegacyRecovery} onChange={event => setAuthorizeLegacyRecovery(event.target.checked)} /><span>我授权覆盖旧记录的暂停归属缺失，以重试同一交付核验</span></label>
+        <p className="mission-budget-reason" role="status">{budgetAction.description}</p>
+      </> : null}
       {error ? <p className="error" role="alert">{error}</p> : null}
-      <footer><small>续跑尚未完成的任务；系统复核全部限额。响应丢失时请按原参数重试。</small><button type="button" className="btn btn-primary" disabled={busy} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '更新中' : '确认并继续'}</button></footer>
+      <footer><small>{legacyOverrideCandidate ? '不会重做实现或增加返工次数。' : '续跑尚未完成的任务；系统复核全部限额。响应丢失时请按原参数重试。'}</small><button type="button" className="btn btn-primary" disabled={busy || budgetAction.disabled} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '更新中' : budgetAction.label}</button></footer>
     </section>
   </CollaborationDialog>;
 }

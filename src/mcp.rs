@@ -2967,6 +2967,17 @@ mod tests {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["approvalRequired"], approval, "{name}");
         }
+        let retry = tools.iter().find(|tool| tool["name"] == "mission.verification.retry").unwrap();
+        let retry_override = &retry["inputSchema"]["properties"]["input"]["properties"]["legacy_verification_override"];
+        assert_eq!(retry_override["required"], json!(["expected_pause_event_id", "expected_runtime_failure_event_id"]));
+        let budget = tools.iter().find(|tool| tool["name"] == "mission.budget.extend").unwrap();
+        let budget_override = &budget["inputSchema"]["properties"]["input"]["properties"]["legacy_verification_override"];
+        assert_eq!(budget_override["required"], json!(["expected_pause_event_id", "expected_runtime_failure_event_id"]));
+        assert!(budget_override["description"].as_str().unwrap().contains("增额后 Mission 仍保持等待"));
+        let budget_input = &budget["inputSchema"]["properties"]["input"];
+        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["additional_rounds"]["const"], 0);
+        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["additional_minutes"]["minimum"], 1);
+        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["unlimited_tokens"]["const"], false);
         assert!(!tools.iter().any(|tool| tool["name"] == "mission.paths.authorize"));
     }
 

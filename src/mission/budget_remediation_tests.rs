@@ -60,7 +60,8 @@ fn exhausted(store: &MissionStore) -> MissionView {
 fn increase(mission: &MissionView) -> MissionBudgetIncrease {
     MissionBudgetIncrease { request_id: "K".into(), expected_plan_sha256: mission.plan_sha256.clone(),
         additional_rounds: 0, additional_minutes: 0, additional_repair_attempts: 0,
-        additional_tokens: Some(50), unlimited_tokens: false, additional_cost: None }
+        additional_tokens: Some(50), unlimited_tokens: false, additional_cost: None,
+        legacy_verification_override: None }
 }
 
 fn events_of(store: &MissionStore, id: &str, kind: &str) -> usize {

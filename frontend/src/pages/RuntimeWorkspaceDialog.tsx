@@ -43,13 +43,13 @@ export function RuntimeWorkspaceDialog({ mission, onClose, onResolved }: {
       <p>工作区沙箱未能启动。你可以直接授予本任务完全访问权限，继续执行。</p>
       <p className="task-evidence-path">{mission.workspace.root}</p>
       {busy || checking ? <p role="status"><BusyIndicator size={16} />{busy ? '正在应用执行权限，请稍候' : '正在检查隔离环境；你可以直接选择完全访问'}</p> : null}
-      <section><h3>完全访问</h3><p>本任务的命令按你的系统账户权限执行，可以访问工作区外文件。无需手动修改目录权限，不自动提权为管理员。</p><button className="btn btn-primary" disabled={Boolean(busy) || mission.tasks.some(task => !['himind.builtin', 'personal.codex'].includes(task.spec.execution.executor) && !task.spec.execution.executor.startsWith('acp.'))} onClick={() => void resolve('full_access')}>授予完全访问并继续</button>{mission.tasks.some(task => !['himind.builtin', 'personal.codex'].includes(task.spec.execution.executor) && !task.spec.execution.executor.startsWith('acp.')) ? <small>完全访问支持 HiMind AI、Codex 和 ACP 执行器，请调整任务的执行器。</small> : null}</section>
+      <section><h3>完全访问</h3><p>命令按你的系统账户权限执行，可访问工作区外文件。<br />无需手动修改目录权限，不自动提权为管理员。</p><button className="btn btn-primary" disabled={Boolean(busy) || mission.tasks.some(task => !['himind.builtin', 'personal.codex'].includes(task.spec.execution.executor) && !task.spec.execution.executor.startsWith('acp.'))} onClick={() => void resolve('full_access')}>授予完全访问并继续</button>{mission.tasks.some(task => !['himind.builtin', 'personal.codex'].includes(task.spec.execution.executor) && !task.spec.execution.executor.startsWith('acp.')) ? <small>完全访问支持 HiMind AI、Codex 和 ACP 执行器，请调整任务的执行器。</small> : null}</section>
       {diagnosis ? <>
         <details><summary>保留工作区隔离（高级）</summary><p>{diagnosis.message}</p>
-        {diagnosis.repairable ? <section><h3>仅为此目录补充权限</h3><p>为当前用户增加此目录的“更改所有者”权限，供 Windows 设置沙箱标签使用。授权不继承到子目录，系统保留权限备份；目录所有者保持不变。</p><button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => void resolve('repair')}>授权此目录并继续</button></section> : null}
+        {diagnosis.repairable ? <section><h3>仅为此目录补充权限</h3><p>为当前用户增加此目录的“更改所有者”权限。<br />供 Windows 设置沙箱标签使用，授权不继承到子目录。<br />系统保留权限备份，目录所有者保持不变。</p><button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => void resolve('repair')}>授权此目录并继续</button></section> : null}
         <section><h3>已在外部修复</h3><p>重新运行沙箱检查，通过后恢复原任务。</p><button className="btn" disabled={Boolean(busy)} onClick={() => void resolve('retry')}>重新检查并继续</button></section>
         </details>
-        <section><h3>仅使用文件工具</h3><p>专家仍可读取和修改计划允许的文件，命令工具将被禁用。必需测试仍由宿主执行，验收标准保持有效。</p><button className="btn" disabled={Boolean(busy)} onClick={() => void resolve('files_only')}>仅用文件工具继续</button></section>
+        <section><h3>仅使用文件工具</h3><p>专家仍可读写计划允许的文件，命令工具将被禁用。<br />必需测试仍由宿主执行，验收标准保持有效。</p><button className="btn" disabled={Boolean(busy)} onClick={() => void resolve('files_only')}>仅用文件工具继续</button></section>
       </> : null}
       {error ? <p className="error" role="alert">{error}</p> : null}
       <footer><small>本次选择绑定到当前工作区与已确认计划。</small></footer>
