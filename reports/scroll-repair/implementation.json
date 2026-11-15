@@ -1,0 +1,514 @@
+{
+  "mission_id": "mission_1794732359431_3bcc7634",
+  "task_id": "task-center-scroll-transport-recovery-v3",
+  "producer_role": "remediation.frontend",
+  "delivery_ready": true,
+  "delivery_scope": "Producer delivery readiness derives only from actual local source/module and byte-integrity evidence. Host independent VERIFY must follow, then a different HiMind test expert. Not Mission, native capture acceptance, built-browser or final60 approval.",
+  "evidence_precedence": "current_recovery records actual recovery-v3 source/check evidence. historical_recovery_v2, historical_recovery_v2_report_metadata and all previous histories preserve prior claims unchanged, including failed native capture and R10 outcomes; historical generated_evidence references were not independently revalidated. Earlier descriptive fields retain their historical context. Current exclusions permanently supersede historical deferred screen-reader/200% wording.",
+  "current_recovery": {
+    "task_id": "task-center-scroll-transport-recovery-v3",
+    "repair_of": "task-center-scroll-recovery-v2",
+    "date": "2026-11-15",
+    "status": "producer_delivery_ready_for_independent_verification",
+    "delivery_ready": true,
+    "readiness_basis": "Actual final-source required module check, exact-byte integrity review and producer source review; supplemental callback probe confirms only the narrowly corrected lifecycle behavior. This is a producer handoff recommendation, not real-browser or native acceptance.",
+    "baseline_authority": "This recovery task explicitly authorizes acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f as the sole before-edit baseline. Earlier 2044/ee7 values are historical only.",
+    "expected_before_sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f",
+    "before_sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f",
+    "baseline_matched_before_action": true,
+    "baseline_matched_before_edit": true,
+    "after_sha256": "702ce1dc00338b0bf5f4cf39bb4af9f19bf5599ccd45f162c02a04ef4f6f2d36",
+    "source_changed": true,
+    "source_hunks": [
+      {
+        "path": "frontend/src/pages/TaskCenterPage.tsx",
+        "line": 322,
+        "before": "onClick={()=>{depart();onOpenDashboard();}}",
+        "after": "onClick={()=>{rememberScroll();onOpenDashboard();}}",
+        "reason": "The actual main.tsx dashboard callback opens externally via run(agentApi.openDashboard) without a route change. Keep scroll capture active while saving the list snapshot. Workflow departure freeze remains unchanged.",
+        "unrelated_bytes_preserved": true
+      }
+    ],
+    "concrete_remaining_defect": {
+      "finding": "Dashboard opening disabled scrollActive even though the Tasks page stays mounted. The ownership layout setup has an empty dependency list, so ordinary rerenders do not re-enable capture; later scrolling and departure can retain an older context.",
+      "source_evidence": [
+        "frontend/src/pages/TaskCenterPage.tsx:223-227,237,322",
+        "frontend/src/main.tsx:1482-1488,2361: run(agentApi.openDashboard) does not change page",
+        "frontend/src/services/agentApi.ts:4315: invokes open_dashboard_page"
+      ],
+      "correction": "Save the current list snapshot with rememberScroll for this external action. Keep depart for workflow-run and workflow-library route changes and keep all hidden/detached/unmounted ownership guards.",
+      "reproduced_by": "Actual source callback bodies executed with local callback/ref stubs: before correction exit 1 with active=false; after correction exit 0 with both assertions/tests passing. No browser, React renderer, scrollTop assignment or acceptance adapter is involved."
+    },
+    "changed_business_paths": [
+      "frontend/src/pages/TaskCenterPage.tsx",
+      "reports/scroll-repair/implementation.json"
+    ],
+    "direction": {
+      "purpose": "Preserve repeated task-list/workflow use at the same saved search, workspace and list position.",
+      "personality": [
+        "restrained",
+        "dense"
+      ],
+      "density": "Existing compact layout retained.",
+      "memory_point": "Return to the same filtered list position after workflow/detail navigation.",
+      "reference": "The existing product and unchanged browser regression are the local behavioral reference. No external competitor assessment or visual redesign was authorized."
+    },
+    "structure": "Existing main-content, task-list hierarchy and primary actions remain intact. Workflow departures snapshot then freeze; hide/unmount layout cleanup disables capture; reveal/remount rearms the preserved target; restoration waits for committed history and sufficient range. Internal detail return restores the list; filter changes intentionally target zero. External dashboard opening saves without disabling the still-mounted list.",
+    "state_coverage": {
+      "loading": {
+        "status": "source_reviewed_not_render_verified",
+        "evidence": "TaskCenterPage.tsx:213-251,293-302: isolated nullable target, both loaders and ownership guards prevent capture while loading/restoring."
+      },
+      "empty": {
+        "status": "source_reviewed_not_render_verified",
+        "evidence": "TaskCenterPage.tsx:299,309-316,359: missing history or insufficient range keeps the target; row-count/layout growth can retry. Existing no-data and filtered-empty text remain distinct. Real empty-to-29-row behavior is pending."
+      },
+      "error": {
+        "status": "source_reviewed_not_render_verified",
+        "evidence": "TaskCenterPage.tsx:263,341: partial-read error and retry action retained; no error-path runtime exercise."
+      },
+      "partial": {
+        "status": "source_reviewed_not_render_verified",
+        "evidence": "TaskCenterPage.tsx:256-264,299-304: previous results retained on read failure; insufficient range cannot release pending restoration."
+      },
+      "success": {
+        "status": "source_reviewed_and_callback_probe_only",
+        "evidence": "TaskCenterPage.tsx:205,218-249,281-315: live ref, owned host, second-RAF confirmation and cleanup retained. Callback probe covers dashboard continuity and workflow departure freeze only; it does not establish restored browser position."
+      },
+      "no_permission": {
+        "status": "unverified",
+        "evidence": "No authorization behavior changed; no permission-denied runtime state was exercised."
+      }
+    },
+    "token_values": {
+      "visual": "No typography, spacing, color, radius, shadow, hit-area, theme or animation token changed.",
+      "product_restore_confirmation_css_px": "absolute difference < 1 on the second RAF",
+      "browser_scroll_before_css_px": "> 500",
+      "browser_restore_error_css_px": "absolute difference < 5",
+      "filter_reset_css_px": 0,
+      "browser_timeout": "Original unmodified waitForFunction timeout; no override or increase.",
+      "motion": "Existing behavior retained; reduced-motion rendering unverified."
+    },
+    "acceptance_review": [
+      {
+        "criterion": "Repair product-owned TaskCenterPage scroll context persistence across real workflow navigation, unmount/remount, lazy loading, empty-to-29-row loading and unrelated rerenders. Isolate the pending restoration target; prevent loading/restoration scroll events from overwriting it; do not reset ref-only user scroll on every render. Preserve intentional filter-change scroll reset and detail/list return behavior.",
+        "result": "Source-reviewed; real workflow/lazy/renderer acceptance remains pending_external_verification.",
+        "source_evidence": {
+          "pending_target": "213, 230-251, 290-315: numeric pending target isolated; loading/restoration and ownership suppress capture; insufficient range retains target",
+          "unrelated_rerender": "205, 246: current ref is only initialized from context; live user scroll remains ref-only",
+          "lifecycle": "218-227, 248, 299-315: active connected laid-out host required; layout cleanup before hide/unmount and preserved passive snapshot; owned RAFs and listeners cleaned up",
+          "filter_and_details": "238-240, 281-284, 328: intentional zero filter target and detail/list target preserved",
+          "navigation": "317, 322; main.tsx:2358-2362 and 1482-1488: workflow run/library capture then freeze; dashboard saves without disabling the mounted page"
+        }
+      },
+      {
+        "criterion": "Retain the existing main-content host, search/workspace values, scrollBefore>500 and abs(actual-expected)<5 with the original timeout. The actual R10 failed value2181 must not be changed into0 or assigned by an adapter. Do not remove assertions, swallow timeouts, hardcode2181, increase tolerance, force passing scrollTop in a test, change fixtures or mask failures.",
+        "result": "Browser script is byte-identical. Existing main-content, query 报告, workspace f:/project, >500 and <5 checks and timeout/driver/assertions are retained. Historical R10 offset 2181 and its failed outcome are unchanged. No browser execution or adapter assignment was performed."
+      },
+      {
+        "criterion": "Only TaskCenterPage.tsx, a strictly necessary additive regression change in the existing check-task-center.browser.mjs, and reports/scroll-repair/implementation.json may change. Preserve unrelated bytes; no Shell/main routing, executor defaults, dependency/configuration, old Mission/failure evidence or frozen helper changes.",
+        "result": "Exactly one callback substring changed in TaskCenterPage; all other bytes in that file match the hash-authorized baseline. Browser script, original module check, fixtures, helper, package, tsconfig, main and Shell match their captured hashes. Only the source and report were written in business paths. Generated logs/probe/baseline copies are under the host-assigned runtime root."
+      },
+      {
+        "criterion": "Downstream HiMind test expert is a different expert from the Codex UI producer and reads the produced source/report without business writes. Its native returned JSON must distinguish static/source-module review from pending real built-browser/final60 acceptance. No invented accepted-producer envelope or future build/native PASS.",
+        "result": "No downstream expert or native VERIFY invoked. Host independent VERIFY must run before a different HiMind test expert; that expert must review read-only and distinguish source/module evidence from pending real-browser/final60 acceptance. No acceptance result is manufactured here."
+      }
+    ],
+    "required_check": {
+      "task_id": "task-center-scroll-transport-recovery-v3",
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "started_at": "2026-11-15T10:57:33.903Z",
+      "finished_at": "2026-11-15T10:57:34.033Z",
+      "duration_ms": 129,
+      "exit_code": 0,
+      "signal": null,
+      "error": null,
+      "candidate_source_sha256": "702ce1dc00338b0bf5f4cf39bb4af9f19bf5599ccd45f162c02a04ef4f6f2d36",
+      "script_sha256": "5332104e0feabf4ba94e6f2694c4ff576ed19e5cef22670754557e2615b5eaee",
+      "stdout": "task center model checks passed: ownership, cycles, views, user actions, lifecycle, stages, plan identity\nB08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity\nQA-LEGACY-01 recovery action and manual-pause restrictions passed\n",
+      "stderr": "(node:33432) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/mixed-executor-remediation/himind-agent/frontend/src/pages/taskCenterModel.ts is not specified and it doesn't parse as CommonJS.\nReparsing as ES module because module syntax was detected. This incurs a performance overhead.\nTo eliminate this warning, add \"type\": \"module\" to C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent\\frontend\\package.json.\n(Use `node --trace-warnings ...` to show where the warning was created)\n",
+      "execution": "Actual local functions.exec -> exec_command -> node child process on final source.",
+      "evidence_file": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/required-check.final.json",
+      "limitation": "The required model script does not render TaskCenterPage, type-check/build TSX, or prove browser scroll restoration. MODULE_TYPELESS_PACKAGE_JSON warning preserved; configuration unchanged."
+    },
+    "before_edit_required_check": {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "exit_code": 0,
+      "candidate_source_sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f",
+      "evidence_file": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/required-check.json"
+    },
+    "supplemental_source_check": {
+      "kind": "source_callback_probe_with_stubs_not_renderer",
+      "path": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/dashboard-scroll-ownership.check.cjs",
+      "before_exit_code": 1,
+      "after_exit_code": 0,
+      "tests": 2,
+      "before_pass": 1,
+      "before_fail": 1,
+      "after_pass": 2,
+      "after_fail": 0,
+      "failed_before_evidence": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/dashboard-scroll-ownership.before.json",
+      "after_evidence": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/dashboard-scroll-ownership.after.json",
+      "limitations": "Executes the actual two callback bodies with ref/callback stubs only. Does not exercise React scheduling, real DOM, actual scrolling, Suspense or native capture/protocol."
+    },
+    "producer_second_pass": {
+      "kind": "producer_second_pass_source_and_byte_integrity_not_independent_acceptance",
+      "evidence_file": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5/delivery-review.json",
+      "result": "Reconsidered lifecycle and unchanged original acceptance as a reviewer after the one callback correction. Exact single replacement and nine other protected paths verified. This is the same producer, not a downstream independent expert."
+    },
+    "browser_regression_integrity": {
+      "path": "frontend/scripts/check-task-center.browser.mjs",
+      "sha256_before_and_after": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "edited": false,
+      "executed": false,
+      "additive_test_needed": false,
+      "reason": "The focused callback probe can run under the authorized generated root; changing the frozen browser regression was unnecessary."
+    },
+    "host_supplied_history": {
+      "provenance": "Task input and retained historical report only. Prior external paths were not opened or independently authenticated in this recovery.",
+      "recovery_v2": "Host states turn.completed and final were observed but the old generic Codex stdout capture gate failed. That failed run is not native acceptance and is not overridden by current local checks.",
+      "R10": "Historical actual failed offset 2181 and restoration failure remain failed evidence; no reclassification or offset rewrite.",
+      "host_maintenance": "Installed HOST precision-diagnostic maintenance is task context, not producer-verified native success."
+    },
+    "built_browser_status": "pending_external_verification",
+    "final60_status": "pending_external_verification",
+    "native_verify_status": "not_invoked_host_owned",
+    "native_capture_protocol_status": "Not established by producer checks; actual runtime capture/protocol failures and native gates remain authoritative.",
+    "downstream_himind_test_expert": {
+      "status": "pending_after_real_host_independent_VERIFY",
+      "must_be_different_expert": true,
+      "business_writes": false,
+      "invoked": false
+    },
+    "render_evidence": [],
+    "excluded_by_user": [
+      "screen-reader",
+      "ALL200% scaling"
+    ],
+    "exclusion_policy": "Permanent excluded_by_user; these are not deferred obligations.",
+    "unverified": [
+      "Exact final-source real built-browser workflow navigation, unmount/remount, Suspense/lazy loading, empty-to-29-row restoration and unrelated rerender behavior.",
+      "Actual dashboard interaction and subsequent user scrolling in the running application; only source callback continuity was checked.",
+      "Narrow viewport, long text, empty-data rendering, light/dark themes and reduced-motion rendering.",
+      "TSX type/build correctness, host native independent VERIFY, native capture/protocol acceptance, different downstream HiMind test expert acceptance and final60.",
+      "All prior external evidence references remain references rather than independently authenticated current results."
+    ],
+    "assumptions_and_risks": [
+      "Conservative scenario assumption: repeated task/workflow users need their existing query/workspace and saved list context. Existing visual constraints and main-content ownership are retained.",
+      "The target browser supports ResizeObserver and runs layout cleanup/setup for Suspense hide/reveal; real scheduling is unverified.",
+      "If data or viewport changes permanently remove the saved scroll range, the existing target remains pending until capacity returns or an intentional filter change supplies zero. This behavior was not broadened.",
+      "The dashboard callback currently opens externally without changing route, as shown by main.tsx and agentApi.ts. If that contract later changes, its departure handling must be reconsidered.",
+      "No Git mutation, dependency install, build, browser launch, subagent/model invocation, production MCP/DB operation, external unfixed skill loading, permission/routing/pin or fixture/helper/config edit was performed."
+    ],
+    "current_execution_logs": {
+      "root": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/57dd8ba8ce7b0baa06e1661c11f32a4100a26af5c25f8c47348ee7c13f8ab6c5",
+      "files": [
+        {
+          "name": "implementation.before.json",
+          "sha256": "ad2762b9da4a47be3f0a576d42982ce2070bfcb9ef75c3045cfc0b959798daef"
+        },
+        {
+          "name": "protected-paths.before.json",
+          "sha256": "f0ad380400751943eab74818c4e7bbab81eb19efce216e864b686e9cf25fb49c"
+        },
+        {
+          "name": "TaskCenterPage.before.tsx",
+          "sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f"
+        },
+        {
+          "name": "required-check.json",
+          "sha256": "e83f5d667f73332b9492290193d94495bbed582d01d681e16e52f1a34960a4cf"
+        },
+        {
+          "name": "source-change.json",
+          "sha256": "25d1d825b995077a7136fed7df1685005b2ca0bbc00546dfc4ba6565438ba90a"
+        },
+        {
+          "name": "dashboard-scroll-ownership.check.cjs",
+          "sha256": "766d965be1291b16a432bd2b4afcaa5f8365c9d27b6e06699008a6826bfa10cb"
+        },
+        {
+          "name": "dashboard-scroll-ownership.before.json",
+          "sha256": "8a6c0b96ca411f05c8fbe7c70fad4140f526dd17554838862d645ef65fcd8c5a"
+        },
+        {
+          "name": "dashboard-scroll-ownership.after.json",
+          "sha256": "bb45dcee4569ed9c76076d36ff09350581b9ff37e893d0a2b5df1ce3ccb44584"
+        },
+        {
+          "name": "required-check.final.json",
+          "sha256": "c4316dcb67172ee4dd7342923fc28a871bbabfc3a85fb11e1c19cae04c7587b4"
+        },
+        {
+          "name": "delivery-review.json",
+          "sha256": "07c1b3f6b267d78c4f89a005d93362b4deb6ce14ca417b7a6721d00fb886d649"
+        }
+      ],
+      "retention": "Preserve all generated evidence, including the failing before-fix callback probe and original report/source snapshots."
+    }
+  },
+  "historical_recovery_v2_report_metadata": {
+    "mission_id": "mission_1794732359431_3bcc7634",
+    "task_id": "task-center-scroll-recovery-v2",
+    "producer_role": "remediation.frontend",
+    "delivery_ready": true,
+    "delivery_scope": "Producer correction and required module check ready for host independent VERIFY, followed by a different HiMind test expert. Not Mission, native acceptance, built-browser or final60 approval.",
+    "evidence_precedence": "current_recovery is the current candidate record. historical_recovery_validation and historical_* fields retain previous attempts and original implementation claims; they do not endorse the current source. Historical excluded accessibility entries are superseded by current_recovery.excluded_by_user, not deferred obligations.",
+    "changed_paths": [
+      "frontend/src/pages/TaskCenterPage.tsx",
+      "reports/scroll-repair/implementation.json"
+    ],
+    "acceptance_scope": "Implementation handoff and required source-module check only; not Mission acceptance or independent VERIFY.",
+    "built_browser_status": "pending_external_verification",
+    "native_verify_status": "not_invoked_host_owned"
+  },
+  "historical_recovery_v2": {
+    "date": "2026-11-15",
+    "status": "producer_delivery_ready_for_independent_verification",
+    "before_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306",
+    "baseline_matched_before_edit": true,
+    "after_sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f",
+    "source_changed": true,
+    "source_hunks": [
+      "Add stable ownedScrollHost guard: active lifecycle, connected page, containing current main-content and nonempty client rects.",
+      "Layout setup enables capture and rearms preserved restoration target; layout cleanup disables capture before hide/unmount.",
+      "rememberScroll and live scroll handler reject unowned/hidden/detached host; passive cleanup publishes the preserved contextRef only.",
+      "Both restoration RAF stages require current host ownership; existing observer/resize/RAF cleanup remains intact.",
+      "Workflow run, workflow library and dashboard callbacks capture then freeze before departure; internal detail paths and filter reset remain unchanged."
+    ],
+    "changed_business_paths": ["frontend/src/pages/TaskCenterPage.tsx", "reports/scroll-repair/implementation.json"],
+    "historical_evidence": {
+      "original_before_sha256": "2044fb335a363af24cc939cccf1a50fafd373794c6702b17e2196cdc5f65e199",
+      "original_patch_sha256": "b26af4810f5f242d0d7f95b696fe902aaa96a6c5b09fbcbce80802e4d0e82f0c",
+      "failed_transport_attempts": "Prior runtime capture/transport failures are historical infrastructure attempts, not new execution or browser acceptance. No additional transport logs were supplied or read in this recovery.",
+      "fresh_built_failure": {
+        "provenance": "Host-supplied task input; referenced external files not read or independently hash-authenticated here.",
+        "candidate_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306",
+        "external_result_sha256": "bc5885dc7ff47ce46b220a9a6f518fa822be6e722db827964f97a4a1871d1b27",
+        "diagnosis_sha256": "6aa4de2f65a5fd26800ec8005ff69060212892f118801f4212b22ec777ed6def",
+        "result": "Actual taskcenter07 restoration wait failed after 10 seconds; raw exit 2, genuine frontend/probe builds exit 0, source/deps unchanged. Not merely a transport failure. No all4 or final60 success exists.",
+        "diagnosis": "Saved list offset 2181 was overwritten by hidden-route scroll 0 after Suspense clamped host range; passive cleanup persisted 0 although return had 29 rows and range 2596."
+      }
+    },
+    "direction": "Preserve the existing compact task-center hierarchy, tokens and main-content host; repair lifecycle ownership only. Existing browser regression is the local behavioral reference, not a new visual redesign.",
+    "structure": "Workflow-run, workflow-library and dashboard departures capture then freeze the valid list context before navigation. Layout cleanup disables scroll capture before Suspense hide or unmount; setup rearms the preserved target on reveal/remount. Scroll persistence and both restoration RAFs require the connected, laid-out page inside its current host. Passive cleanup publishes the valid ref snapshot without re-reading a clamped host.",
+    "state_coverage": {
+      "loading": "Existing loading/restoration guards retained; isolated source check verifies pending target is not overwritten.",
+      "empty": "Missing history or insufficient range retains target; isolated source check verifies range growth retries. Empty-data and filter-empty UI unchanged; no real 29-row rendering performed.",
+      "error": "Error/retry UI unchanged; no new business or permission behavior. Runtime error state unverified.",
+      "partial": "Partial-result behavior unchanged; insufficient range continues to retain the target.",
+      "success": "Isolated source check covers legitimate scrolling including zero, explicit departure, hidden/detached/replaced host, passive cleanup, reveal, detail guard and intentional filter reset; not a real renderer.",
+      "no_permission": "Authorization and no-permission UI unchanged; runtime not verified."
+    },
+    "token_values": "No visual tokens, animation durations, dependencies or host changes. Existing second-RAF confirmation <1 CSS pixel retained. Original browser scrollBefore >500, absolute error <5 and original timeout retained. No hardcoded failure offset, test adapter assignment or relaxed assertion.",
+    "required_check": {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "execution": "Actual functions.shell execution on current final source",
+      "exit_code": 0,
+      "candidate_source_sha256": "acee1450c307f61c3d3d61234adc727997b3dd8e2d0e15c6f9bb0a483c7a5e0f",
+      "script_sha256": "5332104e0feabf4ba94e6f2694c4ff576ed19e5cef22670754557e2615b5eaee",
+      "stdout": [
+        "task center model checks passed: ownership, cycles, views, user actions, lifecycle, stages, plan identity",
+        "B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity",
+        "QA-LEGACY-01 recovery action and manual-pause restrictions passed"
+      ],
+      "warning": "MODULE_TYPELESS_PACKAGE_JSON; no config modified.",
+      "limitation": "Does not render TaskCenterPage.tsx, check TSX build correctness or establish browser restoration."
+    },
+    "supplemental_source_check": {
+      "path": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/79628635fa72afa9e97666b2c4584a36729c26ea0c0506804fee340d89c78f7a/scroll-lifecycle-source-check.mjs",
+      "exit_code": 0,
+      "kind": "Isolated actual source sections with simulated hooks/DOM/RAF; not React/Suspense renderer, browser or independent acceptance.",
+      "covered": ["visible user scroll and zero", "pre-navigation snapshot freeze", "hidden/disconnected/replaced host rejection", "layout cleanup before passive persistence", "reveal rearms pending target", "missing history and insufficient range", "detail guard and filter reset", "RAF/observer/listener cleanup", "workflow-run/library/dashboard departure wrappers"],
+      "harness_attempts": "Two initial harness-only failures: CRLF extraction mismatch, then stripTypeScriptTypes rejected a top-level return. Harness corrected without any product source change; third execution passed. Experimental stripTypeScriptTypes warning observed."
+    },
+    "current_execution_logs": {
+      "root": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/79628635fa72afa9e97666b2c4584a36729c26ea0c0506804fee340d89c78f7a",
+      "required_check": "required-check.log",
+      "supplemental_source_check": "scroll-lifecycle-source-check.log",
+      "description": "Final reruns both exited 0; JSON logs retain command, stdout and stderr. Earlier harness-only failed execution output remains in the native execution transcript."
+    },
+    "browser_regression_integrity": {
+      "path": "frontend/scripts/check-task-center.browser.mjs",
+      "sha256_before_and_after": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "edited": false,
+      "executed": false
+    },
+    "producer_second_pass": "Separately reconsidered external-route hiding, remount/reveal target rearming, legitimate scroll to zero, detail/list transitions, filter zero reset and owned resource cleanup against the edited source. Supported by the isolated-source execution, not independent reviewer acceptance.",
+    "built_browser_status": "pending_external_verification",
+    "native_verify_status": "not_run_host_owned",
+    "downstream_himind_test_expert": "pending_after_host_independent_VERIFY; must be a different expert, no forged result",
+    "final60_status": "pending_external_verification",
+    "render_evidence": [],
+    "excluded_by_user": ["screen-reader", "ALL200% scaling"],
+    "unverified": ["Fresh exact-source built-browser taskcenter07 rerun, workflow departures, unmount/remount, Suspense/lazy empty-to-29-row behavior and unrelated rerenders.", "Narrow viewport, long text, empty-data rendering, themes and reduced motion.", "TSX type/build correctness, host independent VERIFY, different downstream HiMind test expert and final60 acceptance."],
+    "assumptions_and_risks": ["Existing main-content owns this page; display-none Suspense hiding removes its client rects and runs layout cleanup. Real React scheduling remains pending external verification.", "Navigation callbacks actually depart; if they silently refuse navigation while the page remains mounted without layout reactivation, explicit departure keeps capture frozen. Existing callback contracts and routing were not changed.", "No source/dependency build, browser, Git mutation, subagent/model call, production MCP/DB, fixture or frozen helper change was performed. The first hash command failed because Get-FileHash was unavailable; Node SHA256 succeeded before any edit."]
+  },
+  "historical_recovery_validation": {
+    "task_id": "task-center-scroll-fix-repair-1",
+    "date": "2026-11-15",
+    "status": "blocked_unconfirmed_baseline_drift",
+    "prior_delivery_ready_claim": true,
+    "expected_sha256": "2044fb335a363af24cc939cccf1a50fafd373794c6702b17e2196cdc5f65e199",
+    "actual_before_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306",
+    "actual_after_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306",
+    "matched_before_edit": false,
+    "source_edited": false,
+    "changed_paths": ["reports/scroll-repair/implementation.json"],
+    "source_hunks": [],
+    "report_hunks": [
+      {
+        "anchor": "delivery_ready immediately after producer_role",
+        "change": "Set current handoff readiness false and insert recovery_validation; retain prior implementation, check and generated-evidence records as historical claims, not this worker's execution."
+      }
+    ],
+    "root_cause": "The current source differs from the mandated edit baseline. Its hash matches the existing implementation report's after hash, consistent with an already-landed repair; that correspondence does not authorize accepting the drift or overwriting the source.",
+    "source_observations": [
+      "frontend/src/pages/TaskCenterPage.tsx:205 keeps contextRef without a render-time stale-state assignment; :213 isolates restoreTarget; :217 and :233 suppress scroll capture during loading/restoration; :238 preserves the target before non-silent loading.",
+      "frontend/src/pages/TaskCenterPage.tsx:268 synchronizes deliberate filter reset; :277 checks containing host, history element and sufficient scroll range, confirms position below 1 CSS pixel on a second RAF, and :302 cancels owned RAF and removes resize observation/listener. Activity return snapshots the target at :315.",
+      "These are read-only source observations, not independent review or proof of real navigation, lazy loading, empty-to-29-row behavior or browser restoration. No duplicate source patch is warranted from the observations alone."
+    ],
+    "required_check": {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "source": "worker_current_execution_functions.shell",
+      "exit_code": 0,
+      "observed_duration_seconds": 0.5,
+      "candidate_source_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306",
+      "script_sha256": "5332104e0feabf4ba94e6f2694c4ff576ed19e5cef22670754557e2615b5eaee",
+      "stdout": [
+        "task center model checks passed: ownership, cycles, views, user actions, lifecycle, stages, plan identity",
+        "B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity",
+        "QA-LEGACY-01 recovery action and manual-pause restrictions passed"
+      ],
+      "warning": "MODULE_TYPELESS_PACKAGE_JSON; no configuration modified.",
+      "tap_totals": null,
+      "limitation": "This model script does not render TaskCenterPage.tsx, verify scroll behavior or establish TSX build correctness."
+    },
+    "host_observation": {
+      "event": "mission_1794732359431_3bcc7634:1196",
+      "source": "host_supplied_observation_not_worker_current_execution",
+      "exit_code": 0,
+      "duration_ms": 224,
+      "output_sha256": "5e52a6bfb13776cc00c0eb9812052a17ff9a6c7fe399fe85fbb9891634cb3bd8",
+      "test_summary": "",
+      "tap_totals": null,
+      "candidate_version": "Not established by supplied event; not used to endorse the current candidate."
+    },
+    "browser_script": {
+      "path": "frontend/scripts/check-task-center.browser.mjs",
+      "before_sha256": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "after_sha256": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "edited": false,
+      "executed": false,
+      "result": "Existing main-content, search/workspace, scrollBefore > 500 and absolute error < 5 assertions retained; no assertion, timeout, timing or fixture changes."
+    },
+    "built_browser_status": "pending_external_verification",
+    "render_evidence": [],
+    "unverified": [
+      "Baseline drift has not been confirmed by the host; current handoff is blocked despite a successful model check.",
+      "Prior baseline copy, exact patch and logs referenced below were not accessed or independently authenticated in this recovery; their paths and claims remain historical.",
+      "Historical R10 2181 -> 0, lazy return 0 -> 29 rows and scroll 0 after 10 seconds remain historical failures, not a new run or success.",
+      "Real built-browser/final60 behavior, narrow viewport, long text, empty data, 200% zoom, themes and reduced motion remain unverified. No browser or build was launched.",
+      "Downstream task-center-scroll-independent-review remains for a different HiMind test expert. Host-owned formal VERIFY was not invoked or impersonated; pending VERIFY alone is not the reason for this blocked handoff.",
+      "No external unfixed skills, services, production MCP/DB, dependencies, configuration, Main/Shell routing, executor defaults or Git writes were used or changed."
+    ]
+  },
+  "acceptance_scope": "Implementation handoff and required source-module check only; not Mission acceptance or independent VERIFY.",
+  "built_browser_status": "pending_external_verification",
+  "native_verify_status": "not_invoked_host_owned",
+  "historical_baseline": {
+    "path": "frontend/src/pages/TaskCenterPage.tsx",
+    "expected_sha256": "2044fb335a363af24cc939cccf1a50fafd373794c6702b17e2196cdc5f65e199",
+    "actual_before_sha256": "2044fb335a363af24cc939cccf1a50fafd373794c6702b17e2196cdc5f65e199",
+    "matched_before_edit": true,
+    "actual_after_sha256": "ee7d7c3460922aa11339da93081c19d2d1e9d8a88ae2e8b38c3170e391007306"
+  },
+  "changed_paths": [
+    "frontend/src/pages/TaskCenterPage.tsx",
+    "reports/scroll-repair/implementation.json"
+  ],
+  "historical_original_source_hunks": [
+    {
+      "header": "@@ -202,7 +202,7 @@",
+      "change": "Remove render-time assignment of stale React context into contextRef; retain ref-only user scroll across unrelated rerenders."
+    },
+    {
+      "header": "@@ -210,26 +210,32 @@",
+      "change": "Replace restoration flag with isolated nullable numeric target and page ref. Suppress event and navigation saves while loading/restoring, publish current ref instead of stale state, snapshot detail return target, and preserve pending target when a non-silent load begins."
+    },
+    {
+      "header": "@@ -259,23 +265,45 @@",
+      "change": "Synchronize deliberate filter resets into state/ref/target. Capture restoration target per effect; require actual containing main-content host, committed list and sufficient scroll range. Verify applied position on a second RAF before releasing save suppression. Retry only on list/context/loading transitions or observed size/resize events. Cancel owned RAF and detach observers/listener on cleanup; detach observation after success. Attach page ref without layout/style changes."
+    },
+    {
+      "header": "@@ -284,7 +312,7 @@",
+      "change": "Snapshot the saved list scroll target on activity-detail return."
+    }
+  ],
+  "historical_original_root_causes": [
+    "Scroll events updated only contextRef, but every subsequent render copied older React state over it.",
+    "Loading/short-list and restoration-induced scroll events could persist clamped zero before the saved target was applied.",
+    "The old RAF read a mutable context target, did not check actual scroll capacity, and cleared restoration immediately even if the browser clamped the assignment.",
+    "Publishing context state instead of contextRef could republish an old offset when the callback identity changed. Main already has a stable save callback and was not modified."
+  ],
+  "design_conclusion": {
+    "direction": "Preserve the existing quiet, dense task tool and return users to the same list position; no visual redesign or product-priority changes.",
+    "structure": "Existing main-content host, task list, workflow navigation and detail return paths remain in place. Search/workspace/view/method filtering semantics remain unchanged; intentional filter changes reset scroll to zero.",
+    "reference": "Existing task-center browser regression is the local behavioral reference; no external competitive research performed.",
+    "token_values": "No typography, spacing, color, radius, shadow, hit-area or animation tokens changed. Restoration is an immediate scroll assignment after range readiness, with a second-frame position confirmation below 1 CSS pixel; existing browser acceptance remains below 5 pixels with its original timeout."
+  },
+  "state_coverage": {
+    "loading": "Source-reviewed: suppress persistence and retain the independent restoration target until both loaders settle.",
+    "empty": "Source-reviewed: do not consume a positive target while the current list cannot provide that scroll range; zero filter resets remain restorable. Empty-to-populated row-count changes and observed layout growth schedule another attempt.",
+    "error": "Existing error/retry UI unchanged. If the target cannot be restored, retain it rather than saving a clamped position.",
+    "partial": "Existing partial-result UI unchanged; restored position is released only when the actual host has sufficient range and reports the requested offset.",
+    "success": "Source-reviewed: preserve ref-only user offsets, restore captured target, then release save suppression after position confirmation.",
+    "no_permission": "No authorization logic or no-permission UI changed; runtime behavior unverified."
+  },
+  "historical_checks": [
+    {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "executed_on_final_source": true,
+      "exit_code": 0,
+      "stdout": [
+        "task center model checks passed: ownership, cycles, views, user actions, lifecycle, stages, plan identity",
+        "B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity",
+        "QA-LEGACY-01 recovery action and manual-pause restrictions passed"
+      ],
+      "warnings": ["Node MODULE_TYPELESS_PACKAGE_JSON warning; no package/config change made."],
+      "limitation": "This model script does not render TaskCenterPage.tsx and does not prove browser scroll restoration or TSX type/build correctness."
+    },
+    {
+      "kind": "producer_source_review",
+      "result": "Reviewed final patch against captured hash-matched baseline: four focused source hunks; no polling loop; owned RAF, resize listener and ResizeObserver cleanup present. This is not independent expert acceptance."
+    },
+    {
+      "kind": "browser_regression_integrity",
+      "path": "frontend/scripts/check-task-center.browser.mjs",
+      "before_sha256": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "after_sha256": "d3391a0dcb72dcf3463aa604a5f95de99c1d0f4cbc0653e442ce4766c7046cf1",
+      "result": "Unchanged. Retains main-content, search/workspace checks, scrollBefore > 500, absolute difference < 5 and original timeout. No fixture or test adjustment was necessary."
+    }
+  ],
+  "generated_evidence": {
+    "root": "G:/HiMindAgentRuntime/mission-checks/927fe9ce4f250500ef874ed09d6ff495667cf182996b6709ab286ab27a61bf7e/ca5d9e9da0e48a369bab0ae18653deaf1897bec14b2507f8de386b5ec100b504",
+    "baseline_copy": "TaskCenterPage.before.tsx",
+    "exact_source_patch": "TaskCenterPage.patch",
+    "exact_source_patch_sha256": "b26af4810f5f242d0d7f95b696fe902aaa96a6c5b09fbcbce80802e4d0e82f0c",
+    "required_check_log": "required-check.log",
+    "required_check_log_sha256": "3c1fab6f1ea7bef8b1e1f17b61b4470ee2d6eb4398227f7aa8d4643104a1fd07"
+  },
+  "render_evidence": [],
+  "historical_unverified": [
+    "Real built-browser workflow navigation, unmount/remount and lazy empty-to-29-row scroll restoration.",
+    "Browser confirmation that unrelated rerenders preserve the saved offset and detail/filter resets behave as intended.",
+    "Narrow viewport, long text, empty data, 200% zoom, light/dark themes and reduced-motion interaction checks.",
+    "Type checking/build, independent downstream HiMind test expert review, native VERIFY and final60 acceptance."
+  ],
+  "assumptions_and_risks": [
+    "The existing main-content element contains the task-center page and ResizeObserver is available in the target runtime.",
+    "If loaded data or viewport changes permanently remove the saved scroll range, the target remains pending and saves remain suppressed; no fallback clamps the target to zero and no polling expires it. An intentional filter change supplies a new zero target.",
+    "The historical R10 sequence 2181 -> 0, lazy return 0 -> 29 rows and scroll 0 after 10 seconds remains failed historical evidence; it was not rerun, modified or reclassified.",
+    "No build, browser launch, dependency installation, service/config edit, subagent, extra model invocation, Git write/commit/push, old final verification or host VERIFY was performed."
+  ]
+}

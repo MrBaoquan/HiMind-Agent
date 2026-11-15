@@ -202,7 +202,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
   const catalog = missionCatalog || fallbackCatalog;
   const [items, setItems] = useState<AgentActivityItem[]>([]);
   const [context, setContext] = useState(initialContext);
-  const contextRef = useRef(context); contextRef.current = context;
+  const contextRef = useRef(context);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [missionId, setMissionId] = useState(initialMissionId || '');
@@ -210,26 +210,45 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
   const detailRef = useRef(false); detailRef.current = Boolean(missionId || activityId);
   const [createOpen, setCreateOpen] = useState(false);
   const [newMenu, setNewMenu] = useState(false);
-  const restoreScroll = useRef(true);
+  const restoreTarget = useRef<number | null>(initialContext.scrollTop);
+  const loadingRef = useRef(true); loadingRef.current = loading || catalog.loading;
+  const pageRef = useRef<HTMLDivElement>(null);
+  const scrollActive = useRef(false);
   const main = () => document.querySelector<HTMLElement>('.main-content');
+  const ownedScrollHost = useCallback(() => {
+    const page = pageRef.current;
+    const host = document.querySelector<HTMLElement>('.main-content');
+    return scrollActive.current && page?.isConnected && host?.contains(page) && page.getClientRects().length ? host : null;
+  }, []);
+  useLayoutEffect(() => {
+    scrollActive.current = true;
+    restoreTarget.current ??= contextRef.current.scrollTop;
+    return () => { scrollActive.current = false; };
+  }, []);
   const rememberScroll = () => {
-    const next = { ...contextRef.current, scrollTop: detailRef.current ? contextRef.current.scrollTop : main()?.scrollTop ?? window.scrollY };
+    const host = ownedScrollHost();
+    if (!host || loadingRef.current || restoreTarget.current !== null) {
+      onContextChange?.(contextRef.current);
+      return;
+    }
+    const next = { ...contextRef.current, scrollTop: detailRef.current ? contextRef.current.scrollTop : host.scrollTop };
     contextRef.current = next; setContext(next); onContextChange?.(next);
   };
+  const depart = () => { rememberScroll(); scrollActive.current = false; };
   const openMission = (id: string) => {
-    if (id) rememberScroll(); else restoreScroll.current = true;
+    if (id) rememberScroll(); else restoreTarget.current = contextRef.current.scrollTop;
     setMissionId(id); onMissionSelectionChange?.(id);
   };
   useEffect(() => { setMissionId(initialMissionId || ''); }, [initialMissionId, missionNavigationRevision]);
-  useEffect(() => { onContextChange?.(context); }, [context, onContextChange]);
+  useEffect(() => { onContextChange?.(contextRef.current); }, [context, onContextChange]);
   useEffect(() => {
     const host = main() || window;
-    const save = () => { if (detailRef.current) return; contextRef.current = { ...contextRef.current, scrollTop: main()?.scrollTop ?? window.scrollY }; };
+    const save = () => { if (ownedScrollHost() !== host || detailRef.current || loadingRef.current || restoreTarget.current !== null) return; contextRef.current = { ...contextRef.current, scrollTop: host instanceof HTMLElement ? host.scrollTop : window.scrollY }; };
     host.addEventListener('scroll', save, {passive:true});
     return () => { host.removeEventListener('scroll', save); onContextChange?.(contextRef.current); };
-  }, [onContextChange]);
+  }, [onContextChange, ownedScrollHost]);
   const load = useCallback(async (silent = false, includeRemote = true) => {
-    if (!silent) setLoading(true);
+    if (!silent) { restoreTarget.current ??= contextRef.current.scrollTop; loadingRef.current = true; setLoading(true); }
     const [local, remote] = await Promise.allSettled([
       onLoadLocalActivity(),
       dashboardEnabled && includeRemote ? onLoadTaskHistory() : Promise.resolve([] as AgentTaskHistoryItem[]),
@@ -259,32 +278,54 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
   const counts = {all:scoped.length, attention:scoped.filter(r=>r.needsUser).length, running:scoped.filter(r=>!r.ended).length, ended:scoped.filter(r=>r.ended).length};
   const filtered = scoped.filter(row => context.view === 'all' || (context.view === 'attention' ? row.needsUser : context.view === 'ended' ? row.ended : !row.ended));
   const workspaces = new Map(rows.filter(r=>r.workspace).map(r=>[workspaceKey(r.workspace), r.workspace]));
-  const update = (patch: Partial<TaskListContext>) => setContext(current => ({...current, ...patch, scrollTop:0}));
+  const update = (patch: Partial<TaskListContext>) => {
+    const next = {...contextRef.current, ...patch, scrollTop:0};
+    contextRef.current = next; restoreTarget.current = 0; setContext(next);
+  };
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     if (!rows.some(row => !row.ended)) return;
     const timer=window.setInterval(()=>setNow(Date.now()),1000); return ()=>window.clearInterval(timer);
   }, [rows.some(row => !row.ended)]);
   useLayoutEffect(() => {
-    if (missionId || activityId || loading || catalog.loading || !restoreScroll.current) return;
-    const frame = requestAnimationFrame(() => {
-      const host = main(); if (host) host.scrollTop = contextRef.current.scrollTop; else window.scrollTo(0, contextRef.current.scrollTop);
-      restoreScroll.current = false;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [missionId, activityId, loading, catalog.loading]);
-  const openRun = onOpenWorkflowRun ? (id:string) => { rememberScroll(); onOpenWorkflowRun(id); } : undefined;
+    const target = restoreTarget.current;
+    const page = pageRef.current;
+    if (missionId || activityId || loading || catalog.loading || target === null || !page) return;
+    let frame = 0;
+    const schedule = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const host = ownedScrollHost();
+        if (!host || !host.contains(page) || loadingRef.current || restoreTarget.current !== target || !page.querySelector('.task-center-history') || host.scrollHeight - host.clientHeight < target) return;
+        host.scrollTop = target;
+        frame = requestAnimationFrame(() => {
+          if (!loadingRef.current && restoreTarget.current === target && ownedScrollHost() === host && Math.abs(host.scrollTop - target) < 1) {
+            restoreTarget.current = null;
+            observer.disconnect(); window.removeEventListener('resize', schedule);
+          }
+        });
+      });
+    };
+    const observer = new ResizeObserver(schedule);
+    observer.observe(page);
+    const host = main();
+    if (host) observer.observe(host);
+    window.addEventListener('resize', schedule);
+    schedule();
+    return () => { cancelAnimationFrame(frame); observer.disconnect(); window.removeEventListener('resize', schedule); };
+  }, [missionId, activityId, loading, catalog.loading, filtered.length, context, ownedScrollHost]);
+  const openRun = onOpenWorkflowRun ? (id:string) => { depart(); onOpenWorkflowRun(id); } : undefined;
   const selectedActivity = items.find(i=>i.id===activityId);
-  return <div className="task-center-page">
+  return <div className="task-center-page" ref={pageRef}>
     <PageHeader title="我的任务" description="跟踪任务进展、处理待办、查看交付结果。" actions={!missionId && !activityId ? <div className="task-create-menu">
       <button type="button" className="btn btn-primary" aria-expanded={newMenu} onClick={()=>setNewMenu(v=>!v)}>新建任务</button>
-      {newMenu ? <div className="task-create-options"><button className="btn" onClick={()=>{setNewMenu(false);setCreateOpen(true);}}>新建协作任务</button>{onOpenWorkflowLibrary ? <button className="btn" onClick={()=>{setNewMenu(false);onOpenWorkflowLibrary();}}>运行工作流</button> : null}{dashboardEnabled ? <button className="btn" onClick={onOpenDashboard}>打开工作台</button> : null}</div> : null}
+      {newMenu ? <div className="task-create-options"><button className="btn" onClick={()=>{setNewMenu(false);setCreateOpen(true);}}>新建协作任务</button>{onOpenWorkflowLibrary ? <button className="btn" onClick={()=>{setNewMenu(false);depart();onOpenWorkflowLibrary();}}>运行工作流</button> : null}{dashboardEnabled ? <button className="btn" onClick={()=>{rememberScroll();onOpenDashboard();}}>打开工作台</button> : null}</div> : null}
     </div> : undefined} />
     {missionId ? <CollaborationTaskDetail key={missionId} missionId={missionId} openAssignmentRevision={missionNavigationRevision}
       onBack={()=>openMission('')} onRefresh={catalog.refresh} onMissionChanged={catalog.upsert}
       relatedActivities={missionActivities(missionId)} onOpenWorkflowRun={openRun} />
     : selectedActivity ? <section className="mission-detail">
-      <button className="btn" onClick={()=>{restoreScroll.current=true;setActivityId('');}}>返回我的任务</button>
+      <button className="btn" onClick={()=>{restoreTarget.current=contextRef.current.scrollTop;setActivityId('');}}>返回我的任务</button>
       <header className="mission-detail-hero"><div><h2>{selectedActivity.title}</h2><p>{selectedActivity.subtitle || '执行记录'}</p></div><strong>{activityStatusLabel(selectedActivity) || taskStatusLabel(selectedActivity.status)}</strong></header>
       <dl className="task-facts"><div><dt>工作区</dt><dd>{selectedActivity.workspace_root || '未记录'}</dd></div><div><dt>来源</dt><dd>{selectedActivity.source_client || (selectedActivity.source==='dashboard'?'工作台':'未记录')}</dd></div><div><dt>更新时间</dt><dd>{formatAbsoluteTime(selectedActivity.updated_at)}</dd></div></dl>
       <section className="mission-detail-panel"><h3>概览</h3><p>{selectedActivity.error || selectedActivity.detail || '尚无进一步执行说明'}</p>{selectedActivity.output_path ? <><h3>交付物</h3><code className="task-evidence-path">{selectedActivity.output_path}</code></> : <p className="muted">未记录可展示的交付文件。</p>}</section>
