@@ -34,11 +34,13 @@ pub(crate) fn execute(command: &mut Command, prompt: &str, result_path: &std::pa
         .map_err(|e|format!("Codex owned process launch failed: {e}"))?;
     let completion = std::sync::Arc::new(std::sync::Mutex::new(CodexCompletion::default()));
     let observed = completion.clone();
-    let stdout = child.stdout.take().map(|pipe| process::capture_runtime_output(pipe, true, move |reader| {
+    let stdout = child.stdout.take().map(|pipe| process::capture_runtime_output_typed(pipe, true, move |reader| {
         // Parse and validate outside the completion mutex. Large tool records
         // cannot block the supervisor's cancellation/timeout checks on this lock.
-        let Some(event) = CodexProtocolEvent::read(reader) else { return false; };
-        observed.lock().map(|mut state| state.observe_event(event)).is_ok()
+        let event = CodexProtocolEvent::read(reader)?;
+        observed.lock()
+            .map(|mut state| state.observe_event(event))
+            .map_err(|_| process::CaptureIssue::new(process::CaptureFailureKind::ObserverLock))
     }));
     let stderr = child.stderr.take().map(|pipe| process::capture_runtime_output(pipe, false, |_| true));
     let result = (|| -> Result<CodexOutcome, Box<dyn Error>> {
@@ -232,11 +234,11 @@ where D: serde::Deserializer<'de>, T: serde::Deserialize<'de> {
 }
 
 impl CodexProtocolEvent {
-    pub(crate) fn read(reader: &mut dyn std::io::Read) -> Option<Self> {
+    pub(crate) fn read(reader: &mut dyn std::io::Read) -> Result<Self, process::CaptureIssue> {
         let mut deserializer = serde_json::Deserializer::from_reader(reader);
-        let event = deserialize_protocol_object(&mut deserializer).ok()?;
-        deserializer.end().ok()?;
-        Some(event)
+        let event = deserialize_protocol_object(&mut deserializer).map_err(process::CaptureIssue::json)?;
+        deserializer.end().map_err(process::CaptureIssue::json)?;
+        Ok(event)
     }
 }
 
@@ -274,7 +276,7 @@ impl CodexCompletion {
     }
 
     pub(crate) fn observe_reader(&mut self, reader: &mut dyn std::io::Read) -> bool {
-        let Some(event) = CodexProtocolEvent::read(reader) else { return false; };
+        let Ok(event) = CodexProtocolEvent::read(reader) else { return false; };
         self.observe_event(event);
         true
     }
@@ -345,4 +347,27 @@ fn read_codex_final(path: &std::path::Path) -> Result<String, Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
     if text.trim().is_empty() { return Err("Codex final file is empty".into()); }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_parser_reports_fixed_failure_categories_without_private_text() {
+        use crate::runtime::process::CaptureFailureKind;
+        for (line, expected) in [
+            (r#"{"type":"turn.completed","ignored": invalid}"#, CaptureFailureKind::JsonSyntax),
+            (r#"{"type":"turn.completed","item":"fixture-private-secret"}"#, CaptureFailureKind::JsonSchema),
+            (r#"{"type":"turn.completed""#, CaptureFailureKind::JsonEof),
+        ] {
+            let issue = match CodexProtocolEvent::read(&mut line.as_bytes()) {
+                Ok(_) => panic!("invalid record accepted"), Err(issue) => issue,
+            };
+            assert_eq!(issue.kind, expected);
+            assert!(!issue.to_string().contains("fixture-private-secret"));
+        }
+        assert!(CodexProtocolEvent::read(&mut br#"{"type":"turn.completed"}"#.as_slice()).is_ok());
+    }
+
 }

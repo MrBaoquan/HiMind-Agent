@@ -1,4 +1,5 @@
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -385,7 +386,112 @@ pub(crate) struct RuntimeOutputCapture {
     output: Arc<std::sync::Mutex<RuntimeCaptureText>>,
     overflowed: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    failures: Arc<std::sync::Mutex<CaptureFailures>>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureFailureKind {
+    PipePeek, PipeRead, Utf8, Shape, JsonSyntax, JsonSchema, JsonEof,
+    FieldLimit, DepthLimit, RecordLimit, SpoolCreate, SpoolWrite, SpoolSeek,
+    SpoolRead, IncompleteRecord, UnterminatedRecord, ObserverRejected, ObserverLock, Stopped, OutputLock,
+}
+
+impl CaptureFailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PipePeek => "pipe_peek", Self::PipeRead => "pipe_read",
+            Self::Utf8 => "utf8", Self::Shape => "shape", Self::JsonSyntax => "json_syntax",
+            Self::JsonSchema => "json_schema", Self::JsonEof => "json_eof",
+            Self::FieldLimit => "field_limit", Self::DepthLimit => "depth_limit",
+            Self::RecordLimit => "record_limit", Self::SpoolCreate => "spool_create",
+            Self::SpoolWrite => "spool_write", Self::SpoolSeek => "spool_seek",
+            Self::SpoolRead => "spool_read", Self::IncompleteRecord => "incomplete_record",
+            Self::UnterminatedRecord => "unterminated_record",
+            Self::ObserverRejected => "observer_rejected", Self::ObserverLock => "observer_lock",
+            Self::Stopped => "stopped", Self::OutputLock => "output_lock",
+        }
+    }
+}
+
+/// Fixed metadata only. Never retain an IO/serde error's arbitrary Display text.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaptureIssue {
+    pub(crate) kind: CaptureFailureKind,
+    io_kind: Option<std::io::ErrorKind>,
+    raw_os_error: Option<i32>,
+}
+
+impl CaptureIssue {
+    pub(crate) fn new(kind: CaptureFailureKind) -> Self { Self { kind, io_kind: None, raw_os_error: None } }
+    fn io(kind: CaptureFailureKind, error: std::io::Error) -> Self {
+        Self { kind, io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
+    }
+    pub(crate) fn json(error: serde_json::Error) -> Self {
+        let kind = match error.classify() {
+            serde_json::error::Category::Io => CaptureFailureKind::SpoolRead,
+            serde_json::error::Category::Syntax => CaptureFailureKind::JsonSyntax,
+            serde_json::error::Category::Data => CaptureFailureKind::JsonSchema,
+            serde_json::error::Category::Eof => CaptureFailureKind::JsonEof,
+        };
+        Self { kind, io_kind: error.io_error_kind(), raw_os_error: None }
+    }
+}
+
+impl std::fmt::Display for CaptureIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "category={}; io_kind={:?}; raw_os_error={:?}", self.kind.label(), self.io_kind, self.raw_os_error)
+    }
+}
+impl Error for CaptureIssue {}
+
+struct CapturePosition {
+    protocol: bool,
+    index: u64,
+    start: u64,
+    len: u64,
+    digest: Sha256,
+}
+
+impl CapturePosition {
+    fn new(protocol: bool) -> Self { Self { protocol, index: u64::from(protocol), start: 0, len: 0, digest: Sha256::new() } }
+    fn append(&mut self, bytes: &[u8]) { self.len += bytes.len() as u64; self.digest.update(bytes); }
+    fn next(&mut self) {
+        self.start += self.len + 1; // LF is a wire delimiter, excluded from the record digest.
+        self.index += 1; self.len = 0; self.digest = Sha256::new();
+    }
+}
+
+struct CaptureFailure {
+    issue: CaptureIssue,
+    protocol: bool,
+    record_index: u64,
+    record_offset: u64,
+    observed_length: u64,
+    sha256: [u8; 32],
+    terminated: bool,
+}
+
+#[derive(Default)]
+struct CaptureFailures { first: Option<CaptureFailure>, count: u64 }
+impl CaptureFailures {
+    fn record(&mut self, issue: CaptureIssue, position: &CapturePosition, terminated: bool) {
+        self.count = self.count.saturating_add(1);
+        if self.first.is_none() {
+            self.first = Some(CaptureFailure { issue, protocol: position.protocol, record_index: position.index,
+                record_offset: position.start, observed_length: position.len,
+                sha256: position.digest.clone().finalize().into(), terminated });
+        }
+    }
+    fn summary(&self) -> String {
+        let Some(first) = &self.first else { return "first_failure=none".into(); };
+        let digest: String = first.sha256.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{}; capture_mode={}; record_index={}; record_offset={}; observed_length={}; observed_sha256={}; digest_scope={}; failure_count={}",
+            first.issue, if first.protocol { "protocol" } else { "stream" },
+            first.record_index, first.record_offset, first.observed_length, digest,
+            if !first.protocol { "observed_stream_prefix" }
+            else if first.terminated { "complete_record_without_lf" } else { "observed_prefix_without_lf" }, self.count)
+    }
 }
 
 #[derive(Default)]
@@ -416,18 +522,20 @@ impl RuntimeCaptureText {
 
 impl RuntimeOutputCapture {
     pub(crate) fn finished(&self) -> bool { self.finished.load(Ordering::Acquire) }
+    pub(crate) fn finish(mut self) -> Result<String, Box<dyn Error>> {
+        let diagnostics = || self.failures.lock().map(|state| state.summary())
+            .unwrap_or_else(|_| "category=diagnostic_lock".into());
+        if !self.finished() { return Err(format!("runtime output pipe did not reach EOF within its drain deadline (category=drain_deadline; {})", diagnostics()).into()); }
+        if let Some(handle) = self.handle.take() { handle.join().map_err(|_| "runtime output reader panicked")?; }
+        if self.failed.load(Ordering::Acquire) { return Err(format!("runtime output pipe could not be read ({})", diagnostics()).into()); }
+        if self.overflowed.load(Ordering::Acquire) { return Err(format!("a runtime protocol record exceeded the 64 MiB safety limit ({})", diagnostics()).into()); }
+        Ok(self.output.lock().map_err(|_| "runtime output capture lock poisoned")?.text())
+    }
     pub(crate) fn finish_complete(self) -> Result<String, Box<dyn Error>> {
         if self.output.lock().map_err(|_|"runtime capture lock poisoned")?.truncated {
             return Err("runtime final output exceeded the capture budget".into());
         }
         self.finish()
-    }
-    pub(crate) fn finish(mut self) -> Result<String, Box<dyn Error>> {
-        if !self.finished() { return Err("runtime output pipe did not reach EOF within its drain deadline".into()); }
-        if let Some(handle) = self.handle.take() { handle.join().map_err(|_| "runtime output reader panicked")?; }
-        if self.failed.load(Ordering::Acquire) { return Err("runtime output pipe could not be read".into()); }
-        if self.overflowed.load(Ordering::Acquire) { return Err("a runtime protocol record exceeded the 64 MiB safety limit".into()); }
-        Ok(self.output.lock().map_err(|_| "runtime output capture lock poisoned")?.text())
     }
 }
 
@@ -476,32 +584,31 @@ struct ProtocolValidation {
 struct ProtocolFrame { path: u8, object: bool, expects_key: bool, key: String }
 
 impl ProtocolValidation {
-    fn invalid() -> std::io::Error { std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid or over-budget protocol field") }
-    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), CaptureIssue> {
         let mut utf8 = std::mem::take(&mut self.utf8_tail);
         utf8.extend_from_slice(bytes);
         if let Err(error) = std::str::from_utf8(&utf8) {
-            if error.error_len().is_some() { return Err(Self::invalid()); }
+            if error.error_len().is_some() { return Err(CaptureIssue::new(CaptureFailureKind::Utf8)); }
             self.utf8_tail.extend_from_slice(&utf8[error.valid_up_to()..]);
         }
         for &byte in bytes {
             if self.in_string {
                 self.string_len += 1;
-                if self.string_len > self.string_limit { return Err(Self::invalid()); }
+                if self.string_len > self.string_limit { return Err(CaptureIssue::new(CaptureFailureKind::FieldLimit)); }
                 if self.key_string { self.key_bytes.push(byte); }
                 if self.escaped { self.escaped = false; }
                 else if byte == b'\\' { self.escaped = true; }
                 else if byte == b'"' {
                     self.in_string = false;
                     if self.key_string {
-                        let key: String = serde_json::from_slice(&self.key_bytes).map_err(|_| Self::invalid())?;
+                        let key: String = serde_json::from_slice(&self.key_bytes).map_err(CaptureIssue::json)?;
                         if let Some(frame) = self.frames.last_mut() { frame.key = key; frame.expects_key = false; }
                     }
                 }
                 continue;
             }
             if !self.started && !byte.is_ascii_whitespace() {
-                if byte != b'{' { return Err(Self::invalid()); }
+                if byte != b'{' { return Err(CaptureIssue::new(CaptureFailureKind::Shape)); }
                 self.started = true;
             }
             match byte {
@@ -509,7 +616,7 @@ impl ProtocolValidation {
                     self.in_string = true; self.escaped = false; self.string_len = 0;
                     self.key_string = self.frames.last().is_some_and(|frame| frame.object && frame.expects_key);
                     if !self.key_string && self.frames.last().is_some_and(|frame| frame.path == 1 && matches!(frame.key.as_str(), "item" | "error")) {
-                        return Err(Self::invalid());
+                        return Err(CaptureIssue::new(CaptureFailureKind::Shape));
                     }
                     self.key_bytes.clear();
                     if self.key_string { self.key_bytes.push(b'"'); }
@@ -530,8 +637,8 @@ impl ProtocolValidation {
                             _ => 0,
                         }
                     };
-                    if byte == b'[' && path != 0 { return Err(Self::invalid()); }
-                    if self.frames.len() >= 128 { return Err(Self::invalid()); }
+                    if byte == b'[' && path != 0 { return Err(CaptureIssue::new(CaptureFailureKind::Shape)); }
+                    if self.frames.len() >= 128 { return Err(CaptureIssue::new(CaptureFailureKind::DepthLimit)); }
                     self.frames.push(ProtocolFrame { path, object: byte == b'{', expects_key: byte == b'{', key: String::new() });
                 }
                 b'}' | b']' => { self.frames.pop(); }
@@ -544,11 +651,21 @@ impl ProtocolValidation {
     fn complete(&self) -> bool { self.started && self.utf8_tail.is_empty() && !self.in_string && self.frames.is_empty() }
 }
 
-struct StoppableReader<'a> { reader: &'a mut dyn Read, stop: &'a AtomicBool }
+struct StoppableReader<'a> {
+    reader: &'a mut dyn Read, stop: &'a AtomicBool, failure: &'a mut Option<CaptureIssue>,
+}
 impl Read for StoppableReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        if self.stop.load(Ordering::Acquire) { return Err(std::io::Error::other("protocol reading stopped")); }
-        self.reader.read(bytes)
+        if self.stop.load(Ordering::Acquire) {
+            self.failure.get_or_insert(CaptureIssue::new(CaptureFailureKind::Stopped));
+            return Err(std::io::Error::other("protocol reading stopped"));
+        }
+        let result = self.reader.read(bytes);
+        if let Err(error) = &result {
+            self.failure.get_or_insert(CaptureIssue { kind: CaptureFailureKind::SpoolRead,
+                io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() });
+        }
+        result
     }
 }
 
@@ -589,18 +706,18 @@ impl Drop for ProtocolSpool {
 }
 
 impl RuntimeProtocolRecord {
-    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), CaptureIssue> {
         if self.len.saturating_add(bytes.len()) > PROTOCOL_RECORD_LIMIT {
-            return Err(std::io::Error::new(std::io::ErrorKind::FileTooLarge, "protocol record safety limit"));
+            return Err(CaptureIssue::new(CaptureFailureKind::RecordLimit));
         }
         self.validation.append(bytes)?;
         if self.spool.is_none() && self.len + bytes.len() > OUTPUT_CAPTURE_LIMIT {
-            let mut spool = ProtocolSpool::new()?;
-            spool.file.as_mut().unwrap().write_all(&self.memory)?;
+            let mut spool = ProtocolSpool::new().map_err(|e| CaptureIssue::io(CaptureFailureKind::SpoolCreate, e))?;
+            spool.file.as_mut().unwrap().write_all(&self.memory).map_err(|e| CaptureIssue::io(CaptureFailureKind::SpoolWrite, e))?;
             self.memory.clear();
             self.spool = Some(spool);
         }
-        if let Some(spool) = &mut self.spool { spool.file.as_mut().unwrap().write_all(bytes)?; }
+        if let Some(spool) = &mut self.spool { spool.file.as_mut().unwrap().write_all(bytes).map_err(|e| CaptureIssue::io(CaptureFailureKind::SpoolWrite, e))?; }
         else {
             // Avoid Vec's geometric spare capacity crossing the memory budget
             // when a JSON prefix offsets otherwise aligned pipe chunks.
@@ -611,31 +728,51 @@ impl RuntimeProtocolRecord {
         Ok(())
     }
 
-    fn observe<F: FnMut(&mut dyn Read) -> bool>(&mut self, observe: &mut F, stop: &AtomicBool) -> std::io::Result<bool> {
-        if !self.validation.complete() { return Ok(false); }
-        if let Some(spool) = &mut self.spool {
+    fn observe<F: FnMut(&mut dyn Read) -> Result<(), CaptureIssue>>(&mut self, observe: &mut F, stop: &AtomicBool) -> Result<(), CaptureIssue> {
+        if !self.validation.complete() { return Err(CaptureIssue::new(CaptureFailureKind::IncompleteRecord)); }
+        let mut read_failure = None;
+        let result = if let Some(spool) = &mut self.spool {
             let file = spool.file.as_mut().unwrap();
-            file.seek(SeekFrom::Start(0))?;
-            Ok(observe(&mut StoppableReader { reader: &mut std::io::BufReader::new(file), stop }))
-        } else { Ok(observe(&mut StoppableReader { reader: &mut self.memory.as_slice(), stop })) }
+            file.seek(SeekFrom::Start(0)).map_err(|e| CaptureIssue::io(CaptureFailureKind::SpoolSeek, e))?;
+            observe(&mut StoppableReader { reader: &mut std::io::BufReader::new(file), stop, failure: &mut read_failure })
+        } else { observe(&mut StoppableReader { reader: &mut self.memory.as_slice(), stop, failure: &mut read_failure }) };
+        // serde wraps reader IO errors; retain the actual IO code before that conversion.
+        if let Some(issue) = read_failure { Err(issue) } else { result }
     }
 }
 
-pub(crate) fn capture_runtime_output<R, F>(mut reader: R, protocol: bool, mut observe: F) -> RuntimeOutputCapture
+pub(crate) fn capture_runtime_output<R, F>(reader: R, protocol: bool, mut observe: F) -> RuntimeOutputCapture
 where R: RuntimePipe + 'static, F: FnMut(&mut dyn Read) -> bool + Send + 'static {
+    capture_runtime_output_typed(reader, protocol, move |record| {
+        if observe(record) { Ok(()) }
+        else { Err(CaptureIssue::new(CaptureFailureKind::ObserverRejected)) }
+    })
+}
+
+pub(crate) fn capture_runtime_output_typed<R, F>(mut reader: R, protocol: bool, mut observe: F) -> RuntimeOutputCapture
+where R: RuntimePipe + 'static, F: FnMut(&mut dyn Read) -> Result<(), CaptureIssue> + Send + 'static {
     let stop = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
     let output = Arc::new(std::sync::Mutex::new(RuntimeCaptureText::default()));
     let overflowed = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
+    let failures = Arc::new(std::sync::Mutex::new(CaptureFailures::default()));
+    let thread_failures = failures.clone();
     let (thread_stop, thread_finished, thread_output, thread_overflowed, thread_failed) =
         (stop.clone(), finished.clone(), output.clone(), overflowed.clone(), failed.clone());
     let handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         let mut line = RuntimeProtocolRecord::default();
         let mut skip_line = false;
+        let mut position = CapturePosition::new(protocol);
+        let fail = |issue: CaptureIssue, position: &CapturePosition, terminated| {
+            if issue.kind == CaptureFailureKind::RecordLimit { thread_overflowed.store(true, Ordering::Release); }
+            else { thread_failed.store(true, Ordering::Release); }
+            if let Ok(mut failures) = thread_failures.lock() { failures.record(issue, position, terminated); }
+            else { thread_failed.store(true, Ordering::Release); }
+        };
         loop {
-            if thread_stop.load(Ordering::Acquire) { break; }
+            if thread_stop.load(Ordering::Acquire) { fail(CaptureIssue::new(CaptureFailureKind::Stopped), &position, false); break; }
             let read_limit = buffer.len();
             #[cfg(windows)]
             let read_limit = {
@@ -644,8 +781,8 @@ where R: RuntimePipe + 'static, F: FnMut(&mut dyn Read) -> bool + Send + 'static
                     reader.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(),
                     &mut available, std::ptr::null_mut()) };
                 if ok == 0 {
-                    let error = std::io::Error::last_os_error().raw_os_error();
-                    if !matches!(error, Some(109 | 232)) { thread_failed.store(true, Ordering::Release); }
+                    let error = std::io::Error::last_os_error();
+                    if !matches!(error.raw_os_error(), Some(109 | 232)) { fail(CaptureIssue::io(CaptureFailureKind::PipePeek, error), &position, false); }
                     break;
                 }
                 if available == 0 { thread::sleep(Duration::from_millis(10)); continue; }
@@ -656,34 +793,41 @@ where R: RuntimePipe + 'static, F: FnMut(&mut dyn Read) -> bool + Send + 'static
                 Ok(size) => {
                     if let Ok(mut output) = thread_output.lock() {
                         output.append(&buffer[..size]);
+                    } else {
+                        fail(CaptureIssue::new(CaptureFailureKind::OutputLock), &position, false);
                     }
-                    if !protocol { continue; }
+                    if !protocol { position.append(&buffer[..size]); continue; }
                     for segment in buffer[..size].split_inclusive(|byte| *byte == b'\n') {
                         let terminated = segment.last() == Some(&b'\n');
                         let bytes = if terminated { &segment[..segment.len()-1] } else { segment };
+                        // This cursor hashes observed wire bytes, including rejected records.
+                        // A failure before LF is explicitly a prefix, never a full-record proof.
+                        position.append(bytes);
                         if !skip_line {
                             if let Err(error) = line.append(bytes) {
-                                if error.kind() == std::io::ErrorKind::FileTooLarge { thread_overflowed.store(true, Ordering::Release); }
-                                else { thread_failed.store(true, Ordering::Release); }
+                                fail(error, &position, terminated);
                                 line = RuntimeProtocolRecord::default();
                                 skip_line = true;
                             }
                         }
                         if terminated {
-                            if !skip_line && !matches!(line.observe(&mut observe, &thread_stop), Ok(true)) { thread_failed.store(true, Ordering::Release); }
+                            if !skip_line {
+                                if let Err(error) = line.observe(&mut observe, &thread_stop) { fail(error, &position, true); }
+                            }
                             line = RuntimeProtocolRecord::default();
                             skip_line = false;
+                            position.next();
                         }
                     }
                 }
-                Err(_) => { thread_failed.store(true, Ordering::Release); break; }
+                Err(error) => { fail(CaptureIssue::io(CaptureFailureKind::PipeRead, error), &position, false); break; }
             }
         }
         // An unterminated JSON line is not a complete protocol event.
-        if protocol && (line.len != 0 || skip_line) { thread_failed.store(true, Ordering::Release); }
+        if protocol && (line.len != 0 || skip_line) { fail(CaptureIssue::new(CaptureFailureKind::UnterminatedRecord), &position, false); }
         thread_finished.store(true, Ordering::Release);
     });
-    RuntimeOutputCapture { stop, finished, output, overflowed, failed, handle: Some(handle) }
+    RuntimeOutputCapture { stop, finished, output, overflowed, failed, failures, handle: Some(handle) }
 }
 
 pub(crate) fn redact_error(value: &str, claim: &AgentRunClaim, agent_credential: &str) -> String {
@@ -1096,15 +1240,15 @@ mod tests {
         assert!(record.memory.is_empty());
         let path = record.spool.as_ref().unwrap().path.clone();
         let mut observed = 0;
-        assert!(record.observe(&mut |reader| {
+        record.observe(&mut |reader| {
             let mut buffer = [0u8; 8192];
             loop {
                 let count = reader.read(&mut buffer).unwrap();
                 if count == 0 { break; }
                 observed += count;
             }
-            true
-        }, &std::sync::atomic::AtomicBool::new(false)).unwrap());
+            Ok(())
+        }, &std::sync::atomic::AtomicBool::new(false)).unwrap();
         assert_eq!(observed, record.len, "the entire frame, including its tail, must be observed");
         record.len = PROTOCOL_RECORD_LIMIT;
         assert!(record.append(b"x").is_err());
@@ -1142,10 +1286,143 @@ mod tests {
         for _ in 0..64 { record.append(&[b'x';8192]).unwrap(); }
         record.append(br#""}"#).unwrap();
         let path = record.spool.as_ref().unwrap().path.clone();
-        assert!(!record.observe(&mut |reader| reader.read(&mut [0u8;1]).is_ok(),
-            &std::sync::atomic::AtomicBool::new(true)).unwrap());
+        let issue = record.observe(&mut |reader| reader.read(&mut [0u8;1]).map(|_| ())
+            .map_err(|e| super::CaptureIssue::io(super::CaptureFailureKind::SpoolRead, e)),
+            &std::sync::atomic::AtomicBool::new(true)).unwrap_err();
+        assert_eq!(issue.kind, super::CaptureFailureKind::Stopped);
         drop(record);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn capture_first_failure_retains_position_digest_and_real_io_code_only() {
+        use super::*;
+        let mut position = CapturePosition::new(true);
+        position.append(b"{}"); position.next();
+        let private = b"fixture-private-token";
+        position.append(private);
+        let mut failures = CaptureFailures::default();
+        failures.record(CaptureIssue::io(CaptureFailureKind::PipeRead, std::io::Error::from_raw_os_error(5)), &position, false);
+        position.append(b"later");
+        failures.record(CaptureIssue::new(CaptureFailureKind::UnterminatedRecord), &position, true);
+        let first = failures.first.as_ref().unwrap();
+        assert_eq!((first.record_index, first.record_offset, first.observed_length), (2, 3, private.len() as u64));
+        assert_eq!(first.sha256.as_slice(), Sha256::digest(private).as_slice());
+        assert_eq!(first.issue.raw_os_error, Some(5));
+        let summary = failures.summary();
+        assert!(summary.contains("category=pipe_read") && summary.contains("failure_count=2"));
+        assert!(summary.contains("observed_prefix_without_lf"));
+        assert!(!summary.contains("fixture-private-token"));
+        assert!(summary.contains("capture_mode=protocol"));
+        let mut stream = CapturePosition::new(false);
+        stream.append(b"A\nB");
+        let mut failures = CaptureFailures::default();
+        failures.record(CaptureIssue::new(CaptureFailureKind::PipeRead), &stream, false);
+        let first = failures.first.as_ref().unwrap();
+        assert_eq!((first.record_index, first.record_offset, first.observed_length), (0, 0, 3));
+        assert_eq!(first.sha256.as_slice(), Sha256::digest(b"A\nB").as_slice());
+        assert_ne!(first.sha256.as_slice(), Sha256::digest(b"AB").as_slice(), "stream LF participates in the hash");
+        let summary = failures.summary();
+        assert!(summary.contains("capture_mode=stream") && summary.contains("digest_scope=observed_stream_prefix"));
+        assert!(!summary.contains("without_lf"));
+    }
+
+    #[test]
+    fn capture_validation_failures_have_distinct_fixed_categories() {
+        use super::*;
+        for (bytes, kind) in [
+            (b"{\"ignored\":\"\xff\"}".as_slice(), CaptureFailureKind::Utf8),
+            (b"[]".as_slice(), CaptureFailureKind::Shape),
+            (format!("{{\"type\":\"{}\"}}", "x".repeat(1537)).as_bytes(), CaptureFailureKind::FieldLimit),
+            (format!("{{\"ignored\":{}0{}}}", "[".repeat(128), "]".repeat(128)).as_bytes(), CaptureFailureKind::DepthLimit),
+        ] {
+            assert_eq!(RuntimeProtocolRecord::default().append(bytes).unwrap_err().kind, kind);
+        }
+        let mut record = RuntimeProtocolRecord::default();
+        record.len = PROTOCOL_RECORD_LIMIT;
+        assert_eq!(record.append(b"x").unwrap_err().kind, CaptureFailureKind::RecordLimit);
+        let mut partial = RuntimeProtocolRecord::default();
+        partial.append(b"{\"type\":").unwrap();
+        let mut called = false;
+        let issue = partial.observe(&mut |_| { called = true; Ok(()) }, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(issue.kind, CaptureFailureKind::IncompleteRecord);
+        assert!(!called, "incomplete records must not reach the observer");
+    }
+
+    #[test]
+    fn capture_reader_preserves_actual_io_error_before_serde_wrapping() {
+        use super::*;
+        struct Fault;
+        impl Read for Fault {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { Err(std::io::Error::from_raw_os_error(5)) }
+        }
+        let mut failure = None;
+        let stop = AtomicBool::new(false);
+        let mut reader = StoppableReader { reader: &mut Fault, stop: &stop, failure: &mut failure };
+        assert!(serde_json::from_reader::<_, serde_json::Value>(&mut reader).is_err());
+        let issue = failure.unwrap();
+        assert_eq!(issue.kind, CaptureFailureKind::SpoolRead);
+        assert_eq!(issue.raw_os_error, Some(5));
+        assert_eq!(issue.io_kind, Some(std::io::Error::from_raw_os_error(5).kind()));
+    }
+
+    #[cfg(windows)]
+    fn diagnostic_pipe(bytes: &[u8]) -> std::fs::File {
+        use std::os::windows::io::FromRawHandle;
+        let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_ne!(unsafe { windows_sys::Win32::System::Pipes::CreatePipe(&mut read, &mut write, std::ptr::null(), 4096) }, 0);
+        let reader = unsafe { std::fs::File::from_raw_handle(read) };
+        let mut writer = unsafe { std::fs::File::from_raw_handle(write) };
+        std::io::Write::write_all(&mut writer, bytes).unwrap();
+        reader // writer closes here, so the real pipe must drain to EOF.
+    }
+
+    #[cfg(windows)]
+    fn finish_diagnostic_capture(capture: super::RuntimeOutputCapture) -> Result<String, Box<dyn Error>> {
+        let started = std::time::Instant::now();
+        while !capture.finished() && started.elapsed() < Duration::from_secs(2) { std::thread::yield_now(); }
+        capture.finish()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_earlier_rejection_survives_later_valid_terminal_and_clean_eof() {
+        use super::*;
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = accepted.clone();
+        let pipe = diagnostic_pipe(b"{\"type\":\"rejected\",\"private\":\"fixture-secret\"}\n{\"type\":\"turn.completed\"}\n");
+        let capture = capture_runtime_output_typed(pipe, true, move |reader| {
+            let event: serde_json::Value = serde_json::from_reader(reader).map_err(CaptureIssue::json)?;
+            if event["type"] == "rejected" { return Err(CaptureIssue::new(CaptureFailureKind::ObserverRejected)); }
+            observed.fetch_add(1, Ordering::SeqCst); Ok(())
+        });
+        let error = finish_diagnostic_capture(capture).unwrap_err().to_string();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "keep draining after a rejected record");
+        assert!(error.contains("category=observer_rejected") && error.contains("record_index=1"));
+        assert!(error.contains("complete_record_without_lf") && !error.contains("fixture-secret"));
+        let capture = capture_runtime_output(diagnostic_pipe(b"{}\n"), true, |_| false);
+        let error = finish_diagnostic_capture(capture).unwrap_err().to_string();
+        assert!(error.contains("category=observer_rejected"));
+        let capture = capture_runtime_output(diagnostic_pipe(b"{}\n"), true, |_| true);
+        assert_eq!(finish_diagnostic_capture(capture).unwrap(), "{}\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_unterminated_record_and_actual_pipe_read_error_remain_failures() {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, RawHandle};
+        let capture = capture_runtime_output_typed(diagnostic_pipe(b"{\"type\":\"turn.completed\"}"), true, |_| Ok(()));
+        let error = finish_diagnostic_capture(capture).unwrap_err().to_string();
+        assert!(error.contains("category=unterminated_record") && error.contains("observed_prefix_without_lf"));
+        struct Fault(std::fs::File);
+        impl AsRawHandle for Fault { fn as_raw_handle(&self) -> RawHandle { self.0.as_raw_handle() } }
+        impl Read for Fault {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { Err(std::io::Error::from_raw_os_error(5)) }
+        }
+        let capture = capture_runtime_output_typed(Fault(diagnostic_pipe(b"x")), true, |_| Ok(()));
+        let error = finish_diagnostic_capture(capture).unwrap_err().to_string();
+        assert!(error.contains("category=pipe_read") && error.contains("raw_os_error=Some(5)"), "{error}");
     }
 
     /// Windows 的 `npx` 目录里同时有无扩展名脚本和 `npx.cmd`，候选顺序必须先看后缀，
