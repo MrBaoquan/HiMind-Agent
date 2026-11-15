@@ -338,6 +338,9 @@ pub(crate) fn process_started_at_unix(pid: u32) -> Option<u64> {
 
 #[cfg(windows)]
 fn process_matches_discovery(pid: u32, started_at_unix: u64) -> bool {
+    // Windows keeps creation times queryable after exit while another process
+    // retains a handle. A matching timestamp alone can point at a dead pipe.
+    if !process_is_alive(pid) { return false; }
     let Some(expected_started_at) = nonzero_unix(started_at_unix) else {
         return false;
     };
@@ -802,6 +805,26 @@ mod tests {
     fn current_process_is_alive_and_zero_pid_is_not() {
         assert!(process_is_alive(std::process::id()));
         assert!(!process_is_alive(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_process_with_retained_handle_does_not_keep_discovery_alive() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("cmd.exe").args(["/c","exit 0"])
+            .creation_flags(0x08000000).spawn().unwrap();
+        let pid=child.id();
+        child.wait().unwrap();
+        let started=process_started_at_unix(pid).expect("the retained process handle preserves creation time");
+        assert!(!process_matches_discovery(pid,started));
+        let dir=temp_runtime_dir("exited-retained-handle");
+        let mut record=discovery_for(pid,"\\\\.\\pipe\\himind-agent-exited");
+        record.started_at_unix=started;
+        fs::write(dir.join("service.json"),serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(read_live_discovery(&dir).is_none());
+        assert!(!dir.join("service.json").exists());
+        let _=fs::remove_dir_all(dir);
+        drop(child);
     }
 
     #[test]

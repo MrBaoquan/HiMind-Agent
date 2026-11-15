@@ -1301,6 +1301,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
                 "workspace.registry.candidate.accept",
                 "workspace.registry.candidate.dismiss",
                 "workspace.registry.validate",
+                "workspace.registry.import",
             ],
             &[],
         ),
@@ -3347,8 +3348,8 @@ mod tests {
         assert_eq!(item.version, crate::workspace_registry::CAPABILITY_VERSION);
         assert_eq!(
             item.capabilities.len(),
-            10,
-            "10 条 workspace.registry.* 能力都应在这个条目里"
+            11,
+            "11 条 workspace.registry.* 能力都应在这个条目里"
         );
         for capability in &item.capabilities {
             assert!(

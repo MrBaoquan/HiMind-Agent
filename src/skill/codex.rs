@@ -978,6 +978,7 @@ mod tests {
             version_root: version_root.clone(),
             current: true,
             previous_version: None,
+            development: false,
         };
         let target_root = root.join("rendered");
         let target = SkillTarget::global(target_root.clone(), "test", true);
@@ -1020,6 +1021,7 @@ mod tests {
             version_root,
             current: true,
             previous_version: None,
+            development: false,
         };
         let workspace_a = root.join("project-a");
         fs::create_dir_all(&workspace_a).unwrap();

@@ -1,0 +1,140 @@
+/* WUI-04/05/08: one workspace scale; breakpoints follow available content width. */
+.workspace-registry { container: workspace-registry / inline-size; min-width: 0; min-height: 0; display: flex; flex: 1 1 0; flex-direction: column; gap: var(--space-3); }
+/* Scroll ownership: the shell stays still; each workspace column owns its content. */
+.main-content:has(> .workspace-registry) { overflow: hidden; }
+.main-content:has(> .workspace-registry) > :not(.workspace-registry) { flex-shrink: 0; }
+.workspace-registry > :not(.workspace-registry-view) { flex-shrink: 0; }
+.workspace-registry [hidden] { display: none !important; }
+.workspace-registry-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.workspace-registry-head h2 { margin: 0 0 var(--space-1); font-size: var(--fs-title); }
+.workspace-registry-head p, .workspace-registry-list-head p { max-width: 64ch; margin: 0; color: var(--text-muted); font-size: var(--fs-body); line-height: 1.5; }
+.workspace-registry-status { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-status:empty { display: none; }
+.workspace-registry-tabs { min-width: 0; display: flex; flex-wrap: wrap; gap: var(--space-1); border-bottom: 1px solid var(--border); }
+.workspace-registry-tabs button { min-height: var(--control-h-lg); display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-2); border: 0; border-bottom: 2px solid transparent; color: var(--text-muted); background: transparent; font: inherit; font-size: var(--fs-body); cursor: pointer; }
+.workspace-registry-tabs button span { min-width: var(--space-5); padding: 0 var(--space-1); border-radius: var(--radius-sm); color: var(--text-muted); background: var(--surface-muted); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; text-align: center; }
+.workspace-registry-tabs button.active { border-bottom-color: var(--primary); color: var(--primary); font-weight: 600; }
+.workspace-registry-tabs button.active span { color: var(--primary); background: var(--primary-soft); }
+.workspace-registry-view { min-width: 0; min-height: 0; flex: 1 1 0; }
+.workspace-registry-project-layout { display: grid; grid-template-columns: minmax(220px, 28%) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
+.workspace-registry-project-picker { display: none; }
+.workspace-registry-project-browser { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface-muted); }
+.workspace-registry-browser-head { flex: 0 0 auto; display: grid; gap: var(--space-2); padding: var(--space-3); border-bottom: 1px solid var(--border); }
+.workspace-registry-browser-head > span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-search { min-width: 0; min-height: var(--control-h-lg); display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-2); border: 1px solid var(--control-border); border-radius: var(--radius); color: var(--text-muted); background: var(--surface); }
+.workspace-registry-search svg { flex-shrink: 0; }
+.workspace-registry-search:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.workspace-registry-search input { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--text); background: transparent; font: inherit; font-size: var(--fs-body); }
+.workspace-registry-search input::placeholder { color: var(--text-muted); }
+.workspace-registry-tree { min-width: 0; min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; display: block; list-style: none; margin: 0; padding: var(--space-2); }
+.workspace-registry-tree:focus-visible, .workspace-registry-detail-section:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.workspace-registry-tree-item { min-width: 0; }
+.workspace-registry-node { min-width: 0; display: flex; align-items: center; gap: var(--space-1); border-radius: var(--radius); }
+.workspace-registry-node:hover { background: var(--neutral-soft); }
+.workspace-registry-node.selected { background: var(--primary-soft); }
+.workspace-registry-tree-toggle, .workspace-registry-tree-toggle-placeholder { width: var(--control-h-sm); height: var(--control-h-lg); flex: 0 0 var(--control-h-sm); display: grid; place-items: center; }
+.workspace-registry-tree-toggle { padding: 0; border: 0; border-radius: var(--radius); color: var(--text-muted); background: transparent; cursor: pointer; }
+.workspace-registry-tree-toggle:hover { color: var(--text); background: var(--neutral-soft); }
+.workspace-registry-node-select { min-width: 0; min-height: var(--control-h-xl); flex: 1 1 auto; display: grid; grid-template-columns: var(--space-4) minmax(0, 1fr); align-items: center; gap: var(--space-1) var(--space-2); padding: var(--space-2) var(--space-1); border: 0; border-radius: var(--radius); color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.workspace-registry-node-select > svg { color: var(--text-muted); }
+.workspace-registry-node.selected .workspace-registry-node-select > svg { color: var(--primary); }
+.workspace-registry-node-copy { min-width: 0; display: grid; gap: var(--space-1); }
+.workspace-registry-node-copy strong { overflow: hidden; font-size: var(--fs-body); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-registry-node-copy small { overflow: hidden; color: var(--text-muted); font-size: var(--fs-meta); text-overflow: ellipsis; white-space: nowrap; }
+.workspace-registry-node-count { grid-column: 2; overflow-wrap: anywhere; color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-node-count.no-directories { color: var(--warning-strong); }
+.workspace-registry-tree-children { display: block; list-style: none; margin: var(--space-1) 0 var(--space-1) var(--space-3); padding: 0 0 0 var(--space-2); border-left: 1px solid var(--border-strong); }
+.workspace-registry-tree-empty { margin: 0; padding: var(--space-4) var(--space-3); color: var(--text-muted); font-size: var(--fs-body); }
+.workspace-registry-project-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: var(--space-3); overflow: hidden; }
+.workspace-registry-project-detail > header, .workspace-registry-detail-tabs { flex: 0 0 auto; }
+.workspace-registry-detail-tabs { display: flex; gap: var(--space-3); border-bottom: 1px solid var(--border); margin-bottom: var(--space-3); }
+.workspace-registry-detail-tabs button { min-height: var(--control-h-lg); padding: var(--space-2) 0; border: 0; border-bottom: 2px solid transparent; color: var(--text-muted); background: transparent; font: inherit; font-size: var(--fs-body); cursor: pointer; }
+.workspace-registry-detail-tabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+.workspace-registry-detail-tabs span { font-size: var(--fs-meta); }
+.workspace-registry-history-pane { min-width: 0; min-height: 0; flex: 1 1 0; display: flex; }
+.workspace-registry-detail-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); padding-bottom: var(--space-4); border-bottom: 1px solid var(--border); }
+.workspace-registry-detail-title { min-width: 0; }
+.workspace-registry-project-title-line { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.workspace-registry-project-title-line h3 { min-width: 0; margin: 0; font-size: var(--fs-title); font-weight: 650; overflow-wrap: anywhere; }
+.workspace-registry-detail-title > p { margin: var(--space-2) 0 0; color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-detail-section { min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.workspace-registry-section-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-2); }
+.workspace-registry-section-head > div { display: grid; gap: var(--space-1); }
+.workspace-registry-section-head h4 { margin: 0; font-size: var(--fs-title); }
+.workspace-registry-section-head span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-detail-paths { list-style: none; margin: 0; padding: 0; }
+.workspace-registry-detail-paths li { min-width: 0; display: grid; grid-template-columns: var(--space-4) minmax(0, 1fr); align-items: center; gap: var(--space-2); padding: var(--space-3) 0; border-top: 1px solid var(--border); }
+.workspace-registry-detail-paths li > svg { color: var(--text-muted); }
+.workspace-registry-detail-paths .pill, .workspace-registry-detail-paths .workspace-registry-unlink { grid-column: 2; justify-self: start; }
+.workspace-registry-path-actions { grid-column: 2; }
+.workspace-registry-detail-path-copy { min-width: 0; display: grid; gap: var(--space-1); }
+.workspace-registry-detail-path-copy > span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-path { min-width: 0; color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-meta); overflow-wrap: anywhere; word-break: break-word; }
+.workspace-registry-detail-path-copy code { white-space: normal; }
+.workspace-registry-unlink { white-space: nowrap; }
+.workspace-registry-no-paths { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3); border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--text-muted); background: var(--surface-muted); font-size: var(--fs-body); line-height: 1.5; }
+.workspace-registry-no-paths svg { flex: 0 0 auto; }
+.workspace-registry-detail-empty, .workspace-registry-no-projects { min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-3); color: var(--text-muted); text-align: center; font-size: var(--fs-body); }
+.workspace-registry-no-projects { grid-column: 1 / -1; padding: var(--space-5); }
+.workspace-registry-no-projects strong { color: var(--text); font-size: var(--fs-title); }
+.workspace-registry-no-projects span { max-width: 42ch; font-size: var(--fs-body); line-height: 1.5; }
+.workspace-registry-directory-view, .workspace-registry-pending-view { display: flex; flex-direction: column; gap: var(--space-3); }
+.workspace-registry-list-head { flex-shrink: 0; }
+.workspace-registry-pending-view { overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.workspace-registry-list-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.workspace-registry-list-head h3 { margin: 0 0 var(--space-1); font-size: var(--fs-title); }
+.workspace-registry-directory-search { width: min(320px, 100%); }
+.workspace-registry-table-wrap { min-width: 0; min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.workspace-registry-table thead { position: sticky; top: 0; z-index: 1; background: var(--surface); }
+.workspace-registry-table { width: 100%; min-width: 620px; table-layout: fixed; }
+.workspace-registry-table th:first-child { width: 52%; }
+.workspace-registry-table th:nth-child(2) { width: 25%; }
+.workspace-registry-table th:nth-child(3) { width: 110px; }
+.workspace-registry-table th:last-child { width: 118px; }
+.workspace-registry-table td.workspace-registry-path { max-width: none; overflow-wrap: anywhere; }
+.workspace-registry-table td.workspace-registry-path code { white-space: normal; }
+.workspace-registry-project-link { min-width: var(--space-5); min-height: var(--control-h-sm); padding: var(--space-1); border: 0; border-radius: var(--radius-sm); color: var(--primary); background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.workspace-registry-project-link:hover { text-decoration: underline; }
+.workspace-registry-empty { margin: 0; padding: var(--space-5) var(--space-3); color: var(--text-muted); font-size: var(--fs-body); text-align: center; }
+.workspace-registry-candidates { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.workspace-registry-candidates li { min-width: 0; display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.workspace-registry-candidates p { margin: 0; }
+.workspace-registry-candidate-head { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.workspace-registry-candidate-head > div { min-width: 0; display: grid; gap: var(--space-1); margin-right: auto; }
+.workspace-registry-candidate-head > div span { color: var(--text-muted); font-size: var(--fs-meta); }
+.workspace-registry-candidates .input { min-width: 0; max-width: 100%; flex: 1 1 220px; }
+.workspace-registry-candidate-actions { flex-wrap: wrap; }
+/* WUI-01/02: native top layer sits above the app menu without a z-index contest. */
+.workspace-registry-editor { position: fixed; inset: 0 0 0 auto; margin: 0; width: min(460px, 100%); max-width: 100%; height: 100dvh; max-height: 100dvh; border: 0; border-left: 1px solid var(--border); box-shadow: var(--shadow-3); }
+.workspace-registry-editor[open] { display: flex; flex-direction: column; }
+.workspace-registry-editor-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border); }
+.workspace-registry-editor-head strong { font-size: var(--fs-title); }
+.workspace-registry-form { min-height: 0; display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4); overflow: auto; }
+.workspace-registry-form label, .workspace-registry-form-directory { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); color: var(--text-muted); font-size: var(--fs-body); }
+.workspace-registry-form input, .workspace-registry-form select, .workspace-registry-form textarea { max-width: 100%; min-width: 0; font: inherit; }
+.workspace-registry-form-directory > span { font-weight: 500; }
+.workspace-registry-directory-picker { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.workspace-registry-directory-picker code { min-width: 0; flex: 1 1 120px; color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-meta); overflow-wrap: anywhere; }
+.workspace-registry-form-directory > small { color: var(--text-muted); font-size: var(--fs-meta); line-height: 1.5; }
+.workspace-registry-form-actions { padding-top: var(--space-1); }
+.workspace-registry-spacer { flex: 1; }
+/* Short desktop windows need a reading area, not a second row of page introduction. */
+@media (max-height: 720px) {
+  .workspace-registry { gap: var(--space-2); }
+  .workspace-registry-head { align-items: center; }
+  .workspace-registry-head h2 { margin: 0; }
+  .workspace-registry-head p { display: none; }
+  .workspace-registry-detail-head { padding-bottom: var(--space-2); }
+  .workspace-registry-detail-tabs { margin-bottom: var(--space-2); }
+  .workspace-registry-history-pane .workspace-session-history-head { gap: var(--space-1); margin-bottom: var(--space-1); }
+}
+@container workspace-registry (max-width: 680px) {
+  .workspace-registry-project-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .workspace-registry-project-browser { display: none; }
+  .workspace-registry-project-picker { min-width: 0; display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); background: var(--surface-muted); font-size: var(--fs-meta); }
+  .workspace-registry-project-picker > span { flex: 0 0 auto; }
+  .workspace-registry-project-picker select { min-width: 0; width: 100%; font-size: var(--fs-body); }
+  .workspace-registry-project-detail { padding: var(--space-3); }
+  .workspace-registry-directory-search { width: 100%; }
+  .workspace-registry-candidate-actions > * { flex: 1 1 100%; }
+}

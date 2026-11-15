@@ -256,6 +256,10 @@ fn chat_tool_to_responses(tool: &Value) -> Option<Value> {
     let mut translated = json!({
         "type": "function",
         "name": name,
+        // Responses may normalize omitted strict to a strict schema, unlike
+        // Chat. Preserve optional fields (notably sandbox escalation/cursors)
+        // instead of forcing models to invent values for every property.
+        "strict": function.get("strict").and_then(Value::as_bool).unwrap_or(false),
         "parameters": function
             .get("parameters")
             .cloned()
@@ -263,9 +267,6 @@ fn chat_tool_to_responses(tool: &Value) -> Option<Value> {
     });
     if let Some(description) = function.get("description").filter(|value| !value.is_null()) {
         translated["description"] = description.clone();
-    }
-    if let Some(strict) = function.get("strict").and_then(Value::as_bool) {
-        translated["strict"] = json!(strict);
     }
     Some(translated)
 }
@@ -771,6 +772,21 @@ impl ChatStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_optional_tool_arguments_remain_optional_in_responses() {
+        let parameters = json!({"type":"object","properties":{
+            "file_path":{"type":"string"},
+            "sandbox_permissions":{"type":"string","enum":["workspace-write","danger-full-access"]},
+            "justification":{"type":"string"}
+        },"required":["file_path"]});
+        let mut tool = json!({"type":"function","function":{"name":"write","parameters":parameters}});
+        let translated = chat_tool_to_responses(&tool).unwrap();
+        assert_eq!(translated["strict"], false);
+        assert_eq!(translated["parameters"], parameters);
+        tool["function"]["strict"] = json!(true);
+        assert_eq!(chat_tool_to_responses(&tool).unwrap()["strict"], true);
+    }
 
     #[test]
     fn request_drops_tool_choice_when_no_tool_survives_translation() {

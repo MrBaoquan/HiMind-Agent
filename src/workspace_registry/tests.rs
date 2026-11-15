@@ -9,14 +9,34 @@ use super::*;
 /// 建一个临时目录 + 登记表路径。返回值里的 `PathBuf` 是目录，调用方
 /// 在测试结束时靠它清理；仓里没有 `tempfile` 依赖，沿用 `workspace_lease`
 /// 的 `std::env::temp_dir()` 写法。
+///
+/// **必须能回退**：有些机器的 `%TEMP%` 带着 DSH 沙箱留下的 capability-SID
+/// ACE，Rust 进程在那里 `create_dir` 会拿到 `拒绝访问`，而同一台机器上用别的
+/// 运行时（Python/Node）却能建出来。那是环境状态，不是被测代码的行为——
+/// 遇到就换到工作区的 `.himind/` 下，而不是让 20 个用例一起变红。
 fn temp_registry() -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
+    let name = format!(
         "himind-workspace-registry-{}-{}",
         std::process::id(),
         NEXT_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    (dir.clone(), dir.join("workspace-registry.json"))
+    );
+    let candidates = [
+        std::env::temp_dir().join(&name),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".himind")
+            .join("test-tmp")
+            .join(&name),
+    ];
+    for dir in candidates {
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => return (dir.clone(), dir.join("workspace-registry.json")),
+            Err(error) => eprintln!(
+                "temp_registry: {} 不可用（{error}），换下一个落点",
+                dir.display()
+            ),
+        }
+    }
+    panic!("没有可写的临时目录：%TEMP% 与 <工作区>/.himind/test-tmp 都建不出来");
 }
 
 static NEXT_TEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -462,15 +482,12 @@ fn candidate_flow_records_and_accepts() {
     let (root_id, _sub_id) = seed(&path);
 
     // 造一个真的带 .git 的目录，让 suggest 能推断出来。
-    let work_dir = std::env::temp_dir().join(format!(
-        "himind-workspace-registry-project-{}-{}",
-        std::process::id(),
-        NEXT_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&work_dir).unwrap();
+    // 落点同样走可回退选择：这条用例要读真实目录，不能只靠内存里的路径。
+    let (work_dir, registry_path) = temp_registry();
     let project_dir = work_dir.join("new-thing");
     fs::create_dir_all(project_dir.join(".git")).unwrap();
     let project_path = normalize_path(&project_dir.to_string_lossy()).unwrap();
+    drop(registry_path);
 
     Registry::update_at(&path, |registry| {
         let suggestions = suggest_candidates(registry, &project_path);
@@ -580,4 +597,173 @@ fn registry_file_lives_under_data_for_backup_coverage() {
         path.display()
     );
     assert!(path.ends_with("workspace-registry.json"));
+}
+
+// ---------------------------------------------------------------------------
+// 从工作日志导入
+// ---------------------------------------------------------------------------
+
+fn work_log_fixture() -> WorkLogFile {
+    WorkLogFile {
+        schema_version: "work-log-projects.v2".to_string(),
+        projects: vec![
+            WorkLogProject {
+                id: "pj-1".to_string(),
+                name: "扩展仓库".to_string(),
+                aliases: vec!["himind-extensions".to_string()],
+                kind: "平台产品".to_string(),
+                status: "active".to_string(),
+                external_id: "prj_abc".to_string(),
+                paths: vec![WorkLogPath {
+                    path: "F:/WebProjects/himind-extensions".to_string(),
+                    kind: "repo".to_string(),
+                }],
+            },
+            WorkLogProject {
+                id: "pj-2".to_string(),
+                name: "没有路径的项目".to_string(),
+                kind: "交付项目".to_string(),
+                status: "active".to_string(),
+                ..Default::default()
+            },
+            WorkLogProject {
+                id: "pj-3".to_string(),
+                name: "路径被抢的项目".to_string(),
+                kind: "未知分类".to_string(),
+                paths: vec![
+                    WorkLogPath {
+                        path: "F:/WebProjects/himind-extensions".to_string(),
+                        kind: "repo".to_string(),
+                    },
+                    WorkLogPath {
+                        path: "relative/not/absolute".to_string(),
+                        kind: "repo".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+    }
+}
+
+#[test]
+fn import_plan_flags_conflicts_and_maps_kinds_without_writing() {
+    let (_dir, path) = temp_registry();
+    let registry = Registry::default();
+    let mut plan = plan_work_log_import(&registry, &work_log_fixture());
+
+    assert_eq!(plan.total_projects, 3);
+    assert_eq!(plan.create_count, 3, "登记表为空时三条都是新建");
+    assert_eq!(plan.bind_count, 1, "只有第一条路径可绑定");
+    // 被抢的路径 + 相对路径各跳过一条。
+    assert_eq!(plan.skipped_paths.len(), 2);
+    assert!(
+        plan.skipped_paths
+            .iter()
+            .any(|item| item.note.contains("本批次的项目")),
+        "冲突说明要指出撞的是谁：{:?}",
+        plan.skipped_paths
+    );
+    assert!(plan
+        .skipped_paths
+        .iter()
+        .any(|item| item.note.contains("不是绝对路径")));
+
+    // 类型映射：认不出的落 other 并留一条说明。
+    let unknown = plan
+        .entries
+        .iter()
+        .find(|item| item.work_log_id == "pj-3")
+        .unwrap();
+    assert_eq!(unknown.kind, KIND_OTHER);
+    assert!(unknown.notes.iter().any(|note| note.contains("没有对应项")));
+
+    // 没有路径的项目也要留一条说明，而不是静默变成空项目。
+    let empty = plan
+        .entries
+        .iter()
+        .find(|item| item.work_log_id == "pj-2")
+        .unwrap();
+    assert!(empty.notes.iter().any(|note| note.contains("没有路径")));
+
+    // dry-run 不写盘：计划生成过，登记表文件仍不存在。
+    assert!(!path.exists(), "dry-run 不应写盘");
+    plan.dry_run = true;
+}
+
+#[test]
+fn import_applies_identity_bindings_and_links() {
+    let (_dir, path) = temp_registry();
+    let source = work_log_fixture();
+    let mut plan = None;
+    Registry::update_at(&path, |registry| {
+        let computed = plan_work_log_import(registry, &source);
+        apply_work_log_import(registry, &source, &computed)?;
+        plan = Some(computed);
+        Ok(())
+    })
+    .unwrap();
+    assert!(plan.is_some());
+
+    let registry = Registry::load_from(&path).unwrap();
+    assert_eq!(registry.projects.len(), 3);
+
+    let imported = registry.find_project("扩展仓库").expect("项目应已导入");
+    assert_eq!(imported.kind, KIND_PRODUCT);
+    assert_eq!(imported.links.work_log_project_id, "pj-1");
+    assert_eq!(imported.links.work_log_project_name, "扩展仓库");
+    assert_eq!(imported.links.workbench_project_id, "prj_abc");
+    assert!(imported.description.contains("平台产品"));
+
+    let bindings = registry.workspaces_of(&imported.id);
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source, SOURCE_IMPORT);
+    assert_eq!(bindings[0].confidence, CONFIDENCE_EXACT);
+
+    // 导入后能按路径解析出项目——这是这次迁移真正的目的。
+    let hit = resolve_path(&registry, "F:/WebProjects/himind-extensions/plugins/x")
+        .unwrap()
+        .expect("导入的绑定应能解析");
+    assert_eq!(hit.project.id, imported.id);
+}
+
+#[test]
+fn import_merges_into_existing_project_without_renaming_it() {
+    let (_dir, path) = temp_registry();
+    // 先在登记表里放一个同名项目，名字与工作日志不同（用户后来改过）。
+    Registry::update_at(&path, |registry| {
+        upsert_project(
+            registry,
+            ProjectInput {
+                name: "扩展仓库".to_string(),
+                aliases: vec!["旧别名".to_string()],
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+
+    let source = work_log_fixture();
+    Registry::update_at(&path, |registry| {
+        let plan = plan_work_log_import(registry, &source);
+        assert_eq!(plan.merge_count, 1);
+        apply_work_log_import(registry, &source, &plan)
+    })
+    .unwrap();
+
+    let registry = Registry::load_from(&path).unwrap();
+    let merged = registry.find_project("扩展仓库").unwrap();
+    // 名字不被覆盖，别名是并集，链接补上。
+    assert_eq!(merged.aliases.iter().any(|item| item == "旧别名"), true);
+    assert_eq!(
+        merged
+            .aliases
+            .iter()
+            .any(|item| item == "himind-extensions"),
+        true
+    );
+    assert_eq!(merged.links.work_log_project_id, "pj-1");
+    // 项目总数 = 原有 1 + 另外两条新建。
+    assert_eq!(registry.projects.len(), 3);
 }

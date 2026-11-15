@@ -48,6 +48,10 @@ pub(crate) fn run_bridge_io<R: BufRead, W: Write>(
         )
     })?;
     let mut pipe_reader = BufReader::new(pipe.try_clone()?);
+    let mut bridge_client = json!({"name":"himind-agent-mcp-bridge","version":env!("CARGO_PKG_VERSION")});
+    if let (Ok(id), Ok(workspace)) = (std::env::var("HIMIND_RUNTIME_WORKSPACE_LEASE"), std::env::var("HIMIND_RUNTIME_LEASE_WORKSPACE")) {
+        bridge_client["runtime_lease"] = json!({"lease_id":id,"workspace_root":workspace});
+    }
     write_frame(
         &mut pipe,
         &ServiceFrame::Hello {
@@ -55,7 +59,7 @@ pub(crate) fn run_bridge_io<R: BufRead, W: Write>(
             token: discovery.token,
             profile: discovery.profile,
             state_hash: discovery.state_hash,
-            client: json!({"name":"himind-agent-mcp-bridge","version":env!("CARGO_PKG_VERSION")}),
+            client: bridge_client,
         },
     )?;
     let session_id = match read_frame::<ServiceEvent, _>(&mut pipe_reader)? {

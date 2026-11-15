@@ -1,0 +1,45 @@
+{
+  "files": [
+    {
+      "sha256": "E765A260E1ED7BDC06F3B545235B04E725B62C3D4983F56DCC8B45C04EB5CE67",
+      "path": "frontend/src/pages/WorkspaceRegistryPage.tsx"
+    },
+    {
+      "sha256": "BF59D7BDCC9BA23EE725BF8055504221A974F43D0054F3D1B41190A6FBE38BCC",
+      "path": "frontend/src/pages/WorkspaceRegistryPage.css"
+    },
+    {
+      "sha256": "FA0A80502878C9C2A141CE5CCAEEA20C44BF8E39881CCF1ABCE7D2768EE91A56",
+      "path": "frontend/src/pages/WorkspaceSessionHistoryPanel.tsx"
+    },
+    {
+      "sha256": "2297D6B9836FBB3F01903F8C7E9FA3C4D6C0C81B3F2177DAE6B8450968A33A01",
+      "path": "frontend/src/pages/WorkspaceSessionHistoryPanel.css"
+    },
+    {
+      "sha256": "760D8FD60ABEC962D72EEC5191C5FE06634D9754F355C3C9D3022132E6CABA0E",
+      "path": "frontend/scripts/check-workspace-ui.browser.mjs"
+    },
+    {
+      "sha256": "E75CBDE8D0EE653694178FEAABD45155501E253782CBE16F0A474B5A9C0E60BF",
+      "path": "frontend/scripts/check-session-history.browser.mjs"
+    },
+    {
+      "sha256": "A742D7AF65D9F3A8311BAF71DEC67EB4389D3848359EA1448899A716708BD6D3",
+      "path": "frontend/scripts/fixtures/workspace-ui-review.tsx"
+    },
+    {
+      "sha256": "221D3FFE311864A95422FFC113EF8B7D91FA8A97F9F906E9C5E4487EB3702107",
+      "path": "frontend/scripts/fixtures/workspace-session-history.tsx"
+    },
+    {
+      "sha256": "EF5A3D93037D7F232DD745830AC7074D10D19C26F6CAAE9B6BD347B44797ED8F",
+      "path": "docs/workspace-experience-plan-20261112.md"
+    },
+    {
+      "sha256": "45E432444D7AA7096A60F904B5695A906B112D4F4CA94D7F1E10E307D0DE8FDC",
+      "path": "docs/workspace-session-history.md"
+    }
+  ],
+  "captured_at": "2026-11-12T08:32:41.5138563+08:00"
+}

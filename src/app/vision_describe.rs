@@ -16,6 +16,30 @@ use crate::store::ai_services::{self, AIServiceProtocol, CustomAIService, CAP_VI
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_EDGE: u32 = 1024;
 
+/// Return pixels to the calling model through standard MCP image content.
+/// This reads evidence without changing its filename or using another model.
+pub(crate) fn read_image(input: &Value) -> Result<Value, Box<dyn Error>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let root = PathBuf::from(string_field(input, "workspace_root").ok_or("workspace_root is required")?).canonicalize()?;
+    let requested = PathBuf::from(string_field(input, "path").ok_or("path is required")?);
+    let target = if requested.is_absolute() { requested } else { root.join(requested) }.canonicalize()?;
+    if !target.starts_with(&root) { return Err("image path is outside the requested workspace".into()); }
+    let mut bytes = Vec::new();
+    fs::File::open(&target)?.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES { return Err("image exceeds 20 MiB limit".into()); }
+    let image = image::load_from_memory(&bytes)?;
+    let width = image.width();
+    let height = image.height();
+    let edge = input.get("max_edge").and_then(Value::as_u64).unwrap_or(1536).clamp(128, 2048) as u32;
+    let (payload, mime) = encode_pixels(image, edge)?;
+    Ok(json!({"content":[{"type":"image","mimeType":mime,
+        "data":base64::engine::general_purpose::STANDARD.encode(payload)}],
+        "structuredContent":{"path":target,"original_sha256":format!("{:x}",Sha256::digest(&bytes)),
+            "original_width":width,"original_height":height,"max_edge":edge,
+            "source_unchanged":true},"isError":false}))
+}
+
 pub(crate) fn describe(input: &Value) -> Result<Value, Box<dyn Error>> {
     let path = string_field(input, "path").unwrap_or_default();
     let image_input = string_field(input, "image");
@@ -111,6 +135,9 @@ pub(crate) fn describe(input: &Value) -> Result<Value, Box<dyn Error>> {
     if text.trim().is_empty() {
         return Err("视觉模型返回了空内容".into());
     }
+    if let Err(error) = crate::app::ai_provider_import::record_image_input_observed(&service, &model) {
+        eprintln!("visual capability observation could not be persisted: {error}");
+    }
     Ok(json!({
         "text": text,
         "model": model,
@@ -157,7 +184,7 @@ fn encode_image(path: &str, max_edge: u32) -> Result<(Vec<u8>, &'static str), Bo
     if info.len() > MAX_IMAGE_BYTES {
         return Err(format!("图片超过 {} MiB 上限", MAX_IMAGE_BYTES / 1024 / 1024).into());
     }
-    let image = image::open(&target)?;
+    let image = image::ImageReader::open(&target)?.with_guessed_format()?.decode()?;
     encode_pixels(image, max_edge)
 }
 
@@ -169,6 +196,35 @@ fn encode_data_url(value: &str, max_edge: u32) -> Result<(Vec<u8>, &'static str)
     }
     let image = image::load_from_memory(&raw)?;
     encode_pixels(image, max_edge)
+}
+
+#[cfg(test)]
+mod format_tests {
+    #[test]
+    fn image_decode_uses_content_when_extension_is_wrong() {
+        let path = std::env::temp_dir().join(format!("himind-image-format-{}.png", rand::random::<u64>()));
+        image::DynamicImage::new_rgb8(4, 4).save_with_format(&path, image::ImageFormat::Jpeg).unwrap();
+        assert!(super::encode_image(path.to_str().unwrap(), 128).is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mcp_image_read_returns_pixels_without_rewriting_evidence_or_escaping_workspace() {
+        let root = std::env::temp_dir().join(format!("himind-image-read-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("evidence.png");
+        image::DynamicImage::new_rgb8(4, 4).save_with_format(&path, image::ImageFormat::Jpeg).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let response = super::read_image(&serde_json::json!({"workspace_root":root,"path":"evidence.png"})).unwrap();
+        assert_eq!(response["content"][0]["type"], "image");
+        assert_eq!(response["content"][0]["mimeType"], "image/jpeg");
+        assert!(!response["content"][0]["data"].as_str().unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let child = root.join("child"); std::fs::create_dir(&child).unwrap();
+        assert!(super::read_image(&serde_json::json!({"workspace_root":child,"path":"../evidence.png"}))
+            .unwrap_err().to_string().contains("outside"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 fn encode_pixels(

@@ -1,0 +1,3 @@
+.modal-surface { padding: 0; color: var(--text); background: var(--surface); }
+.modal-surface::backdrop { background: var(--modal-scrim); }
+.modal-surface.confirm-modal { max-width: calc(100vw - var(--space-6)); max-height: calc(100dvh - var(--space-6)); overflow: auto; }

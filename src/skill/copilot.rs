@@ -830,6 +830,7 @@ mod tests {
             version_root,
             current: true,
             previous_version: None,
+            development: false,
         }
     }
 

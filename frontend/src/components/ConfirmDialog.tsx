@@ -1,5 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
 import { X } from 'lucide-react';
+import { ModalSurface } from './ModalSurface';
 
 /**
  * 破坏性操作的统一确认弹窗。
@@ -52,19 +53,6 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
     current?.resolve(accepted);
   }, []);
 
-  // 确认框是模态的：Esc 只关它，不再往下传，免得顺手关掉底下的抽屉或页面弹窗。
-  useEffect(() => {
-    if (!pending) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      settle(false);
-    };
-    document.addEventListener('keydown', onKeyDown, true);
-    return () => document.removeEventListener('keydown', onKeyDown, true);
-  }, [pending, settle]);
-
   const value = useMemo(() => request, [request]);
   const titleId = pending ? `confirm-dialog-title-${pending.id}` : undefined;
 
@@ -72,34 +60,28 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
     <ConfirmContext.Provider value={value}>
       {children}
       {pending ? (
-        <div
-          className="modal-backdrop is-confirm"
-          role="presentation"
-          onClick={event => { if (event.currentTarget === event.target) settle(false); }}
-        >
-          <section className="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
-            <div className="modal-header">
-              <div>
-                <h3 id={titleId}>{pending.options.title}</h3>
-                {pending.options.description ? <p>{pending.options.description}</p> : null}
-              </div>
-              <button type="button" className="btn btn-icon" title="关闭" aria-label="关闭" onClick={() => settle(false)}><X size={16} /></button>
+        <ModalSurface key={pending.id} className="modal confirm-modal" titleId={titleId!} onClose={() => settle(false)}>
+          <div className="modal-header">
+            <div>
+              <h3 id={titleId}>{pending.options.title}</h3>
+              {pending.options.description ? <p>{pending.options.description}</p> : null}
             </div>
-            <div className="modal-body">
-              <div className="modal-actions">
-                {/* 焦点默认落在取消上：破坏性动作不该被一次回车确认掉。 */}
-                <button type="button" className="btn" autoFocus onClick={() => settle(false)}>{pending.options.cancelText || '取消'}</button>
-                <button
-                  type="button"
-                  className={pending.options.danger === false ? 'btn btn-primary' : 'btn btn-danger'}
-                  onClick={() => settle(true)}
-                >
-                  {pending.options.confirmText || '确认'}
-                </button>
-              </div>
+            <button type="button" className="btn btn-icon" title="关闭" aria-label="关闭" onClick={() => settle(false)}><X size={16} /></button>
+          </div>
+          <div className="modal-body">
+            <div className="modal-actions">
+              {/* 焦点默认落在取消上：破坏性动作不该被一次回车确认掉。 */}
+              <button type="button" className="btn" data-initial-focus onClick={() => settle(false)}>{pending.options.cancelText || '取消'}</button>
+              <button
+                type="button"
+                className={pending.options.danger === false ? 'btn btn-primary' : 'btn btn-danger'}
+                onClick={() => settle(true)}
+              >
+                {pending.options.confirmText || '确认'}
+              </button>
             </div>
-          </section>
-        </div>
+          </div>
+        </ModalSurface>
       ) : null}
     </ConfirmContext.Provider>
   );

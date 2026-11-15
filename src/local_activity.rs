@@ -200,6 +200,18 @@ impl ChildFacts {
     }
 }
 
+/// Only project explicit context fields; run names are not ownership evidence.
+fn activity_context(context: &Value) -> Value {
+    let input = &context["input"];
+    let text = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or_default().trim();
+    json!({
+        "mission_id": text("mission_id"),
+        "mission_task_id": if text("mission_id").is_empty() { "" } else { text("task_id") },
+        "workspace_root": text("workspace_root"),
+        "source_client": text("source_client"),
+    })
+}
+
 /// 本机工作流运行，投影自本地运行台账。
 fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
     let ledger = LocalRunLedger::open_default()?;
@@ -242,6 +254,8 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
             continue;
         }
         let interaction = ledger.get_interaction(&run.interaction_id)?;
+        let context = activity_context(&interaction.as_ref()
+            .map(|item| item.business_context.clone()).unwrap_or(Value::Null));
         let workflow = interaction
             .as_ref()
             .and_then(|interaction| interaction.business_context.get("workflow"));
@@ -301,6 +315,10 @@ fn ledger_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
         items.push(json!({
             "id": run.run_id,
             "source": "workflow",
+            "mission_id": context["mission_id"],
+            "mission_task_id": context["mission_task_id"],
+            "workspace_root": context["workspace_root"],
+            "source_client": context["source_client"],
             "title": title,
             "subtitle": subtitle,
             "status": run_status_key(&run.status),
@@ -378,6 +396,9 @@ fn skill_items(limit: usize) -> Result<Vec<Value>, Box<dyn Error>> {
         items.push(json!({
             "id": record.run_id,
             "source": if record.schedule_id.trim().is_empty() { "skill" } else { "schedule" },
+            "workspace_root": record.workspace,
+            "trigger_kind": if record.schedule_id.trim().is_empty() { "skill" } else { "schedule" },
+            "output_path": record.output_path,
             "title": title,
             "subtitle": subtitle,
             "status": skill_status_key(&record.status),
@@ -430,6 +451,16 @@ pub(crate) fn list(limit: Option<usize>) -> Result<Vec<Value>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_uses_explicit_input_only() {
+        assert_eq!(activity_context(&json!({"workflow":{"id":"com.himind.mission.fake"}}))["mission_id"], "");
+        let fields = activity_context(&json!({"input":{"mission_id":" m1 ", "task_id":"t1", "workspace_root":"F:/project"}}));
+        assert_eq!(fields["mission_id"], "m1");
+        assert_eq!(fields["mission_task_id"], "t1");
+        assert_eq!(fields["workspace_root"], "F:/project");
+        assert_eq!(activity_context(&json!({"input":{"task_id":"unowned"}}))["mission_task_id"], "");
+    }
 
     fn child(delegated: bool, terminal: bool) -> ChildFacts {
         ChildFacts {

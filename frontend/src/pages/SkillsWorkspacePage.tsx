@@ -27,7 +27,7 @@ import { EmptyState, Pill, Tags } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { ExtensionIcon } from '../components/ExtensionIcon';
 import { OperationPlanCard } from '../components/OperationPlanCard';
-import type { ClientCapabilityMatrix, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillWorkspaceStatus } from '../services/agentApi';
+import type { ClientCapabilityMatrix, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillDocument, SkillInstallPlan, SkillWorkspaceStatus } from '../services/agentApi';
 import { compareSemanticVersions, installActionLabel } from './marketCatalog';
 import { extensionStatus, primaryExtensionStatus, VERSION_CURRENT_LABEL, type ExtensionStatusKey, type ExtensionStatusPresentation } from '../data/statusPresentation';
 
@@ -57,6 +57,7 @@ type SkillsWorkspacePageProps = {
   onPurgeLocations: (skillId: string, locations: string[]) => void;
   onSetWorkspaceEnabled: (skillId: string, enabled: boolean) => void;
   onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>;
+  onLoadDocument: (skillId: string) => Promise<SkillDocument>;
   onPlanMarketplace: (skillId: string, version?: string) => Promise<SkillInstallPlan>;
   onInstallMarketplace: (skillId: string, version: string | undefined, optionalPluginIds: string[], clients: string[], location: string) => void;
   onPickSkillLocation: () => Promise<string>;
@@ -81,7 +82,7 @@ export function installedSkills(status: CodexSkillStatusResponse | null, desired
   return dashboardEnabled ? items.filter(item => !isManagedSkill(item, desired, marketplace)) : items;
 }
 
-export function SkillsWorkspacePage({ catalog, status, clientMatrix, workspace, mcpTargets, error, marketplace, desired, dashboardEnabled, catalogEnabled, availablePlugins, busyAction, installTargets, onSyncAll, onClearWorkspace, onSyncSkill, onInstallToLocation, onUpdateLocation, onRemoveLocation, onPurgeLocations, onSyncSkillClient, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onPickSkillLocation, onRepair, onUninstall, onUnregisterClient, onUnregisterClients, onOpenDirectory, onImportLocal, onImportGithub, onOpenExtensions }: SkillsWorkspacePageProps) {
+export function SkillsWorkspacePage({ catalog, status, clientMatrix, workspace, mcpTargets, error, marketplace, desired, dashboardEnabled, catalogEnabled, availablePlugins, busyAction, installTargets, onSyncAll, onClearWorkspace, onSyncSkill, onInstallToLocation, onUpdateLocation, onRemoveLocation, onPurgeLocations, onSyncSkillClient, onLoadVersions, onLoadDocument, onPlanMarketplace, onInstallMarketplace, onPickSkillLocation, onRepair, onUninstall, onUnregisterClient, onUnregisterClients, onOpenDirectory, onImportLocal, onImportGithub, onOpenExtensions }: SkillsWorkspacePageProps) {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState('');
   const [detailOpen, setDetailOpen] = useState(false);
@@ -185,7 +186,7 @@ export function SkillsWorkspacePage({ catalog, status, clientMatrix, workspace, 
 
         <main className="skill-detail">
 		  <button className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回技能列表</button>
-          {selected ? <SkillDetail key={selected.record.manifest.id} item={selected} workspace={workspace} clientStatus={status} clientMatrix={clientMatrix} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onInstallToLocation={onInstallToLocation} onUpdateLocation={onUpdateLocation} onRemoveLocation={(skillId, location) => setPendingLocationRemoval({ skillId, name: selected.record.manifest.name || skillId, locations: [location], stale: false })} onPurgeLocations={(skillId, locations) => setPendingLocationRemoval({ skillId, name: selected.record.manifest.name || skillId, locations, stale: true })} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />}
+          {selected ? <SkillDetail key={selected.record.manifest.id} item={selected} workspace={workspace} clientStatus={status} clientMatrix={clientMatrix} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onLoadDocument={onLoadDocument} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onInstallToLocation={onInstallToLocation} onUpdateLocation={onUpdateLocation} onRemoveLocation={(skillId, location) => setPendingLocationRemoval({ skillId, name: selected.record.manifest.name || skillId, locations: [location], stale: false })} onPurgeLocations={(skillId, locations) => setPendingLocationRemoval({ skillId, name: selected.record.manifest.name || skillId, locations, stale: true })} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />}
         </main>
       </section>
 
@@ -383,9 +384,9 @@ function aggregateClientState(states: CodexSkillStatusItem['client_state'][]): C
   return 'unsupported';
 }
 
-function SkillDetailTabs({ value, onChange }: { value: 'details' | 'versions'; onChange: (value: 'details' | 'versions') => void }) {
-  const tabOrder: Array<'details' | 'versions'> = ['details', 'versions'];
-  const selectTab = (next: 'details' | 'versions', focus = false) => {
+function SkillDetailTabs({ value, onChange }: { value: 'details' | 'versions' | 'document'; onChange: (value: 'details' | 'versions' | 'document') => void }) {
+  const tabOrder: Array<'details' | 'versions' | 'document'> = ['details', 'versions', 'document'];
+  const selectTab = (next: 'details' | 'versions' | 'document', focus = false) => {
     onChange(next);
     if (focus) requestAnimationFrame(() => document.getElementById(`skill-detail-tab-${next}`)?.focus());
   };
@@ -402,6 +403,7 @@ function SkillDetailTabs({ value, onChange }: { value: 'details' | 'versions'; o
   return <div className="extension-detail-tabs" role="tablist" aria-label="技能详情视图" aria-orientation="horizontal">
     <button id="skill-detail-tab-details" role="tab" aria-selected={value === 'details'} aria-controls="skill-detail-panel" tabIndex={value === 'details' ? 0 : -1} className={value === 'details' ? 'active' : ''} onKeyDown={event => onKeyDown(event, 0)} onClick={() => selectTab('details')}>详情</button>
     <button id="skill-detail-tab-versions" role="tab" aria-selected={value === 'versions'} aria-controls="skill-detail-panel" tabIndex={value === 'versions' ? 0 : -1} className={value === 'versions' ? 'active' : ''} onKeyDown={event => onKeyDown(event, 1)} onClick={() => selectTab('versions')}>版本</button>
+    <button id="skill-detail-tab-document" role="tab" aria-selected={value === 'document'} aria-controls="skill-detail-panel" tabIndex={value === 'document' ? 0 : -1} className={value === 'document' ? 'active' : ''} onKeyDown={event => onKeyDown(event, 2)} onClick={() => selectTab('document')}>SKILL.md</button>
   </div>;
 }
 
@@ -462,13 +464,15 @@ function SkillListItem({ item, selected, onSelect }: { item: CodexSkillStatusIte
   const railTone = degraded ? (item.readiness.state === 'blocked' ? 'danger' : 'warn') : stateTone(item.client_state);
   const reason = item.readiness.state === 'ready' ? undefined : readinessReasonText(item);
   const status = skillStatePresentation(item);
-  return <button className={`skill-browser-item ${selected ? 'selected' : ''}`} title={reason} onClick={() => onSelect(manifest.id)}><span className={`skill-state-rail ${railTone}`} /><span className="skill-browser-item-copy"><strong>{manifest.name}</strong><small>作者：{manifest.author || '未知作者'}</small><small>{manifest.description || manifest.id}</small></span>{status ? <span className={`skill-state-label ${status.tone}`}>{status.label}</span> : null}</button>;
+  // 列表说明只够两行，悬停时把完整用途和不可用原因一起给出，避免为了看一句话反复点进详情。
+  const tooltip = [manifest.description || manifest.id, reason].filter(Boolean).join('\n\n');
+  return <button className={`skill-browser-item ${selected ? 'selected' : ''}`} title={tooltip} onClick={() => onSelect(manifest.id)}><span className={`skill-state-rail ${railTone}`} /><span className="skill-browser-item-copy"><strong>{manifest.name}</strong><small>作者：{manifest.author || '未知作者'}{item.record.development ? ' · 开发直挂' : ''}</small><small>{manifest.description || manifest.id}</small></span>{status ? <span className={`skill-state-label ${status.tone}`}>{status.label}</span> : null}</button>;
 }
 
-function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onPlanVersion, onSync, onInstallToLocation, onUpdateLocation, onRemoveLocation, onPurgeLocations, onRepair, onUninstall, onSyncSkillClient, onUnregisterClient, onUnregisterClients, onOpenDirectory }: { item: CodexSkillStatusItem; workspace: SkillWorkspaceStatus; clientStatus: CodexSkillStatusResponse | null; clientMatrix: ClientCapabilityMatrix | null; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onInstallToLocation: (id: string) => void; onUpdateLocation: (id: string, location: string) => void; onRemoveLocation: (id: string, location: string) => void; onPurgeLocations: (skillId: string, locations: string[]) => void; onRepair: (id: string) => void; onUninstall: () => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void; onOpenDirectory: (path: string) => void }) {
+function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onLoadDocument, onPlanVersion, onSync, onInstallToLocation, onUpdateLocation, onRemoveLocation, onPurgeLocations, onRepair, onUninstall, onSyncSkillClient, onUnregisterClient, onUnregisterClients, onOpenDirectory }: { item: CodexSkillStatusItem; workspace: SkillWorkspaceStatus; clientStatus: CodexSkillStatusResponse | null; clientMatrix: ClientCapabilityMatrix | null; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onLoadDocument: (skillId: string) => Promise<SkillDocument>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onInstallToLocation: (id: string) => void; onUpdateLocation: (id: string, location: string) => void; onRemoveLocation: (id: string, location: string) => void; onPurgeLocations: (skillId: string, locations: string[]) => void; onRepair: (id: string) => void; onUninstall: () => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void; onOpenDirectory: (path: string) => void }) {
   const manifest = item.record.manifest;
   const actionBusy = Boolean(busyAction?.endsWith(manifest.id));
-  const [tab, setTab] = useState<'details' | 'versions'>('details');
+  const [tab, setTab] = useState<'details' | 'versions' | 'document'>('details');
   const [versions, setVersions] = useState<SkillVersionDisplay[]>(catalogPolicy ? [catalogPolicy] : [{ version: manifest.version, release_notes: manifest.release_notes || '' }]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState('');
@@ -511,19 +515,20 @@ function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlu
     return () => { active = false; };
   }, [catalogPolicy, manifest.id, onLoadVersions, tab]);
   return <>
-    <header className="skill-detail-header"><div className="skill-detail-title"><ExtensionIcon kind="skill" name={manifest.name || manifest.id} icon={item.record.icon} size={48} /><div><div className="skill-title-line"><h3>{manifest.name}</h3>{skillStatePresentation(item) ? <Pill kind={skillStatePresentation(item)!.tone}>{skillStatePresentation(item)!.label}</Pill> : null}</div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}</small></div></div><div className="skill-detail-actions">
+    <header className="skill-detail-header"><div className="skill-detail-title"><ExtensionIcon kind="skill" name={manifest.name || manifest.id} icon={item.record.icon} size={48} /><div><div className="skill-title-line"><h3>{manifest.name}</h3>{skillStatePresentation(item) ? <Pill kind={skillStatePresentation(item)!.tone}>{skillStatePresentation(item)!.label}</Pill> : null}</div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}{item.record.development ? ' · 开发直挂' : ''}</small></div></div><div className="skill-detail-actions">
       {/* 详情级动作只留两个：同步这一份技能、卸载。投放范围与安装目录都在对应分区里，
           不在这里重复堆入口——右上角堆成一排按钮会像补丁。 */}
       {item.available_actions.includes('repair') ? <button className="btn" disabled={actionBusy} onClick={() => onRepair(manifest.id)}>{item.client_state === 'modified' ? <><Wrench size={15} />修复并备份</> : <><PlugZap size={15} />重新同步</>}</button> : null}
       {item.available_actions.includes('uninstall') && catalogPolicy?.allow_uninstall !== false ? <button className="btn btn-danger-quiet" disabled={actionBusy} onClick={onUninstall}><Trash2 size={15} />卸载</button> : null}
     </div></header>
+    {manifest.description ? <p className="skill-detail-description">{manifest.description}</p> : null}
     <SkillDetailTabs value={tab} onChange={setTab} />
     <div id="skill-detail-panel" role="tabpanel" aria-labelledby={`skill-detail-tab-${tab}`} className="skill-detail-panel">
+    {item.record.development ? <div className="skill-detail-notice development"><Code2 size={16} /><div><strong>开发直挂技能</strong><span>{item.client_state === 'not_installed' ? '来自本机开发工作区，尚未投放到全局目录；可直接用于开发验证。' : '来自本机开发工作区，重新构建后即可生效。'}</span></div></div> : null}
     {item.readiness.state !== 'ready' ? <div className="skill-detail-notice"><CircleAlert size={16} /><div><strong>{item.readiness.state === 'blocked' ? '当前不可安装' : '部分功能不可用'}</strong><span>{readinessReasonText(item) || '请安装所需插件或更新 HiMind Agent。'}</span></div></div> : null}
     {item.client_state === 'modified' ? <div className="skill-detail-notice modified"><Wrench size={16} /><div><strong>检测到技能文件已被修改</strong><span>修复前会自动保留一份备份。</span></div></div> : null}
     {item.client_state === 'render_stale' ? <div className="skill-detail-notice modified"><RefreshCw size={16} /><div><strong>渲染方式与当前设置不一致</strong><span>文件内容与同步记录一致，重新同步即可按当前设置重排。</span></div></div> : null}
-    {tab === 'versions' ? <SkillVersionList versions={versions} currentVersion={item.installed_version || manifest.version} lockedLabel={catalogPolicy?.assignment === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={catalogPolicy ? onPlanVersion : undefined} /> : <>
-      {manifest.description ? <section className="skill-detail-section"><div className="skill-section-title"><div><strong>功能</strong></div></div><p className="skill-release-notes">{manifest.description}</p></section> : null}
+    {tab === 'versions' ? <SkillVersionList versions={versions} currentVersion={item.installed_version || manifest.version} lockedLabel={catalogPolicy?.assignment === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={catalogPolicy ? onPlanVersion : undefined} /> : tab === 'document' ? <SkillDocumentView skillId={manifest.id} onLoad={onLoadDocument} /> : <>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>投放目标</strong><small>这个技能可以被哪些 AI 工具使用</small></div></div><SkillClientAvailability status={clientStatus} clientMatrix={clientMatrix} skillId={manifest.id} busyAction={busyAction} allowUnregister={catalogPolicy?.allow_uninstall !== false} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} /></section>
       {/* 安装位置：技能库 → 落点目录 → 工具。与"项目/工作区"无关。 */}
       <section className="skill-detail-section">
@@ -555,10 +560,47 @@ function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlu
           {resolution?.reason ? <small className="skill-dependency-reason">{resolution.reason}</small> : null}
         </div>;
       })}{!manifest.plugin_dependencies?.length ? <span className="skill-section-empty">无依赖</span> : null}</div></section>
-      <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>技能 ID</span><code>{manifest.id}</code></div><div><span>作者</span><strong>{manifest.author || '未知作者'}</strong></div><div><span>来源</span><strong>{scopeLabel(manifest.scope)}</strong></div><div><span>最近同步</span><strong>{formatSyncedAt(item.last_synced_at)}</strong></div><div className="wide"><span>本地目录</span><code>{item.rendered_root || '--'}</code></div></div><div className="skill-file-summary"><span /><button className="text-action" disabled={!item.rendered} onClick={() => onOpenDirectory(item.rendered_root)}><FolderOpen size={14} />打开目录</button></div></details>
+      <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>技能 ID</span><code>{manifest.id}</code></div><div><span>作者</span><strong>{manifest.author || '未知作者'}</strong></div><div><span>来源</span><strong>{item.record.development ? '开发直挂' : scopeLabel(manifest.scope)}</strong></div><div><span>最近同步</span><strong>{formatSyncedAt(item.last_synced_at)}</strong></div><div className="wide"><span>本地目录</span><code>{item.rendered_root || '--'}</code></div></div><div className="skill-file-summary"><span /><button className="text-action" disabled={!item.rendered} onClick={() => onOpenDirectory(item.rendered_root)}><FolderOpen size={14} />打开目录</button></div></details>
     </>}
     </div>
   </>;
+}
+
+function SkillDocumentView({ skillId, onLoad }: { skillId: string; onLoad: (skillId: string) => Promise<SkillDocument> }) {
+  const [doc, setDoc] = useState<SkillDocument | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [reloadKey, setReloadKey] = useState(0);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    onLoad(skillId)
+      .then(result => { if (active) setDoc(result); })
+      .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [skillId, onLoad, reloadKey]);
+  if (loading) return <div className="skill-document-state" role="status"><BusyIndicator size={15} />正在读取 SKILL.md</div>;
+  if (error) return <div className="skill-document-state error" role="alert"><CircleAlert size={15} /><span>{error}</span><button type="button" className="text-action" onClick={() => setReloadKey(value => value + 1)}>重试</button></div>;
+  if (!doc) return null;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(doc.content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 剪贴板不可用时保持原文，不影响阅读。
+    }
+  };
+  return <section className="skill-document-panel">
+    <div className="skill-document-head">
+      <div><strong>SKILL.md 原文</strong><small>{doc.path} · v{doc.version} · {formatDocumentSize(doc.size)}</small></div>
+      <button type="button" className="btn" onClick={() => void copy()}>{copied ? '已复制' : '复制全文'}</button>
+    </div>
+    <pre className="skill-document-content" tabIndex={0} aria-label="SKILL.md 原文">{doc.content}</pre>
+  </section>;
 }
 
 function SkillClientAvailability({ status, clientMatrix, skillId, busyAction, allowUnregister, onSyncSkillClient, onUnregisterClient, onUnregisterClients }: { status: CodexSkillStatusResponse | null; clientMatrix: ClientCapabilityMatrix | null; skillId: string; busyAction: string | null; allowUnregister: boolean; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void }) {
@@ -645,6 +687,8 @@ function readinessReasonText(item: CodexSkillStatusItem) {
 
 function skillStatePresentation(item: CodexSkillStatusItem): ExtensionStatusPresentation | null {
   if (item.readiness.state === 'blocked') return extensionStatus('blocked');
+  // 开发直挂没有全局副本时用「开发」表达，避免和真正缺失的「未安装」混在一起。
+  if (item.record.development && item.client_state === 'not_installed') return { ...extensionStatus('not-installed'), label: '开发' };
   const keys: ExtensionStatusKey[] = [];
   if (item.client_state === 'failed') keys.push('error');
   if (item.client_state === 'outdated') keys.push('update');
@@ -660,6 +704,11 @@ function skillStatePresentation(item: CodexSkillStatusItem): ExtensionStatusPres
 
 function stateTone(state: CodexSkillStatusItem['client_state']) { if (state === 'installed' || state === 'managed_elsewhere') return 'success'; if (state === 'outdated' || state === 'modified' || state === 'render_stale') return 'warn'; if (state === 'not_installed') return 'neutral'; return 'danger'; }
 function scopeLabel(scope: string) { if (scope === 'builtin') return '系统内置'; if (scope === 'organization') return '技能市场'; if (scope === 'user') return '我的技能'; return scope || '--'; }
+function formatDocumentSize(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 function formatSyncedAt(value?: string | null) { if (!value) return '尚未同步'; const milliseconds = Number.parseInt(value.split('-')[0], 10); return Number.isFinite(milliseconds) ? new Date(milliseconds).toLocaleString('zh-CN', { hour12: false }) : value; }
 function formatPublishedAt(value?: string) { if (!value) return '发布时间未知'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('zh-CN'); }
 function installActionDescription(action: string) { return ({ satisfied: '已安装', install: '将一并安装', update: '将一并更新', blocked: '被组织策略阻止', unavailable: '当前不可用' } as Record<string, string>)[action] || '需要处理'; }
