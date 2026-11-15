@@ -1,0 +1,11 @@
+{
+  "command": "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+  "exit_code": 1,
+  "evidence": [
+    "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\required-check.stdout.log",
+    "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\required-check.stderr.log"
+  ],
+  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "stderr_sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+  "classification": "reviewer_actual_execution_not_host_VERIFY"
+}

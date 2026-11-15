@@ -1,0 +1,37 @@
+{
+  "passed": true,
+  "checks": [
+    {
+      "selector": "workflow::runtime::tests::",
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 0.01s"
+      ],
+      "log": "workflow__runtime__tests__.log"
+    },
+    {
+      "selector": "codex_full_access_preflight",
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1901 filtered out; finished in 0.00s"
+      ],
+      "log": "codex_full_access_preflight.log"
+    },
+    {
+      "selector": "confirmed_full_access_reaches_codex",
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1901 filtered out; finished in 0.09s"
+      ],
+      "log": "confirmed_full_access_reaches_codex.log"
+    },
+    {
+      "selector": "mission::store::tests::runtime_full_access",
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1901 filtered out; finished in 0.06s"
+      ],
+      "log": "mission__store__tests__runtime_full_access.log"
+    }
+  ]
+}

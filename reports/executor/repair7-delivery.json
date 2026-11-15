@@ -1,0 +1,304 @@
+{
+  "classification": "runtime7_worker_delivery_recommendation_not_Mission_acceptance",
+  "passed": true,
+  "candidate_id": "29da5f62bb588fa5f206ad6809320566666514c2b279d8ee10f4bf2b400d905d",
+  "checks": [
+    {
+      "name": "required-product",
+      "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+      "argv": [
+        "python",
+        "scripts/remediation/executor-lifecycle-repair-checks.py"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 33922,
+      "timed_out": false,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\required-product-1794570560634564100.log",
+      "sha256": "b2f7cb8781215e4abc9e4c2cad70896a29befef33e50b7e564aec1bce4f90da1",
+      "test_count": 455,
+      "classification": "runtime7_worker_exact_required_command_not_host_VERIFY",
+      "unique_test_count": 450,
+      "candidate_id": "29da5f62bb588fa5f206ad6809320566666514c2b279d8ee10f4bf2b400d905d",
+      "product_receipt": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\checks.json",
+      "product_receipt_sha256": "a7bc0da77509d933289475a31a793bacbc7b3bf3e38f93444a98ae3ac07df9dd"
+    },
+    {
+      "name": "required-assertion-2",
+      "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 125,
+      "timed_out": false,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\required-assertion-2-1794570594593780900.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_count": 0,
+      "classification": "runtime7_worker_exact_original_report_assertion",
+      "report_snapshot": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\required-assertion-2-input.json",
+      "report_snapshot_sha256": "1976dfdf9fee264c462397c9ea92f9c39244d84a6ecd0b7b3d28a94cafbe16fc"
+    },
+    {
+      "name": "required-assertion-3",
+      "command": "python -c \"import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 125,
+      "timed_out": false,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\required-assertion-3-1794570594716596900.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_count": 0,
+      "classification": "runtime7_worker_exact_original_report_assertion",
+      "report_snapshot": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\required-assertion-3-input.json",
+      "report_snapshot_sha256": "752cf09f8165c1b70c392df0baae1e2c7834e90ea1fea404ee91885a25899edb"
+    }
+  ],
+  "test_count": 455,
+  "unique_test_count": 450,
+  "domains": {
+    "lineage": {
+      "required_scenarios": 3,
+      "executed_required_scenarios": 3,
+      "test_count": 3,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "dispatch_contract_part_1",
+          "elapsed_ms": 7828,
+          "exit_code": 0,
+          "suite_test_count": 12,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\dispatch_contract_part_1-1794570563510842300.log"
+        },
+        {
+          "name": "mission_contract",
+          "elapsed_ms": 7953,
+          "exit_code": 0,
+          "suite_test_count": 55,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\mission_contract-1794570571333135000.log"
+        },
+        {
+          "name": "lineage",
+          "elapsed_ms": 1953,
+          "exit_code": 0,
+          "suite_test_count": 2,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\lineage-1794570583706587400.log"
+        }
+      ]
+    },
+    "ownership_windows": {
+      "required_scenarios": 3,
+      "executed_required_scenarios": 3,
+      "test_count": 3,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "ownership_windows",
+          "elapsed_ms": 9625,
+          "exit_code": 0,
+          "suite_test_count": 3,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\ownership_windows-1794570575286511200.log"
+        }
+      ]
+    },
+    "usage": {
+      "required_scenarios": 6,
+      "executed_required_scenarios": 6,
+      "test_count": 6,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "usage",
+          "elapsed_ms": 875,
+          "exit_code": 0,
+          "suite_test_count": 6,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\usage-1794570583800478400.log"
+        }
+      ]
+    },
+    "compatibility_and_input": {
+      "required_scenarios": 6,
+      "executed_required_scenarios": 6,
+      "test_count": 6,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "codex_contract_part_2",
+          "elapsed_ms": 6344,
+          "exit_code": 0,
+          "suite_test_count": 5,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\codex_contract_part_2-1794570569432052300.log"
+        },
+        {
+          "name": "workflow_codex_protocol_lifecycle_part_1",
+          "elapsed_ms": 15281,
+          "exit_code": 0,
+          "suite_test_count": 1,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\workflow_codex_protocol_lifecycle_part_1-1794570563509839600.log"
+        },
+        {
+          "name": "codex_contract_part_1",
+          "elapsed_ms": 17281,
+          "exit_code": 0,
+          "suite_test_count": 6,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\codex_contract_part_1-1794570563512841300.log"
+        },
+        {
+          "name": "workflow_runtime",
+          "elapsed_ms": 11422,
+          "exit_code": 0,
+          "suite_test_count": 28,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\workflow_runtime-1794570570366708100.log"
+        }
+      ]
+    },
+    "receipt_delivery": {
+      "required_scenarios": 12,
+      "executed_required_scenarios": 12,
+      "test_count": 12,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "workflow_runner_part_2",
+          "elapsed_ms": 5922,
+          "exit_code": 0,
+          "suite_test_count": 23,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\workflow_runner_part_2-1794570563511853600.log"
+        },
+        {
+          "name": "workflow_runner_part_1",
+          "elapsed_ms": 11781,
+          "exit_code": 0,
+          "suite_test_count": 23,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\workflow_runner_part_1-1794570563511853600.log"
+        },
+        {
+          "name": "codex_contract_part_2",
+          "elapsed_ms": 6344,
+          "exit_code": 0,
+          "suite_test_count": 5,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\codex_contract_part_2-1794570569432052300.log"
+        },
+        {
+          "name": "codex_contract_part_1",
+          "elapsed_ms": 17281,
+          "exit_code": 0,
+          "suite_test_count": 6,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\codex_contract_part_1-1794570563512841300.log"
+        },
+        {
+          "name": "cancel_projection",
+          "elapsed_ms": 6203,
+          "exit_code": 0,
+          "suite_test_count": 1,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\cancel_projection-1794570577789249100.log"
+        }
+      ]
+    },
+    "prestart_and_diagnostics": {
+      "required_scenarios": 4,
+      "executed_required_scenarios": 4,
+      "test_count": 4,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "dispatch_contract_part_1",
+          "elapsed_ms": 7828,
+          "exit_code": 0,
+          "suite_test_count": 12,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\dispatch_contract_part_1-1794570563510842300.log"
+        },
+        {
+          "name": "dispatch_contract_part_2",
+          "elapsed_ms": 14281,
+          "exit_code": 0,
+          "suite_test_count": 12,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\dispatch_contract_part_2-1794570563510842300.log"
+        },
+        {
+          "name": "mission_contract",
+          "elapsed_ms": 7953,
+          "exit_code": 0,
+          "suite_test_count": 55,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\mission_contract-1794570571333135000.log"
+        },
+        {
+          "name": "check_diagnostics",
+          "elapsed_ms": 2234,
+          "exit_code": 0,
+          "suite_test_count": 8,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\check_diagnostics-1794570583360451100.log"
+        }
+      ]
+    },
+    "native_guard": {
+      "required_scenarios": 2,
+      "executed_required_scenarios": 2,
+      "test_count": 2,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "native_guard",
+          "elapsed_ms": 1390,
+          "exit_code": 0,
+          "suite_test_count": 2,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\native_guard-1794570583849593300.log"
+        }
+      ]
+    },
+    "budget_boundary": {
+      "required_scenarios": 2,
+      "executed_required_scenarios": 2,
+      "test_count": 2,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "supervisor_contract",
+          "elapsed_ms": 4328,
+          "exit_code": 0,
+          "suite_test_count": 6,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\supervisor_contract-1794570581795390200.log"
+        }
+      ]
+    },
+    "resource_boundary": {
+      "required_scenarios": 3,
+      "executed_required_scenarios": 3,
+      "test_count": 3,
+      "assertions_passed": true,
+      "execution_records": [
+        {
+          "name": "resource_contract",
+          "elapsed_ms": 546,
+          "exit_code": 0,
+          "suite_test_count": 5,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\resource_contract-1794570584692089800.log"
+        }
+      ]
+    },
+    "real_codex": {
+      "classification": "current_candidate_worker_live_execution_revalidated",
+      "test_count": 1,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor\\live-codex-753837c705f0d4d4\\result.json",
+      "sha256": "195e779bdf7e31c41d09a206492561d218f9e693c14205c096498f1d2a9d9553",
+      "assertions_passed": true
+    },
+    "real_himind": {
+      "classification": "current_candidate_worker_live_execution_revalidated",
+      "test_count": 1,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\3d7e19fd726a2013038ec16b455cb88f6aa383b1aa6b249f199a39dbd2e60da8\\executor-lifecycle-repair\\real-himind.json",
+      "sha256": "055d36f0f15fd80d96cd356d705875eb35bb270ff6225dd51e56c839163ed98b",
+      "assertions_passed": true
+    }
+  },
+  "summary": "当前候选已编译，455次产品测试执行（450个唯一测试名），真实HiMind→Codex→HiMind→Codex交接及三个原必需检查通过；仅建议送验。",
+  "next_steps": [
+    "Host separately starts formal VERIFY on this delivery candidate.",
+    "Retain B01-B13 independent QA, final review, final build/deployment and installed health gates."
+  ]
+}

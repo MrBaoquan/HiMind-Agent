@@ -1,0 +1,164 @@
+{
+  "task_id": "repair-mission-ui-clock-evidence-1",
+  "generated_at": "2026-11-13T02:52:38.884268+00:00",
+  "input_hashes": {
+    "frontend/src/pages/MissionTeamPanel.tsx": "01d700802745e23fae83d8048d011f9f5fdbc5bc1a62e2f68d058d75466987cd",
+    "frontend/src/pages/MissionBudgetSummary.tsx": "42aaa76f096a57ce04c9313a59805feea3701c64e4344399aa5ceffbb24c2bcf",
+    "frontend/src/pages/MissionEvidence.tsx": "6ce24a5026fb1d8e30e218a5977383391254562ebed5bac617cf40f1dfaa1c6c",
+    "frontend/styles.css": "5cb6ae8918362bb8541175fed19823c39063529bc282b7f6377d5843afd76b37",
+    "reports/mission-ui/result.json": "373f92c1cb28de8a750f0201ab014f2caa6b2877eb5af52b533c52e7bf1ce191",
+    "reports/mission-ui/design-review.md": "9ba8319d1759e310395bbfc0789572f30b566c4087644a6a681ad28d92966c99"
+  },
+  "source_outputs": {
+    "frontend/src/pages/MissionTeamPanel.tsx": "7eb0e1925f830370471c60615dc17750f38e791cc193e3e122238a5eea74f941",
+    "frontend/src/pages/MissionBudgetSummary.tsx": "0c5e3fa6f6804d5164b2e70f10f8bd7c8abe36bad7d85d92eab8334974c0c2e2",
+    "frontend/src/pages/MissionEvidence.tsx": "ff3987cb721836ca88f2125d2d514998c89e788c23c080ffec74b960e960b07d",
+    "frontend/styles.css": "ff83485216a5d257d616c88d634bc26de255b493cd777a28c23ae7574b427c71",
+    "frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs": "46135f6097307497f8ac7107a2d8f97789da4c73fac40b557987fff448d58850",
+    "frontend/scripts/fixtures/mission-ui-clock-evidence.html": "7f87e9a2d50694b056d5c1a936ddf36936268cfa955942f58e668b6bf3390253",
+    "frontend/scripts/fixtures/mission-ui-clock-evidence.fixture.tsx": "6bb1c038ebca379816692c35cdfcc1afc303e6827af21216ec250116aac48e36",
+    "scripts/remediation/mission-ui-clock-checks.py": "018438785e3f163cdc72971c04606c1005194b1a4db74c24decdd010e241776a",
+    "reports/mission-ui/design-review.md": "985df30452a9666c7daab55c6513cff146ff169d38ffc605d81663120746bca7",
+    "reports/mission-ui/repair-clock-evidence.md": "6920c2fb1665642f5c982987fa19b3375078ee04997226cb14b673a4a1ecc983"
+  },
+  "contract_inputs": {
+    "remediation-input/execution-contract.md": "223f2504846212b0be923ea68557a6066e4add4e561357f656e01f49e5390dd0",
+    "remediation-input/backlog.json": "391f81822f5a40715893e580d8525e87924803dcec5b527e7dd0373a36d7f53c",
+    "reports/implementation-plan.md": "606cd8159f5dda3fd3591487550cbe84f7ad3b441ecd272f6540c998d601190d"
+  },
+  "check_logs": [
+    {
+      "command": "npm --prefix frontend run check:task-view",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-llyu7sf7\\0.log",
+      "output_sha256": "ca1634fe987d009919f7f1cdefd4238f5d230e2f7c086e98cea7b86b53b63ad4",
+      "started_at": "2026-11-13T02:44:51.992647+00:00",
+      "finished_at": "2026-11-13T02:44:52.660563+00:00",
+      "classification": "current worker execution; not host VERIFY"
+    },
+    {
+      "command": "npm --prefix frontend run check:task-center-model",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-llyu7sf7\\1.log",
+      "output_sha256": "c5132a5476a69ce6b2080ae6d1161325b9c2d42d02cf8cb3eb1acf9622b9d3f5",
+      "started_at": "2026-11-13T02:44:52.660563+00:00",
+      "finished_at": "2026-11-13T02:44:53.498414+00:00",
+      "classification": "current worker execution; not host VERIFY"
+    },
+    {
+      "command": "npm --prefix frontend run build",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-llyu7sf7\\2.log",
+      "output_sha256": "b46a1e774a7b66254cb79073cf653a8fd81eff6f7df1bca465a8f0a572bdaf4f",
+      "started_at": "2026-11-13T02:44:53.499415+00:00",
+      "finished_at": "2026-11-13T02:44:56.086361+00:00",
+      "classification": "current worker execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/service-ui-build-modes.mjs",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-llyu7sf7\\4.log",
+      "output_sha256": "51976a120b2873cdbb3c46cb2f849b3f33fccfdef5e55f5535ad53d721cb34b7",
+      "started_at": "2026-11-13T02:44:56.086361+00:00",
+      "finished_at": "2026-11-13T02:45:17.536472+00:00",
+      "classification": "current worker execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-gx_70b0f\\3.log",
+      "output_sha256": "7d0f5b2fa87626b5684fdfdef1a61d5c90bce07d015744998c8c28098f5047a3",
+      "started_at": "2026-11-13T02:44:52.009158+00:00",
+      "finished_at": "2026-11-13T02:45:22.980166+00:00",
+      "classification": "current worker execution; not host VERIFY"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert p.get('passed') is True\"",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\report-direct-1.log",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "recorded_at": "2026-11-13T02:55:32.027650+00:00",
+      "classification": "actual direct PowerShell exec_command execution; empty output; not host VERIFY",
+      "tool_chunk_id": "db9535"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run check:task-view','npm --prefix frontend run check:task-center-model','npm --prefix frontend run build','node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); assert set(['B08','B09']).issubset(set(p['implemented_backlog_ids'])); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['frontend/src','frontend/scripts','reports/mission-ui','scripts/remediation']; files=['frontend/styles.css','frontend/package.json','frontend/package-lock.json']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\report-direct-2.log",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "recorded_at": "2026-11-13T02:55:32.028650+00:00",
+      "classification": "actual direct PowerShell exec_command execution; empty output; not host VERIFY",
+      "tool_chunk_id": "9bdf9f"
+    }
+  ],
+  "candidate_integrity": [
+    {
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-llyu7sf7\\candidate-integrity.json",
+      "unchanged": true,
+      "changed_files": []
+    },
+    {
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\checks-gx_70b0f\\candidate-integrity.json",
+      "unchanged": true,
+      "changed_files": []
+    }
+  ],
+  "evidence_files": {
+    "c-igXOCN/browser-result.json": "4be5a34becbc152a3aa10ac34cdb249f7d1af928ef2bb534041a26c5ae65d5da",
+    "c-igXOCN/browser-trace.zip": "bf658e3eb4f6b7eae6af867df4b7995f545436df10b290559777a784e3ab275d",
+    "c-igXOCN/budget_exhausted-exhausted.png": "5a8f591ee6965240767aba4104e4133ca7ccfb41b5f59af146bfe68307fbbf86",
+    "c-igXOCN/budget_exhausted-input.json": "5b0d627e98a8ed75eca62d092bcf3cba76a7e15b275f301cffbfcb54df29411e",
+    "c-igXOCN/budget_exhausted-waiting.png": "65b28f47f665f54fcbac36257f3c0de00b96f9f05b57766928138e8d626950bd",
+    "c-igXOCN/clock-dom.jsonl": "922887aee5d9871b2b5f0861312de2dc44a7fd821e9f84df54117c47b99fe197",
+    "c-igXOCN/denied.png": "edefd61c24f1075e4901d612057d011a0a761613837b3a50a300c0752aa83276",
+    "c-igXOCN/empty-input.json": "f45858230ec690938544516a466b013ffab3b377324965c8470692b9a3a6cbc8",
+    "c-igXOCN/empty.png": "99452984a364ff867c2b35e4b5e489bff88549ae6528f153172d728f9bf867ba",
+    "c-igXOCN/environment_blocked-exhausted.png": "d4dc7deed1a3abb4b877bf43b885650237d45131e1b814c6a028295e3096f902",
+    "c-igXOCN/environment_blocked-input.json": "5b0d627e98a8ed75eca62d092bcf3cba76a7e15b275f301cffbfcb54df29411e",
+    "c-igXOCN/environment_blocked-waiting.png": "318e81fd9220bb348bec2b8344652d468b6335b5801b4f0e7a230082d768fe1d",
+    "c-igXOCN/error.png": "896b67db3283e1fafc091810b2cee76f7a07c31223e14f70cdaa1b3b910d8448",
+    "c-igXOCN/evidence-completed-entries.png": "c4a31db8d3a10ac4965a09cb53e247174c97e02f6c5708643ae6d270de0c2bab",
+    "c-igXOCN/evidence-completed-input.json": "8b448b88ad9f83c6f85a3ed7dacbe0bafc43fcd9fcddb5e184a5cdf1c8260913",
+    "c-igXOCN/evidence-completed-overview.png": "c242920706c6fdc041aca2440aeb2ae590246b3e8fd01f75144930b8b1c63132",
+    "c-igXOCN/evidence-completed-row.png": "2d1e5ca16260e945f9e9059a70a9550c9306ae196f2e7fc036a7e3edd7a30dc4",
+    "c-igXOCN/evidence-entries-320.png": "13b887cfdc1cab4517a93f54c935c929cb7420d50ea2f8990c50748ca87b7d1f",
+    "c-igXOCN/evidence-entries-390.png": "a1b667090ce0c098ac7efdb49e0641e9f6a40a5281be18b107215b5ecb0e3b89",
+    "c-igXOCN/evidence-partial-entries.png": "ce39602d8d3945afcfde545da0610ae72c8ef21731e785f259c434177ebe254a",
+    "c-igXOCN/evidence-partial-input.json": "c1cf32b9eabba54f75cbda0812b17ec4c2ec9c87b81912eb0fd1fc31a2ae1ed6",
+    "c-igXOCN/evidence-partial-overview.png": "ed9358545996162dbf365f50b632b45e7f8248b9b9e4942dd470895a199a8564",
+    "c-igXOCN/evidence-partial-row.png": "a0a2867ad403c93900d284c2a180fc4fc4aaa801db487e7110aec081c2e9e0eb",
+    "c-igXOCN/evidence-rejected-entries.png": "91bb069d79c6affe454e6ab97236e17f7c0cfc1618d79aed9e42672f4bff30f5",
+    "c-igXOCN/evidence-rejected-input.json": "8373f59e1551d6819a7d31f9974f4c9cc739170b015f7d30b85953ba965e797c",
+    "c-igXOCN/evidence-rejected-overview.png": "e513fc21b4ac06ff9018d2596b46bbf874b8e08b468c82aab089b18bb0f567a7",
+    "c-igXOCN/evidence-rejected-row.png": "a12af4e04d8c9936b30e7a2e68ca4bbd51595895c87ce436e72674ee1f06b489",
+    "c-igXOCN/evidence-row-200-percent.png": "2fd45e82a139a86f118b5e5016ac673b67a5f20da32d92a10aa68ccb9388a9bc",
+    "c-igXOCN/evidence-row-320.png": "863666b2cd0d60bc8a2b356dbb299e963248063eae7f985f335d2b5e2b283c32",
+    "c-igXOCN/evidence-row-390.png": "dfed44f20a14e4561d276512019deb88f2d598932dfec0912d813c95aced3878",
+    "c-igXOCN/evidence-row-dark-reduced.png": "e09cc2bbe94a48cf010d956fe6fd319f53d5078dc4137fe58f6a1e26fc2ad547",
+    "c-igXOCN/evidence-row-light-reduced.png": "e09cc2bbe94a48cf010d956fe6fd319f53d5078dc4137fe58f6a1e26fc2ad547",
+    "c-igXOCN/loading.png": "10d00312e8cd20fb0b1e21666b46491cfcbe59f459ea2fc4802e570c82ba4d8d",
+    "c-igXOCN/manual_pause-exhausted.png": "7efccc3c5ae9a18822865cd0140065171f578c0a5933707afbb79759b557e4d5",
+    "c-igXOCN/manual_pause-input.json": "5b0d627e98a8ed75eca62d092bcf3cba76a7e15b275f301cffbfcb54df29411e",
+    "c-igXOCN/manual_pause-waiting.png": "4979236506da46430c57a4b60a88bf8a86eab1db88c1d17d0a1198e9fbaee8c6",
+    "c-igXOCN/mismatched-plan-input.json": "7e4840f122130b922bf677d707b380e4e280df9e32be8a680bd000e28d99e5f7",
+    "c-igXOCN/mismatched-plan.png": "f00b35637e54d82ea480ae7846836a04489ebdc406859268d078bf560adcda81",
+    "c-igXOCN/out-of-order-input.json": "5b0d627e98a8ed75eca62d092bcf3cba76a7e15b275f301cffbfcb54df29411e",
+    "c-igXOCN/out-of-order-latest-kept.png": "d886207e47210e783a728d24a3efde91ec38041b9327e3818c18dba65f8799ae",
+    "c-igXOCN/pagination-global-gaps-no-new-events.png": "2b5edfaab07f5a67fa0433de793009301ec9a1229c50e9e8ef47d234e4bab475",
+    "c-igXOCN/pagination-input.json": "e76dbe100d5cb26bea09ed3f027fcb18317eab8d284a6cf6dc1f974c31d4e318",
+    "c-igXOCN/system_verification-exhausted.png": "c22d13fda5018545dabb312c3dc4289ce2055775728bec6c0671a918eaced4c0",
+    "c-igXOCN/system_verification-input.json": "5b0d627e98a8ed75eca62d092bcf3cba76a7e15b275f301cffbfcb54df29411e",
+    "c-igXOCN/system_verification-waiting.png": "fc3ab8fb49a5db752fced2483d38156f30bb2cabd2c25e3266afb5c0d5c1c29a",
+    "c-igXOCN/terminal-no-freeze-input.json": "dbe2c3871eed7e6dfe6b3e2cf80af63c2202837a2fb6dcf8ce7f8bd8de59bb3a",
+    "c-igXOCN/transport.jsonl": "eaa7e462f74b01fc245774b58713d42d5f8dd545cce1fcf82e3f8f4eea61c360"
+  },
+  "self_hash_exclusion": "result/manifest excluded to avoid self-reference; report validations retained under host root",
+  "historical_boundary": {
+    "classification": "pre-fix previous stage, not current execution; external references in history not read",
+    "result_copy": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\previous-mission-ui-result.json",
+    "manifest_copy": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\previous-manifest.json",
+    "design_copy": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\previous-design-review.md",
+    "result_sha256": "373f92c1cb28de8a750f0201ab014f2caa6b2877eb5af52b533c52e7bf1ce191"
+  },
+  "report_validation_evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\b07afb633fa788fc5441b642992956fc7b719a85e66c122c59ae2b6a76dfa7f4\\report-direct-checks.json"
+}

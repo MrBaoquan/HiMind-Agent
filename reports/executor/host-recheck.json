@@ -1,0 +1,254 @@
+{
+  "schema_version": "executor_host_recheck.v1",
+  "status": "pending_host_redeployment_and_controller_review",
+  "executed": false,
+  "current_mission_untouched": "mission_1794473598404_ffe1e069",
+  "new_mission_needed_for_current_stage": false,
+  "source_binding": "read-only mission.get snapshot; preserve fixed workflow, role/expert/service/model assignments",
+  "blocked_production_evidence": [
+    "Fresh himind.builtin run through newly deployed code, including shell and token usage.",
+    "Remote AgentRun API claim/renew/session/usage/terminal and restart reconciliation.",
+    "Fresh actual H→C→H handoff envelope from host input generation; historical runs do not contain it.",
+    "Isolated cancellation/late completion and pause/resume; never cancel the remediation Mission.",
+    "Host-owned required checks, independent VERIFY and deployment health."
+  ],
+  "optional_isolated_mission": {
+    "requires_controller_review": true,
+    "resource_rule": "Controller must allocate a new explicit task-bound generated workspace/resource contract; the existing task resource contract does not authorize another Mission automatically.",
+    "prepare": "Create evidence directory only inside that newly allocated isolated test workspace; substitute its exact authorized absolute path for ${HOST_ALLOCATED_ISOLATED_TEST_WORKSPACE}.",
+    "create": {
+      "capability": "mission.handoff.create",
+      "arguments": {
+        "idempotency_key": "executor-lifecycle-host-recheck-v1",
+        "source_client": "host-controller",
+        "source_reference": "mission_1794473598404_ffe1e069:executor-lifecycle",
+        "context_summary": "Pending deployment test only. Does not modify or reopen the source Mission. Candidate readiness is distinct from host independent acceptance.",
+        "title": "隔离跨执行器重部署核验",
+        "objective": "实际 HiMind→Codex→HiMind marker 交接，保持绑定及完整证据",
+        "workspace": {
+          "root": "${HOST_ALLOCATED_ISOLATED_TEST_WORKSPACE}",
+          "permission_mode": "full_access",
+          "read_scope": [
+            "evidence"
+          ],
+          "write_scope": [
+            "evidence"
+          ]
+        },
+        "acceptance_criteria": [
+          "新部署运行证据，非 probe；双向 envelope 绑定；独立核验另行由宿主执行"
+        ],
+        "workflow": {
+          "workflow_id": "local.himind.mixed-remediation",
+          "workflow_version": "1.0.0",
+          "workflow_sha256": "46734815ee2b08186cc5286bf0b0e9bed94819cb08bcbb20fb900005a8b9ad4a",
+          "entrypoint": ""
+        },
+        "plan_mode": "imported",
+        "imported_plan": {
+          "summary": "隔离三步实跑，不操作原 Mission 或业务源码",
+          "tasks": [
+            {
+              "id": "handoff-himind-1",
+              "title": "handoff-himind-1",
+              "objective": "这是隔离宿主重部署测试。只读写 evidence 目录，不读取其他路径、不调用技能、不自行核验。使用 shell 写 evidence/h1.txt 为精确文本 HIMIND-1，读回确认。仅在成功后返回完整 JSON，含 passed、summary、evidence:[\"evidence/h1.txt\"]。",
+              "depends_on": [],
+              "read_paths": [
+                "evidence"
+              ],
+              "write_paths": [
+                "evidence/h1.txt"
+              ],
+              "acceptance_criteria": [
+                "实际执行 shell；完整结果；handoff 绑定 run/hash/权限/模型来源"
+              ],
+              "required_checks": [
+                "python -c \"from pathlib import Path; assert Path('evidence/h1.txt').read_text(encoding='utf-8').strip() == 'HIMIND-1'\""
+              ],
+              "execution": {
+                "expert": {
+                  "expert_id": "com.himind.expert.software-engineer",
+                  "expert_version": "1.0.0",
+                  "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+                },
+                "executor": "himind.builtin",
+                "service_id": "lucen",
+                "model": "himind:lucen:gpt-6.1-sol",
+                "role_id": "remediation.backend"
+              },
+              "repair_of": ""
+            },
+            {
+              "id": "handoff-codex",
+              "title": "handoff-codex",
+              "objective": "这是隔离宿主重部署测试。只读写 evidence 目录，不读取其他路径、不调用技能、不自行核验。先读取前序 marker 并核对 executor_handoffs 的 upstream_run_id、模型来源和产物 hash。使用 shell 写 evidence/c1.txt 为精确文本 CODEX-1，读回确认。仅在成功后返回完整 JSON，含 passed、summary、evidence:[\"evidence/c1.txt\"]。",
+              "depends_on": [
+                "handoff-himind-1"
+              ],
+              "read_paths": [
+                "evidence"
+              ],
+              "write_paths": [
+                "evidence/c1.txt"
+              ],
+              "acceptance_criteria": [
+                "实际执行 shell；完整结果；handoff 绑定 run/hash/权限/模型来源"
+              ],
+              "required_checks": [
+                "python -c \"from pathlib import Path; assert Path('evidence/c1.txt').read_text(encoding='utf-8').strip() == 'CODEX-1'\""
+              ],
+              "execution": {
+                "expert": {
+                  "expert_id": "com.himind.expert.senior-system-architect",
+                  "expert_version": "1.0.0",
+                  "expert_digest": "sha256:8cd4326e74539a52f3b4d7582f13a29d9581bc73b8dd8b764f9b4ce7dbe8142c"
+                },
+                "executor": "personal.codex",
+                "service_id": "",
+                "model": "",
+                "role_id": "remediation.executor"
+              },
+              "repair_of": ""
+            },
+            {
+              "id": "handoff-himind-2",
+              "title": "handoff-himind-2",
+              "objective": "这是隔离宿主重部署测试。只读写 evidence 目录，不读取其他路径、不调用技能、不自行核验。先读取前序 marker 并核对 executor_handoffs 的 upstream_run_id、模型来源和产物 hash。使用 shell 写 evidence/h2.txt 为精确文本 HIMIND-2，读回确认。仅在成功后返回完整 JSON，含 passed、summary、evidence:[\"evidence/h2.txt\"]。",
+              "depends_on": [
+                "handoff-codex"
+              ],
+              "read_paths": [
+                "evidence"
+              ],
+              "write_paths": [
+                "evidence/h2.txt"
+              ],
+              "acceptance_criteria": [
+                "实际执行 shell；完整结果；handoff 绑定 run/hash/权限/模型来源"
+              ],
+              "required_checks": [
+                "python -c \"from pathlib import Path; assert Path('evidence/h2.txt').read_text(encoding='utf-8').strip() == 'HIMIND-2'\""
+              ],
+              "execution": {
+                "expert": {
+                  "expert_id": "com.himind.expert.software-engineer",
+                  "expert_version": "1.0.0",
+                  "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+                },
+                "executor": "himind.builtin",
+                "service_id": "lucen",
+                "model": "himind:lucen:gpt-6.1-sol",
+                "role_id": "remediation.backend"
+              },
+              "repair_of": ""
+            }
+          ],
+          "required_acceptance": [
+            "每步正文完整、必需检查 exit0；unknown cost 不伪造；真实交接与 host verification 独立留痕"
+          ],
+          "budget": {
+            "max_rounds": 12,
+            "max_minutes": 30,
+            "max_repair_attempts": 0,
+            "max_total_tokens": null,
+            "max_cost": null,
+            "currency": null
+          }
+        }
+      }
+    },
+    "assignment": {
+      "capability": "mission.assignment.apply",
+      "arguments": {
+        "mission_id": "${NEW_MISSION_ID_FROM_CREATE}",
+        "input": {
+          "roles": [
+            {
+              "expert": {
+                "expert_id": "com.himind.expert.software-engineer",
+                "expert_version": "1.0.0",
+                "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+              },
+              "role_id": "remediation.backend",
+              "label": "服务可靠性实现",
+              "executor": "himind.builtin",
+              "service_id": "lucen",
+              "model": "himind:lucen:gpt-6.1-sol"
+            },
+            {
+              "expert": {
+                "expert_id": "com.himind.expert.senior-system-architect",
+                "expert_version": "1.0.0",
+                "expert_digest": "sha256:8cd4326e74539a52f3b4d7582f13a29d9581bc73b8dd8b764f9b4ce7dbe8142c"
+              },
+              "role_id": "remediation.executor",
+              "label": "执行器链路实现",
+              "executor": "personal.codex",
+              "service_id": "",
+              "model": ""
+            },
+            {
+              "expert": {
+                "expert_id": "com.himind.expert.project-architect",
+                "expert_version": "1.0.0",
+                "expert_digest": "sha256:88bb04bd2125cc4dc22ed8171e48b0318cdce19560563f4ff188b59bf4119029"
+              },
+              "role_id": "remediation.reviewer",
+              "label": "独立交付复核",
+              "executor": "personal.codex",
+              "service_id": "",
+              "model": ""
+            },
+            {
+              "expert": {
+                "expert_id": "com.himind.expert.senior-test-engineer",
+                "expert_version": "1.0.0",
+                "expert_digest": "sha256:8b693c046dfbe08d46fa442f8f5c613141b58bf6a30c5329244805cec65bb707"
+              },
+              "role_id": "remediation.verifier",
+              "label": "独立测试",
+              "executor": "himind.builtin",
+              "service_id": "lucen",
+              "model": "himind:lucen:gpt-6.1-sol"
+            }
+          ],
+          "task_roles": [
+            {
+              "task_id": "handoff-himind-1",
+              "role_id": "remediation.backend"
+            },
+            {
+              "task_id": "handoff-codex",
+              "role_id": "remediation.executor"
+            },
+            {
+              "task_id": "handoff-himind-2",
+              "role_id": "remediation.backend"
+            }
+          ],
+          "applied_by": "host-controller",
+          "recommended": false
+        }
+      }
+    },
+    "confirm": {
+      "capability": "mission.plan.confirm",
+      "arguments": {
+        "mission_id": "${NEW_MISSION_ID_FROM_CREATE}",
+        "plan_sha256": "${CURRENT_PLAN_SHA256_AFTER_ASSIGNMENT}",
+        "selected_task_ids": [
+          "handoff-himind-1",
+          "handoff-codex",
+          "handoff-himind-2"
+        ],
+        "approved_paths": [
+          "evidence"
+        ],
+        "approved_absolute_read_paths": [],
+        "approved_absolute_write_paths": [],
+        "confirmed_by": "host-controller"
+      }
+    },
+    "expected": "Host must record actual shell markers, task-bound resource grant, LocalRun/session, model/service provenance, hash manifests, usage and independent verifier run. No pending observation is an acceptance result."
+  }
+}

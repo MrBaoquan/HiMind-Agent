@@ -1,0 +1,16 @@
+{
+  "task_id": "repair-independent-qa-user-scope-6",
+  "status": "in_progress",
+  "risk_summary": ["Historical QA4 pass must not certify this task's candidate", "Preparation, source/toolchain/configuration and live artifacts must bind to this task root", "Browser transport fixtures alone do not prove scheduler recovery or mixed-executor operation"],
+  "minimal_matrix": [
+    {"scope":"QA validator","cases":["old task","old candidate","empty checks","changed evidence hash","nonzero or boolean exit","timeout","missing backlog evidence"],"classification":"validator unit tests only"},
+    {"scope":"Service browser","command":"node frontend/scripts/remediation/mission-ui-retained-browser.mjs service","coverage":"Real React keyboard, focus/modal, background isolation, semantics, narrow layout and contrast; fixture transport"},
+    {"scope":"Mission browser","command":"node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs","coverage":"Real React recovery CTA, keyboard, ownership and missing-attempt refusals; evidence association and failure history; fixture transport"},
+    {"scope":"Preparation","command":"HIMIND_EXECUTOR_LIVE_HIMIND=1 python scripts/remediation/executor-lifecycle-repair-checks.py --prepare","coverage":"Task-owned cold build with 16GiB guard; product calibration; native guard/config identity; real fixed-route mixed execution"},
+    {"scope":"Backend","coverage":"config/gateway/budget/store/supervisor/handoff/usage/product and F01-F10; current task binary only"},
+    {"scope":"Final checks","coverage":"All four original required checks after report completion and candidate freeze; no paid inference or preparation from default independent entry"}
+  ],
+  "excluded_by_user": {"screen_reader_specific":{"status":"excluded_by_user","passed":null,"blocking":false,"future_obligation":false},"all_200_percent_zoom":{"status":"excluded_by_user","passed":null,"blocking":false,"future_obligation":false}},
+  "limitations": ["Event988 cause remains unproven: this task's missing frozen.json reproduction is not a diagnosis of the historical event", "No installed application, deployment or formal host VERIFY claim", "No reading old task caches or CONTROL; historical report bytes preserved in own root"],
+  "next_steps": ["Collect running preparation before assessing backend/live readiness", "Preserve any failure and exact ownership; do not repair production sources", "Finish reports, freeze and run unchanged four required checks on the same candidate"]
+}

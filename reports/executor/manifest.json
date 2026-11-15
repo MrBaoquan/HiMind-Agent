@@ -1,0 +1,105 @@
+{
+  "schema_version": "executor_lifecycle_repair_manifest.v3",
+  "task_id": "repair-executor-lifecycle-lineage-ownership-usage-3",
+  "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+  "scope": "Actual third-repair touched paths; parallel/prestart/inherited contents retained.",
+  "source_sha256": {
+    "docs/mixed-executor-runtime.md": "a578eb1a34bc82a1e6aefa881bc793ad1cce1d6333fe2537a21e4b442b3e4e16",
+    "scripts/remediation/executor-lifecycle-repair-checks.py": "40deda4f1f87abe664277a370214b22ac03e1169862155bed1b48635b92a6cf1",
+    "scripts/remediation/executor_lifecycle_support.py": "7dd9d5c22476a92cdc4c8e3aee381450b03bac8d0d65d0b8253cb5d56be04f3b",
+    "src/runtime/codex.rs": "28188bdd280990dba7b5a19bc345de4b066d229a4c16fbd34cc26d6f44a280db",
+    "src/runtime/codex_transport.rs": "5bd5fcf5fd80261ce433d912cd1f549395d41afb48ccbcf15383e70c35186f86",
+    "src/runtime/codex_usage_delivery.rs": "5ace16c913b81b52e8103a16fe49a9e84d76fae7a8988a9a5835717a97692f52",
+    "src/runtime/owned_tree.rs": "9c569147bda6dc69cbecf890a666ed34776a5b9536015b18a7fd609c28dd4c25",
+    "src/runtime/process.rs": "cbc2de74bd596ae95a755c40066f943fa8bcc32d921df914f78925f3cf04d30c",
+    "src/workflow/runner.rs": "57e64999bc53f9dddac09b1a1f0540527e2e40bea11c91e784165b1cdc55c45d",
+    "src/workflow/runtime.rs": "a6ca4de35ee31b434100563b9d564b6ada37d8dd582c90151145a91ca49a8a81"
+  },
+  "retained_source_sha256": {
+    "src/runtime/codex_usage.rs": "98ee46ae50d4ae0ad378623ad839e0636fb828acd00ed40d95480feeb960ebbf",
+    "src/runtime/deepseek_harness.rs": "250c01adc89a09738cfe950994eb762c7f2f7d5ae8d81d65fdf995e708c60b2b",
+    "src/runtime/acp.rs": "b066a1eb623d0d57b828f647a7dbc4533cd0111b992765f5d026591abb260058",
+    "src/runtime/copilot.rs": "3af8339547c3a068d1cbc6be36210f6fff7b58254c2ca47b313c2be6e2e3185f",
+    "src/mission/executor_handoff.rs": "d9b84d5802eeed54c0bb9f9722e22a33e94a696d49d9e4545583fa508ed4295d",
+    "src/mission/store.rs": "4e27e2eed8e03e45b6f601153b08751f158bae3ba883af9fca476799bbf4b9b7",
+    "src/app/mission_commands.rs": "3c799fdd0d5677b82ab23138e312f46eb71bbb5f7cc691d6437c0ddc16e70ab9",
+    "src/app/mission_dispatch.rs": "5d00acad164c09e0e9b24515ee2dc7ea9579dfcb5148d641d029e5530bafdd73",
+    "src/app/mission_supervisor.rs": "2bc4be82f205c43bd3e69bce7d6f92363c3450038aaf89d8277c75ece5c5fefc",
+    "src/capability/service.rs": "1eee8e8463b5c76c6cafc11d9a0118b5248f3cf1290c13ed87fd89eaa78974e1",
+    "src/store/local_runs.rs": "56b20cfbf0b98412d493d683e3ba4d00349d260023068888c044cf95e72099ba",
+    "src/workflow/preflight.rs": "dd9e672d12222eb9c68b10836106db955bcc0201b4f89eef7af206f85ac9a13d",
+    "src/workflow/mod.rs": "73f6dedeefe7fe3f8eea21e85abab708daff9361ada33e0db6322f19520f234a"
+  },
+  "input_reference_sha256": {
+    "remediation-input/execution-contract.md": "223f2504846212b0be923ea68557a6066e4add4e561357f656e01f49e5390dd0",
+    "remediation-input/backlog.json": "391f81822f5a40715893e580d8525e87924803dcec5b527e7dd0373a36d7f53c",
+    "remediation-input/prestart-host-patch.json": "6e3f81575f102378129e43a6be219668ff542c3e65c04f9b4452c51ffa049c0d"
+  },
+  "input_baselines_unchanged": true,
+  "src_store_unchanged": true,
+  "start_snapshot": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\before-files.json",
+  "candidate_identity": {
+    "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepared.json",
+    "sha256": "cbf07aa2f39030bbebb9d86ca99dfa69aa810d97264930bcb43fdd819761a378",
+    "source_file_count": 485,
+    "toolchain": {
+      "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-pc-windows-msvc\nrelease: 1.97.1\nLLVM version: 22.1.6",
+      "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: x86_64-pc-windows-msvc\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:Schannel)\nos: Windows 10.0.22631 (Windows 11 Education) [64-bit]",
+      "msvc_linker": "Microsoft (R) Incremental Linker Version 14.34.31948.0"
+    },
+    "effective_configuration": {
+      "rustc_commands": [
+        "C:\\Users\\Administrator\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rustc.exe --crate-name himind_agent --edition=2021 src\\main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg cfg(docsrs,test) --check-cfg \"cfg(feature, values())\" -C metadata=14d4cbb47b78c6b2 -C extra-filename=-193ef50571f09dfb --out-dir C:\\Users\\ADMINI~1\\AppData\\Local\\HIMIND~1\\cache\\MISSIO~1\\8C9530~1\\2B537A~1\\executor\\t\\debug\\deps -C linker=C:\\Users\\ADMINI~1\\AppData\\Local\\HIMIND~1\\cache\\MISSIO~1\\8C9530~1\\2B537A~1\\executor\\linkwrap.exe -C incremental=C:\\Users\\ADMINI~1\\AppData\\Local\\HIMIND~1\\cache\\MISSIO~1\\8C9530~1\\2B537A~1\\executor\\t\\debug\\incremental -L dependency=C:\\Users\\ADMINI~1\\AppData\\Local\\HIMIND~1\\cache\\MISSIO~1\\8C9530~1\\2B537A~1\\executor\\t\\debug\\deps --print=cfg"
+      ],
+      "cfg": [
+        "debug_assertions",
+        "panic=\"unwind\"",
+        "target_abi=\"\"",
+        "target_arch=\"x86_64\"",
+        "target_endian=\"little\"",
+        "target_env=\"msvc\"",
+        "target_family=\"windows\"",
+        "target_feature=\"cmpxchg16b\"",
+        "target_feature=\"fxsr\"",
+        "target_feature=\"sse\"",
+        "target_feature=\"sse2\"",
+        "target_feature=\"sse3\"",
+        "target_has_atomic=\"128\"",
+        "target_has_atomic=\"16\"",
+        "target_has_atomic=\"32\"",
+        "target_has_atomic=\"64\"",
+        "target_has_atomic=\"8\"",
+        "target_has_atomic=\"ptr\"",
+        "target_has_atomic_primitive_alignment=\"128\"",
+        "target_has_atomic_primitive_alignment=\"16\"",
+        "target_has_atomic_primitive_alignment=\"32\"",
+        "target_has_atomic_primitive_alignment=\"64\"",
+        "target_has_atomic_primitive_alignment=\"8\"",
+        "target_has_atomic_primitive_alignment=\"ptr\"",
+        "target_os=\"windows\"",
+        "target_pointer_width=\"64\"",
+        "target_vendor=\"pc\"",
+        "windows"
+      ],
+      "probe_manifest_sha256": "0dd466725124ff5891729f488cb158be7671d945d8150909f0b656d219261bb1"
+    }
+  },
+  "current_test_binary": {
+    "path": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+    "sha256": "a13db2e9159c41f33a35b0ee20a2606dcf0d97a30f0e38e1f4f98f768f467eb8"
+  },
+  "prior_delivery_archive": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prior-delivery-reports",
+  "all_changed_files_authorized": true,
+  "readiness": "blocked_required_live_evidence_and_historical_diagnosis",
+  "evidence_report_sha256": {
+    "reports/executor/lifecycle-checks.json": "d000fd0f4de522e0db5f5ef9d670047bf97254d44922245c44d055b9c6fac1be",
+    "reports/executor/real-codex-lifecycle.json": "cea385c394d0005986230e6be473d3d33d63b2f62aa00ff07b51c0b24c432aff",
+    "reports/executor/repair-plan.json": "8a6c9cb00ac6b3588a0864a4fbc6246be2a48dd7432d7bbe369b1a0dbbce133a",
+    "reports/executor/required-checks.json": "31731851bdecb289d66021e09bab5be263696354058189d7494872c7326b4f69"
+  },
+  "required_check_exit_codes": [
+    1,
+    1,
+    1
+  ]
+}

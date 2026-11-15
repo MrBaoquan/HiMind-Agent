@@ -1,0 +1,202 @@
+{
+  "schema_version": "gateway_cold_start_implementation.v1",
+  "mission_id": "mission_1794683248705_b88ad285",
+  "task_id": "gateway-cold-start-fix",
+  "role": "remediation.frontend",
+  "passed": true,
+  "stage_status": "ready_for_host_verify",
+  "summary": "Only the settingsWindowQuery aiTab whitelist at frontend/src/main.tsx:128 now additionally accepts gateway. The required existing source/module check passed once; this is a narrow-scope delivery recommendation, not Mission or final product acceptance.",
+  "source_change": {
+    "path": "frontend/src/main.tsx",
+    "line": 128,
+    "before_sha256": "9aedf2e54b0772ee4f6b6dc4752c72dc47b87ea36f45542a051b78f2e08b90db",
+    "after_sha256": "f77d84c2c19617e5184681db5ccc710d7674525bdeae6e002af4f688801c2c74",
+    "exact_diff": "--- a/frontend/src/main.tsx\n+++ b/frontend/src/main.tsx\n@@ -128 +128 @@\n-      aiTab: aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',\n+      aiTab: aiTab === 'services' || aiTab === 'gateway' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',\n",
+    "byte_length_delta": 23,
+    "before_format": {
+      "byte_length": 171599,
+      "encoding": "UTF-8",
+      "utf8_bom": false,
+      "crlf_count": 2948,
+      "bare_lf_count": 4,
+      "bare_cr_count": 0
+    },
+    "after_format": {
+      "byte_length": 171622,
+      "encoding": "UTF-8",
+      "utf8_bom": false,
+      "crlf_count": 2948,
+      "bare_lf_count": 4,
+      "bare_cr_count": 0
+    },
+    "all_other_bytes_preserved": true,
+    "proof": "Replacing the sole authorized new ASCII sequence with the original sequence reconstructs the exact expected original SHA256."
+  },
+  "preserved_behavior": {
+    "previous_values": [
+      "mcp",
+      "services",
+      "routes",
+      "acp"
+    ],
+    "added_value": "gateway",
+    "unknown_value_fallback": "mcp",
+    "unknown_value_fallback_preserved": true,
+    "query_bootstrap_precedence": "const aiTab = params.get('aiTab') || bootstrap?.aiTab;",
+    "query_bootstrap_precedence_preserved": true,
+    "panel_routing_preserved": true,
+    "basis": "Exact byte reconstruction and review of settingsWindowQuery; runtime behavior was not exercised."
+  },
+  "scope": {
+    "business_source_files_modified_by_this_task": [
+      "frontend/src/main.tsx"
+    ],
+    "delivery_report": "reports/gateway-cold-start/implementation.json",
+    "generated_evidence_root": "G:/HiMindAgentRuntime/mission-checks/a78413a6f411bc4921c287c4d7f61a0b42d7992cbc8cc0dfaafc406a9f805db3/937732388cea2731e8ffe185d7748344b4b34f52b7bd590c1afabf0b2241eaba",
+    "qa_and_fixture_files_modified_by_this_task": [],
+    "tests_added_or_rewritten": false,
+    "other_business_paths_written_by_this_task": [],
+    "prohibited_operations_performed": [],
+    "prohibited_operations": "No build, browser execution, production DB/MCP, subagent, extra model call, automatic retry, Git write, configuration/dependency/adapter/sealed-family change, build-output change or original completed Mission operation was performed."
+  },
+  "unchanged_approved_files": [
+    {
+      "path": "frontend/src/settingsModel.ts",
+      "before_sha256": "66862fa0f96b46a449207da1e01257950ad4bdf50dc1ec5703e91d5ee5829ccf",
+      "after_sha256": "66862fa0f96b46a449207da1e01257950ad4bdf50dc1ec5703e91d5ee5829ccf",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/AiConnectionsPage.tsx",
+      "before_sha256": "ec04c7d7e3396b92fa0f0436d2f1111f47763983528feaea9f88fff6c63754ea",
+      "after_sha256": "ec04c7d7e3396b92fa0f0436d2f1111f47763983528feaea9f88fff6c63754ea",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/aiConnectionsTabs.ts",
+      "before_sha256": "7a48ecb7980820ddf4e96617ec1cba413d61c6f192e617c5240460600159e253",
+      "after_sha256": "7a48ecb7980820ddf4e96617ec1cba413d61c6f192e617c5240460600159e253",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/components/SettingsWindow.tsx",
+      "before_sha256": "8d2693382919b2a54e07296db63abcd566a77b930cad692667973e4b85ba5096",
+      "after_sha256": "8d2693382919b2a54e07296db63abcd566a77b930cad692667973e4b85ba5096",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/SettingsPage.tsx",
+      "before_sha256": "6c578e779a6435dd17e1d103724e132ef4b8ca618ddd3e4f0dd79d883fb65019",
+      "after_sha256": "6c578e779a6435dd17e1d103724e132ef4b8ca618ddd3e4f0dd79d883fb65019",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/AiProvidersPanel.tsx",
+      "before_sha256": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e",
+      "after_sha256": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/AiToolsPanel.tsx",
+      "before_sha256": "8734b12d141134e345e9366c6e52e644ea8bca563fcab5981d93d8535f2abda0",
+      "after_sha256": "8734b12d141134e345e9366c6e52e644ea8bca563fcab5981d93d8535f2abda0",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/pages/BuiltinAiPage.tsx",
+      "before_sha256": "202b57acdfe78ec377c00b848f6167ae3a649be6bef04d7eac5fa4815c679a84",
+      "after_sha256": "202b57acdfe78ec377c00b848f6167ae3a649be6bef04d7eac5fa4815c679a84",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/src/components/CredentialCenterPanel.tsx",
+      "before_sha256": "9ac3d1cf29397713b91c2ec32d86997ca28afa6a6db3a12971c930008a1416fd",
+      "after_sha256": "9ac3d1cf29397713b91c2ec32d86997ca28afa6a6db3a12971c930008a1416fd",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/styles.css",
+      "before_sha256": "ff83485216a5d257d616c88d634bc26de255b493cd777a28c23ae7574b427c71",
+      "after_sha256": "ff83485216a5d257d616c88d634bc26de255b493cd777a28c23ae7574b427c71",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/scripts/check-settings-ia.mts",
+      "before_sha256": "e4153508ea9af1eb32d4b5eaf8f17838fd7acd0841b21e936ec8552df6868caf",
+      "after_sha256": "e4153508ea9af1eb32d4b5eaf8f17838fd7acd0841b21e936ec8552df6868caf",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/scripts/remediation/qa-browser.mjs",
+      "before_sha256": "55a5b3b9a9bd5c832c6dc40ea97652180f021cfe712b6a392d02938fe2057119",
+      "after_sha256": "55a5b3b9a9bd5c832c6dc40ea97652180f021cfe712b6a392d02938fe2057119",
+      "unchanged": true
+    },
+    {
+      "path": "frontend/scripts/remediation/service-ui-scenarios.mjs",
+      "before_sha256": "4daf67cf34fbe1046eab2f3238b48161ca5dfa238381e6ac0474ecd1a3fcc99a",
+      "after_sha256": "4daf67cf34fbe1046eab2f3238b48161ca5dfa238381e6ac0474ecd1a3fcc99a",
+      "unchanged": true
+    },
+    {
+      "path": "src/app/ui.rs",
+      "before_sha256": "b5dc8b7b791b401058068fb38da7d1490191c164f1911f8c925c663c0220c720",
+      "after_sha256": "b5dc8b7b791b401058068fb38da7d1490191c164f1911f8c925c663c0220c720",
+      "unchanged": true
+    }
+  ],
+  "required_check": {
+    "command": "node --experimental-strip-types frontend/scripts/check-settings-ia.mts",
+    "execution_count": 1,
+    "exit_code": 0,
+    "started_at_utc": "2026-11-14T19:13:48.7642039Z",
+    "completed_at_utc": "2026-11-14T19:13:48.9276906Z",
+    "output": [
+      "settings IA: 3 组 / 8 条，深链白名单、窄窗折叠、AI 连接约定校验通过"
+    ],
+    "scope": "existing source/module check; not browser, final-dist, installed/native or complete B/F/UI acceptance",
+    "evidence_path": "G:\\HiMindAgentRuntime\\mission-checks\\a78413a6f411bc4921c287c4d7f61a0b42d7992cbc8cc0dfaafc406a9f805db3\\937732388cea2731e8ffe185d7748344b4b34f52b7bd590c1afabf0b2241eaba\\gateway-cold-start-required-check.json",
+    "evidence_sha256": "4ed7d16e0cd99dffca5cf44885f7eeb364784b609860d8c34b4bb10c41c22b80",
+    "result": "passed",
+    "interpretation": "Existing source/module check only. This does not prove browser execution, fresh final-dist behavior, installed/native behavior, or complete B/F/UI acceptance."
+  },
+  "built_ui_status": "pending_external_final_verification",
+  "browser_boundary": {
+    "executed": false,
+    "qa_script": "frontend/scripts/remediation/qa-browser.mjs",
+    "assertion_line": 63,
+    "assertion_unchanged": true,
+    "assertion_tabs": [
+      "mcp",
+      "services",
+      "gateway",
+      "routes",
+      "acp"
+    ],
+    "original_assertion": "  for(const tab of ['mcp','services','gateway','routes','acp']){await page.goto(url+'?tab='+tab);await page.locator('#ai-tab-'+tab+'[aria-selected=\"true\"]').waitFor();assert.equal(await page.locator('#ai-panel-'+tab).count(),1);assert.equal(await page.getByRole('tabpanel').count(),1);for(const control of await page.getByRole('tab').all()){assert.equal(await page.locator('#'+await control.getAttribute('aria-controls')).count(),1)}}",
+    "next_owner": "Downstream host/supervisor",
+    "required_followup": "Execute the existing line-63 five-tab cold-start assertion unchanged against the fresh final dist."
+  },
+  "host_boundary": {
+    "native_required_checks": "Host responsibility; not invoked or represented by this producer.",
+    "formal_VERIFY": "Not invoked; host will start formal VERIFY after this stage succeeds.",
+    "independent_acceptance": "Pending host review binding producer identity, source bytes, exact diff, required-check evidence and native implementation/verification runs.",
+    "passed_scope": "Current authorized one-line source delivery and the actually executed required source/module check only."
+  },
+  "render_evidence": [],
+  "unverified": [
+    "Fresh final-dist browser cold start and interactions.",
+    "Native/installed behavior and host-required checks.",
+    "Formal host VERIFY and independent Mission/product acceptance.",
+    "Loading, empty, error, partial availability, success and permission UI states; narrow viewports, long text, 200% zoom, light/dark themes and reduced motion: not exercised because build/browser work is prohibited in this task."
+  ],
+  "assumptions_and_risks": [
+    "The fixed task contract supersedes the general UI expert render workflow; no external skills were loaded.",
+    "Unchanged-file hashes cover only explicitly approved readable paths; no repository-wide or Git audit was performed.",
+    "Source/module check success cannot establish the pending browser/native acceptance."
+  ],
+  "source_evidence": {
+    "path": "G:\\HiMindAgentRuntime\\mission-checks\\a78413a6f411bc4921c287c4d7f61a0b42d7992cbc8cc0dfaafc406a9f805db3\\937732388cea2731e8ffe185d7748344b4b34f52b7bd590c1afabf0b2241eaba\\gateway-cold-start-source-evidence.json",
+    "sha256": "81e0c3ed72c5da7afa393f95ed0dc04372ac29fdbb758f69c648c9688be31ef8"
+  }
+}

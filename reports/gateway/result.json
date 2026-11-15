@@ -1,0 +1,68 @@
+{
+  "passed": true,
+  "summary": "B03/B04 targeted repair: bounded complete SSE events are classified before forwarding; multiline JSON data is joined and normalized for native and translated paths; incomplete events fail closed with incomplete usage and no replay.",
+  "implemented_backlog_ids": [
+    "B03",
+    "B04"
+  ],
+  "changed_files": [
+    "src/app/inference_gateway.rs",
+    "scripts/remediation/gateway-multidata-check.py",
+    "reports/gateway/result.json",
+    "reports/gateway/summary.md"
+  ],
+  "checks": [
+    {
+      "command": "cargo test remediation_stream_boundaries_real_loopback -- --nocapture",
+      "exit_code": 0,
+      "evidence": "reports/gateway/multidata-boundaries.log",
+      "classification": "real_loopback_and_unit"
+    },
+    {
+      "command": "cargo test remediation_stream_multidata_error_no_leak -- --nocapture",
+      "exit_code": 0,
+      "evidence": "reports/gateway/multidata-errors.log",
+      "classification": "real_loopback_and_unit"
+    },
+    {
+      "command": "cargo test --locked --bin himind-agent app::inference_gateway::tests:: -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "evidence": "reports/gateway/multidata-suite.log",
+      "classification": "real_loopback_and_unit"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/gateway/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+      "exit_code": 0,
+      "evidence": "reports/gateway/multidata-result-check-1.log"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/gateway/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['cargo test remediation_stream_boundaries_real_loopback -- --nocapture','cargo test remediation_stream_multidata_error_no_leak -- --nocapture']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected)\"",
+      "exit_code": 0,
+      "evidence": "reports/gateway/multidata-result-check-2.log"
+    }
+  ],
+  "limitations": [
+    "This is local worker delivery readiness, not Mission acceptance, host formal VERIFY or deployment.",
+    "Host event mission_1794473598404_ffe1e069:455 historically recorded exit 0 but security verification failed; no TAP count was supplied. Those observations are not current worker test evidence.",
+    "Real loopback upstreams use fabricated credentials, not production providers. Deterministic downstream TCP resets on every translation route remain untested.",
+    "Only JSON SSE data and the protocol terminal [DONE] are accepted by provider relays; unclassifiable data fails closed. LF/CRLF supported; bare CR-only streams are outside this repair.",
+    "The inherited workspace lease is runtime-managed; no host VERIFY or production service was invoked.",
+    "No separate DevelopmentCheckpoint created: no stable engineering project_id was supplied; this repair returns the scoped report directly to its owning Mission."
+  ],
+  "next_steps": [
+    "Submit this candidate and its raw logs to the controller for independent formal VERIFY; deploy only through the controller."
+  ],
+  "sha256": {
+    "remediation-input/execution-contract.md": "223f2504846212b0be923ea68557a6066e4add4e561357f656e01f49e5390dd0",
+    "remediation-input/backlog.json": "391f81822f5a40715893e580d8525e87924803dcec5b527e7dd0373a36d7f53c",
+    "reports/implementation-plan.md": "606cd8159f5dda3fd3591487550cbe84f7ad3b441ecd272f6540c998d601190d",
+    "src/app/inference_gateway.rs": "f5eefacf299b5d2973c0ed67fd9d35b4e4ee4aa35925ad0ec7a2afeeb08488ad",
+    "scripts/remediation/gateway-multidata-check.py": "a4619a4b8a9a54b1ff95e6f17a7af65a3a61e77befd5190159bdb5b0faa1fee8",
+    "reports/gateway/multidata-boundaries.log": "578a317e4fceaa9a82ecb24defdf42ba644367a11e86822cef2dba1c982bbd32",
+    "reports/gateway/multidata-errors.log": "846653f77180ac078edb5a96049f7f98dc721d8a31954bea992f5cce9394d6b5",
+    "reports/gateway/multidata-suite.log": "4406a87fff2e424964816230418fb70e1ed93dfd5fadaf8cc1858712b457288f",
+    "reports/gateway/summary.md": "fd2581145dd138c3a20542a78d85971b87e9153a2a03a756e23961c6b79879b4",
+    "reports/gateway/multidata-result-check-1.log": "c1e97067c5f479a44a6f57297a0a8f87a59d181c3c529910f8bf059094bc3abb",
+    "reports/gateway/multidata-result-check-2.log": "c1e97067c5f479a44a6f57297a0a8f87a59d181c3c529910f8bf059094bc3abb"
+  }
+}

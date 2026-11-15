@@ -1,0 +1,169 @@
+{
+  "text": [
+    {
+      "selector": ".ai-service-fact-line",
+      "foreground": [
+        91,
+        97,
+        107,
+        1
+      ],
+      "compositedBackground": [
+        238,
+        244,
+        250,
+        1
+      ],
+      "ratio": 5.629951533418025,
+      "threshold": 4.5
+    },
+    {
+      "selector": ".ai-client-copy strong",
+      "foreground": [
+        23,
+        26,
+        31,
+        1
+      ],
+      "compositedBackground": [
+        238,
+        244,
+        250,
+        1
+      ],
+      "ratio": 15.744615404641717,
+      "threshold": 4.5
+    },
+    {
+      "selector": ".ai-catalog-state",
+      "foreground": [
+        91,
+        97,
+        107,
+        1
+      ],
+      "compositedBackground": [
+        238,
+        240,
+        237,
+        1
+      ],
+      "ratio": 5.441719860545301,
+      "threshold": 4.5
+    },
+    {
+      "selector": ".btn-primary",
+      "foreground": [
+        255,
+        255,
+        255,
+        1
+      ],
+      "compositedBackground": [
+        23,
+        62,
+        97,
+        1
+      ],
+      "ratio": 11.063724803807123,
+      "threshold": 4.5
+    },
+    {
+      "selector": ".ai-tab.active",
+      "foreground": [
+        17,
+        24,
+        39,
+        1
+      ],
+      "compositedBackground": [
+        255,
+        255,
+        255,
+        1
+      ],
+      "ratio": 17.73971700407407,
+      "threshold": 4.5
+    },
+    {
+      "selector": ".ai-service-health",
+      "foreground": [
+        17,
+        94,
+        89,
+        1
+      ],
+      "compositedBackground": [
+        238,
+        244,
+        250,
+        1
+      ],
+      "ratio": 6.845420133792272,
+      "threshold": 4.5
+    }
+  ],
+  "focus": {
+    "color": [
+      31,
+      78,
+      121,
+      1
+    ],
+    "compositedBackground": [
+      247,
+      255,
+      250,
+      1
+    ],
+    "ratio": 8.514150884045685,
+    "threshold": 3
+  },
+  "targets": [
+    {
+      "label": "工具接入",
+      "width": 72,
+      "height": 30
+    },
+    {
+      "label": "AI 服务",
+      "width": 62.8125,
+      "height": 30
+    },
+    {
+      "label": "模型网关",
+      "width": 72,
+      "height": 30
+    },
+    {
+      "label": "能力路由",
+      "width": 72,
+      "height": 30
+    },
+    {
+      "label": "运行环境",
+      "width": 72,
+      "height": 30
+    },
+    {
+      "label": "检查 验收 AI 服务",
+      "width": 28,
+      "height": 28
+    },
+    {
+      "label": "复制 AI 服务 验收 AI 服务",
+      "width": 28,
+      "height": 28
+    },
+    {
+      "label": "编辑 AI 服务 验收 AI 服务",
+      "width": 28,
+      "height": 28
+    },
+    {
+      "label": "删除 AI 服务 验收 AI 服务",
+      "width": 28,
+      "height": 28
+    }
+  ]
+}

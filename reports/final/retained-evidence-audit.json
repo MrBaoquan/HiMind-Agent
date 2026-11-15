@@ -1,0 +1,460 @@
+[
+  {
+    "report": "reports/config/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports\\config\\ai-services-final.log",
+    "sha256": "ea23450329d5a2e65a9cac186923fd6fb9c32b18d9e05bacdfce2d2b8576d408",
+    "test_summaries": [
+      "test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 1865 filtered out; finished in 0.99s"
+    ],
+    "reported_hash_matches": true
+  },
+  {
+    "report": "reports/config/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports\\config\\atomic-file-final.log",
+    "sha256": "4d26a303145769a7b91a9880d5ef5123f7dcbf2f9885760af89011f611d37ffc",
+    "test_summaries": [
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1908 filtered out; finished in 0.03s"
+    ],
+    "reported_hash_matches": true
+  },
+  {
+    "report": "reports/gateway/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/gateway/multidata-boundaries.log",
+    "sha256": "578a317e4fceaa9a82ecb24defdf42ba644367a11e86822cef2dba1c982bbd32",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1920 filtered out; finished in 0.85s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "report": "reports/gateway/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/gateway/multidata-errors.log",
+    "sha256": "846653f77180ac078edb5a96049f7f98dc721d8a31954bea992f5cce9394d6b5",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1920 filtered out; finished in 7.23s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "report": "reports/gateway/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/gateway/multidata-suite.log",
+    "sha256": "4406a87fff2e424964816230418fb70e1ed93dfd5fadaf8cc1858712b457288f",
+    "test_summaries": [
+      "test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 1852 filtered out; finished in 73.98s"
+    ]
+  },
+  {
+    "report": "reports/gateway/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/gateway/multidata-result-check-1.log",
+    "sha256": "c1e97067c5f479a44a6f57297a0a8f87a59d181c3c529910f8bf059094bc3abb",
+    "test_summaries": []
+  },
+  {
+    "report": "reports/gateway/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/gateway/multidata-result-check-2.log",
+    "sha256": "c1e97067c5f479a44a6f57297a0a8f87a59d181c3c529910f8bf059094bc3abb",
+    "test_summaries": []
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/mission-final.log",
+    "sha256": "90fdbb5ecc51e502f7188ee92d5162c5f080d17128bd690f0ecba6c4b5e0bb8e",
+    "test_summaries": [
+      "test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 1861 filtered out; finished in 10.87s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/handlers-final.log",
+    "sha256": "32ab6a24ca15e7cd2b4c72b66cdb5bc461126ae6460ed06163162470864414c3",
+    "test_summaries": [
+      "test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 1914 filtered out; finished in 5.01s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f01",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f01.log",
+    "sha256": "4a4521f580afdde356ded8984300e2e9fb26947bd62d0762db81e6a082d8c829",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.10s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f02",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f02.log",
+    "sha256": "b8f1fead87bed7ce85902157aab439491b95636d5065960416ddc6cb0ec59ea9",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.12s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f03",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f03.log",
+    "sha256": "45b71900bfdf00b55ca7f3c817d1600a68db8cf7d0e46af79ee1ad18d02589bb",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.75s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f04",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f04.log",
+    "sha256": "e8e42f79f71e580debf991112378646382937c5ccd40a417e740dfa0517314dd",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.11s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f05",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f05.log",
+    "sha256": "fbf2f9d384d73e371ce0f3e13a27a5ecb234da75c8e06ed4527f452683ba2fee",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 1.89s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f06",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f06.log",
+    "sha256": "7b99a5f81bb5b2d53083e9b680fd1b3f1c7897fef4dd86e387c7dc4dbe33beec",
+    "test_summaries": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1932 filtered out; finished in 0.18s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f07",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f07.log",
+    "sha256": "4ff3dcd8c5c92fd5be0c67f3237d7f4a88b7802591ba492a965681a4cdd96219",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.90s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f08",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f08.log",
+    "sha256": "e4ad2f1504ee3696113ab0e71bebcbe222044ee7c4429d4d6cd64c227648e004",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.97s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f09",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f09.log",
+    "sha256": "28f9b95576aa345cdb0b71f522135f0ba783ccb1d79e7160c9f778de6e780ece",
+    "test_summaries": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1932 filtered out; finished in 0.84s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "f10",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/f10.log",
+    "sha256": "b8e051a80b037b0bc5b19926e3c9654762ff2b6884ac057a0f9de8ee61625e8f",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.16s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": "b05",
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/b05.log",
+    "sha256": "b1b5182903fd0c9fc01068d18db46c247db900c27c141714e5e087f22ecc675d",
+    "test_summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1933 filtered out; finished in 0.07s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\r",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s\r"
+    ]
+  },
+  {
+    "report": "reports/budget/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "read_retained_log",
+    "evidence": "reports/budget/required-check.log",
+    "sha256": "4643a99f41a4ecd1dd4a00e2866c8056830d9856daab6d8d4195a769943028d2",
+    "test_summaries": []
+  },
+  {
+    "report": "reports/service-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/service-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/service-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/service-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/service-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/mission-ui/result.json",
+    "name": null,
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "config",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "gateway",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "budget",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "mission",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "supervisor",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "handoff",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "usage",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "frontend-build",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "service-browser",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "mission-browser",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "legacy",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "budget-browser",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "provenance",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "legacy-binding",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "build-environment",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "baseline",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "executor",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "qa11-staged-independent",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  },
+  {
+    "report": "reports/qa/result.json",
+    "name": "path-serialization",
+    "declared_exit_code": 0,
+    "inspection": "not_read_outside_task_scope"
+  }
+]

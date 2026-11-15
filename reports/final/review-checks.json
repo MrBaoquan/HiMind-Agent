@@ -1,0 +1,34 @@
+[
+  {
+    "command": "python -X utf8 -B scripts/remediation/qa11-binding-tests.py",
+    "exit_code": 0,
+    "elapsed_ms": 78,
+    "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\review-checks\\1.log",
+    "sha256": "dc3c8db99a74a9eb29ce400ff520283cdcef2adb7965bc48912c0f079404b49e",
+    "classification": "reviewer_current_execution_contract_regression_not_browser_or_host_VERIFY"
+  },
+  {
+    "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+    "exit_code": 0,
+    "elapsed_ms": 172,
+    "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\review-checks\\2.log",
+    "sha256": "9371ab2ede6f7afce26c29a7a53fce29ee5d1756828ece9e3668f7a19ed37314",
+    "classification": "reviewer_current_execution_contract_regression_not_browser_or_host_VERIFY"
+  },
+  {
+    "command": "node --experimental-strip-types frontend/scripts/check-task-view.mts",
+    "exit_code": 0,
+    "elapsed_ms": 141,
+    "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\review-checks\\3.log",
+    "sha256": "4275388ed5396f28bf35f59f1eaaf3aee002430b1582ae1804df3dd0c1486f8e",
+    "classification": "reviewer_current_execution_contract_regression_not_browser_or_host_VERIFY"
+  },
+  {
+    "command": "node --test frontend/scripts/remediation/service-ui-runtime.test.mjs",
+    "exit_code": 0,
+    "elapsed_ms": 437,
+    "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\review-checks\\4.log",
+    "sha256": "7c4ce45e322f2fdcaf7f0d7d816b7257552d1bf303d92a8fe4361d260740d437",
+    "classification": "reviewer_current_execution_contract_regression_not_browser_or_host_VERIFY"
+  }
+]

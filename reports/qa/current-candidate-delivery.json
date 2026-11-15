@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "status": "pass",
+  "task_id": "repair-independent-qa-user-scope-11",
+  "candidate_id": "b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61",
+  "report_sha256": "15b7778a1b5c397189e7967704ebab3581dc24e2c1e71d27afd87083038535f0",
+  "summary": "Current own-root preparation and independent product/browser coverage completed. Final original-command replay is a separate generated receipt; not host formal VERIFY.",
+  "next_steps": [
+    "Inspect final-required-checks.json in this own resource; any failure overrides readiness.",
+    "Host separately initiates formal VERIFY; later review/deployment/installed health remain separate."
+  ]
+}

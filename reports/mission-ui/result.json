@@ -1,0 +1,399 @@
+{
+  "schema_version": "mission-ui.result.v5",
+  "passed": true,
+  "task_id": "repair-mission-ui-native-workspace-evidence-4",
+  "repair_of": "repair-mission-ui-paused-verification-checks-3",
+  "mission_id": "mission_1794473598404_ffe1e069",
+  "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-mission-ui-native-workspace-evidence-4",
+  "readiness_only": true,
+  "formal_verify": "host_owned_not_invoked",
+  "execution_binding": {
+    "expert_id": "com.himind.expert.senior-ui-designer",
+    "expert_version": "1.1.0",
+    "expert_digest": "sha256:30c2ff1e01ebb3cb5eebfe45b2c203a1e76b834c6f26e286c7a6c4fb302a1cc4",
+    "executor": "personal.codex",
+    "model": "",
+    "role_id": "remediation.frontend",
+    "service_id": ""
+  },
+  "summary": "B08/B09 Windows 根路径工作区归属修复和原实际组件回归完成；报告仅记录本任务真实准备执行，冻结后六项原检查结果由同任务资源根只读重跑记录决定送验建议。",
+  "implemented_backlog_ids": [
+    "B08",
+    "B09"
+  ],
+  "changed_files": [
+    "frontend/src/pages/MissionEvidence.tsx",
+    "frontend/scripts/remediation/mission-ui-paused-checks-cases.mjs",
+    "frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+    "scripts/remediation/mission-ui-native-workspace-checks.py",
+    "reports/mission-ui/native-workspace-4/history/previous-result.json",
+    "reports/mission-ui/native-workspace-4/delivery.md",
+    "reports/mission-ui/native-workspace-4/source-review.json",
+    "reports/mission-ui/native-workspace-4/evidence-index.json",
+    "reports/mission-ui/result.json"
+  ],
+  "checks": [
+    {
+      "command": "npm --prefix frontend run check:task-view",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\0.log",
+      "sha256": "43d4a0cb2409d0f539915ac42b25537505f2ef339edd97b8f8fc590fb64786e4",
+      "started_at": "2026-11-13T23:20:49.214797+00:00",
+      "finished_at": "2026-11-13T23:20:49.720134+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "npm --prefix frontend run check:task-center-model",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\1.log",
+      "sha256": "a25a707ddc38571b3323a98f4623b1443f23a76603fc64cff05f94a10b201e37",
+      "started_at": "2026-11-13T23:20:49.721131+00:00",
+      "finished_at": "2026-11-13T23:20:50.242997+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "npm --prefix frontend run build",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\2.log",
+      "sha256": "6f3b3ee28b3b9ce10748b4e141ee6fb8db104dd7322b6606139d1c2782da556f",
+      "started_at": "2026-11-13T23:20:50.243999+00:00",
+      "finished_at": "2026-11-13T23:20:51.776799+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\4.log",
+      "sha256": "ef6c49de0a830fa4a7a3ce9abd67092f657866ef6ebb64b0706f1cdca250d182",
+      "started_at": "2026-11-13T23:20:51.777799+00:00",
+      "finished_at": "2026-11-13T23:22:14.601485+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs budget",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\6.log",
+      "sha256": "30e8733d6597ea017f14f8cfe208a2c48beeff4050b37cf69007df77c89d8741",
+      "started_at": "2026-11-13T23:22:14.602991+00:00",
+      "finished_at": "2026-11-13T23:22:23.174928+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/service-ui-build-modes.mjs",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\7.log",
+      "sha256": "308f05fb71ff74b495cb25f77889c4993d33fe9e6ec786615235a220824525aa",
+      "started_at": "2026-11-13T23:22:23.175926+00:00",
+      "finished_at": "2026-11-13T23:22:34.875975+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    },
+    {
+      "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\8.log",
+      "sha256": "bab219f5005ad5815ed516fc000b9ea6e5f195845964aeb2b3ef80ac354fb393",
+      "started_at": "2026-11-13T23:22:34.875975+00:00",
+      "finished_at": "2026-11-13T23:22:48.164855+00:00",
+      "classification": "actual current-task preparation execution; not host VERIFY"
+    }
+  ],
+  "limitations": [
+    "本阶段 passed 为交付准备就绪，不代表 Mission 或独立验收通过；最终六项只读重跑实际结果在 frozen_readiness_replay，失败则不建议送验。",
+    "历史 :887 宿主检查 0,0,0,0,-1,-1；test_summary 全空、TAP 数值总数未知。不得用 :872/:885 较早全绿覆盖，不外推当前候选。",
+    "路径等价只处理明确盘符绝对形式；保留目录大小写，其他未知形式拒绝跨拼写归属；不推断符号链接或文件系统身份。",
+    "真实组件浏览器以原生 DTO 传输夹具提供事件；样本命令退出码/独立结论不是真实宿主命令执行或专家核验。",
+    "Store 补充场景实际调用本任务新构建隔离 SQLite Store；不是生产数据库、安装版 Tauri 或真实远端模型交接。",
+    "真正深色调色板、完整无障碍标准与正式 VERIFY 未验证。",
+    "读屏语音和所有 200% 缩放为 user_deferred，未新增执行、不计通过。",
+    "首次离线探针构建和开发夹具失败均保留；后续稳定源码完整准备重跑全部退出 0。"
+  ],
+  "stage": "deliver",
+  "source_identity": {
+    "path": "frontend/src/pages/MissionEvidence.tsx",
+    "sha256": "540267ad0b3ae484863e7b3e013baae693be143369bc0d7a452b02078231ecb7",
+    "event885_sha256": "540267ad0b3ae484863e7b3e013baae693be143369bc0d7a452b02078231ecb7",
+    "same_as_event885": true,
+    "same_as_feedback878": true,
+    "final_sha256": "bed0005926e3e5f7d3770a20994f92c9da568c1681ff1ebb1a16327af31e640f",
+    "same_as_final": false,
+    "authority": "initial Get-FileHash + actual read-only event885 reason; no external evidence_ref files read"
+  },
+  "local_source_manifest": {
+    "path": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\source.json",
+    "sha256": "6bca91bfa8030ff16ac9f1d345d8e55f7f50c1809fb51cfc4d5b3292c5abd850",
+    "classification": "local audit manifest, not a recomputed host candidate_id"
+  },
+  "toolchain_identity": {
+    "path": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-prepared-20261113T232048\\toolchain.json",
+    "sha256": "64b676e770ad2b24cc8353e6629fa00b9fb60d036537dba7903b2db96e968105"
+  },
+  "prepared_build_dist": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\b-JNVJsW\\dist",
+  "prepared_build_files": {
+    "approval-popup.html": "d4043bbfb7b4ae2d7a33581ca03430363ec813ff35ffa8510429475ee2e706ac",
+    "assets/activity-D8LxVp14.js": "09c6594ef17470e52a723e3db40d165ef285da23c4bf79c616dd4a016bfb4457",
+    "assets/AiConnectionsPage-DcS668c4.js": "eba4165da52b679058182f8bc0dabdedb91f90fef8bcf3362612343b841c3a7f",
+    "assets/AiConnectionsPage-DOE7LUNx.css": "59d2380de2f5b9d42d138f81d611b6407f3bb05de27283a29394ecb6c71aa14f",
+    "assets/ApprovalsPage-BMi4DIuF.js": "f28b8d2b4fb5f9a7ea1d50a58996a2f0849f479c9083f317ec9f08ddca4af629",
+    "assets/book-open-B8tJ8n41.js": "bf5aeba6e3b6ae0aa0d4cf3d96baddbb777ccda21c88c2d44203eaea0c36c062",
+    "assets/categoryCatalog-D4inMqbK.js": "35d8f34ae456b890ba65a4959539057a436521734e6bf8c73c83cde69081c868",
+    "assets/chevron-up-pOyEkdVR.js": "975747ae32f51227dd30d77bfb5d7eb9a35146c878521314216ee2c94b420964",
+    "assets/circle-x-fG-m-NP4.js": "1872ded6f34b3479568f4932698b92e2bf5aa4d46d7278bf6357ea64393ecdad",
+    "assets/clipboard-check-CUn854VQ.js": "a15d4b4aeef05cd8cba2c988b1ac7e00d5ac986f26a8414d6c39a3b5a254b04f",
+    "assets/clock-Du79_6IA.js": "d13c92f819e2274bf7e1ade0465f8f90d496b034e5e42a2917ea504b24b7a842",
+    "assets/Common-sk5syyoH.js": "592262e5f16792eb7fbad0da74112c0825ace60df9d0d7d5bf1143089e54eaf0",
+    "assets/copy-D24JKGXu.js": "3c7ee8b543cf698e53be189f515b4db9215dadb9e52afc508b7bfc4033886c62",
+    "assets/DashboardPage-D7ltq1xp.js": "cc651fa07a62a0562d9fa108a5cc8755c3d3235747b78ea6c4548a6d7eff7c8f",
+    "assets/ellipsis-BB_krqcd.js": "97a150f8eda3a1d1bf5bce757a46a42706a098201bc33818bc35386c78709497",
+    "assets/ExpertStudioPanel-DaFQU7BZ.js": "05de8c3cada4349be4f5b06eefc055d2c99b1be23b2828c20991141d318f6089",
+    "assets/ExtensionDevelopmentPage-DuoQfPJk.js": "757504894909f3a6a9375aca4daa0b72b95682dd2cf1ee4c18ee2693e20e8b14",
+    "assets/ExtensionsPage-C3WIN1gP.js": "5a58c631d9c81999a13cc058b4b20ef5e551ab826cc834fd6a241a636f73fdee",
+    "assets/file-text-DzZ9Aw0E.js": "c7e628bed6b7531c34044355918995a54c571f60adcaa459df8b53283e4db33d",
+    "assets/folder-plus-gSqM29hR.js": "9da0286b8dda454a0afba55a0e9494d4b85c6c31769e069e43e33adfe5fb1746",
+    "assets/git-branch-D54lZ-j8.js": "8c34d09a1bbaaa3509e391ac1067aa066df3616ea6f60bbc6409946e6571c29c",
+    "assets/github-C3PTJ1OU.js": "fc4e50d2f38d2b1b90e6df8dcd967839a4c31ac89f93fda9ee6c1046149c0f4f",
+    "assets/history-BWcqZs-S.js": "3d5c6576fe927a2b4eb7792b529577492d66b492b4efb9eb85d2a62e33630c98",
+    "assets/InboxPage-BQbyTH3L.js": "1125748ab3b34b42ec6a3b2f98a652fc25032f663364dd88510f6769afed4068",
+    "assets/index-B2IBiLtu.css": "4ae7d60eabca885df7950f936a722dc9e80571f476dc46b7100a8227c7cb0a66",
+    "assets/index-CToE1gre.js": "6acf57eaa4ddf17f17969481dafb4dcc5f040edff961ce260c12eb8b0d2dccf0",
+    "assets/InstalledPage-CfcgRVtL.js": "58a384c08f8e6a2e25f37ce115101ebb717369e949d32adb15e8d1f283942ec4",
+    "assets/InstructionProjectionPanel-YIHvlFEO.js": "a0b65101d5359137888f881ca0e1728fd3e56ec635b9e12c3eb5ab2976725cb9",
+    "assets/ManagedCapabilitiesPage-CbqMUdbD.js": "1e650546c04f3ab09df1e60170e0a960a85943a40e73718ca7543d6b3d9ed2a1",
+    "assets/pathDisplay-bRJy8Vkb.js": "91a0069f3e99bac550c7fcd449080a22e654b134a5eb9a0d0a0f3ea68bd1586b",
+    "assets/rotate-ccw-CHAbnNrU.js": "390b9daa077e68d6d53a6290322b19560566a55b8c02334126f87cd130c15cc0",
+    "assets/runtimeProviderView-BLf6Wt4y.js": "20fc08be0368749e2f746d3c1c59f17d90a891ff0ea4d8b8b56f42ecc2c9dcb7",
+    "assets/SchedulesPage-BuFL-KkX.js": "fc18beb5b7ba349c889addc2949a5963be09c3dba83a112a4626af6af4f11648",
+    "assets/send-BqD9j5lf.js": "7b4af6fbbe0335ae8681ed8c2daa5804df9997029992993ff7d0701a34b05385",
+    "assets/SettingsPage-D67H3zME.js": "e0ac2cd0f7f1b336e56e5b7cc30e62364f955bfc9b66c2d94279f49c1b257205",
+    "assets/TaskCenterPage-D59XZrUs.js": "ece1c0ebc26cfffd82160f27029895bfc01a03744b272e8c6352b2c485160015",
+    "assets/timeFormat-CTHNwBh7.js": "56591066643fff0135a662c1d69c1d0e3875e76fd3d68e0007a828e9dc831746",
+    "assets/unplug-N8F_SZuT.js": "b4709ecc4df5c9e6710d4b049ce8522dfa989025a9ce6c5fe346eee48cd89ba7",
+    "assets/upload-B--1K6lp.js": "232557f3df6802b841a376063ea37c5c8aff9d87e94f8cb16b9a153e498dbcf6",
+    "assets/WorkflowsPage-Bk3kBUMV.js": "d74d65de75198cf4e25860d80f7d0c24638be11e4246670637370640f7c37c59",
+    "assets/WorkspaceRegistryPage--Aek3Qxr.css": "6828a0b6b64ca1f961afd02bf6c583ccea7dab12b0e2888933b493692a36e7f4",
+    "assets/WorkspaceRegistryPage-D6_cEXA_.js": "b27499c6db7722f403160edc164ae3259274b13735acb2ae6301769c29598e3a",
+    "brand/himind-app.png": "2ad93196aed31eddbbcc65c498e8139a0209125343d9bb4c1d1cb394c50f5078",
+    "brand/himind-lockup-horizontal.png": "95122a1ffa09409e391a593ed899a85b3a4df9405f897228fed2c3124f5006da",
+    "index.html": "818d3b35b3d8bb0e13d5b6ba2756b1ab37f52d26668ecb32663abbc6fb9e0908"
+  },
+  "historical_host_events": [
+    {
+      "event_id": "mission_1794473598404_ffe1e069:858",
+      "classification": "source_review_observation_not_browser_failure",
+      "authority": "task input transcription",
+      "boundary": "Source review findings only; response_stream interruption is a runtime outcome, not a confirmed product defect or pass.",
+      "current_candidate_evidence": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:860",
+      "classification": "historical_host_required_checks",
+      "task_id": "repair-mission-ui-paused-verification-checks-2",
+      "checks": [
+        {
+          "command": "npm --prefix frontend run check:task-view",
+          "exit_code": 0,
+          "error": ""
+        },
+        {
+          "command": "npm --prefix frontend run check:task-center-model",
+          "exit_code": 0,
+          "error": ""
+        },
+        {
+          "command": "npm --prefix frontend run build",
+          "exit_code": 0,
+          "error": ""
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert p.get('passed') is True\"",
+          "exit_code": -1,
+          "error": "Mission check time budget exhausted"
+        },
+        {
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": -1,
+          "error": "Mission check time budget exhausted"
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run check:task-view','npm --prefix frontend run check:task-center-model','npm --prefix frontend run build','node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); assert set(['B08','B09']).issubset(set(p['implemented_backlog_ids'])); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['frontend/src','frontend/scripts','reports/mission-ui','scripts/remediation']; files=['frontend/styles.css','frontend/package.json','frontend/package-lock.json']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+          "exit_code": -1,
+          "error": "Mission check time budget exhausted"
+        }
+      ],
+      "tap_total": null,
+      "boundary": "Only first three passed; final three exhausted Mission check time budget. Not worker executions.",
+      "current_candidate_evidence": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:872",
+      "classification": "newer_historical_host_transcription",
+      "task_id": "repair-mission-ui-paused-verification-checks-2",
+      "checks": [
+        {
+          "command": "npm --prefix frontend run check:task-view",
+          "exit_code": 0
+        },
+        {
+          "command": "npm --prefix frontend run check:task-center-model",
+          "exit_code": 0
+        },
+        {
+          "command": "npm --prefix frontend run build",
+          "exit_code": 0
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert p.get('passed') is True\"",
+          "exit_code": 0
+        },
+        {
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": 0
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run check:task-view','npm --prefix frontend run check:task-center-model','npm --prefix frontend run build','node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); assert set(['B08','B09']).issubset(set(p['implemented_backlog_ids'])); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['frontend/src','frontend/scripts','reports/mission-ui','scripts/remediation']; files=['frontend/styles.css','frontend/package.json','frontend/package-lock.json']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+          "exit_code": 0
+        }
+      ],
+      "tap_total": null,
+      "tap_total_status": "未提供数值 TAP 总数，不得编造",
+      "authority": "task input supplied host event transcription; raw event file/full output summaries not independently supplied or read in this turn",
+      "candidate_identity": "not supplied in task input; bound only to that historical host event/task, not extrapolated",
+      "boundary": "All six host exit codes are 0 for that historical candidate. No worker execution claimed; no use as proof for current changed candidate.",
+      "current_candidate_evidence": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:885",
+      "task_id": "repair-mission-ui-paused-verification-checks-3",
+      "authority": "host event read via mission.events.list",
+      "classification": "historical independent rejection based on source review, not final candidate browser acceptance",
+      "passed": false,
+      "source_sha256": "540267ad0b3ae484863e7b3e013baae693be143369bc0d7a452b02078231ecb7",
+      "candidate": {
+        "schema_version": "mission_candidate.v1",
+        "identity_kind": "scoped_files_sha256",
+        "workspace_root": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+        "candidate_id": "e2237df8cd4f6545f0b8d46d71f1c068dc2e28fd60f5d8df2dcc8c1a13ce4268",
+        "commit_sha": "not-applicable",
+        "tree_digest": "83c87d16764dd551199662ec239ab8b93a54766d76a06b1f06519d44ff6d3365",
+        "status_digest": "d7199e61e8a51c50419e81f3bf89c02318a2ee80c014be3a9674f5c5ecc2ed40"
+      },
+      "host_check_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "test_summaries": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "tap_total": null,
+      "current_candidate_evidence": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:887",
+      "task_id": "repair-mission-ui-paused-verification-checks-3",
+      "authority": "host event read via mission.events.list",
+      "classification": "latest historical host checks, incomplete",
+      "checks": [
+        {
+          "command": "npm --prefix frontend run check:task-view",
+          "exit_code": 0,
+          "output_sha256": "21fa244a25f10d3da4a9b81962c7f3b1b840d5f2041b3d055732fb2beef49c2e",
+          "test_summary": "",
+          "elapsed_ms": 15978,
+          "error": ""
+        },
+        {
+          "command": "npm --prefix frontend run check:task-center-model",
+          "exit_code": 0,
+          "output_sha256": "435b622d828112a7078e373d8e600e9f28f5c68080c4a8c2ab453453ac3b1e76",
+          "test_summary": "",
+          "elapsed_ms": 15367,
+          "error": ""
+        },
+        {
+          "command": "npm --prefix frontend run build",
+          "exit_code": 0,
+          "output_sha256": "9bbb69c06d8cbe1af4fdb056b87cab3f0d7d651aa1c0775252059b9d586d85a7",
+          "test_summary": "",
+          "elapsed_ms": 17427,
+          "error": ""
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert p.get('passed') is True\"",
+          "exit_code": 0,
+          "output_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+          "test_summary": "",
+          "elapsed_ms": 16380,
+          "error": ""
+        },
+        {
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": -1,
+          "output_sha256": "",
+          "test_summary": "",
+          "elapsed_ms": 0,
+          "error": "Mission check time budget exhausted"
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/mission-ui/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run check:task-view','npm --prefix frontend run check:task-center-model','npm --prefix frontend run build','node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); assert set(['B08','B09']).issubset(set(p['implemented_backlog_ids'])); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['frontend/src','frontend/scripts','reports/mission-ui','scripts/remediation']; files=['frontend/styles.css','frontend/package.json','frontend/package-lock.json']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+          "exit_code": -1,
+          "output_sha256": "",
+          "test_summary": "",
+          "elapsed_ms": 0,
+          "error": "Mission check time budget exhausted"
+        }
+      ],
+      "candidate_identity": null,
+      "candidate_boundary": "Event887 does not include a candidate envelope; historical task/event only. Never extrapolated to current source.",
+      "tap_total": null,
+      "current_candidate_evidence": false
+    }
+  ],
+  "evidence_index": "reports/mission-ui/native-workspace-4/evidence-index.json",
+  "design_delivery": "reports/mission-ui/native-workspace-4/delivery.md",
+  "source_review": "reports/mission-ui/native-workspace-4/source-review.json",
+  "archived_previous_result": {
+    "path": "reports/mission-ui/native-workspace-4/history/previous-result.json",
+    "sha256": "8d2e9a82f381e5ee9c195d35b9b1976ae41cbe183b07b39d72816e6e19e8cd83",
+    "historical_only": true
+  },
+  "preserved_failures": [
+    "reports/mission-ui/user-scope-1/history/result.json",
+    "reports/mission-ui/paused-verification-2/history/previous-result.json",
+    "reports/mission-ui/paused-verification-3/history/previous-result.json"
+  ],
+  "qa_constraints": {
+    "QA-LEGACY-01": "explicit eligible resume ownership/next action/CTA + running exception; all conservative refusal cases retained",
+    "QA-HARNESS-01": "original actual component entry and Refresh preamble; no copied comparator, original nondeferred scenarios retained"
+  },
+  "user_deferred": {
+    "screen_reader_speech": {
+      "status": "user_deferred",
+      "passed": null,
+      "executed": false
+    },
+    "all_200_percent_zoom": {
+      "status": "user_deferred",
+      "passed": null,
+      "executed": false
+    }
+  },
+  "frozen_readiness_replay": {
+    "entry": "python scripts/remediation/mission-ui-native-workspace-checks.py checks",
+    "freeze_entry": "python scripts/remediation/mission-ui-native-workspace-checks.py freeze",
+    "directory": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-frozen-replay",
+    "required_command_records": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-frozen-replay\\commands.json",
+    "invariants": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\d4f5743bee103f03091ffa36dbf7d705d6e38fdb78ad8776755558e3fe3c918a\\native-frozen-replay\\invariants.json",
+    "policy": "candidate source/reports remain immutable after freeze; evidence produced only under this task root; this is not formal host VERIFY",
+    "required_check_count": 6,
+    "supplementary_commands_retained": 3
+  },
+  "generated_at": "2026-11-13T23:26:00.979518+00:00"
+}

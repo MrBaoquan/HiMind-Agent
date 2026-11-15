@@ -1,0 +1,38 @@
+{
+  "phase": "pre-confirmation prerequisite; no runtime or worker active",
+  "mission_id": "mission_1794473598404_ffe1e069",
+  "reason": "Host refused full_access personal.codex. Fixed explicit access propagation, preflight and read-only verification before first Mission run.",
+  "files": {
+    "src/workflow/mod.rs": {
+      "before": "1430d31d452733e2c0091d660bf5ab0b80f5234a5e23de97454f03b0678cf45d",
+      "after": "2e7b19a76e1d5109a696b6294803355c06f4c163aa598330d832e137c2edaa93"
+    },
+    "src/workflow/runtime.rs": {
+      "before": "906759560c6cbebe0dc50cca06cd92157a8ba56318962b2180f78fcf075a75a5",
+      "after": "f7eed24fb61c24e2d3242e782fb8525c61e3b96dd5b07b93e8de8964f7d03d8d"
+    },
+    "src/workflow/preflight.rs": {
+      "before": "77fbbefa89691af95e0bca913ad87509731fa30d32b96bad55651d22152d703d",
+      "after": "dd9e672d12222eb9c68b10836106db955bcc0201b4f89eef7af206f85ac9a13d"
+    },
+    "src/mission/store.rs": {
+      "before": "2f1193a3a1c6e3fc4cdd18c9dd8fe4a88310bd4110c22277f3574d36bffe713d",
+      "after": "feb1bddd1e7575a73e7a243c18b949cd35068785912c95c4ab1fe3f6c37b17f6"
+    },
+    "src/app/mission_dispatch.rs": {
+      "before": "b27c9e112afa549ce51b354a072a075775d9e7a0a9c42c2eb14e81e2b9f4552d",
+      "after": "3eb07ac62384bb51f8a95aef5724459fbe6a674359a060ddc4237134491d9a43"
+    },
+    "src/app/runtime_workspace.rs": {
+      "before": "676a453fdf11ee6dccadc488cbb78e72631a336f9be4254d8f29a00bbc925b2a",
+      "after": "7a03fe958eeb4829a661b5f96feda211e6c92665a0ddb62c77b7dd28a0f532a5"
+    },
+    "frontend/src/pages/RuntimeWorkspaceDialog.tsx": {
+      "before": "37fd9cc8336eef935b9b314567a19470a21dbdbf870a7070aa5e94170dd21b55",
+      "after": "2ef47c4ed678f7c351f381a8093910f3ecd3319a0634e4dcbbdcad17431d707a"
+    }
+  },
+  "host_tests": "22 passed; host-tests-result.json",
+  "real_codex_smoke": "3 stages passed; codex-cli-smoke-result.json",
+  "captured_at_unix": 1794473431.9096642
+}

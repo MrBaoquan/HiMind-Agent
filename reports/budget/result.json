@@ -1,0 +1,181 @@
+{
+  "passed": true,
+  "implemented_backlog_ids": [
+    "B05",
+    "B08"
+  ],
+  "summary": "后端候选交付：成本按币分桶、未知/混币不比较；统一读事务有效等待DTO与游标；保留已有主动增额、双hash、所有限额、运行中禁止、原键幂等。F01-F10真实Store逐例执行，最终73项Mission及20项app handler回归通过。不是正式VERIFY。",
+  "changed_files": [
+    "src/mission/contract.rs",
+    "src/mission/store.rs",
+    "src/mission/budget_remediation_tests.rs",
+    "src/mission/mod.rs",
+    "src/mission/export.rs",
+    "src/app/mission_supervisor.rs",
+    "reports/budget/*"
+  ],
+  "checks": [
+    {
+      "command": "cargo test mission:: -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "evidence": "reports/budget/mission-final.log",
+      "passed_tests": 73,
+      "classification": "real_store_and_handler_unit"
+    },
+    {
+      "command": "cargo test app::mission -- --nocapture --test-threads=1",
+      "exit_code": 0,
+      "evidence": "reports/budget/handlers-final.log",
+      "passed_tests": 20,
+      "classification": "real_store_and_handler_unit"
+    },
+    {
+      "evidence": "reports/budget/f01.log",
+      "exit_code": 0,
+      "case": "f01",
+      "command": "cargo test mission::store::budget_remediation_tests::f01 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f02.log",
+      "exit_code": 0,
+      "case": "f02",
+      "command": "cargo test mission::store::budget_remediation_tests::f02 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f03.log",
+      "exit_code": 0,
+      "case": "f03",
+      "command": "cargo test mission::store::budget_remediation_tests::f03 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f04.log",
+      "exit_code": 0,
+      "case": "f04",
+      "command": "cargo test mission::store::budget_remediation_tests::f04 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f05.log",
+      "exit_code": 0,
+      "case": "f05",
+      "command": "cargo test mission::store::budget_remediation_tests::f05 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f06.log",
+      "exit_code": 0,
+      "case": "f06",
+      "command": "cargo test mission::store::budget_remediation_tests::f06 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f07.log",
+      "exit_code": 0,
+      "case": "f07",
+      "command": "cargo test mission::store::budget_remediation_tests::f07 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f08.log",
+      "exit_code": 0,
+      "case": "f08",
+      "command": "cargo test mission::store::budget_remediation_tests::f08 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f09.log",
+      "exit_code": 0,
+      "case": "f09",
+      "command": "cargo test mission::store::budget_remediation_tests::f09 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/f10.log",
+      "exit_code": 0,
+      "case": "f10",
+      "command": "cargo test mission::store::budget_remediation_tests::f10 -- --nocapture --test-threads=1"
+    },
+    {
+      "evidence": "reports/budget/b05.log",
+      "exit_code": 0,
+      "case": "b05",
+      "command": "cargo test mission::store::budget_remediation_tests::b05 -- --nocapture --test-threads=1"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/budget/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+      "exit_code": 0,
+      "evidence": "reports/budget/required-check.log",
+      "classification": "required_report_check"
+    }
+  ],
+  "limitations": [
+    "真实测试为实际SQLite Store和handler单元路径，无模型调用、生产服务、MCP网络端到端或浏览器；SQL仅用于损坏/旧数据和事务竞争夹具。",
+    "F05原manual_pause拒绝与本次明确保留主动增额授权冲突，按后者验证接受；F09测试新版Store显式诊断与安全门控，不声称执行旧后端二进制或前端旧能力降级循环。",
+    "事件replay在Store是只读快照重取，重复/乱序读取不重加预算；requires_snapshot标记缺口/截断/超前。前端实际消费和乱序delta归约由前端任务/正式验收核查。",
+    "旧事件未带trusted/complete保持原值但成本不可比较；LocalRunUsage入口从billing_owner与currency生成标记，不是上游账单真实性审计。",
+    "既有主动增额与run/request幂等不是本次原创；git diff含663文件基线及前置改动，不用HEAD差异冒充本次成果。",
+    "宿主继承runtime-managed租约；不自行释放宿主租约。DevelopmentCheckpoint需要权威project_id且默认写出位置未授权，未虚构ID调用。"
+  ],
+  "fixture_evidence": {
+    "F01": {
+      "evidence": "reports/budget/f01.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F02": {
+      "evidence": "reports/budget/f02.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F03": {
+      "evidence": "reports/budget/f03.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F04": {
+      "evidence": "reports/budget/f04.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F05": {
+      "evidence": "reports/budget/f05.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F06": {
+      "evidence": "reports/budget/f06.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F07": {
+      "evidence": "reports/budget/f07.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F08": {
+      "evidence": "reports/budget/f08.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F09": {
+      "evidence": "reports/budget/f09.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "F10": {
+      "evidence": "reports/budget/f10.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    },
+    "B05": {
+      "evidence": "reports/budget/b05.log",
+      "exit_code": 0,
+      "classification": "real_store"
+    }
+  },
+  "next_steps": [
+    "前端按frontend-handoff.md消费effective_wait、cost_usage及requires_snapshot；稳定request_id重试，不按最后事件推断。",
+    "宿主启动正式VERIFY，核验接口消费和独立验收；由控制端决定部署。"
+  ],
+  "evidence": [
+    "reports/budget/hashes.json",
+    "reports/budget/frontend-handoff.md",
+    "reports/budget/dto-sample.json",
+    "reports/budget/fixture-checks.json",
+    "reports/budget/final-checks.json"
+  ]
+}

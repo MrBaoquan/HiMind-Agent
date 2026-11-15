@@ -1,0 +1,72 @@
+{
+  "passed": true,
+  "summary": "B01/B02 implemented: directory-scoped locked read/modify/write, synced atomic replacement and validated previous encrypted version recovery, idempotent route cleanup, read-only startup consistency diagnostics.",
+  "implemented_backlog_ids": [
+    "B01",
+    "B02"
+  ],
+  "changed_files": [
+    "src/store/ai_services.rs",
+    "src/store/atomic_file.rs",
+    "src/app/ai_provider_import.rs",
+    "scripts/remediation/config-check.py",
+    "reports/config/result.json"
+  ],
+  "checks": [
+    {
+      "command": "cargo test --bin himind-agent store::ai_services -- --nocapture",
+      "exit_code": 0,
+      "evidence": "reports\\config\\ai-services-final.log",
+      "sha256": "ea23450329d5a2e65a9cac186923fd6fb9c32b18d9e05bacdfce2d2b8576d408",
+      "classification": "real_isolated_rust_tests",
+      "passed": true
+    },
+    {
+      "command": "cargo test --bin himind-agent store::atomic_file -- --nocapture",
+      "exit_code": 0,
+      "evidence": "reports\\config\\atomic-file-final.log",
+      "sha256": "4d26a303145769a7b91a9880d5ef5123f7dcbf2f9885760af89011f611d37ffc",
+      "classification": "real_isolated_rust_tests",
+      "passed": true
+    }
+  ],
+  "input_sha256": {
+    "remediation-input/execution-contract.md": "223f2504846212b0be923ea68557a6066e4add4e561357f656e01f49e5390dd0",
+    "remediation-input/backlog.json": "391f81822f5a40715893e580d8525e87924803dcec5b527e7dd0373a36d7f53c",
+    "reports/implementation-plan.md": "606cd8159f5dda3fd3591487550cbe84f7ad3b441ecd272f6540c998d601190d"
+  },
+  "artifact_sha256": {
+    "src/store/ai_services.rs": "e5423450f3bdd8126169616c6ea2282ed0112526a2e82a8bb598d86a138b20e3",
+    "src/store/atomic_file.rs": "f77ffe4b22917f6880dfeb5b01b659eb8e17efc75a7a8ecb41ef9715bf0ece68",
+    "src/app/ai_provider_import.rs": "ad477db258eead029d7a5a54264c6ad1b0f65af8f5ad4152712b272c51ce323a",
+    "scripts/remediation/config-check.py": "97a0abfbdb4021628fd1681185282c66551206d3a13a03f48f5efa8c9bfdd8a4"
+  },
+  "coverage": {
+    "real": [
+      "24 concurrent updates of two different service IDs with a barrier",
+      "actual test child process exits 86 without unwind at before_temporary, temporary_created, temporary_written, temporary_flushed, before_replace, after_replace, directory_committed",
+      "restart parse and same-ID delete retry twice",
+      "dangling-reference diagnostic leaves selection bytes unchanged",
+      "deleting final selected service leaves default unset",
+      "corrupt primary restores validated encrypted previous snapshot; corrupt backup rejected; recovery version hash contains no credentials",
+      "existing all-capability route cleanup and legacy compatibility regressions"
+    ],
+    "contract_only": [],
+    "not_covered": [
+      "physical power failure / hardware cache behavior",
+      "formal host VERIFY, deployment and frontend diagnostic rendering"
+    ]
+  },
+  "reference_model": "ADR0023 ordered capability route entries remain the only default/fallback fact source. Deletion preserves survivor order; existing first fallback becomes first by list semantics. No service is selected from the directory, and an empty route stays unset.",
+  "limitations": [
+    "Not a cross-file transactional database: directory-to-selection interruption is diagnosed and converges on explicit same-ID deletion retry.",
+    "Windows process interruption tested, not a physical power cut; Unix parent-directory fsync path is not executed here.",
+    "An early compilation log was accidentally opened at reports/config-tests-initial.log outside the task write subtree; relocation while open failed, then the completed log was moved to reports/config/initial-build.log. No input baseline or production configuration was changed.",
+    "Existing compiler warnings retained; no unrelated cleanup.",
+    "This passed flag is delivery readiness only, not Mission approval or independent verification."
+  ],
+  "next_steps": [
+    "Host runs required result JSON check and separately schedules formal VERIFY.",
+    "Independent verifier replays python scripts/remediation/config-check.py; UI owner may present consistency_diagnostics without changing default selection."
+  ]
+}

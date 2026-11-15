@@ -1,0 +1,129 @@
+{
+  "schema_version": "gateway_cold_start_independent_review.v1",
+  "mission_id": "mission_1794683248705_b88ad285",
+  "task_id": "gateway-cold-start-independent-review",
+  "role": "remediation.verifier",
+  "passed": false,
+  "summary": "源码/模块窄复核通过，现有必需检查真实执行一次并成功；但输入未包含可独立核验的 accepted_producer handoff、实际 Codex producer 身份及宿主候选/确认/原生检查证据，不能完成任务要求的依赖与来源绑定，当前证据不足以建议本阶段交付就绪。此结论不是产品失败，也不因尚未启动正式 VERIFY 而判失败。",
+  "stage": "deliver",
+  "built_ui_status": "pending_external_final_verification",
+  "plan": {
+    "high_risks": [
+      "gateway 在设置窗口冷启动时被白名单错误回退为 mcp",
+      "新增白名单值导致 query/bootstrap 优先级、未知值回退或现有页签回归",
+      "实现报告代替真实源码或真实 accepted producer/宿主证据",
+      "为通过检查改写原 QA，或将源码检查冒充浏览器/原生验收"
+    ],
+    "acceptance": "只允许 main.tsx 白名单单行增加 gateway；保留既有值、query 优先级、路由与未知值回退；现有 settings 检查成功；独立绑定真实 accepted producer 与宿主候选证据。",
+    "minimum_matrix": [
+      "mcp/services/gateway/routes/acp 各自经 query 与 bootstrap，共 10 例",
+      "query gateway 覆盖 bootstrap services；query routes 覆盖 bootstrap gateway",
+      "未知 query 覆盖有效 bootstrap 后回退 mcp；空 query 使用 bootstrap",
+      "未知 bootstrap、缺失值、大小写不匹配均回退 mcp",
+      "非设置窗口返回 null；native 设置窗口默认 mcp；panel/section/tab 转发",
+      "实际文件 SHA256 与反向单行重构；原 QA 与授权依赖文件摘要对照",
+      "原样执行 node --experimental-strip-types frontend/scripts/check-settings-ia.mts 一次"
+    ]
+  },
+  "dependency_binding": {
+    "logical_dependency": "gateway-cold-start-fix",
+    "logical_dependency_basis": "宿主 task.depends_on 明确声明",
+    "implementation_report_task_id": "gateway-cold-start-fix",
+    "implementation_report_sha256": "094905e63229e324ed48a1b1490f418c5da2a20e1d59a363d02f28e5c288455a",
+    "accepted_producer_handoff": "not_supplied",
+    "actual_codex_producer_identity": "not_independently_verifiable",
+    "host_plan_sha256_claim": "17accee28cc717a8fcb337520634ce31d118bf4a5779d5e93195f75a6365847e",
+    "host_plan_and_confirmation_records": "未提供实际记录；只有任务授权与 feedback_context 中的摘要，不能据此证明实际 producer 获批计划",
+    "host_candidate": null,
+    "host_candidate_basis": "所给 workflow_context.candidate 为 null，steps/parent_steps 为空，artifacts 为空",
+    "host_native_implementation_and_verification_runs": "not_supplied; host_owned",
+    "producer_required_check": "implementation.json 声称成功，但其证据路径位于 producer 资源根，不在本任务授权资源根，未读取且未用作独立证明",
+    "blocking_evidence_gap": true,
+    "formal_VERIFY": "宿主后续负责，未调用；尚未运行本身不是本阶段失败原因"
+  },
+  "source_verification": {
+    "path": "frontend/src/main.tsx",
+    "line": 128,
+    "actual_sha256": "f77d84c2c19617e5184681db5ccc710d7674525bdeae6e002af4f688801c2c74",
+    "expected_after_was_prediction": true,
+    "actual_matches_predicted_after": true,
+    "actual_byte_length": 171622,
+    "reconstructed_before_sha256": "9aedf2e54b0772ee4f6b6dc4752c72dc47b87ea36f45542a051b78f2e08b90db",
+    "byte_length_delta": 23,
+    "new_sequence_occurrences": 1,
+    "exact_diff": "--- a/frontend/src/main.tsx\n+++ b/frontend/src/main.tsx\n@@ -128 +128 @@\n-      aiTab: aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',\n+      aiTab: aiTab === 'services' || aiTab === 'gateway' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',\n",
+    "proof": "读取实际字节并计算 SHA256；断言新行仅出现一次，将其反向替换后得到授权原 SHA256。由此独立证明相对于该固定摘要的 main.tsx 仅有这一行替换，不依赖实现者的修改陈述。",
+    "routing_source_observations": [
+      "main.tsx:120 使用 params.get('aiTab') || bootstrap?.aiTab",
+      "main.tsx:123-128 保留 settingsRoute({ panel, section, tab }) 与路由输出；仅增加 gateway 判定",
+      "main.tsx:240 从 settingsWindow?.aiTab 初始化 aiConnectionsTab",
+      "aiConnectionsTabs.ts:8-17 声明五个稳定页签及 gateway 标签",
+      "AiConnectionsPage.tsx:187-267 保留 acp/services/gateway/routes/mcp 分支，gateway 对应 GatewayProfilesPanel"
+    ]
+  },
+  "independent_execution": {
+    "required_check": {
+      "command": "node --experimental-strip-types frontend/scripts/check-settings-ia.mts",
+      "execution_count": 1,
+      "result": "passed",
+      "exit_code": 0,
+      "stdout": "settings IA: 3 组 / 8 条，深链白名单、窄窗折叠、AI 连接约定校验通过",
+      "evidence": "本会话 pwsh call_3340d7973a6748f989b768070e94de6e 原始执行返回",
+      "scope": "source/module only; not browser, final-dist, installed/native or complete B/F/UI acceptance"
+    },
+    "cold_start_matrix": {
+      "result": "passed",
+      "execution_count": 1,
+      "ai_tab_cases_passed": 17,
+      "additional_assertions_passed": 3,
+      "method": "从实际 main.tsx 提取 settingsWindowQuery，使用 node:module.stripTypeScriptTypes 后执行；传入 window 与 isNativeSettingsWindow 测试替身以及 settingsRoute 透传替身；未运行应用、React、浏览器或 native 宿主",
+      "covered": [
+        "query/bootstrap 各五个受支持值均保留自身",
+        "gateway 经 query 与 bootstrap 均不回退 mcp",
+        "query 优先级双向冲突保留",
+        "未知 query 不使用有效 bootstrap，仍回退 mcp",
+        "空 query 使用 bootstrap gateway",
+        "未知 bootstrap、缺省、Gateway 均回退 mcp",
+        "非设置窗口 null、native 设置窗口默认 mcp、路由字段透传"
+      ],
+      "evidence": "本会话 pwsh call_41cc4ad8217a47e5b8943343d1693b0b 原始断言与 JSON 输出",
+      "stderr": "只有 stripTypeScriptTypes ExperimentalWarning，无失败",
+      "limitations": "settingsRoute 被替身替代，原生窗口与组件未实例化，不等同真实用户 UI 冷启动"
+    }
+  },
+  "actual_approved_file_hashes": {
+    "frontend/src/settingsModel.ts": "66862fa0f96b46a449207da1e01257950ad4bdf50dc1ec5703e91d5ee5829ccf",
+    "frontend/src/pages/AiConnectionsPage.tsx": "ec04c7d7e3396b92fa0f0436d2f1111f47763983528feaea9f88fff6c63754ea",
+    "frontend/src/pages/aiConnectionsTabs.ts": "7a48ecb7980820ddf4e96617ec1cba413d61c6f192e617c5240460600159e253",
+    "frontend/src/components/SettingsWindow.tsx": "8d2693382919b2a54e07296db63abcd566a77b930cad692667973e4b85ba5096",
+    "frontend/src/pages/SettingsPage.tsx": "6c578e779a6435dd17e1d103724e132ef4b8ca618ddd3e4f0dd79d883fb65019",
+    "frontend/src/pages/AiProvidersPanel.tsx": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e",
+    "frontend/src/pages/AiToolsPanel.tsx": "8734b12d141134e345e9366c6e52e644ea8bca563fcab5981d93d8535f2abda0",
+    "frontend/src/pages/BuiltinAiPage.tsx": "202b57acdfe78ec377c00b848f6167ae3a649be6bef04d7eac5fa4815c679a84",
+    "frontend/src/components/CredentialCenterPanel.tsx": "9ac3d1cf29397713b91c2ec32d86997ca28afa6a6db3a12971c930008a1416fd",
+    "frontend/styles.css": "ff83485216a5d257d616c88d634bc26de255b493cd777a28c23ae7574b427c71",
+    "frontend/scripts/check-settings-ia.mts": "e4153508ea9af1eb32d4b5eaf8f17838fd7acd0841b21e936ec8552df6868caf",
+    "frontend/scripts/remediation/qa-browser.mjs": "55a5b3b9a9bd5c832c6dc40ea97652180f021cfe712b6a392d02938fe2057119",
+    "frontend/scripts/remediation/service-ui-scenarios.mjs": "4daf67cf34fbe1046eab2f3238b48161ca5dfa238381e6ac0474ecd1a3fcc99a",
+    "src/app/ui.rs": "b5dc8b7b791b401058068fb38da7d1490191c164f1911f8c925c663c0220c720"
+  },
+  "qa_integrity": {
+    "all_14_hashes_match_producer_reported_before_and_after": true,
+    "independent_original_baseline_available": false,
+    "interpretation": "实际摘要已独立计算，全部匹配实现报告原/后摘要；原始基线仅由实现者提供，不把这种一致性升级为宿主确认的全仓未改证明。复核者未修改任何业务源码或 QA。",
+    "original_five_tab_assertion": "已阅读 qa-browser.mjs:63，仍含 mcp/services/gateway/routes/acp 五项冷启动断言，未改写、未运行"
+  },
+  "scope_and_uncovered": [
+    "本阶段仅新增 reports/gateway-cold-start/independent-review.json；未修业务、QA、fixture、配置或依赖，未 git 写入、build、browser、生产 DB、子代理或额外模型调用，未自动重试。",
+    "未执行全仓审计，不能独立证明授权读取路径以外无变更；只有两份报告新增的全仓结论仍需宿主候选证据。",
+    "未读取实现报告引用的另一任务资源根，未把不可信引用当作额外授权。",
+    "未加载外部技能；分配资源根中发现的非任务技能未读取。",
+    "未覆盖真实用户 UI 冷启动、失败恢复、加载/空/错误/权限状态、窄窗/缩放/主题及安装态行为；本任务禁止 build/browser。",
+    "宿主原生 required checks 和正式 VERIFY 由宿主负责，未调用或冒充。"
+  ],
+  "next_steps": [
+    "请求宿主补充当前 Mission 的真实 accepted_producer handoff，包含 logical_dependency 与 actual Codex producer 的不可混淆绑定、计划/确认记录、候选 diff/文件清单及宿主检查结果，并提供本任务授权范围内可读的证据。",
+    "补齐来源绑定后再决定本阶段送验建议；不要为补证据自动重试检查、改写候选或重开已完成任务。",
+    "后续由宿主负责正式 VERIFY 及 fresh final-dist 上原样五页签浏览器断言；built_ui_status 保持 pending_external_final_verification。"
+  ]
+}

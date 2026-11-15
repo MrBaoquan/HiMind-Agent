@@ -1,0 +1,172 @@
+{
+  "schema_version": "executor_repair5_result.v1",
+  "passed": false,
+  "task_id": "repair-executor-lifecycle-lineage-ownership-usage-5",
+  "mission_id": "mission_1794473598404_ffe1e069",
+  "role": "remediation.executor",
+  "phase": "execute",
+  "summary": "结论：源码返工进行中，尚未具备送验条件。下一步：完成当前候选编译和产品回归，记录三个原命令真实结果。",
+  "next_steps": [
+    "Finish current-source compilation and actual retained product regressions",
+    "Provide an authorized resource-contained fixed HiMind route and actual bidirectional task evidence",
+    "Run the three original checks unchanged; host handles later formal VERIFY/QA/review/deployment"
+  ],
+  "implemented_backlog_ids": [
+    "B05",
+    "B08"
+  ],
+  "implemented_backlog_scope": "Only executor usage/lifecycle and narrow Mission budget/claim consistency; partial source implementation, not acceptance of full backlog",
+  "changed_files": [
+    "src/runtime/codex_usage_delivery.rs",
+    "src/workflow/runner.rs",
+    "src/app/mission_dispatch.rs",
+    "src/mission/store.rs",
+    "src/mission/checks.rs",
+    "src/runtime/mod.rs",
+    "src/runtime/deepseek_harness.rs",
+    "src/runtime/executor_live.rs",
+    "scripts/remediation/executor-lifecycle-repair-checks.py",
+    "docs/mixed-executor-runtime.md",
+    "reports/executor/repair-plan.json",
+    "reports/executor/prior-repair3-result.json",
+    "reports/executor/result.json"
+  ],
+  "checks": [
+    {
+      "command": "python -B scripts/remediation/executor-lifecycle-repair-checks.py",
+      "exit_code": 1,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\5d418118d113d32282d291c41c2296fb0b36e0edba11e9750ea04e698d0e4297\\executor-lifecycle-repair\\checks-1794555276092773200.json",
+      "elapsed_ms": 0,
+      "test_count": 0,
+      "classification": "this_round_initial_fresh_root_missing_preparation"
+    },
+    {
+      "command": "cargo test --locked --bin himind-agent --no-run --message-format=json",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--bin",
+        "himind-agent",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "exit_code": 101,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\5d418118d113d32282d291c41c2296fb0b36e0edba11e9750ea04e698d0e4297\\executor\\repair5-build-1794555764603902700.log",
+      "sha256": "6b130ca4a2b5d38fdf67e8dc741d112377daac7daae18d4c6ee1b168762e6139",
+      "elapsed_seconds": 1256.953,
+      "classification": "this_round_intermediate_compile_failed_E0425_fixed_source_rebuild_pending"
+    }
+  ],
+  "limitations": [
+    "No current product-test pass claimed while compilation is pending.",
+    "HiMind opt-in is off and authorized generated fixed route is absent. Feedback 734/736 is not additional authority for production reads/writes.",
+    "Native helper inference is not actual bidirectional task or installed pipeline acceptance.",
+    "No formal VERIFY, independent QA, final review or deployment invoked."
+  ],
+  "execution_binding": {
+    "executor": "personal.codex",
+    "model": "",
+    "service_id": ""
+  },
+  "historical_host_observations": [
+    {
+      "event_id": "mission_1794473598404_ffe1e069:748",
+      "classification": "latest_supplied_host_actual_check_failure_not_this_worker",
+      "checks": [
+        {
+          "exit_code": 1,
+          "elapsed_ms": 128,
+          "output_sha256": "a08dc3e86afd6d9a5ff09983d0526b98947e5e94cdcb6af74ca0558b153f4baf",
+          "test_summary": ""
+        },
+        {
+          "exit_code": 1,
+          "elapsed_ms": 123,
+          "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+          "test_summary": ""
+        },
+        {
+          "exit_code": 1,
+          "elapsed_ms": 128,
+          "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+          "test_summary": ""
+        }
+      ],
+      "numeric_tap_total": null,
+      "raw_output_available": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:741",
+      "classification": "historical_observation_only_details_not_supplied",
+      "numeric_tap_total": null
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:727",
+      "classification": "supplied_current_failure_baseline_not_local_execution",
+      "checks": [
+        {
+          "exit_code": 1,
+          "elapsed_ms": 43041,
+          "output_sha256": "59fe2929d37a78cefcadd8fd76de6470043e94803b87e9c434fc8e05d9bda87f",
+          "test_summary": ""
+        },
+        {
+          "exit_code": 1,
+          "elapsed_ms": 4125,
+          "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+          "test_summary": ""
+        },
+        {
+          "exit_code": 1,
+          "elapsed_ms": 3127,
+          "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+          "test_summary": ""
+        }
+      ],
+      "numeric_tap_total": null,
+      "raw_output_available": false
+    },
+    {
+      "event_id": "mission_1794473598404_ffe1e069:717",
+      "classification": "separate_supplied_historical_diagnostic_timeout",
+      "regression": {
+        "exit_code": -1,
+        "elapsed_ms": 62760,
+        "error": "terminated after exceeding 59 seconds",
+        "test_summary": ""
+      },
+      "remaining_checks": [
+        {
+          "exit_code": -1,
+          "elapsed_ms": 0,
+          "outcome": "not_executed_check_budget_exhausted",
+          "test_summary": ""
+        },
+        {
+          "exit_code": -1,
+          "elapsed_ms": 0,
+          "outcome": "not_executed_check_budget_exhausted",
+          "test_summary": ""
+        }
+      ],
+      "numeric_tap_total": null
+    }
+  ],
+  "creation_failure": {
+    "classification": "pre_worker_LocalRun_creation_failure",
+    "cause": "workflow runtime step timeout_seconds exceeded 86400",
+    "worker_executed": false,
+    "business_result": null
+  },
+  "resource_contract": {
+    "root": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\5d418118d113d32282d291c41c2296fb0b36e0edba11e9750ea04e698d0e4297",
+    "other_worker_cache_read": false,
+    "external_CONTROL_read": false,
+    "src_store_written": false
+  },
+  "prior_report": "reports\\executor\\prior-repair3-result.json",
+  "host_formal_verify_invoked": false,
+  "independent_qa_invoked": false,
+  "deployment_invoked": false
+}

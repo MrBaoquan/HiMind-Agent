@@ -1,0 +1,54 @@
+{
+  "classification": "historical_prior_executor_manifest_not_current_build",
+  "manifest": {
+    "schema_version": "executor_source_evidence_manifest.v1",
+    "hash_algorithm": "sha256",
+    "scope": "explicit task-written final source/doc/report files; not a diff against git HEAD or ownership of inherited host changes",
+    "source_sha256": {
+      "src/runtime/codex.rs": "b54c03c2c2e71bbcb4cf73710f3e0f0e55d86b58b0404efc3083ae8485c92365",
+      "src/runtime/codex_transport.rs": "d3c7c400f78c25d2a5c75668e7efdaee12c1f37c920f9d54ff3e860989b7c018",
+      "src/runtime/deepseek_harness.rs": "86536d53fb834f69a3eda2672d77ad7974fd7a9617db9ec1f2bece4fbea2f743",
+      "src/runtime/mod.rs": "46874a64ccdfa1947b56142d5f5fe937c706a684a03d27c868b6940984d61e4f",
+      "src/runtime/owned_tree.rs": "b55f687e0abb1e8b5c32e90567a22ee8667ca56f72dd40365ce5d78990c1d491",
+      "src/runtime/process.rs": "e052a2c644840bd3f959e54985969b952a3a39e15c1533568e95b7c869c69551",
+      "src/workflow/mod.rs": "73f6dedeefe7fe3f8eea21e85abab708daff9361ada33e0db6322f19520f234a",
+      "src/workflow/runtime.rs": "50bed1f0325e49f3a3bfdce0aca000caf72c233524bee5ab4d923576a8999005",
+      "src/workflow/runner.rs": "f492b47c6448d91abb7ff7be68d66fb90191858bd57d88cffa8caeb1671d449a",
+      "src/workflow/candidate.rs": "0014fb69d37255061a835fab26eb8d681f1bf69a9979e49984f2667bec33b1c7",
+      "src/mission/mod.rs": "152a8557e55e04adb003c04229d8630857a68135d7fbeceacb3636355e92e57b",
+      "src/mission/executor_handoff.rs": "264a0b180e34ac77e3dd4e25f7d9d4dc6624d8069778466cb8640a3eaca83781",
+      "src/app/mission_dispatch.rs": "181b9c6a050acc2a4f7e4186e42e445a5cc4b84edd37d1ba231a5302c93b2d18",
+      "scripts/remediation/executor-check.py": "778a1905f4a3c5db96b6f5befd86760ca68de38cfa42477f9b4b60620c09e7aa",
+      "docs/mixed-executor-runtime.md": "f85acf72fcdaa1fbd936b09e7901370cfd0b0c6feb3480ccfb6660dea38a7215"
+    },
+    "evidence_report_sha256": {
+      "reports/executor/observed-model-runs.json": "3fba13c2a2ff013aaf467a5b4082e35eb2f20c6e212ab8477db24b4bde09f432",
+      "reports/executor/observed-failed-himind-run.json": "23b46ba5d17b443ee5443b3151f7e721c7eecb234a13756f29f37305c21f79c2",
+      "reports/executor/host-recheck.json": "059db724b60b05ad60dc58cb3dcac7728c4ef7cbd9df04e2c0df2a08cf7e91df"
+    },
+    "input_sha256": {
+      "remediation-input/execution-contract.md": "223f2504846212b0be923ea68557a6066e4add4e561357f656e01f49e5390dd0",
+      "remediation-input/backlog.json": "391f81822f5a40715893e580d8525e87924803dcec5b527e7dd0373a36d7f53c",
+      "remediation-input/prestart-host-patch.json": "6e3f81575f102378129e43a6be219668ff542c3e65c04f9b4452c51ffa049c0d",
+      "remediation-input/baseline-manifest.json": "b19505f763d23bdc3f0a5a9a23ef3f90a3d5926af36768a8479152cecba4f686",
+      "reports/implementation-plan.md": "606cd8159f5dda3fd3591487550cbe84f7ad3b441ecd272f6540c998d601190d"
+    },
+    "real_codex_artifact_sha256": {
+      "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\live-codex-f38e04a38cb7b820\\result.json": "747f7b0b6408f2a6553fcb0e66488823ccf825a3719efd1bca1b75529e2204b2",
+      "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\live-codex-f38e04a38cb7b820\\launch.txt": "6c356348abb7d4b603cbbf3a6689f78ca7717494cab8586812c7fa3d20a9225a",
+      "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\live-codex-f38e04a38cb7b820\\resume.txt": "417de212296d35d6d59d6294ca5d59bc64444e09be478c769a77a9e07a696039"
+    },
+    "generated_debug_binary": {
+      "path": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\t\\debug\\himind-agent.exe",
+      "sha256": "2e62312e6634b3dfe58737b2d40ac82b2ef2b2334c05c701b78380aa9984802e",
+      "deployed": false
+    },
+    "resource_contract": {
+      "root": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9",
+      "mission_id": "mission_1794473598404_ffe1e069",
+      "task_id": "executor-lifecycle",
+      "source_authority": false
+    },
+    "result_json_excluded_to_avoid_self_hash": true
+  }
+}

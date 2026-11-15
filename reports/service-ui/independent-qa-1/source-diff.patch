@@ -1,0 +1,25 @@
+--- inherited/frontend/scripts/check-service-ui.browser.mjs
++++ current/frontend/scripts/remediation/service-ui-browser.mjs
+@@ -2,10 +2,10 @@
+ import { resolve, dirname } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+-import { createRuntime } from './remediation/service-ui-runtime.mjs';
+-import { checkServiceSummaryLayout, checkServiceUiExtended } from './remediation/service-ui-scenarios.mjs';
++import { createRuntime } from './service-ui-runtime.mjs';
++import { checkServiceSummaryLayout, checkServiceUiExtended } from './service-ui-scenarios.mjs';
+ 
+-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
++const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+ if (process.env.SERVICE_UI_MEASURE_ONLY === '1') throw new Error('Measurement-only mode cannot satisfy the required browser scenarios.');
+ const runtime = createRuntime('browser');
+ const evidence = runtime.directory;
+@@ -37,7 +37,7 @@
+ async function shot(name){await page.screenshot({path:resolve(evidence,name+'.png'),fullPage:true,timeout:5000});}
+ async function overflow(){return page.evaluate(()=>({viewport:innerWidth,document:document.documentElement.scrollWidth,outside:[...document.querySelectorAll('main *')].filter(element=>element.getBoundingClientRect().right>innerWidth+1).slice(0,15).map(element=>({tag:element.tagName,class:element.className,right:element.getBoundingClientRect().right})),dialogs:[...document.querySelectorAll('dialog')].map(element=>({width:element.clientWidth,scroll:element.scrollWidth,height:element.clientHeight,scrollHeight:element.scrollHeight}))}));}
+ try {
+- server = await createServer({root,configFile:false,cacheDir:runtime.cache,plugins:[react(),{name:'service-ui-test',resolveId(id){if(id==='/__service-ui-fixture.tsx'||id===virtual)return virtual},load(id){if(id===virtual)return fixture},configureServer(server){server.middlewares.use('/__service-ui',async(req,res,next)=>{if(req.url&&!req.url.startsWith('/?')&&req.url!=='/')return next();res.setHeader('Content-Type','text/html');res.end(await server.transformIndexHtml('/__service-ui','<!doctype html><html lang="zh"><body><div id="root"></div><script type="module" src="/__service-ui-fixture.tsx"></script></body></html>'))})}}],server:{host:'127.0.0.1',port:0}});
++ server = await createServer({root,configFile:false,cacheDir:runtime.cache,plugins:[react(),{name:'service-ui-test',resolveId(id){if(id==='/__service-ui-fixture.tsx'||id===virtual)return virtual},load(id){if(id===virtual)return fixture},configureServer(server){server.middlewares.use('/__service-ui',async(req,res,next)=>{if(req.url&&!req.url.startsWith('/?')&&req.url!=='/')return next();res.setHeader('Content-Type','text/html');res.end(await server.transformIndexHtml('/__service-ui','<!doctype html><html lang="zh"><body><script type="module">import RefreshRuntime from "/@react-refresh";RefreshRuntime.injectIntoGlobalHook(window);window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>type=>type;window.__vite_plugin_react_preamble_installed__=true;</script><div id="root"></div><script type="module" src="/__service-ui-fixture.tsx"></script></body></html>'))})}}],server:{host:'127.0.0.1',port:0}});
+  await server.listen();
+  // Use explicit short, task-owned paths: Playwright's generated profile prefix
+  // exceeds Windows mkdtemp limits beneath the host's two-hash resource root.

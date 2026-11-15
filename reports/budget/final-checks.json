@@ -1,0 +1,16 @@
+[
+  {
+    "command": "cargo test mission:: -- --nocapture --test-threads=1",
+    "exit_code": 0,
+    "evidence": "reports/budget/mission-final.log",
+    "passed_tests": 73,
+    "classification": "real_store_and_handler_unit"
+  },
+  {
+    "command": "cargo test app::mission -- --nocapture --test-threads=1",
+    "exit_code": 0,
+    "evidence": "reports/budget/handlers-final.log",
+    "passed_tests": 20,
+    "classification": "real_store_and_handler_unit"
+  }
+]

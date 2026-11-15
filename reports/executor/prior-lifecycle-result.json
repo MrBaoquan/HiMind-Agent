@@ -1,0 +1,709 @@
+{
+  "classification": "historical_prior_executor_report_not_current_verification",
+  "report": {
+    "schema_version": "executor_remediation_result.v1",
+    "passed": true,
+    "mission_id": "mission_1794473598404_ffe1e069",
+    "task_id": "executor-lifecycle",
+    "role": "remediation.executor",
+    "summary": "结论：当前源码交付和本地验证就绪；共享 Codex 协议与输入/取消处理、AgentRun 恢复权限、严格最终正文、保守 usage、双向交接与可观测性已实施。passed 仅为送验建议。",
+    "stage_scope": "plan→execute→local verify→deliver; host formal VERIFY is separate",
+    "implemented_backlog_ids": [
+      "B05",
+      "B08"
+    ],
+    "implemented_backlog_scope": {
+      "B05": "Runtime 的真实 token/未知金额标记、持久快照和按尝试去重/累加；保留已有 Mission 币种与可信成本门控。",
+      "B08": "Runtime 收尾、取消/超时、恢复、失败返工及独立验收边界贡献；不包含其他任务拥有的 UI/预算事务实施。"
+    },
+    "changed_files": [
+      "src/runtime/codex.rs",
+      "src/runtime/codex_transport.rs",
+      "src/runtime/deepseek_harness.rs",
+      "src/runtime/mod.rs",
+      "src/runtime/owned_tree.rs",
+      "src/runtime/process.rs",
+      "src/workflow/mod.rs",
+      "src/workflow/runtime.rs",
+      "src/workflow/runner.rs",
+      "src/workflow/candidate.rs",
+      "src/mission/mod.rs",
+      "src/mission/executor_handoff.rs",
+      "src/app/mission_dispatch.rs",
+      "scripts/remediation/executor-check.py",
+      "docs/mixed-executor-runtime.md",
+      "reports/executor/observed-model-runs.json",
+      "reports/executor/observed-failed-himind-run.json",
+      "reports/executor/host-recheck.json",
+      "reports/executor/manifest.json",
+      "reports/executor/result.json"
+    ],
+    "checks": [
+      {
+        "command": "cargo test --locked --bin himind-agent workflow:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "workflow::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow3-1794542125183182100.log",
+        "sha256": "5acdb0969ea3a827311187b1f8726e14ce62b922ef8760fa0eb7a20675d6fd18",
+        "elapsed_seconds": 84.469,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow3-1794542125183182100.json",
+        "test_result": "test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 1803 filtered out; finished in 36.30s",
+        "name": "workflow3",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent executor_ -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "executor_",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle-final-1794542258754039300.log",
+        "sha256": "e120f4a20831819f0f6d41784bee6538a22bdb0d393fce5c498ed3e3fc98a394",
+        "elapsed_seconds": 37.594,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle-final-1794542258754039300.json",
+        "test_result": "test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 1989 filtered out; finished in 12.64s",
+        "name": "lifecycle-final",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent workflow::runner::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "workflow::runner::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\runner-1794541803197570000.log",
+        "sha256": "c434f3f889efb15adbdf0908bdc7866a45846e694570f49ff7fb06013614c9fb",
+        "elapsed_seconds": 33.421,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\runner-1794541803197570000.json",
+        "test_result": "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1965 filtered out; finished in 7.21s",
+        "name": "runner",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::process::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::process::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\process-1794541836989079200.log",
+        "sha256": "3563af2b972f14b472a92de57ba58fa3a7dd7c8ddf7beedb32bf88a9364bec77",
+        "elapsed_seconds": 27.594,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\process-1794541836989079200.json",
+        "test_result": "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1996 filtered out; finished in 1.97s",
+        "name": "process",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::codex::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::codex::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\codex-1794541864916500800.log",
+        "sha256": "f4b3417aea53f658866f91d14b49e4f5641d8e26c1fa316ea0ea67a4bd05093b",
+        "elapsed_seconds": 30.0,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\codex-1794541864916500800.json",
+        "test_result": "test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 1995 filtered out; finished in 5.75s",
+        "name": "codex",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\agent-result-1794541895259238100.log",
+        "sha256": "13df11e8c621fa26a6132e65802a280b33613f38aae661893f0d739716daec97",
+        "elapsed_seconds": 45.547,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\agent-result-1794541895259238100.json",
+        "test_result": "test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 1962 filtered out; finished in 20.47s",
+        "name": "agent-result",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::deepseek_harness::headless_input_tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::deepseek_harness::headless_input_tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\builtin-input-1794541941395697200.log",
+        "sha256": "a6905d26babd9a30ab7e0a78b356e7e228eeb07617aabf800ed6691cc0f9a544",
+        "elapsed_seconds": 26.812,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\builtin-input-1794541941395697200.json",
+        "test_result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1999 filtered out; finished in 1.73s",
+        "name": "builtin-input",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::deepseek_harness::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::deepseek_harness::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\builtin-contract-1794542296772895200.log",
+        "sha256": "cddca1e0f6afde7ca4c8808597845bf3929ca439f0c35cbcfd912a612cc098f1",
+        "elapsed_seconds": 26.937,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\builtin-contract-1794542296772895200.json",
+        "test_result": "test result: ok. 74 passed; 0 failed; 1 ignored; 0 measured; 1928 filtered out; finished in 0.32s",
+        "name": "builtin-contract",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent app::mission_dispatch::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "app::mission_dispatch::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\dispatch-1794541968557978400.log",
+        "sha256": "f48495fa357bdc582cb81f2edc5c99d7ef41f0bc0b9e18ab060b4fa7b262c9fc",
+        "elapsed_seconds": 34.109,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\dispatch-1794541968557978400.json",
+        "test_result": "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 1981 filtered out; finished in 9.34s",
+        "name": "dispatch",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent mission::store::tests:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "mission::store::tests::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\mission-store-1794542002983139500.log",
+        "sha256": "66e644aad198e12717bd6a6b1f18ec2c4b829359ed8db209d3ef6cbce573fa45",
+        "elapsed_seconds": 31.719,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\mission-store-1794542002983139500.json",
+        "test_result": "test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 1950 filtered out; finished in 6.10s",
+        "name": "mission-store",
+        "classification": "isolated_contract_or_regression"
+      },
+      {
+        "command": "cargo build --locked --bin himind-agent",
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--bin",
+          "himind-agent"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\build-1794542324114908400.log",
+        "sha256": "5bf0913b4e83ea840ccacace6e3d2493fb2122cc2e7e79dd9b13b1142c1eee57",
+        "elapsed_seconds": 136.266,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\build-1794542324114908400.json",
+        "name": "build",
+        "classification": "ordinary_debug_build"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent runtime::codex::tests::executor_real_codex_launch_resume_shell_preflight -- --ignored --exact --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "runtime::codex::tests::executor_real_codex_launch_resume_shell_preflight",
+          "--",
+          "--ignored",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\real-codex-final-1794542460754870400.log",
+        "sha256": "73701fbab145886bbade38920017fbd0df06f700758aedbc95b4814e58602fb4",
+        "elapsed_seconds": 68.438,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\real-codex-final-1794542460754870400.json",
+        "test_result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2002 filtered out; finished in 44.40s",
+        "name": "real-codex-final",
+        "classification": "real_personal_codex_model"
+      },
+      {
+        "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+        "argv": [
+          "python",
+          "-c",
+          "import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\required-1794542691665031600.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "elapsed_seconds": 0.047,
+        "name": "required_check_exact",
+        "classification": "required_delivery_assertion",
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\required-1794542691665031600.json"
+      }
+    ],
+    "historical_failed_checks": [
+      {
+        "command": "cargo test --locked --bin himind-agent --no-run",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "--no-run"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile-1794539394681899000.log",
+        "sha256": "19280671fb1284398793c129ed50f99fcc63d542563a14f5d11e85c21fd76552",
+        "elapsed_seconds": 20.031,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile-1794539394681899000.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent --no-run",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "--no-run"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile2-1794539488067843100.log",
+        "sha256": "43cb54f5faab2457ab5ae834acd362921ade49d5e1d60eb7e19a22ba2b5c3fc9",
+        "elapsed_seconds": 70.406,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile2-1794539488067843100.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent --no-run",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "--no-run"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile3-1794539642036078900.log",
+        "sha256": "eb6864dc348e0cc01845003f254c74e1a0a5152025adddcce1fa6cef485a7bdd",
+        "elapsed_seconds": 207.953,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile3-1794539642036078900.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent --no-run",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "--no-run"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile4-1794539950523957700.log",
+        "sha256": "6b4654d47dd862fe99ad6f993758ef2764023ef9a0d83f5831a22affd2f2eae1",
+        "elapsed_seconds": 77.75,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\compile4-1794539950523957700.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent executor_ -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "executor_",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle-1794540221981688100.log",
+        "sha256": "8ba58a292240aae7c12a5e1348681cbdf4e3c2a504e65dc0ce2df1df74d810a2",
+        "elapsed_seconds": 64.312,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle-1794540221981688100.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent executor_ -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "executor_",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle2-1794540356212917400.log",
+        "sha256": "24dcff5f174206129ce9003ec2f3f3baff5b4d06862e0f858c0c3e29e254ad69",
+        "elapsed_seconds": 16.422,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle2-1794540356212917400.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent executor_ -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "executor_",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle4-1794541071538046500.log",
+        "sha256": "0950c6e60457e5bff7fe806a6d5bafa8a3324ecc61c04e2bc8f5b223a8ffc378",
+        "elapsed_seconds": 80.375,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle4-1794541071538046500.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent executor_ -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "executor_",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle5-1794541232183659600.log",
+        "sha256": "a698eba31bffde1e73f4d815b1e8888d42cd41c6f2ddbaa252c3fd952c6cd502",
+        "elapsed_seconds": 63.406,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\lifecycle5-1794541232183659600.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent workflow:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "workflow::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow-1794541494528710900.log",
+        "sha256": "4a415eececbaeca366b5edf036b12672acc27337653ff3b65c46e9b0a61fa0d2",
+        "elapsed_seconds": 62.922,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow-1794541494528710900.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent workflow:: -- --nocapture --test-threads=1",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "workflow::",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow2-1794541591288920400.log",
+        "sha256": "21bd7afe656b5d64283c7af82e5ecdeb34b70bcc7d1a8fae45e0c62729bc38f4",
+        "elapsed_seconds": 55.219,
+        "record": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\workflow2-1794541591288920400.json",
+        "status": "historical_failed_attempt_superseded_by_named_final_checks"
+      }
+    ],
+    "failure_history_resolution": {
+      "compile/compile2": "Task-local MSVC generated long path linker wrapper; no global changes.",
+      "compile3/compile4/lifecycle2": "Fixed actual compilation/import/borrow issues; final ordinary build exit0.",
+      "lifecycle/lifecycle4/lifecycle5": "Fixed stale-final fixture/result-path and durable selection serialization/runtime event slot problems; final lifecycle exit0.",
+      "workflow/workflow2": "Updated the CLI fixture to report the newly required compatible semantic version; shortened only Git fixture directory names under assigned root, retained all assertions; workflow3 all 200 passed."
+    },
+    "test_counts_overlap": true,
+    "coverage": [
+      {
+        "area": "Workflow personal.codex",
+        "evidence": [
+          "workflow3",
+          "lifecycle-final"
+        ],
+        "classification": "fake CLI through actual runtime and ordinary runner; >32767 UTF16 input, output-first, no-reader, cancel/timeout, preflight hang/pipe, missing/nonzero/negative/truncated final, no downstream on failure"
+      },
+      {
+        "area": "AgentRun personal.codex",
+        "evidence": [
+          "lifecycle-final",
+          "real-codex-final"
+        ],
+        "classification": "claimed invocation boundary fake CLI launch/resume plus real personal Codex shell launch/resume; remote API/lease path pending"
+      },
+      {
+        "area": "himind.builtin",
+        "evidence": [
+          "builtin-input",
+          "builtin-contract",
+          "reports/executor/observed-model-runs.json",
+          "reports/executor/observed-failed-himind-run.json"
+        ],
+        "classification": "isolated headless input/cancel/timeout and model/service overlay tests plus historical real successful/failed model runs; newly deployed route pending"
+      },
+      {
+        "area": "usage/session/recovery",
+        "evidence": [
+          "runner",
+          "agent-result",
+          "mission-store",
+          "lifecycle-final"
+        ],
+        "classification": "SQLite persistence/replay, per-attempt retry accounting, late completion after cancellation, fixed recorder terminal slots and idempotent runtime facts; personal Codex real session resume separately proven"
+      },
+      {
+        "area": "bidirectional handoff",
+        "evidence": [
+          "lifecycle-final",
+          "dispatch"
+        ],
+        "classification": "host input builder, actual local ledger/files; upstream run, protected baseline/output/artifact hashes, scopes, model source and verification binding; model-chain deployment proof pending"
+      },
+      {
+        "area": "required checks and independent acceptance",
+        "evidence": [
+          "dispatch",
+          "mission-store"
+        ],
+        "classification": "host boundary contract tests, preserves mutation rejection/read-only checks and separate verifier; not a real formal VERIFY"
+      }
+    ],
+    "real_codex": {
+      "classification": "new source real personal model shell launch/resume",
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\live-codex-f38e04a38cb7b820\\result.json",
+      "sha256": "747f7b0b6408f2a6553fcb0e66488823ccf825a3719efd1bca1b75529e2204b2",
+      "version": "codex-cli 0.167.0-alpha.4.1",
+      "session_id": "01a1d311-3eb8-77f1-9707-f66504daced1",
+      "permission": "danger-full-access",
+      "model_source": "personal_cli_config",
+      "cost_status": "unknown",
+      "launch_usage": {
+        "input_tokens": 47391,
+        "output_tokens": 174,
+        "estimated_cost": 0.0,
+        "currency": "",
+        "billing_owner": "user"
+      },
+      "resume_usage": {
+        "input_tokens": 95746,
+        "output_tokens": 349,
+        "estimated_cost": 0.0,
+        "currency": "",
+        "billing_owner": "user"
+      },
+      "host_verify_invoked": false
+    },
+    "observed_model_runs": [
+      {
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+        "provider": "himind.builtin",
+        "status": "succeeded",
+        "models": [
+          "himind:lucen:gpt-6.1-sol"
+        ],
+        "usage": {
+          "input_tokens": 6813583,
+          "output_tokens": 11254,
+          "estimated_cost": 0,
+          "currency": "",
+          "billing_owner": "local"
+        },
+        "classification": "historical_real_model_run_read_via_MCP_not_current_source_acceptance"
+      },
+      {
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_budget-state-contract",
+        "provider": "himind.builtin",
+        "status": "succeeded",
+        "models": [
+          "himind:lucen:gpt-6.1-sol"
+        ],
+        "usage": {
+          "input_tokens": 8642004,
+          "output_tokens": 23313,
+          "estimated_cost": 0,
+          "currency": "",
+          "billing_owner": "local"
+        },
+        "classification": "historical_real_model_run_read_via_MCP_not_current_source_acceptance"
+      },
+      {
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-service-ui-delivery-11",
+        "provider": "personal.codex",
+        "status": "succeeded",
+        "models": [],
+        "usage": null,
+        "classification": "historical_real_model_run_read_via_MCP_not_current_source_acceptance"
+      },
+      {
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-implementation-plan-1",
+        "provider": "himind.builtin",
+        "status": "failed",
+        "usage": {
+          "input_tokens": 2645362,
+          "output_tokens": 2640,
+          "estimated_cost": 0,
+          "currency": "",
+          "billing_owner": "local"
+        },
+        "classification": "historical_real_failure_not_a_fixture"
+      }
+    ],
+    "preserved_host_prerequisites": {
+      "record": "remediation-input/prestart-host-patch.json",
+      "sha256": "6e3f81575f102378129e43a6be219668ff542c3e65c04f9b4452c51ffa049c0d",
+      "seven_file_patch_not_claimed_as_our_work": true,
+      "policy_regression_evidence": [
+        "workflow3",
+        "dispatch",
+        "mission-store",
+        "real-codex-final"
+      ],
+      "shared_files_have_authorized_successor_changes_not_byte_identity_claim": true
+    },
+    "limitations": [
+      "宿主重部署及新 himind.builtin 实跑是生产结论阻塞项。HiMind 成功/失败为只读 MCP 取得的历史真实运行，不证明本次新源码已部署。",
+      "远程 Dashboard AgentRun API 的 claim/lease、失败结果回传、断联/进程重启与会话恢复尚无本次生产证据；已有 execute_invocation 契约及本地账本证据不能代替该验证。",
+      "真实 H→C→H 在本次新宿主输入边界生成 envelope 尚待控制端隔离任务；当前双向 envelope/hash/权限/模型来源为真实本地账本加文件的契约测试。",
+      "取消、超时、暂停/恢复、失败返工、重启、晚到完成和独立核验边界按矩阵标为契约测试；没有取消本 Mission、重开旧任务或调用宿主正式 VERIFY。",
+      "Windows Job attach 在 spawn 后存在短窗口；非 Windows OwnedTree 为空实现，未声称具有相同子树归属保障。",
+      "产物 hash 是接收输入生成时的当前字节观测，不是历史签名。绝对 evidence_refs 不授予权限，当前 envelope 不读取这类引用。",
+      "个人 Codex 金额未知；legacy usage numeric=0/currency空是不可比较哨兵，外层 cost=null/cost_status=unknown。不得据此认定免费。未上报 usage 仍为 null。",
+      "Windows 0.167 是本环境验证的版本下限；未保证所有未来 Codex 版本兼容。普通 debug 构建已验证，release/部署/健康检查属于宿主后续工作。",
+      "B05/B08 仅列本任务 Runtime 部分贡献，未重新宣称其他负责人、前置宿主或全部 backlog 的实施/验收成果。"
+    ],
+    "host_production_blockers": [
+      "Fresh himind.builtin run through newly deployed code, including shell and token usage.",
+      "Remote AgentRun API claim/renew/session/usage/terminal and restart reconciliation.",
+      "Fresh actual H→C→H handoff envelope from host input generation; historical runs do not contain it.",
+      "Isolated cancellation/late completion and pause/resume; never cancel the remediation Mission.",
+      "Host-owned required checks, independent VERIFY and deployment health."
+    ],
+    "next_steps": [
+      "控制端审阅 reports/executor/manifest.json 和历史失败/最终检查；按现有授权重部署候选，执行部署健康检查。",
+      "控制端在新资源契约下审核 reports/executor/host-recheck.json 的隔离任务 payload；完成真实 H→C→H 与远程 AgentRun API 的待验证项目，不操作本 Mission 的取消状态。",
+      "宿主另行启动当前任务正式 VERIFY、独立 QA 和最终复核；只有宿主可宣布 Mission/独立验收通过。"
+    ],
+    "formal_verification": {
+      "invoked": false,
+      "authority": "host_only",
+      "status": "pending_host_owned_verify_not_a_stage_failure"
+    },
+    "required_check": {
+      "status": "passed",
+      "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\required-1794542691665031600.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "manifest": "reports/executor/manifest.json",
+    "evidence": [
+      "reports/executor/manifest.json",
+      "reports/executor/observed-model-runs.json",
+      "reports/executor/observed-failed-himind-run.json",
+      "reports/executor/host-recheck.json",
+      "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\live-codex-f38e04a38cb7b820\\result.json",
+      "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\462397d74e6d3806fcbfd1d99d9d33890787f9a6bfcf711532fc9502d3871ae9\\executor\\required-1794542691665031600.log"
+    ],
+    "created_at": "2026-11-13T04:04:33.309053+00:00",
+    "delivery_ready": true
+  }
+}

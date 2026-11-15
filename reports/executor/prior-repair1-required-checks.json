@@ -1,0 +1,36 @@
+{
+  "classification": "current_execution_of_original_required_result_assertions",
+  "passed": false,
+  "checks": [
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')"
+      ],
+      "exit_code": 1,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\37583735e4c61aaf3214649f4bc06481105faff2144c8a6df40aa3442bb4d0ae\\executor\\repair-result-required-1-1794545776794489900.log",
+      "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+      "elapsed_seconds": 0.047,
+      "classification": "current_exact_required_validator",
+      "test_count": 0,
+      "outcome": "failed_because_delivery_remains_blocked; not waived"
+    },
+    {
+      "command": "python -c \"import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)"
+      ],
+      "exit_code": 1,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\37583735e4c61aaf3214649f4bc06481105faff2144c8a6df40aa3442bb4d0ae\\executor\\repair-result-required-2-1794545777184417700.log",
+      "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+      "elapsed_seconds": 0.047,
+      "classification": "current_exact_required_validator",
+      "test_count": 0,
+      "outcome": "failed_because_delivery_remains_blocked; not waived"
+    }
+  ]
+}

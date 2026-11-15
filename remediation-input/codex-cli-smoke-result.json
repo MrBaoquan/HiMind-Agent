@@ -1,0 +1,76 @@
+{
+  "passed": true,
+  "steps": [
+    {
+      "name": "codex-launch",
+      "exit_code": 0,
+      "sandbox": "danger-full-access",
+      "session_id": "01a1ceee-63be-7b33-b191-e95393e8cb8f",
+      "elapsed_seconds": 105.22484087944031,
+      "event_types": [
+        "thread.started",
+        "item.completed",
+        "turn.started",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "turn.completed"
+      ],
+      "final_present": true
+    },
+    {
+      "name": "codex-resume",
+      "exit_code": 0,
+      "sandbox": "danger-full-access",
+      "session_id": "01a1ceee-63be-7b33-b191-e95393e8cb8f",
+      "elapsed_seconds": 32.580756187438965,
+      "event_types": [
+        "thread.started",
+        "item.completed",
+        "turn.started",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "turn.completed"
+      ],
+      "final_present": true
+    },
+    {
+      "name": "codex-readonly",
+      "exit_code": 0,
+      "sandbox": "read-only",
+      "session_id": "01a1cef0-7c77-7323-bdaa-fcb99ca90a50",
+      "elapsed_seconds": 30.60079789161682,
+      "event_types": [
+        "thread.started",
+        "item.completed",
+        "turn.started",
+        "item.completed",
+        "item.completed",
+        "item.completed",
+        "item.started",
+        "item.completed",
+        "item.completed",
+        "turn.completed"
+      ],
+      "final_present": true
+    }
+  ],
+  "readonly_hash_unchanged": true
+}

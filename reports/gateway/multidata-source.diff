@@ -1,0 +1,2371 @@
+diff --git a/src/app/inference_gateway.rs b/src/app/inference_gateway.rs
+index b69d9c7..62e692a 100644
+--- a/src/app/inference_gateway.rs
++++ b/src/app/inference_gateway.rs
+@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
+ use std::time::{Duration, Instant};
+ 
+ use crate::app::reasoning_tags::{sanitize_reasoning_tags, ReasoningTagSanitizer};
++use crate::store::ai_services::{upstream_endpoint_url, AIServiceProtocol, UpstreamEndpoint};
+ use crate::store::local_usage::{self, LocalUsageRecord};
+ 
+ const HEADER_LIMIT: usize = 64 * 1024;
+@@ -826,20 +827,18 @@ fn binding_has_model(binding: &GatewayBinding, model: &str) -> bool {
+             .iter()
+             .any(|candidate| candidate.trim() == model)
+ }
+-/// 上游地址拼接：base 通常已含 `/v1`，避免拼成 `/v1/v1/...`。
+-fn join_upstream(base_url: &str, path: &str) -> String {
+-    let base = base_url.trim().trim_end_matches('/');
+-    let path = if path.starts_with("/v1/") && base.ends_with("/v1") {
+-        // 两边都带 `/v1`：去掉路径里的那份，避免拼成 `/v1/v1/...`。
+-        &path[3..]
+-    } else {
+-        path
+-    };
+-    if !path.starts_with("/v1/") && !base.ends_with("/v1") {
+-        // 两边都没有 `/v1`：上游是 OpenAI 兼容服务，补上标准前缀。
+-        return format!("{base}/v1{path}");
++/// 绑定里的上游协议字符串来自持久化数据；解析失败按 OpenAI Chat 兜底。
++fn upstream_protocol(protocol: &str) -> AIServiceProtocol {
++    AIServiceProtocol::parse(protocol).unwrap_or(AIServiceProtocol::OpenaiChat)
++}
++
++/// 直通转发时按上游协议选择端点；互译路径各自显式指定协议。
++fn protocol_endpoint(protocol: &AIServiceProtocol) -> UpstreamEndpoint {
++    match protocol {
++        AIServiceProtocol::Anthropic => UpstreamEndpoint::Messages,
++        AIServiceProtocol::OpenaiChat => UpstreamEndpoint::ChatCompletions,
++        AIServiceProtocol::OpenaiResponses => UpstreamEndpoint::Responses,
+     }
+-    format!("{base}{path}")
+ }
+ 
+ /// 将 Responses 工具结果里的图片/文件附件降级成文本说明。
+@@ -1028,7 +1027,7 @@ where
+                         ),
+                     );
+                     mark_route_outcome(candidate, status);
+-                    let _ = response.bytes();
++                    let _ = read_error_body(response);
+                     continue;
+                 }
+                 active.set(index);
+@@ -1060,8 +1059,8 @@ where
+ /// 否则所有“未知兼容上游”会共享同一份降级事实。
+ fn capability_provider_key(binding: &GatewayBinding) -> (String, String) {
+     use crate::store::ai_services::AIServiceProtocol;
+-    let protocol = AIServiceProtocol::parse(&binding.protocol)
+-        .unwrap_or(AIServiceProtocol::OpenaiChat);
++    let protocol =
++        AIServiceProtocol::parse(&binding.protocol).unwrap_or(AIServiceProtocol::OpenaiChat);
+     let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+     let provider = matrix.resolve_provider(&binding.base_url, &protocol);
+     let key = if provider.id == crate::app::ai_compatibility::UNKNOWN_PROVIDER_ID {
+@@ -1083,13 +1082,17 @@ fn apply_observed_responses_fallbacks(
+     body: &[u8],
+ ) -> (Vec<u8>, Vec<&'static str>) {
+     let (provider, protocol) = capability_provider_key(binding);
+-    let observed = crate::store::ai_capability_observations::observed_features(&provider, &protocol);
++    let observed =
++        crate::store::ai_capability_observations::observed_features(&provider, &protocol);
+     if observed.is_empty() {
+         return (body.to_vec(), Vec::new());
+     }
+     let mut current = body.to_vec();
+     let mut applied = Vec::new();
+-    if observed.iter().any(|feature| feature == "tool_result_media") {
++    if observed
++        .iter()
++        .any(|feature| feature == "tool_result_media")
++    {
+         if let Some(next) = response_tool_output_media_fallback(&current) {
+             current = next;
+             applied.push("tool_result_media");
+@@ -1103,7 +1106,10 @@ fn apply_observed_responses_fallbacks(
+             }
+         }
+     }
+-    if observed.iter().any(|feature| feature == "unsupported_tools") {
++    if observed
++        .iter()
++        .any(|feature| feature == "unsupported_tools")
++    {
+         if let Some(next) = response_unsupported_tools_fallback(&current) {
+             current = next;
+             applied.push("unsupported_tools");
+@@ -1388,10 +1394,19 @@ fn anchor_text(value: &Value) -> String {
+     }
+ }
+ 
++#[cfg(test)]
++static TEST_UPSTREAM_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
++
+ fn upstream_client(base_url: &str) -> reqwest::Result<reqwest::blocking::Client> {
+     let mut builder = reqwest::blocking::Client::builder()
+         .connect_timeout(CONNECT_TIMEOUT)
+         .timeout(REQUEST_TIMEOUT);
++    #[cfg(test)]
++    if TEST_UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed) > 0 {
++        builder = builder.timeout(Duration::from_millis(
++            TEST_UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed),
++        ));
++    }
+     let loopback = url::Url::parse(base_url)
+         .ok()
+         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+@@ -1578,12 +1593,7 @@ fn route(
+             binding.client,
+             current_request_id()
+         );
+-        let _ = write_json_error(
+-            stream,
+-            429,
+-            "himind_gateway_too_many_requests",
+-            &message,
+-        );
++        let _ = write_json_error(stream, 429, "himind_gateway_too_many_requests", &message);
+         let display_model = binding_exposed_model(&binding).to_string();
+         record_usage(
+             &binding,
+@@ -1731,8 +1741,7 @@ fn rewrite_json_model(raw: &[u8], exposed_model: &str) -> Vec<u8> {
+         return raw.to_vec();
+     };
+     let has_model = value.get("model").is_some();
+-    let has_responses_output =
+-        value.get("output").is_some() || value.get("output_text").is_some();
++    let has_responses_output = value.get("output").is_some() || value.get("output_text").is_some();
+     if !has_model && !has_responses_output {
+         return raw.to_vec();
+     }
+@@ -1823,7 +1832,10 @@ fn sanitize_responses_stream_event(
+ ) -> Option<usize> {
+     match event_type {
+         Some("response.output_text.delta") => {
+-            let delta = value.get("delta").and_then(Value::as_str).unwrap_or_default();
++            let delta = value
++                .get("delta")
++                .and_then(Value::as_str)
++                .unwrap_or_default();
+             let clean = sanitizer.push(delta);
+             value["delta"] = json!(clean);
+             Some(0)
+@@ -1835,12 +1847,9 @@ fn sanitize_responses_stream_event(
+                 .map(sanitize_content_part)
+                 .unwrap_or(0),
+         ),
+-        Some("response.output_item.added" | "response.output_item.done") => Some(
+-            value
+-                .get_mut("item")
+-                .map(sanitize_output_item)
+-                .unwrap_or(0),
+-        ),
++        Some("response.output_item.added" | "response.output_item.done") => {
++            Some(value.get_mut("item").map(sanitize_output_item).unwrap_or(0))
++        }
+         Some("response.completed" | "response.incomplete" | "response.failed") => Some(
+             value
+                 .get_mut("response")
+@@ -1904,7 +1913,7 @@ where
+                     binding.client, binding.service
+                 ),
+             );
+-            let _ = response.bytes();
++            let _ = read_error_body(response);
+             thread::sleep(Duration::from_millis(250));
+             continue;
+         }
+@@ -2022,13 +2031,7 @@ fn forward(
+     }
+     // OpenCode 等通用客户端讲 Chat，落在只提供 Responses 的上游上。
+     if kind == "openai-chat" && binding.protocol == "openai-responses" {
+-        return forward_chat_responses_translated(
+-            stream,
+-            binding,
+-            retry_candidates,
+-            body,
+-            started,
+-        );
++        return forward_chat_responses_translated(stream, binding, retry_candidates, body, started);
+     }
+     let compatibility_request = match normalized_responses {
+         Some(request) => Some(request),
+@@ -2068,7 +2071,9 @@ fn forward(
+     let active_index = std::cell::Cell::new(0usize);
+     let mut send_upstream = |payload: &[u8]| {
+         let mut route_send = |candidate: &GatewayBinding| {
+-            let upstream_url = join_upstream(&candidate.base_url, &head.path);
++            let protocol = upstream_protocol(&candidate.protocol);
++            let upstream_url =
++                upstream_endpoint_url(&candidate.base_url, &protocol, protocol_endpoint(&protocol));
+             let client = upstream_client(&upstream_url)?;
+             let mut request = client
+                 .request(method.clone(), &upstream_url)
+@@ -2156,20 +2161,40 @@ fn forward(
+     if !status.is_success() {
+         let upstream_headers = response.headers().clone();
+         let raw = read_error_body(response);
+-        let header_names = head.headers.keys().cloned().collect::<Vec<_>>().join(",");
+-        crate::approval::manager::append_event_log(
+-            "warn",
+-            &format!(
+-                "本机网关上游返回失败：request_id={} status={} path={} bytes={} headers={} request={} structure={}",
+-                current_request_id(),
+-                status.as_u16(),
+-                head.path,
+-                raw.len(),
+-                header_names,
+-                request_summary,
+-                anthropic_request_profile,
+-            ),
++        let upstream_protocol = upstream_protocol(&response_binding.protocol);
++        let upstream_url = upstream_endpoint_url(
++            &response_binding.base_url,
++            &upstream_protocol,
++            protocol_endpoint(&upstream_protocol),
++        );
++        log_upstream_failure(
++            response_binding,
++            &upstream_url,
++            status.as_u16(),
++            &raw,
++            &request_summary,
++            &anthropic_request_profile,
+         );
++        if status.as_u16() == 404 {
++            write_upstream_not_found_diagnostic(
++                stream,
++                kind,
++                response_binding,
++                &upstream_url,
++                status.as_u16(),
++                &raw,
++            )?;
++            record_usage(
++                response_binding,
++                &display_model,
++                streaming,
++                status.as_u16(),
++                Usage::default(),
++                true,
++                started.elapsed().as_millis() as u64,
++            );
++            return Ok(());
++        }
+         if matches!(status.as_u16(), 400 | 422) {
+             let request = serde_json::from_slice::<Value>(
+                 final_request_body.as_deref().unwrap_or(&outgoing_body),
+@@ -2200,16 +2225,13 @@ fn forward(
+             }
+             return Ok(());
+         }
+-        write_buffered_head(
++        write_json_error(
+             stream,
+             status.as_u16(),
+-            &content_type,
+-            &response_binding.id,
+-            raw.len(),
++            "himind_gateway_upstream_rejected",
++            "上游拒绝请求；请凭 request_id 查询安全诊断。",
+         )
+         .map_err(|_| GatewayError::Answered)?;
+-        let _ = stream.write_all(&raw);
+-        let _ = stream.flush();
+         if kind != "models" {
+             record_usage(
+                 response_binding,
+@@ -2226,44 +2248,21 @@ fn forward(
+ 
+     // 流式：长度不可知，用 `Connection: close` 结束，客户端按 EOF 收尾。
+     if streaming {
+-        write_stream_head(stream, status.as_u16(), &content_type, &response_binding.id)
+-            .map_err(|_| GatewayError::Answered)?;
+-        let mut scanner = StreamScanner::new(response_binding.protocol.clone());
+         let mut content_sanitizer = ReasoningTagSanitizer::default();
+-        let mut pending = String::new();
+-        let mut chunk = [0_u8; 8192];
+-        let mut client_gone = false;
+-        loop {
+-            let read = match response.read(&mut chunk) {
+-                Ok(0) => break,
+-                Ok(read) => read,
+-                Err(_) => break,
+-            };
+-            scanner.push(&chunk[..read]);
+-            pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
+-            while let Some(position) = pending.find('\n') {
+-                let line = pending[..position].trim_end_matches('\r').to_string();
+-                pending.drain(..=position);
+-                let rewritten =
+-                    rewrite_sse_model_line(&line, &display_model, &mut content_sanitizer);
+-                if stream.write_all(rewritten.as_bytes()).is_err()
+-                    || stream.write_all(b"\n").is_err()
+-                {
+-                    client_gone = true;
+-                    break;
+-                }
+-            }
+-            if client_gone {
+-                // 客户端断开：已看到的用量仍然记账，再结束这次转发。
+-                break;
+-            }
+-        }
+-        if !client_gone && !pending.is_empty() {
+-            let rewritten =
+-                rewrite_sse_model_line(&pending, &display_model, &mut content_sanitizer);
+-            let _ = stream.write_all(rewritten.as_bytes());
+-        }
+-        let _ = stream.flush();
++        let mut scanner = StreamScanner::new(response_binding.protocol.clone());
++        let complete = relay_stream(
++            stream,
++            &mut response,
++            &response_binding.id,
++            &response_binding.protocol,
++            |line| {
++                scanner.push(format!("{line}\n").as_bytes());
++                format!(
++                    "{}\n",
++                    rewrite_sse_model_line(line, &display_model, &mut content_sanitizer)
++                )
++            },
++        );
+         if content_sanitizer.removed() > 0 {
+             crate::approval::manager::append_event_log(
+                 "warn",
+@@ -2280,9 +2279,9 @@ fn forward(
+                 response_binding,
+                 &display_model,
+                 true,
+-                status.as_u16(),
++                if complete { status.as_u16() } else { 502 },
+                 usage,
+-                usage.is_empty(),
++                !complete || usage.is_empty(),
+                 started.elapsed().as_millis() as u64,
+             );
+         }
+@@ -2292,16 +2291,10 @@ fn forward(
+     // 非流式：先收完再写，才能给出准确的 content-length。
+     let raw = match read_success_body(response) {
+         Ok(raw) => raw,
+-        Err(actual) => {
+-            let message = format!(
+-                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+-            );
+-            let _ = write_json_error(
+-                stream,
+-                502,
+-                "himind_gateway_response_too_large",
+-                &message,
+-            );
++        Err(failure) => {
++            let message = "上游响应读取未完成，已拒绝转发。";
++            log_transport_outcome(failure.code(), false);
++            let _ = write_json_error(stream, 502, failure.code(), message);
+             record_usage(
+                 response_binding,
+                 &display_model,
+@@ -2323,8 +2316,13 @@ fn forward(
+         output_raw.len(),
+     )
+     .map_err(|_| GatewayError::Answered)?;
+-    let _ = stream.write_all(&output_raw);
+-    let _ = stream.flush();
++    let delivered = stream
++        .write_all(&output_raw)
++        .and_then(|_| stream.flush())
++        .is_ok();
++    if !delivered {
++        log_transport_outcome("himind_gateway_client_io", true);
++    }
+     if kind != "models" {
+         let usage = serde_json::from_slice::<Value>(&raw)
+             .map(|value| extract_usage(&response_binding.protocol, &value))
+@@ -2333,9 +2331,9 @@ fn forward(
+             response_binding,
+             &display_model,
+             false,
+-            status.as_u16(),
++            if delivered { status.as_u16() } else { 502 },
+             usage,
+-            usage.is_empty(),
++            !delivered || usage.is_empty(),
+             started.elapsed().as_millis() as u64,
+         );
+     }
+@@ -2372,12 +2370,20 @@ fn forward_translated(
+     let attempted_normalizations = openai_normalized.attempted.clone();
+     let openai_payload = openai_normalized.request.to_string();
+     enforce_outbound_body_limit(stream, openai_payload.len())?;
+-    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
++    let non_empty_candidates = if retry_candidates.is_empty() {
++        std::slice::from_ref(binding)
++    } else {
++        retry_candidates
++    };
+     let active_index = std::cell::Cell::new(0usize);
+     let mut send = |candidate: &GatewayBinding| {
+         let client = upstream_client(&candidate.base_url)?;
+         let request = client
+-            .post(join_upstream(&candidate.base_url, "/v1/chat/completions"))
++            .post(upstream_endpoint_url(
++                &candidate.base_url,
++                &AIServiceProtocol::OpenaiChat,
++                UpstreamEndpoint::ChatCompletions,
++            ))
+             .header("authorization", format!("Bearer {}", candidate.api_key))
+             .header("content-type", "application/json")
+             .header("accept-encoding", "identity");
+@@ -2389,14 +2395,42 @@ fn forward_translated(
+         send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+     })
+     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+-    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
++    let binding = non_empty_candidates
++        .get(active_index.get())
++        .unwrap_or(binding);
+     let status = response.status();
+     mark_route_outcome(binding, status.as_u16());
+     if !status.is_success() {
+         // 上游错误原样翻成 Anthropic 的错误体，客户端才能显示真实原因。
+         let upstream_headers = response.headers().clone();
+         let raw_error = read_error_body(response);
+-        let detail = String::from_utf8_lossy(&raw_error).to_string();
++        let detail = "上游拒绝请求；请凭 request_id 查询安全诊断。";
++        let upstream_url = upstream_endpoint_url(
++            &binding.base_url,
++            &AIServiceProtocol::OpenaiChat,
++            UpstreamEndpoint::ChatCompletions,
++        );
++        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
++        if status.as_u16() == 404 {
++            write_upstream_not_found_diagnostic(
++                stream,
++                kind,
++                binding,
++                &upstream_url,
++                status.as_u16(),
++                &raw_error,
++            )?;
++            record_usage(
++                binding,
++                &display_model,
++                streaming,
++                status.as_u16(),
++                Usage::default(),
++                true,
++                started.elapsed().as_millis() as u64,
++            );
++            return Ok(());
++        }
+         if matches!(status.as_u16(), 400 | 422) {
+             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+             write_upstream_compatibility_diagnostic(
+@@ -2424,7 +2458,7 @@ fn forward_translated(
+         }
+         let payload = json!({
+             "type": "error",
+-            "error": { "type": "api_error", "message": detail },
++            "error": { "type": "api_error", "code": "himind_gateway_upstream_rejected", "request_id": current_request_id(), "message": detail },
+         })
+         .to_string();
+         let head = format!(
+@@ -2448,37 +2482,20 @@ fn forward_translated(
+     }
+ 
+     if streaming {
+-        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+-            .map_err(|_| GatewayError::Answered)?;
+         let mut translator =
+             crate::app::anthropic_openai::AnthropicStream::new(display_model.clone());
+-        let mut buffer = String::new();
+-        let mut chunk = [0_u8; 8192];
+-        let mut client_gone = false;
+-        loop {
+-            let read = match response.read(&mut chunk) {
+-                Ok(0) => break,
+-                Ok(read) => read,
+-                Err(_) => break,
+-            };
+-            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+-            while let Some(position) = buffer.find('\n') {
+-                let line = buffer[..position].trim_end_matches('\r').to_string();
+-                buffer.drain(..=position);
+-                let events = translator.push_line(&line);
+-                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+-                    client_gone = true;
+-                    break;
+-                }
+-            }
+-            if client_gone {
+-                break;
+-            }
++        let complete = relay_stream(stream, &mut response, &binding.id, "openai-chat", |line| {
++            translator.push_line(line).concat()
++        });
++        let mut failed = !complete || translator.failed();
++        if !failed {
++            let tail = translator.finish().concat();
++            failed = stream
++                .write_all(tail.as_bytes())
++                .and_then(|_| stream.flush())
++                .is_err()
++                || translator.failed();
+         }
+-        let tail = translator.finish().concat();
+-        let _ = stream.write_all(tail.as_bytes());
+-        let _ = stream.flush();
+-        let failed = translator.failed();
+         let (input, output) = translator.usage();
+         record_usage(
+             binding,
+@@ -2491,7 +2508,7 @@ fn forward_translated(
+                 cached: 0,
+                 reasoning: 0,
+             },
+-            input == 0 && output == 0,
++            failed || (input == 0 && output == 0),
+             started.elapsed().as_millis() as u64,
+         );
+         return Ok(());
+@@ -2499,16 +2516,10 @@ fn forward_translated(
+ 
+     let raw = match read_success_body(response) {
+         Ok(raw) => raw,
+-        Err(actual) => {
+-            let message = format!(
+-                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+-            );
+-            let _ = write_json_error(
+-                stream,
+-                502,
+-                "himind_gateway_response_too_large",
+-                &message,
+-            );
++        Err(failure) => {
++            let message = "上游响应读取未完成，已拒绝转发。";
++            log_transport_outcome(failure.code(), false);
++            let _ = write_json_error(stream, 502, failure.code(), message);
+             record_usage(
+                 binding,
+                 &display_model,
+@@ -2534,16 +2545,21 @@ fn forward_translated(
+         gateway_response_head(status.as_u16(), "application/json", &binding.id),
+         payload.len()
+     );
+-    let _ = stream.write_all(head.as_bytes());
+-    let _ = stream.write_all(payload.as_bytes());
+-    let _ = stream.flush();
++    let delivered = stream
++        .write_all(head.as_bytes())
++        .and_then(|_| stream.write_all(payload.as_bytes()))
++        .and_then(|_| stream.flush())
++        .is_ok();
++    if !delivered {
++        log_transport_outcome("himind_gateway_client_io", true);
++    }
+     record_usage(
+         binding,
+         &display_model,
+         false,
+-        status.as_u16(),
++        if delivered { status.as_u16() } else { 502 },
+         usage,
+-        usage.is_empty(),
++        !delivered || usage.is_empty(),
+         started.elapsed().as_millis() as u64,
+     );
+     Ok(())
+@@ -2585,12 +2601,20 @@ fn forward_anthropic_responses_translated(
+         attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+     }
+     enforce_outbound_body_limit(stream, payload.len())?;
+-    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
++    let non_empty_candidates = if retry_candidates.is_empty() {
++        std::slice::from_ref(binding)
++    } else {
++        retry_candidates
++    };
+     let active_index = std::cell::Cell::new(0usize);
+     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+         let client = upstream_client(&candidate.base_url)?;
+         let request_builder = client
+-            .post(join_upstream(&candidate.base_url, "/responses"))
++            .post(upstream_endpoint_url(
++                &candidate.base_url,
++                &AIServiceProtocol::OpenaiResponses,
++                UpstreamEndpoint::Responses,
++            ))
+             .header("authorization", format!("Bearer {}", candidate.api_key))
+             .header("content-type", "application/json")
+             .header("accept-encoding", "identity");
+@@ -2604,14 +2628,42 @@ fn forward_anthropic_responses_translated(
+         })
+     })
+     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+-    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
++    let binding = non_empty_candidates
++        .get(active_index.get())
++        .unwrap_or(binding);
+     let final_request_body = Some(payload.clone());
+     let status = response.status();
+     mark_route_outcome(binding, status.as_u16());
+     if !status.is_success() {
+         let upstream_headers = response.headers().clone();
+         let raw_error = read_error_body(response);
+-        let detail = String::from_utf8_lossy(&raw_error).to_string();
++        let detail = "上游拒绝请求；请凭 request_id 查询安全诊断。";
++        let upstream_url = upstream_endpoint_url(
++            &binding.base_url,
++            &AIServiceProtocol::OpenaiResponses,
++            UpstreamEndpoint::Responses,
++        );
++        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
++        if status.as_u16() == 404 {
++            write_upstream_not_found_diagnostic(
++                stream,
++                kind,
++                binding,
++                &upstream_url,
++                status.as_u16(),
++                &raw_error,
++            )?;
++            record_usage(
++                binding,
++                &display_model,
++                streaming,
++                status.as_u16(),
++                Usage::default(),
++                true,
++                started.elapsed().as_millis() as u64,
++            );
++            return Ok(());
++        }
+         if matches!(status.as_u16(), 400 | 422) {
+             let request =
+                 serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
+@@ -2641,7 +2693,7 @@ fn forward_anthropic_responses_translated(
+         }
+         let payload = json!({
+             "type": "error",
+-            "error": { "type": "api_error", "message": detail },
++            "error": { "type": "api_error", "code": "himind_gateway_upstream_rejected", "request_id": current_request_id(), "message": detail },
+         })
+         .to_string();
+         let head = format!(
+@@ -2671,37 +2723,24 @@ fn forward_anthropic_responses_translated(
+         .unwrap_or("application/json")
+         .to_string();
+     if streaming && content_type.contains("text/event-stream") {
+-        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+-            .map_err(|_| GatewayError::Answered)?;
+         let mut translator =
+             crate::app::anthropic_responses::AnthropicResponsesStream::new(display_model.clone());
+-        let mut buffer = String::new();
+-        let mut chunk = [0_u8; 8192];
+-        let mut client_gone = false;
+-        loop {
+-            let read = match response.read(&mut chunk) {
+-                Ok(0) => break,
+-                Ok(read) => read,
+-                Err(_) => break,
+-            };
+-            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+-            while let Some(position) = buffer.find('\n') {
+-                let line = buffer[..position].trim_end_matches('\r').to_string();
+-                buffer.drain(..=position);
+-                let events = translator.push_line(&line);
+-                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+-                    client_gone = true;
+-                    break;
+-                }
+-            }
+-            if client_gone {
+-                break;
+-            }
++        let complete = relay_stream(
++            stream,
++            &mut response,
++            &binding.id,
++            "openai-responses",
++            |line| translator.push_line(line).concat(),
++        );
++        let mut failed = !complete || translator.failed();
++        if !failed {
++            let tail = translator.finish().concat();
++            failed = stream
++                .write_all(tail.as_bytes())
++                .and_then(|_| stream.flush())
++                .is_err()
++                || translator.failed();
+         }
+-        let tail = translator.finish().concat();
+-        let _ = stream.write_all(tail.as_bytes());
+-        let _ = stream.flush();
+-        let failed = translator.failed();
+         let (input, output) = translator.usage();
+         record_usage(
+             binding,
+@@ -2714,7 +2753,7 @@ fn forward_anthropic_responses_translated(
+                 cached: 0,
+                 reasoning: 0,
+             },
+-            input == 0 && output == 0,
++            failed || (input == 0 && output == 0),
+             started.elapsed().as_millis() as u64,
+         );
+         return Ok(());
+@@ -2722,16 +2761,10 @@ fn forward_anthropic_responses_translated(
+ 
+     let raw = match read_success_body(response) {
+         Ok(raw) => raw,
+-        Err(actual) => {
+-            let message = format!(
+-                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+-            );
+-            let _ = write_json_error(
+-                stream,
+-                502,
+-                "himind_gateway_response_too_large",
+-                &message,
+-            );
++        Err(failure) => {
++            let message = "上游响应读取未完成，已拒绝转发。";
++            log_transport_outcome(failure.code(), false);
++            let _ = write_json_error(stream, 502, failure.code(), message);
+             record_usage(
+                 binding,
+                 &display_model,
+@@ -2746,6 +2779,7 @@ fn forward_anthropic_responses_translated(
+     };
+     let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
+     let usage = extract_usage("openai-responses", &upstream);
++    let mut delivered = true;
+     if streaming {
+         let payload = match crate::app::anthropic_responses::response_to_anthropic_sse(
+             &upstream,
+@@ -2756,8 +2790,10 @@ fn forward_anthropic_responses_translated(
+         };
+         write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+             .map_err(|_| GatewayError::Answered)?;
+-        let _ = stream.write_all(payload.as_bytes());
+-        let _ = stream.flush();
++        delivered &= stream
++            .write_all(payload.as_bytes())
++            .and_then(|_| stream.flush())
++            .is_ok();
+     } else {
+         let payload =
+             match crate::app::anthropic_responses::response_to_anthropic(&upstream, &display_model)
+@@ -2770,17 +2806,22 @@ fn forward_anthropic_responses_translated(
+             gateway_response_head(status.as_u16(), "application/json", &binding.id),
+             payload.len()
+         );
+-        let _ = stream.write_all(head.as_bytes());
+-        let _ = stream.write_all(payload.as_bytes());
+-        let _ = stream.flush();
++        delivered &= stream.write_all(head.as_bytes()).is_ok();
++        delivered &= stream
++            .write_all(payload.as_bytes())
++            .and_then(|_| stream.flush())
++            .is_ok();
++    }
++    if !delivered {
++        log_transport_outcome("himind_gateway_client_io", true);
+     }
+     record_usage(
+         binding,
+         &display_model,
+         streaming,
+-        status.as_u16(),
++        if delivered { status.as_u16() } else { 502 },
+         usage,
+-        usage.is_empty(),
++        !delivered || usage.is_empty(),
+         started.elapsed().as_millis() as u64,
+     );
+     Ok(())
+@@ -2814,13 +2855,21 @@ fn forward_responses_translated(
+     let attempted_normalizations = chat_normalized.attempted.clone();
+     let chat_payload = chat_normalized.request.to_string();
+     enforce_outbound_body_limit(stream, chat_payload.len())?;
+-    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
++    let non_empty_candidates = if retry_candidates.is_empty() {
++        std::slice::from_ref(binding)
++    } else {
++        retry_candidates
++    };
+     let active_index = std::cell::Cell::new(0usize);
+     let mut send = |candidate: &GatewayBinding| {
+         let client = upstream_client(&candidate.base_url)?;
+         let opencode_session = opencode_session_for_value(candidate, client_session, request);
+         let mut upstream_request = client
+-            .post(join_upstream(&candidate.base_url, "/chat/completions"))
++            .post(upstream_endpoint_url(
++                &candidate.base_url,
++                &AIServiceProtocol::OpenaiChat,
++                UpstreamEndpoint::ChatCompletions,
++            ))
+             .header("authorization", format!("Bearer {}", candidate.api_key))
+             .header("content-type", "application/json")
+             .header("accept-encoding", "identity");
+@@ -2833,13 +2882,41 @@ fn forward_responses_translated(
+         send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+     })
+     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+-    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
++    let binding = non_empty_candidates
++        .get(active_index.get())
++        .unwrap_or(binding);
+     let status = response.status();
+     mark_route_outcome(binding, status.as_u16());
+     if !status.is_success() {
+         let upstream_headers = response.headers().clone();
+         let raw_error = read_error_body(response);
+-        let detail = String::from_utf8_lossy(&raw_error).to_string();
++        let detail = "上游拒绝请求；请凭 request_id 查询安全诊断。";
++        let upstream_url = upstream_endpoint_url(
++            &binding.base_url,
++            &AIServiceProtocol::OpenaiChat,
++            UpstreamEndpoint::ChatCompletions,
++        );
++        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
++        if status.as_u16() == 404 {
++            write_upstream_not_found_diagnostic(
++                stream,
++                kind,
++                binding,
++                &upstream_url,
++                status.as_u16(),
++                &raw_error,
++            )?;
++            record_usage(
++                binding,
++                &display_model,
++                streaming,
++                status.as_u16(),
++                Usage::default(),
++                true,
++                started.elapsed().as_millis() as u64,
++            );
++            return Ok(());
++        }
+         if matches!(status.as_u16(), 400 | 422) {
+             let request = request.clone();
+             write_upstream_compatibility_diagnostic(
+@@ -2865,19 +2942,7 @@ fn forward_responses_translated(
+             );
+             return Ok(());
+         }
+-        // 翻译路径的失败要留痕：只看上游报错无法判断是哪条消息结构不合法。
+-        crate::approval::manager::append_event_log(
+-            "warn",
+-            &format!(
+-                "本机网关上游返回失败：request_id={} status={} path=/chat/completions binding={} model={} detail={}",
+-                current_request_id(),
+-                status.as_u16(),
+-                binding.id,
+-                binding.exposed_model,
+-                detail.replace('\n', " "),
+-            ),
+-        );
+-        let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
++        let payload = json!({ "error": { "type": "api_error", "code": "himind_gateway_upstream_rejected", "request_id": current_request_id(), "message": detail } }).to_string();
+         let head = format!(
+             "{}content-length: {}\r\n\r\n",
+             gateway_response_head(status.as_u16(), "application/json", &binding.id),
+@@ -2899,37 +2964,20 @@ fn forward_responses_translated(
+     }
+ 
+     if streaming {
+-        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+-            .map_err(|_| GatewayError::Answered)?;
+         let mut translator =
+             crate::app::responses_chat::ResponsesStream::new(display_model.clone());
+-        let mut buffer = String::new();
+-        let mut chunk = [0_u8; 8192];
+-        let mut client_gone = false;
+-        loop {
+-            let read = match response.read(&mut chunk) {
+-                Ok(0) => break,
+-                Ok(read) => read,
+-                Err(_) => break,
+-            };
+-            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+-            while let Some(position) = buffer.find('\n') {
+-                let line = buffer[..position].trim_end_matches('\r').to_string();
+-                buffer.drain(..=position);
+-                let events = translator.push_line(&line);
+-                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+-                    client_gone = true;
+-                    break;
+-                }
+-            }
+-            if client_gone {
+-                break;
+-            }
++        let complete = relay_stream(stream, &mut response, &binding.id, "openai-chat", |line| {
++            translator.push_line(line).concat()
++        });
++        let mut failed = !complete || translator.failed();
++        if !failed {
++            let tail = translator.finish().concat();
++            failed = stream
++                .write_all(tail.as_bytes())
++                .and_then(|_| stream.flush())
++                .is_err()
++                || translator.failed();
+         }
+-        let tail = translator.finish().concat();
+-        let _ = stream.write_all(tail.as_bytes());
+-        let _ = stream.flush();
+-        let failed = translator.failed();
+         let (input, output) = translator.usage();
+         record_usage(
+             binding,
+@@ -2942,7 +2990,7 @@ fn forward_responses_translated(
+                 cached: translator.cached_tokens(),
+                 reasoning: translator.reasoning_tokens(),
+             },
+-            input == 0 && output == 0,
++            failed || (input == 0 && output == 0),
+             started.elapsed().as_millis() as u64,
+         );
+         return Ok(());
+@@ -2950,16 +2998,10 @@ fn forward_responses_translated(
+ 
+     let raw = match read_success_body(response) {
+         Ok(raw) => raw,
+-        Err(actual) => {
+-            let message = format!(
+-                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+-            );
+-            let _ = write_json_error(
+-                stream,
+-                502,
+-                "himind_gateway_response_too_large",
+-                &message,
+-            );
++        Err(failure) => {
++            let message = "上游响应读取未完成，已拒绝转发。";
++            log_transport_outcome(failure.code(), false);
++            let _ = write_json_error(stream, 502, failure.code(), message);
+             record_usage(
+                 binding,
+                 &display_model,
+@@ -2980,17 +3022,22 @@ fn forward_responses_translated(
+         gateway_response_head(status.as_u16(), "application/json", &binding.id),
+         payload.len()
+     );
+-    let _ = stream.write_all(head.as_bytes());
+-    let _ = stream.write_all(payload.as_bytes());
+-    let _ = stream.flush();
++    let delivered = stream
++        .write_all(head.as_bytes())
++        .and_then(|_| stream.write_all(payload.as_bytes()))
++        .and_then(|_| stream.flush())
++        .is_ok();
+     let usage = extract_usage("openai-chat", &chat);
++    if !delivered {
++        log_transport_outcome("himind_gateway_client_io", true);
++    }
+     record_usage(
+         binding,
+         &display_model,
+         false,
+-        status.as_u16(),
++        if delivered { status.as_u16() } else { 502 },
+         usage,
+-        usage.is_empty(),
++        !delivered || usage.is_empty(),
+         started.elapsed().as_millis() as u64,
+     );
+     Ok(())
+@@ -3032,12 +3079,20 @@ fn forward_chat_responses_translated(
+         attempted_normalizations.push(crate::app::ai_compatibility::NormalizationAction::Degrade);
+     }
+     enforce_outbound_body_limit(stream, payload.len())?;
+-    let non_empty_candidates = if retry_candidates.is_empty() { std::slice::from_ref(binding) } else { retry_candidates };
++    let non_empty_candidates = if retry_candidates.is_empty() {
++        std::slice::from_ref(binding)
++    } else {
++        retry_candidates
++    };
+     let active_index = std::cell::Cell::new(0usize);
+     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+         let client = upstream_client(&candidate.base_url)?;
+         let upstream_request = client
+-            .post(join_upstream(&candidate.base_url, "/responses"))
++            .post(upstream_endpoint_url(
++                &candidate.base_url,
++                &AIServiceProtocol::OpenaiResponses,
++                UpstreamEndpoint::Responses,
++            ))
+             .header("authorization", format!("Bearer {}", candidate.api_key))
+             .header("content-type", "application/json")
+             .header("accept-encoding", "identity");
+@@ -3051,14 +3106,42 @@ fn forward_chat_responses_translated(
+         })
+     })
+     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+-    let binding = non_empty_candidates.get(active_index.get()).unwrap_or(binding);
++    let binding = non_empty_candidates
++        .get(active_index.get())
++        .unwrap_or(binding);
+     let final_request_body = Some(payload.clone());
+     let status = response.status();
+     mark_route_outcome(binding, status.as_u16());
+     if !status.is_success() {
+         let upstream_headers = response.headers().clone();
+         let raw_error = read_error_body(response);
+-        let detail = String::from_utf8_lossy(&raw_error).to_string();
++        let detail = "上游拒绝请求；请凭 request_id 查询安全诊断。";
++        let upstream_url = upstream_endpoint_url(
++            &binding.base_url,
++            &AIServiceProtocol::OpenaiResponses,
++            UpstreamEndpoint::Responses,
++        );
++        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
++        if status.as_u16() == 404 {
++            write_upstream_not_found_diagnostic(
++                stream,
++                kind,
++                binding,
++                &upstream_url,
++                status.as_u16(),
++                &raw_error,
++            )?;
++            record_usage(
++                binding,
++                &display_model,
++                streaming,
++                status.as_u16(),
++                Usage::default(),
++                true,
++                started.elapsed().as_millis() as u64,
++            );
++            return Ok(());
++        }
+         if matches!(status.as_u16(), 400 | 422) {
+             let request =
+                 serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
+@@ -3086,7 +3169,7 @@ fn forward_chat_responses_translated(
+             );
+             return Ok(());
+         }
+-        let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
++        let payload = json!({ "error": { "type": "api_error", "code": "himind_gateway_upstream_rejected", "request_id": current_request_id(), "message": detail } }).to_string();
+         let head = format!(
+             "{}content-length: {}\r\n\r\n",
+             gateway_response_head(status.as_u16(), "application/json", &binding.id),
+@@ -3108,36 +3191,23 @@ fn forward_chat_responses_translated(
+     }
+ 
+     if streaming {
+-        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+-            .map_err(|_| GatewayError::Answered)?;
+         let mut translator = crate::app::chat_responses::ChatStream::new(display_model.clone());
+-        let mut buffer = String::new();
+-        let mut chunk = [0_u8; 8192];
+-        let mut client_gone = false;
+-        loop {
+-            let read = match response.read(&mut chunk) {
+-                Ok(0) => break,
+-                Ok(read) => read,
+-                Err(_) => break,
+-            };
+-            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+-            while let Some(position) = buffer.find('\n') {
+-                let line = buffer[..position].trim_end_matches('\r').to_string();
+-                buffer.drain(..=position);
+-                let events = translator.push_line(&line);
+-                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+-                    client_gone = true;
+-                    break;
+-                }
+-            }
+-            if client_gone {
+-                break;
+-            }
++        let complete = relay_stream(
++            stream,
++            &mut response,
++            &binding.id,
++            "openai-responses",
++            |line| translator.push_line(line).concat(),
++        );
++        let mut failed = !complete || translator.failed();
++        if !failed {
++            let tail = translator.finish().concat();
++            failed = stream
++                .write_all(tail.as_bytes())
++                .and_then(|_| stream.flush())
++                .is_err()
++                || translator.failed();
+         }
+-        let tail = translator.finish().concat();
+-        let _ = stream.write_all(tail.as_bytes());
+-        let _ = stream.flush();
+-        let failed = translator.failed();
+         let (input, output) = translator.usage();
+         record_usage(
+             binding,
+@@ -3150,7 +3220,7 @@ fn forward_chat_responses_translated(
+                 cached: translator.cached_tokens(),
+                 reasoning: translator.reasoning_tokens(),
+             },
+-            input == 0 && output == 0,
++            failed || (input == 0 && output == 0),
+             started.elapsed().as_millis() as u64,
+         );
+         return Ok(());
+@@ -3158,16 +3228,10 @@ fn forward_chat_responses_translated(
+ 
+     let raw = match read_success_body(response) {
+         Ok(raw) => raw,
+-        Err(actual) => {
+-            let message = format!(
+-                "上游非流式响应超过本机网关上限（{actual} bytes > {RESPONSE_BODY_LIMIT} bytes），已拒绝转发。"
+-            );
+-            let _ = write_json_error(
+-                stream,
+-                502,
+-                "himind_gateway_response_too_large",
+-                &message,
+-            );
++        Err(failure) => {
++            let message = "上游响应读取未完成，已拒绝转发。";
++            log_transport_outcome(failure.code(), false);
++            let _ = write_json_error(stream, 502, failure.code(), message);
+             record_usage(
+                 binding,
+                 &display_model,
+@@ -3194,16 +3258,21 @@ fn forward_chat_responses_translated(
+         gateway_response_head(status.as_u16(), "application/json", &binding.id),
+         payload.len()
+     );
+-    let _ = stream.write_all(head.as_bytes());
+-    let _ = stream.write_all(payload.as_bytes());
+-    let _ = stream.flush();
++    let delivered = stream
++        .write_all(head.as_bytes())
++        .and_then(|_| stream.write_all(payload.as_bytes()))
++        .and_then(|_| stream.flush())
++        .is_ok();
++    if !delivered {
++        log_transport_outcome("himind_gateway_client_io", true);
++    }
+     record_usage(
+         binding,
+         &display_model,
+         false,
+-        status.as_u16(),
++        if delivered { status.as_u16() } else { 502 },
+         usage,
+-        usage.is_empty(),
++        !delivered || usage.is_empty(),
+         started.elapsed().as_millis() as u64,
+     );
+     Ok(())
+@@ -3270,6 +3339,8 @@ fn compatibility_normalize_error(
+             "type": "error",
+             "error": {
+                 "type": "invalid_request_error",
++                "code": "himind_gateway_compatibility_rejected",
++                "request_id": current_request_id(),
+                 "message": safe_message,
+                 "diagnostic": diagnostic
+             }
+@@ -3279,6 +3350,7 @@ fn compatibility_normalize_error(
+             "error": {
+                 "type": "invalid_request_error",
+                 "code": "himind_gateway_compatibility_rejected",
++                "request_id": current_request_id(),
+                 "message": safe_message,
+                 "diagnostic": diagnostic
+             }
+@@ -3377,7 +3449,8 @@ fn write_upstream_compatibility_diagnostic(
+     } = input;
+     let upstream_text = String::from_utf8_lossy(upstream_body);
+     let gateway_request_id = current_request_id();
+-    let request_id = upstream_request_id(upstream_headers, upstream_text.as_ref());
++    let request_id = Some(gateway_request_id.clone());
++    let _ = upstream_headers;
+     let provider_protocol = crate::store::ai_services::AIServiceProtocol::parse(&binding.protocol)
+         .unwrap_or(crate::store::ai_services::AIServiceProtocol::OpenaiChat);
+     let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+@@ -3445,6 +3518,8 @@ fn write_upstream_compatibility_diagnostic(
+             "type": "error",
+             "error": {
+                 "type": "invalid_request_error",
++                "code": "himind_gateway_compatibility_rejected",
++                "request_id": current_request_id(),
+                 "message": safe_message,
+                 "diagnostic": diagnostic
+             }
+@@ -3454,6 +3529,7 @@ fn write_upstream_compatibility_diagnostic(
+             "error": {
+                 "type": "invalid_request_error",
+                 "code": "himind_gateway_compatibility_rejected",
++                "request_id": current_request_id(),
+                 "message": safe_message,
+                 "diagnostic": diagnostic
+             }
+@@ -3492,7 +3568,10 @@ fn describe_request_structure(request: &Value) -> String {
+             .flatten()
+             .filter(|block| {
+                 block.get("type").and_then(Value::as_str) == Some("text")
+-                    && block.get("text").and_then(Value::as_str).is_none_or(str::is_empty)
++                    && block
++                        .get("text")
++                        .and_then(Value::as_str)
++                        .is_none_or(str::is_empty)
+             })
+             .count();
+         let empty_messages = messages
+@@ -3725,46 +3804,7 @@ fn json_kind(value: &Value) -> &'static str {
+ const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 600;
+ 
+ fn summarize_upstream_error(upstream_text: &str) -> String {
+-    let value = serde_json::from_str::<Value>(upstream_text).ok();
+-    let mut facts = Vec::new();
+-    if let Some(value) = value.as_ref() {
+-        for pointer in [
+-            "/error/type",
+-            "/error/code",
+-            "/error/param",
+-            "/error/message",
+-            "/type",
+-            "/code",
+-            "/param",
+-            "/message",
+-            "/error",
+-        ] {
+-            let Some(field) = value.pointer(pointer) else {
+-                continue;
+-            };
+-            let Some(text) = field.as_str() else {
+-                continue;
+-            };
+-            let text = text.trim();
+-            if text.is_empty() {
+-                continue;
+-            }
+-            facts.push(format!(
+-                "{}={}",
+-                pointer.trim_start_matches('/'),
+-                excerpt(text, 200)
+-            ));
+-        }
+-    }
+-    let skeleton = upstream_skeleton(upstream_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+-    let mut out = String::new();
+-    if facts.is_empty() {
+-        out.push_str("shape=none");
+-    } else {
+-        out.push_str(&facts.join(" "));
+-    }
+-    out.push_str(&format!(" excerpt=\"{skeleton}\""));
+-    out
++    format!("upstream_body_withheld bytes={}", upstream_text.len())
+ }
+ 
+ /// 把上游错误体压成可安全落盘的骨架：URL 去掉，连续标点/数字折叠，限长。
+@@ -4147,29 +4187,347 @@ fn read_error_body(response: reqwest::blocking::Response) -> Vec<u8> {
+ 
+ /// 非流式成功响应也必须有上界；超过时返回实际读到的字节数，由调用方回 502，
+ /// 而不是悄悄截断成一个非法 JSON。
+-fn read_success_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, usize> {
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum BodyFailure {
++    TooLarge,
++    Timeout,
++    Truncated,
++    Io,
++}
++impl BodyFailure {
++    fn code(self) -> &'static str {
++        match self {
++            Self::TooLarge => "himind_gateway_response_too_large",
++            Self::Timeout => "himind_gateway_upstream_timeout",
++            Self::Truncated => "himind_gateway_response_truncated",
++            Self::Io => "himind_gateway_upstream_io",
++        }
++    }
++}
++fn classify_read_error(error: &std::io::Error) -> BodyFailure {
++    // reqwest wraps hyper errors in io::ErrorKind::Other. Inspect the private
++    // chain only for classification; never publish or log its text/URL.
++    let text = format!("{error:?}").to_ascii_lowercase();
++    if matches!(
++        error.kind(),
++        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
++    ) || text.contains("timeout")
++        || text.contains("timedout")
++    {
++        BodyFailure::Timeout
++    } else if error.kind() == std::io::ErrorKind::UnexpectedEof
++        || text.contains("incomplete")
++        || text.contains("unexpected eof")
++        || text.contains("body length")
++    {
++        BodyFailure::Truncated
++    } else {
++        BodyFailure::Io
++    }
++}
++fn read_success_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, BodyFailure> {
+     let mut raw = Vec::new();
+-    let mut reader = response.take(RESPONSE_BODY_LIMIT as u64 + 1);
+-    let _ = reader.read_to_end(&mut raw);
++    response
++        .take(RESPONSE_BODY_LIMIT as u64 + 1)
++        .read_to_end(&mut raw)
++        .map_err(|error| classify_read_error(&error))?;
+     if raw.len() > RESPONSE_BODY_LIMIT {
+-        return Err(raw.len());
++        return Err(BodyFailure::TooLarge);
++    }
++    // A clean EOF is not proof of a complete JSON response.
++    let value = serde_json::from_slice::<Value>(&raw).map_err(|_| BodyFailure::Truncated)?;
++    if value.get("error").is_some() {
++        return Err(BodyFailure::Truncated);
++    }
++    Ok(raw)
++}
++
++fn write_upstream_failure(stream: &mut TcpStream, _detail: &str) -> GatewayError {
++    let request_id = current_request_id();
++    crate::approval::manager::append_event_log(
++        "warn",
++        &format!(
++            "本机网关上游请求失败：request_id={request_id} code=himind_gateway_upstream_failed"
++        ),
++    );
++    let _ = write_json_error(
++        stream,
++        502,
++        "himind_gateway_upstream_failed",
++        "上游请求失败；请凭 request_id 查询安全诊断。",
++    );
++    GatewayError::Answered
++}
++
++/// 上游失败日志行：必须带上实际上游 URL，否则 404 只能看到客户端路径。
++fn upstream_failure_log_line(
++    binding: &GatewayBinding,
++    upstream_url: &str,
++    status: u16,
++    raw: &[u8],
++    request_summary: &str,
++    request_profile: &str,
++) -> String {
++    let detail = summarize_upstream_error(&String::from_utf8_lossy(raw));
++    format!(
++        "本机网关上游返回失败：request_id={} client={} service={} binding={} status={} upstream={} bytes={} request={} structure={} upstream_detail=[{detail}]",
++        current_request_id(),
++        binding.client,
++        binding.service,
++        binding.id,
++        status,
++        upstream_url,
++        raw.len(),
++        request_summary,
++        request_profile,
++    )
++}
++
++fn log_upstream_failure(
++    binding: &GatewayBinding,
++    upstream_url: &str,
++    status: u16,
++    raw: &[u8],
++    request_summary: &str,
++    request_profile: &str,
++) {
++    crate::approval::manager::append_event_log(
++        "warn",
++        &upstream_failure_log_line(
++            binding,
++            upstream_url,
++            status,
++            raw,
++            request_summary,
++            request_profile,
++        ),
++    );
++}
++
++/// 上游 404 的可读错误体。不能把上游原文直接丢给客户端：
++/// Claude Desktop 会把 404 统一解释成“模型不可用”，真实原因被吞掉。
++fn upstream_not_found_payload(
++    client_protocol: &str,
++    upstream_url: &str,
++    upstream_status: u16,
++    raw: &[u8],
++) -> String {
++    let detail = summarize_upstream_error(&String::from_utf8_lossy(raw));
++    let message = format!(
++        "上游返回 {upstream_status}（端点或模型未找到）：{upstream_url}。请检查服务 Base URL、接口类型与上游模型名是否匹配；Anthropic 地址不要包含 /v1/messages，OpenAI 兼容地址应保留 /v1 或厂商版本前缀。上游响应：{detail}"
++    );
++    if client_protocol == "anthropic" {
++        json!({
++            "type": "error",
++            "error": {
++                "type": "api_error",
++                "code": "himind_gateway_upstream_not_found",
++                "request_id": current_request_id(),
++                "message": message,
++                "upstream_url": upstream_url,
++                "upstream_status": upstream_status,
++            }
++        })
++    } else {
++        json!({
++            "error": {
++                "type": "api_error",
++                "code": "himind_gateway_upstream_not_found",
++                "request_id": current_request_id(),
++                "message": message,
++                "upstream_url": upstream_url,
++                "upstream_status": upstream_status,
++            }
++        })
++    }
++    .to_string()
++}
++
++fn write_upstream_not_found_diagnostic(
++    stream: &mut TcpStream,
++    client_protocol: &str,
++    binding: &GatewayBinding,
++    upstream_url: &str,
++    upstream_status: u16,
++    raw: &[u8],
++) -> Result<(), GatewayError> {
++    let payload = upstream_not_found_payload(client_protocol, upstream_url, upstream_status, raw);
++    write_buffered_head(
++        stream,
++        502,
++        "application/json; charset=utf-8",
++        &binding.id,
++        payload.len(),
++    )
++    .map_err(|_| GatewayError::Answered)?;
++    let _ = stream.write_all(payload.as_bytes());
++    let _ = stream.flush();
++    Ok(())
++}
++
++/// No retry is permitted once an upstream 200 body is being consumed. A clean
++/// socket EOF without a protocol terminal marker is still an interrupted stream.
++fn relay_stream<F: FnMut(&str) -> String>(
++    stream: &mut TcpStream,
++    response: &mut reqwest::blocking::Response,
++    binding_id: &str,
++    protocol: &str,
++    mut translate: F,
++) -> bool {
++    let mut pending = Vec::<u8>::new();
++    let mut event = Vec::<String>::new();
++    let mut event_bytes = 0usize;
++    let mut chunk = [0u8; 8192];
++    let mut written = false;
++    let mut terminal = false;
++    let mut total = 0usize;
++    let failure = loop {
++        let count = match response.read(&mut chunk) {
++            Ok(0) => {
++                if terminal && pending.is_empty() && event.is_empty() {
++                    return true;
++                }
++                break BodyFailure::Truncated;
++            }
++            Ok(count) => count,
++            Err(error) => break classify_read_error(&error),
++        };
++        total = total.saturating_add(count);
++        if total > RESPONSE_BODY_LIMIT {
++            break BodyFailure::TooLarge;
++        }
++        pending.extend_from_slice(&chunk[..count]);
++        if pending.len() > SSE_LINE_LIMIT && !pending.contains(&b'\n') {
++            break BodyFailure::TooLarge;
++        }
++        let mut protocol_error = false;
++        let mut line_too_large = false;
++        while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
++            if position > SSE_LINE_LIMIT {
++                line_too_large = true;
++                protocol_error = true;
++                break;
++            }
++            let line = match std::str::from_utf8(&pending[..position]) {
++                Ok(line) => line.trim_end_matches('\r').to_string(),
++                Err(_) => {
++                    protocol_error = true;
++                    break;
++                }
++            };
++            pending.drain(..=position);
++            event_bytes = event_bytes.saturating_add(position + 1);
++            if event_bytes > SSE_LINE_LIMIT {
++                line_too_large = true;
++                protocol_error = true;
++                break;
++            }
++            if !line.is_empty() {
++                event.push(line);
++                continue;
++            }
++            // A blank line dispatches ONE SSE event. Never expose a field before
++            // all data fields have been joined and the event has been classified.
++            let mut data_fields = Vec::new();
++            let mut event_kind = "";
++            for field in &event {
++                let (name, value) = field.split_once(':').unwrap_or((field, ""));
++                let value = value.strip_prefix(' ').unwrap_or(value);
++                match name {
++                    "data" => data_fields.push(value),
++                    "event" => event_kind = value,
++                    _ => {}
++                }
++            }
++            let data = data_fields.join("\n");
++            if !data_fields.is_empty() {
++                let data = data.trim();
++                if data == "[DONE]" {
++                    terminal = protocol == "openai-chat";
++                } else if let Ok(value) = serde_json::from_str::<Value>(data) {
++                    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
++                    if value.get("error").is_some()
++                        || matches!(kind, "error" | "response.failed" | "response.incomplete")
++                    {
++                        protocol_error = true;
++                        break;
++                    }
++                    terminal |= matches!(
++                        (protocol, kind),
++                        ("openai-responses", "response.completed") | ("anthropic", "message_stop")
++                    );
++                } else {
++                    // Provider protocols carry JSON (or [DONE]); unclassifiable
++                    // data must fail closed, not become a raw-body escape hatch.
++                    protocol_error = true;
++                    break;
++                }
++            }
++            if matches!(
++                event_kind,
++                "error" | "response.failed" | "response.incomplete"
++            ) {
++                protocol_error = true;
++                break;
++            }
++            // Delay headers until a complete, classified event. Canonicalize JSON
++            // to one data field for the existing line-oriented protocol adapters;
++            // its decoded payload (including embedded newlines) is unchanged.
++            let canonical = serde_json::from_str::<Value>(&data).ok();
++            let mut output = String::new();
++            if let Some(value) = canonical {
++                for field in &event {
++                    if field.split(':').next() != Some("data") {
++                        output.push_str(&translate(field));
++                    }
++                }
++                output.push_str(&translate(&format!("data: {value}")));
++            } else {
++                for field in &event {
++                    output.push_str(&translate(field));
++                }
++            }
++            output.push_str(&translate(""));
++            event.clear();
++            event_bytes = 0;
++            // No raw fields from a rejected or unfinished event reach this point.
++            if !written {
++                if write_stream_head(stream, 200, "text/event-stream", binding_id).is_err() {
++                    return false;
++                }
++                written = true;
++            }
++            if stream
++                .write_all(output.as_bytes())
++                .and_then(|_| stream.flush())
++                .is_err()
++            {
++                log_transport_outcome("himind_gateway_client_io", true);
++                return false;
++            }
++        }
++        if protocol_error {
++            break if line_too_large {
++                BodyFailure::TooLarge
++            } else {
++                BodyFailure::Truncated
++            };
++        }
++    };
++    log_transport_outcome(failure.code(), written);
++    if !written {
++        let _ = write_json_error(stream, 502, failure.code(), "上游响应未完成。");
++    } else {
++        let payload = json!({"type":"error","error":{"type":"api_error","code":failure.code(),
++            "request_id":current_request_id(),"message":"上游流已中断；不会自动重放。"}});
++        let _ = write!(stream, "event: error\ndata: {payload}\n\n");
++        let _ = stream.flush();
+     }
+-    Ok(raw)
++    false
+ }
+-
+-fn write_upstream_failure(stream: &mut TcpStream, detail: &str) -> GatewayError {
+-    let request_id = current_request_id();
+-    crate::approval::manager::append_event_log(
+-        "warn",
+-        &format!("本机网关上游请求失败：request_id={request_id} {detail}"),
+-    );
+-    let _ = write_json_error(
+-        stream,
+-        502,
+-        "himind_gateway_upstream_failed",
+-        &format!("上游请求失败：{detail}（request_id={request_id}）"),
+-    );
+-    GatewayError::Answered
++fn log_transport_outcome(code: &str, written: bool) {
++    crate::approval::manager::append_event_log("warn", &format!(
++        "gateway transport_outcome={code} request_id={} response_started={written} usage_complete=false replay=false", current_request_id()));
+ }
+ 
+ /// SSE 行扫描：只在行边界解析，避免把半个 JSON 当成用量。
+@@ -4304,7 +4662,14 @@ fn write_json_error(
+     code: &str,
+     message: &str,
+ ) -> std::io::Result<()> {
+-    let body = json!({ "error": { "code": code, "message": message } }).to_string();
++    let safe_message = if code.contains("translation") || code.contains("upstream") {
++        "上游请求或协议处理失败；请凭 request_id 查询安全诊断。"
++    } else {
++        message
++    };
++    let body = json!({ "type": "error", "error": { "type": "api_error", "code": code,
++        "request_id": current_request_id(), "message": safe_message } })
++    .to_string();
+     let response = format!(
+         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n{body}",
+         reason = reason_phrase(status),
+@@ -4784,25 +5149,83 @@ mod tests {
+     #[test]
+     fn upstream_url_does_not_duplicate_v1() {
+         assert_eq!(
+-            join_upstream("https://api.example.com/v1", "/v1/chat/completions"),
++            upstream_endpoint_url(
++                "https://api.example.com/v1",
++                &AIServiceProtocol::OpenaiChat,
++                UpstreamEndpoint::ChatCompletions,
++            ),
+             "https://api.example.com/v1/chat/completions"
+         );
+         assert_eq!(
+-            join_upstream("https://api.example.com", "/v1/chat/completions"),
++            upstream_endpoint_url(
++                "https://api.example.com",
++                &AIServiceProtocol::OpenaiChat,
++                UpstreamEndpoint::ChatCompletions,
++            ),
+             "https://api.example.com/v1/chat/completions"
+         );
+         assert_eq!(
+-            join_upstream("https://api.example.com/v1/", "/v1/models"),
++            upstream_endpoint_url(
++                "https://api.example.com/v1/",
++                &AIServiceProtocol::OpenaiResponses,
++                UpstreamEndpoint::Models,
++            ),
+             "https://api.example.com/v1/models"
+         );
+-        // 客户端不带 `/v1`（OpenCode 的 openai-compatible provider 就是这样）。
++    }
++
++    #[test]
++    fn upstream_url_handles_versioned_and_full_endpoint_bases() {
++        // Anthropic 上游：Base URL 误填完整端点时不能重复拼 `/v1/messages`。
+         assert_eq!(
+-            join_upstream("https://api.example.com/v1", "/chat/completions"),
+-            "https://api.example.com/v1/chat/completions"
++            upstream_endpoint_url(
++                "https://vectide.cn/v1/messages",
++                &AIServiceProtocol::Anthropic,
++                UpstreamEndpoint::Messages,
++            ),
++            "https://vectide.cn/v1/messages"
+         );
+         assert_eq!(
+-            join_upstream("https://api.example.com", "/chat/completions"),
+-            "https://api.example.com/v1/chat/completions"
++            upstream_endpoint_url(
++                "https://vectide.cn/v1/messages",
++                &AIServiceProtocol::Anthropic,
++                UpstreamEndpoint::Models,
++            ),
++            "https://vectide.cn/v1/models"
++        );
++        assert_eq!(
++            upstream_endpoint_url(
++                "https://api.moonshot.cn/anthropic/v1",
++                &AIServiceProtocol::Anthropic,
++                UpstreamEndpoint::Messages,
++            ),
++            "https://api.moonshot.cn/anthropic/v1/messages"
++        );
++        // OpenAI 兼容上游：保留 `/api/v3` 这类厂商版本前缀，不再额外补 `/v1`。
++        assert_eq!(
++            upstream_endpoint_url(
++                "https://ark.cn-beijing.volces.com/api/v3",
++                &AIServiceProtocol::OpenaiResponses,
++                UpstreamEndpoint::Responses,
++            ),
++            "https://ark.cn-beijing.volces.com/api/v3/responses"
++        );
++        assert_eq!(
++            upstream_endpoint_url(
++                "https://ark.cn-beijing.volces.com/api/plan/v3",
++                &AIServiceProtocol::OpenaiChat,
++                UpstreamEndpoint::ChatCompletions,
++            ),
++            "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions"
++        );
++        // query/fragment 必须被清掉，否则拼接出的地址非法。
++        assert_eq!(
++            upstream_endpoint_url(
++                "https://api.example.com/v1?x=1#y",
++                &AIServiceProtocol::OpenaiResponses,
++                UpstreamEndpoint::Responses,
++            ),
++            "https://api.example.com/v1/responses"
+         );
+     }
+ 
+@@ -5148,6 +5571,80 @@ mod tests {
+             "response={response}"
+         );
+     }
++    #[test]
++    fn upstream_404_returns_gateway_diagnostic_with_upstream_url() {
++        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
++        let upstream_address = upstream.local_addr().unwrap();
++        let upstream_thread = thread::spawn(move || {
++            let (mut stream, _) = upstream.accept().unwrap();
++            let head = match read_request(&mut stream).unwrap() {
++                RequestRead::Request(head, _) => head,
++                _ => panic!("expected request"),
++            };
++            assert_eq!(head.path, "/v1/messages");
++            let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"接口路径不存在或不受支持。请检查基础地址与接口路径是否重复拼接","code":"VectorTide_invalid_api_endpoint"}}"#.as_bytes();
++            let response = format!(
++                "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
++                body.len()
++            );
++            stream.write_all(response.as_bytes()).unwrap();
++            stream.write_all(body).unwrap();
++            stream.flush().unwrap();
++        });
++
++        let token = "k2-404-token".to_string();
++        let resolver_token = token.clone();
++        let upstream_base = format!("http://{upstream_address}/v1/messages");
++        let resolver_base = upstream_base.clone();
++        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
++            vec![GatewayBinding {
++                id: "claude-desktop:profile:vector-tide-k2".to_string(),
++                client: "claude-desktop".to_string(),
++                service: "custom:vector-tide-copy-copy".to_string(),
++                profile_id: "himind-proxy".to_string(),
++                entry_protocol: "anthropic".to_string(),
++                exposed_model: "vector-tide-k2/deepseek-v4.1-flash-1017".to_string(),
++                models: vec!["vector-tide-k2/deepseek-v4.1-flash-1017".to_string()],
++                default_model: "deepseek-v4.1-flash-1017".to_string(),
++                upstream_model: "deepseek-v4.1-flash-1017".to_string(),
++                is_default: true,
++                protocol: "anthropic".to_string(),
++                base_url: resolver_base.clone(),
++                api_key: "upstream-key".to_string(),
++                token: resolver_token.clone(),
++                platform_metered: false,
++            }]
++        });
++        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
++        let request_body = br#"{"model":"vector-tide-k2/deepseek-v4.1-flash-1017","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
++        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
++        let head = format!(
++            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
++            request_body.len()
++        );
++        client.write_all(head.as_bytes()).unwrap();
++        client.write_all(request_body).unwrap();
++        client.flush().unwrap();
++        let mut response = String::new();
++        client.read_to_string(&mut response).unwrap();
++        gateway.stop();
++        upstream_thread.join().unwrap();
++
++        assert!(
++            response.starts_with("HTTP/1.1 502 Bad Gateway"),
++            "response={response}"
++        );
++        assert!(
++            response.contains("himind_gateway_upstream_not_found"),
++            "response={response}"
++        );
++        assert!(
++            response.contains(&format!("\"upstream_url\":\"{upstream_base}\"")),
++            "response={response}"
++        );
++        assert!(response.contains("Base URL"), "response={response}");
++    }
++
+     #[test]
+     fn responses_gateway_pre_normalizes_limited_tool_history() {
+         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+@@ -5603,7 +6100,7 @@ mod tests {
+         assert!(response.contains("thinking=adaptive"), "{response}");
+         assert!(response.contains("output_config=effort:high"), "{response}");
+         assert!(
+-            response.contains("error/type=invalid_request_error"),
++            response.contains("upstream_body_withheld bytes="),
+             "{response}"
+         );
+         // 结构化字段也要落到 diagnostic 里，便于前端直接展示而不是解析文案。
+@@ -5837,14 +6334,66 @@ mod tests {
+             r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.1: unexpected field `cache_control`; Authorization: Bearer sk-secret-value\nrequest id: req_vt_abc123"}}"#,
+         );
+         assert!(
+-            summarised.contains("error/type=invalid_request_error"),
++            summarised.contains("upstream_body_withheld bytes="),
+             "{summarised}"
+         );
+-        assert!(summarised.contains("cache_control"), "{summarised}");
+-        assert!(summarised.contains("excerpt="), "{summarised}");
++        assert!(!summarised.contains("cache_control"), "{summarised}");
+         assert!(!summarised.contains("sk-secret-value"), "{summarised}");
+     }
+ 
++    #[test]
++    fn upstream_not_found_payload_is_actionable_for_both_client_shapes() {
++        let raw = r#"{"type":"error","error":{"type":"invalid_request_error","message":"接口路径不存在或不受支持","code":"VectorTide_invalid_api_endpoint"}}"#.as_bytes();
++        let anthropic =
++            upstream_not_found_payload("anthropic", "https://vectide.cn/v1/messages", 404, raw);
++        let value: Value = serde_json::from_str(&anthropic).unwrap();
++        assert_eq!(value["type"], "error");
++        assert_eq!(value["error"]["code"], "himind_gateway_upstream_not_found");
++        assert_eq!(
++            value["error"]["upstream_url"],
++            "https://vectide.cn/v1/messages"
++        );
++        assert_eq!(value["error"]["upstream_status"], 404);
++        let message = value["error"]["message"].as_str().unwrap();
++        assert!(message.contains("Base URL"), "{message}");
++        assert!(
++            !message.contains("VectorTide_invalid_api_endpoint"),
++            "{message}"
++        );
++        assert!(message.contains("upstream_body_withheld"), "{message}");
++
++        let openai = upstream_not_found_payload(
++            "openai-chat",
++            "https://api.example.com/v1/chat/completions",
++            404,
++            b"{}",
++        );
++        let value: Value = serde_json::from_str(&openai).unwrap();
++        assert!(value.get("type").is_none());
++        assert_eq!(value["error"]["code"], "himind_gateway_upstream_not_found");
++    }
++
++    #[test]
++    fn upstream_failure_log_line_includes_url_and_redacts_credentials() {
++        let binding = binding("claude-desktop", "anthropic", "local-token");
++        let line = upstream_failure_log_line(
++            &binding,
++            "https://vectide.cn/v1/messages",
++            404,
++            br#"{"error":{"message":"bad","code":"X","authorization":"Bearer sk-secret"}}"#,
++            "",
++            "",
++        );
++        assert!(line.contains("status=404"), "{line}");
++        assert!(
++            line.contains("upstream=https://vectide.cn/v1/messages"),
++            "{line}"
++        );
++        assert!(!line.contains("real-secret"), "{line}");
++        assert!(!line.contains("local-token"), "{line}");
++        assert!(!line.contains("sk-secret"), "{line}");
++    }
++
+     #[test]
+     fn upstream_skeleton_is_char_bounded_and_keeps_words() {
+         let long = "messages.3.content.0.type must be one of text image".repeat(20);
+@@ -6024,14 +6573,12 @@ mod tests {
+         assert!(response.contains(r#""client":"opencode""#));
+         assert!(response.contains(r#""provider":"openai_responses_limited""#));
+         assert!(response.contains(r#""unsupported_feature":"tool_choice""#));
+-        assert!(response.contains(r#""request_id":"req_vt_header_456""#));
++        assert!(response.contains(r#""request_id":"req_himind_"#));
++        assert!(!response.contains("req_vt_header_456"));
+         assert!(response.contains(r#""suggested_action""#));
+         // 泛化 400 也要把两侧画像带出来，否则用户手里没有任何可定位的证据。
+         assert!(response.contains("诊断："), "{response}");
+-        assert!(
+-            response.contains("request_id=req_vt_header_456"),
+-            "{response}"
+-        );
++        assert!(response.contains("request_id=req_himind_"), "{response}");
+         // 上游把 "Authorization: Bearer sk-secret-value" 写进了错误原文，
+         // 两个画像都必须先脱敏：响应体与日志里都不能出现它。
+         assert!(!response.contains("sk-secret-value"), "{response}");
+@@ -6467,7 +7014,10 @@ mod tests {
+         assert!(response.contains(r#""text":"okdone""#), "{response}");
+ 
+         let upstream_request = String::from_utf8_lossy(&seen.lock().unwrap()).to_string();
+-        assert!(!upstream_request.contains("</thought>"), "{upstream_request}");
++        assert!(
++            !upstream_request.contains("</thought>"),
++            "{upstream_request}"
++        );
+         assert!(
+             upstream_request.contains(r#""role":"assistant""#),
+             "{upstream_request}"
+@@ -6598,4 +7148,430 @@ mod tests {
+         assert!(!String::from_utf8_lossy(&seen[2]).contains("function_call"));
+         thread.join().unwrap();
+     }
++    // Real TCP upstream fixture: each request is counted; EOF/truncation never replays.
++    fn remediation_exchange(
++        entry: &str,
++        protocol: &str,
++        status: u16,
++        body: Vec<u8>,
++        declared: usize,
++        sse: bool,
++    ) -> String {
++        remediation_exchange_chunks(entry, protocol, status, body, declared, sse, 0)
++    }
++
++    fn remediation_exchange_chunks(
++        entry: &str,
++        protocol: &str,
++        status: u16,
++        body: Vec<u8>,
++        declared: usize,
++        sse: bool,
++        chunk_size: usize,
++    ) -> String {
++        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = upstream.local_addr().unwrap();
++        let worker = thread::spawn(move || {
++            // Error statuses may use the pre-body transient retry (never body replay).
++            upstream.set_nonblocking(true).unwrap();
++            let deadline = Instant::now() + Duration::from_secs(3);
++            let mut count = 0;
++            while Instant::now() < deadline {
++                let (mut socket, _) = match upstream.accept() {
++                    Ok(pair) => pair,
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                        thread::sleep(Duration::from_millis(5));
++                        continue;
++                    }
++                    Err(error) => panic!("{error}"),
++                };
++                count += 1;
++                socket.set_nonblocking(false).unwrap();
++                socket
++                    .set_read_timeout(Some(Duration::from_secs(2)))
++                    .unwrap();
++                let _ = read_request(&mut socket).unwrap();
++                let ct = if sse {
++                    "text/event-stream"
++                } else {
++                    "application/json"
++                };
++                if body == b"BAD_CHUNK" {
++                    write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\nZZZ\r\ninvalid\r\n").unwrap();
++                    break;
++                }
++                write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: {ct}\r\ncontent-length: {declared}\r\nconnection: close\r\n\r\n").unwrap();
++                if body == b"TIMEOUT" {
++                    thread::sleep(Duration::from_millis(250));
++                } else {
++                    for part in body.chunks(if chunk_size == 0 {
++                        body.len().max(1)
++                    } else {
++                        chunk_size
++                    }) {
++                        if socket.write_all(part).and_then(|_| socket.flush()).is_err() {
++                            break;
++                        }
++                        if chunk_size != 0 {
++                            thread::sleep(Duration::from_millis(1));
++                        }
++                    }
++                }
++                if status == 200 {
++                    break;
++                }
++            }
++            count
++        });
++        let mut b = binding("remediation", protocol, "local-fixture-token");
++        b.entry_protocol = entry.to_string();
++        b.exposed_model = "model-a".into();
++        b.models = vec!["model-a".into()];
++        b.default_model = "model-a".into();
++        b.upstream_model = "model-a".into();
++        b.base_url = format!("http://{address}");
++        b.api_key = "FAKE_BEARER_unpatterned_secret".into();
++        let mut gateway =
++            InferenceGateway::start(Some(0), Box::new(move || vec![b.clone()]), false).unwrap();
++        let path = match entry {
++            "anthropic" => "/v1/messages",
++            "openai-responses" => "/v1/responses",
++            _ => "/v1/chat/completions",
++        };
++        let request = json!({"model":"model-a","messages":[{"role":"user","content":"hi"}],"input":"hi","max_tokens":8,"stream":sse}).to_string();
++        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
++        client
++            .set_read_timeout(Some(Duration::from_secs(10)))
++            .unwrap();
++        write!(client,"POST {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer local-fixture-token\r\nx-api-key: local-fixture-token\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{request}",request.len()).unwrap();
++        let mut result = String::new();
++        client.read_to_string(&mut result).unwrap();
++        gateway.stop();
++        let count = worker.join().unwrap();
++        let (records, _) = local_usage::read_all().unwrap();
++        let record = records
++            .iter()
++            .rev()
++            .find(|r| r.client == "remediation")
++            .expect("real gateway usage record");
++        assert!(!record.request_id.is_empty());
++        let failed =
++            status != 200 || result.starts_with("HTTP/1.1 502") || result.contains("event: error");
++        assert_eq!(record.status, if failed { "failure" } else { "success" });
++        if failed {
++            assert!(
++                record.usage_unreported,
++                "incomplete usage must not be complete"
++            );
++        } else if !sse {
++            assert!(!record.usage_unreported);
++            assert_eq!(record.input_tokens, 3);
++            assert_eq!(record.output_tokens, 1);
++        }
++        let logs = std::fs::read_to_string(
++            crate::store::paths::agent_home().join("logs/agent-events.jsonl"),
++        )
++        .unwrap_or_default();
++        assert!(!logs.contains("FAKE_BEARER_unpatterned_secret"));
++        assert!(!logs.contains("FAKE_XAPI_unpatterned_secret"));
++        if status == 200 {
++            assert_eq!(count, 1, "body failure must not replay");
++        }
++        result
++    }
++    #[test]
++    fn remediation_error_matrix_real_loopback() {
++        for (entry, protocol) in [
++            ("openai-chat", "openai-chat"),
++            ("openai-responses", "openai-responses"),
++            ("anthropic", "anthropic"),
++            ("anthropic", "openai-chat"),
++            ("anthropic", "openai-responses"),
++            ("openai-responses", "openai-chat"),
++            ("openai-chat", "openai-responses"),
++        ] {
++            for status in [401, 403, 500] {
++                let body=format!("<html>Bearer FAKE_BEARER_unpatterned_secret x-api-key FAKE_XAPI_unpatterned_secret {}</html>","x".repeat(ERROR_BODY_LIMIT+10)).into_bytes();
++                let result =
++                    remediation_exchange(entry, protocol, status, body.clone(), body.len(), false);
++                assert!(!result.contains("FAKE_"), "{entry}/{protocol}/{status}");
++                assert!(result.contains("request_id"), "{result}");
++                assert!(result.contains("himind_gateway_"), "{result}");
++                assert!(result.len() < 4096, "public error must be bounded");
++            }
++        }
++    }
++    #[test]
++    fn remediation_body_truncated_and_complete_real_loopback() {
++        let raw = br#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#.to_vec();
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            raw.clone(),
++            raw.len() + 40,
++            false,
++        );
++        assert!(result.starts_with("HTTP/1.1 502"), "{result}");
++        assert!(
++            result.contains("truncated") || result.contains("upstream_io"),
++            "{result}"
++        );
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            raw.clone(),
++            raw.len(),
++            false,
++        );
++        assert!(result.starts_with("HTTP/1.1 200"), "{result}");
++    }
++    #[test]
++    fn remediation_stream_boundaries_real_loopback() {
++        for (entry, protocol) in [
++            ("openai-chat", "openai-chat"),
++            ("anthropic", "openai-chat"),
++            ("openai-responses", "openai-chat"),
++            ("anthropic", "openai-responses"),
++            ("openai-chat", "openai-responses"),
++        ] {
++            let first = if protocol == "openai-chat" {
++                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n"
++            } else {
++                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
++            };
++            let result = remediation_exchange(
++                entry,
++                protocol,
++                200,
++                first.as_bytes().to_vec(),
++                first.len() + 100,
++                true,
++            );
++            assert!(
++                result.contains("event: error"),
++                "{entry}/{protocol}: {result}"
++            );
++            assert!(
++                !result.contains("response.completed") && !result.contains("message_stop"),
++                "must not synthesize completion: {result}"
++            );
++            let result = remediation_exchange(entry, protocol, 200, b"data: {".to_vec(), 100, true);
++            assert!(result.starts_with("HTTP/1.1 502"), "{result}");
++            let error = b"data: {\"type\":\"error\",\"error\":{\"message\":\"Bearer FAKE_BEARER_unpatterned_secret x-api-key FAKE_XAPI_unpatterned_secret\"}}\n\n";
++            let result =
++                remediation_exchange(entry, protocol, 200, error.to_vec(), error.len(), true);
++            assert!(
++                result.starts_with("HTTP/1.1 502") && !result.contains("FAKE_"),
++                "{result}"
++            );
++        }
++        let full = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            full.to_vec(),
++            full.len(),
++            true,
++        );
++        assert!(
++            result.contains("[DONE]") && !result.contains("event: error"),
++            "{result}"
++        );
++        let (records, _) = local_usage::read_all().unwrap();
++        let record = records
++            .iter()
++            .rev()
++            .find(|r| r.client == "remediation")
++            .unwrap();
++        assert_eq!(record.status, "success");
++        assert!(!record.usage_unreported);
++        assert_eq!(record.input_tokens, 3);
++    }
++    #[test]
++    fn remediation_stream_multidata_error_no_leak() {
++        for (entry, protocol) in [
++            ("openai-chat", "openai-chat"),
++            ("openai-responses", "openai-responses"),
++            ("anthropic", "anthropic"),
++            ("anthropic", "openai-chat"),
++            ("openai-responses", "openai-chat"),
++            ("anthropic", "openai-responses"),
++            ("openai-chat", "openai-responses"),
++        ] {
++            let normal = match protocol {
++                "openai-chat" => "data: {\"choices\":[],\ndata: \"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
++                "anthropic" => "data: {\"type\":\"message_start\",\ndata: \"message\":{\"id\":\"r\",\"usage\":{\"input_tokens\":3},\"content\":[]}}\n\n",
++                _ => "data: {\"type\":\"response.created\",\ndata: \"response\":{\"id\":\"r\",\"output\":[]}}\n\n",
++            };
++            for newline in ["\n", "\r\n"] {
++                for prefix in ["", normal] {
++                    for chunk_size in [0, 7] {
++                        for ended in [true, false] {
++                            let error = "data: {\"error\":\ndata: {\"message\":\"FAKE_BEARER_unpatterned_secret\"}}";
++                            let body =
++                                format!("{prefix}{error}{}", if ended { "\n\n" } else { "\n" })
++                                    .replace('\n', newline)
++                                    .into_bytes();
++                            let result = remediation_exchange_chunks(
++                                entry,
++                                protocol,
++                                200,
++                                body.clone(),
++                                body.len(),
++                                true,
++                                chunk_size,
++                            );
++                            for secret in [
++                                "FAKE_BEARER_unpatterned_secret",
++                                "unpatterned_secret",
++                                "FAKE_BEARER",
++                                "\"message\":\"FAKE",
++                            ] {
++                                assert!(
++                                    !result.contains(secret),
++                                    "response leaked {entry}/{protocol}"
++                                );
++                            }
++                            assert!(
++                                result.contains("request_id") && result.contains("himind_gateway_"),
++                                "{result}"
++                            );
++                            assert!(
++                                if prefix.is_empty() {
++                                    result.starts_with("HTTP/1.1 502")
++                                } else {
++                                    result.contains("event: error")
++                                },
++                                "{result}"
++                            );
++                        }
++                    }
++                }
++            }
++            // A valid multiline event is not discarded: terminal events and usage
++            // remain visible to both native relays and line-oriented translators.
++            let terminal = match protocol {
++                "openai-chat" => "data: [DONE]\n\n",
++                "anthropic" => "data: {\"type\":\"message_stop\"}\n\n",
++                _ => "data: {\"type\":\"response.completed\",\ndata: \"response\":{\"id\":\"r\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
++            };
++            let body = format!("{normal}{terminal}").into_bytes();
++            let result = remediation_exchange_chunks(
++                entry,
++                protocol,
++                200,
++                body.clone(),
++                body.len(),
++                true,
++                7,
++            );
++            assert!(
++                result.starts_with("HTTP/1.1 200") && !result.contains("event: error"),
++                "{entry}/{protocol}: {result}"
++            );
++        }
++        let oversized = format!(
++            "data: {{\"error\":\n{}",
++            "data:  \n".repeat(SSE_LINE_LIMIT / 8 + 1)
++        );
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            oversized.as_bytes().to_vec(),
++            oversized.len(),
++            true,
++        );
++        assert!(
++            result.starts_with("HTTP/1.1 502") && result.contains("response_too_large"),
++            "{result}"
++        );
++        let logs = std::fs::read_to_string(
++            crate::store::paths::agent_home().join("logs/agent-events.jsonl"),
++        )
++        .expect("captured gateway logs");
++        for secret in [
++            "FAKE_BEARER_unpatterned_secret",
++            "unpatterned_secret",
++            "FAKE_BEARER",
++            "FAKE_XAPI",
++        ] {
++            assert!(
++                !logs.contains(secret),
++                "captured logs leaked secret fragment"
++            );
++        }
++        assert!(logs.contains("request_id=") && logs.contains("usage_complete=false"));
++    }
++
++    #[test]
++    fn remediation_body_limit_and_timeout_real_loopback() {
++        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
++        let addr = upstream.local_addr().unwrap();
++        let worker = thread::spawn(move || {
++            let (mut s, _) = upstream.accept().unwrap();
++            let _ = read_request(&mut s);
++            write!(s, "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n").unwrap();
++            thread::sleep(Duration::from_millis(200));
++        });
++        let response = reqwest::blocking::Client::builder()
++            .no_proxy()
++            .timeout(Duration::from_millis(80))
++            .build()
++            .unwrap()
++            .get(format!("http://{addr}"))
++            .send()
++            .unwrap();
++        assert_eq!(
++            read_success_body(response).unwrap_err(),
++            BodyFailure::Timeout
++        );
++        worker.join().unwrap();
++        TEST_UPSTREAM_TIMEOUT_MS.store(80, Ordering::Relaxed);
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            b"TIMEOUT".to_vec(),
++            100,
++            false,
++        );
++        TEST_UPSTREAM_TIMEOUT_MS.store(0, Ordering::Relaxed);
++        assert!(
++            result.starts_with("HTTP/1.1 502") && result.contains("upstream_timeout"),
++            "{result}"
++        );
++        let raw = vec![b' '; RESPONSE_BODY_LIMIT + 1];
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            raw.clone(),
++            raw.len(),
++            false,
++        );
++        assert!(result.contains("response_too_large"), "{result}");
++        let result = remediation_exchange(
++            "openai-chat",
++            "openai-chat",
++            200,
++            b"BAD_CHUNK".to_vec(),
++            100,
++            false,
++        );
++        assert!(
++            result.starts_with("HTTP/1.1 502") && result.contains("upstream_io"),
++            "{result}"
++        );
++        assert_eq!(
++            classify_read_error(&std::io::Error::new(
++                std::io::ErrorKind::ConnectionReset,
++                "fake secret"
++            )),
++            BodyFailure::Io
++        );
++    }
+ }
