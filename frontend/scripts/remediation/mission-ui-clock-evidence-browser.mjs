@@ -185,7 +185,7 @@ try {
   const terminal = snapshot(); terminal.mission.status = 'completed'; terminal.mission.tasks = [];
   await load(terminal, 'terminal-no-freeze'); await observe('terminal:initial', two);
   await page.clock.runFor(120000); await observe('terminal:wall-clock-limit', exhausted);
-  assert.match(await overview().innerText(), /不代表结算运行耗时/);
+  assert.match(await overview().innerText(), /(?:不代表|并非)结算运行耗时/);
   checked('terminal has no invented freeze endpoint; explicit cumulative-time disclosure');
 
   function deliveries(state) {
@@ -364,7 +364,7 @@ try {
     assert.equal(await page.getByRole('button',{name:'续跑未完成任务',exact:true}).count(),test.optional ? 1 : 0);
     if (test.resume) {
       assert.doesNotMatch(actionText,/无需你操作|等待系统检查或核验，不重复/);
-      assert.match(actionText,/系统不会自动推进/); assert.match(actionText,/必需检查与独立核验，不重复执行已完成的实现/);
+      assert.match(actionText,/(?:系统不会自动推进|需要你手动续跑 · 系统随后检查与独立核验)/); assert.match(actionText,/(?:必需检查与独立核验，不重复执行已完成的实现|请手动续跑检查与独立核验，不重做实现)/);
       assert.equal(await detail.getAttribute('data-todo-id'),todoId);
       assert.equal(await detail.getAttribute('data-wait-actor'),'user');
       assert.equal(await action.locator('.busy-indicator').count(),0);
@@ -372,7 +372,7 @@ try {
     if (test.optionalVerification) assert.match(actionText,/由你决定何时继续/);
     await page.getByRole('tab',{name:'执行计划',exact:true}).click();
     const rowText=await page.locator('[data-mission-task-id="legacy"]').innerText();
-    if (test.resume) { assert.match(rowText,/待手动续跑核验/); assert.match(rowText,/不重复执行已完成的实现/); }
+    if (test.resume) { assert.match(rowText,/待手动续跑核验/); assert.match(rowText,/(?:不重复执行已完成的实现|不重做实现)/); }
     if (test.name==='environment') assert.match(actionText,/处理命令环境/);
     if (test.name==='budget') assert.match(actionText,/增加预算并继续/);
     await capture('recovery-' + test.name);

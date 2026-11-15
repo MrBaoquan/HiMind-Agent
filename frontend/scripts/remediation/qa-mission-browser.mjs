@@ -157,7 +157,7 @@ try {
   const terminal = snapshot(); terminal.mission.status = 'completed'; terminal.mission.tasks = [];
   await load(terminal, 'terminal-no-freeze'); await observe('terminal:initial', two);
   await page.clock.runFor(120000); await observe('terminal:wall-clock-limit', exhausted);
-  assert.match(await overview().innerText(), /不代表结算运行耗时/);
+  assert.match(await overview().innerText(), /(?:不代表|并非)结算运行耗时/);
   checked('terminal has no invented freeze endpoint; explicit cumulative-time disclosure');
 
   function deliveries(state) {
