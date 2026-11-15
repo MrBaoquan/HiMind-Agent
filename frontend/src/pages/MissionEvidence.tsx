@@ -77,8 +77,8 @@ function AttemptEvidence({task, events, missionId, plan, workspace, entries = fa
         {latest && boundaryKnown ? <><p>检查时冻结候选：<code>{String(after?.candidate_id)}</code></p>
           <p>检查前候选：<code>{String(before?.candidate_id)}</code> · 检查后候选：<code>{String(after?.candidate_id)}</code></p>
           <p>{boundary?.matches === true ? '宿主记录检查前后候选一致' : '检查前后候选发生变化，不能作为通过依据'}；仅关联本次准备记录，不推断当前文件仍相同。</p></>
-          : <p className="muted">{latest ? '检查候选边界缺失、失配或无法确认；未串用其他候选，原始记录可在历史中查看。' : '未提供检查候选边界；已有独立验收记录仅按任务与运行关联展示。'}</p>}
-        <p>宿主必需检查与独立验收分别记录；检查全绿不等于独立验收通过。</p>
+          : <p className="muted">{latest ? <>检查候选边界缺失、失配或无法确认。<br />未串用其他候选，原始记录可在历史中查看。</> : <>未提供检查候选边界。<br />已有独立验收记录仅按任务与运行关联展示。</>}</p>}
+        <p>宿主必需检查与独立验收分别记录。<br />检查全绿不等于独立验收通过。</p>
         {checks?.length ? checks.map((check, index) => <div key={index}><code>{String(check.command || '未提供命令')}</code>
           <p>{typeof check.exit_code === 'number' ? `退出码 ${check.exit_code}` : '未提供退出码'}</p>
           <pre>{body(check.test_summary)}</pre>{check.error ? <p>{String(check.error)}</p> : null}

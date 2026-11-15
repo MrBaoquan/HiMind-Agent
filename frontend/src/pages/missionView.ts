@@ -65,7 +65,7 @@ export function missionResumeAction(mission: MissionView, activities: AgentActiv
     const optional = wait.reason === 'manual_pause';
     return {kind: 'verification' as const, label: '续跑待核验', optional,
       responsibility: optional ? '由你决定何时继续 · 当前无需处理' : '需要你手动续跑 · 系统随后检查与独立核验',
-      explanation: '任务已暂停。请手动续跑待核验；系统检查已提交结果并独立核验，不重做实现。'};
+      explanation: '任务已暂停；请手动续跑检查与独立核验，不重做实现。'};
   }
   if (!pending && wait.reason === 'manual_pause' && wait.actor === 'user') {
     return {kind: 'tasks' as const, label: '续跑未完成任务', optional: true,
@@ -417,7 +417,7 @@ export function legacyBudgetExtensionAction(isLegacyRecovery: boolean, authorize
   if (!authorized) return {
     disabled: true,
     label: '请先确认人工授权',
-    description: '旧记录缺少暂停归属。本次只允许单独补充核验时限；不授权时不会提交增额。',
+    description: '未授权不会提交增额；本次只补核验时限，重试需另行确认。',
   };
   return {
     disabled: false,

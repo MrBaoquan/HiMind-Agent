@@ -55,8 +55,8 @@ function MissionPermissionPanel({ mission, events, onSaved }: { mission: Mission
   }
   return <section className="mission-detail-panel"><h3>执行权限</h3>
     {editable ? <label><span>任务访问模式</span><select value={full ? 'full_access' : 'workspace_write'} disabled={busy} onChange={event => void save(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label> : <strong>{full ? '完全访问' : recovery?.payload?.mode === 'files_only' ? '仅文件工具' : '工作区访问'}</strong>}
-    <p>{full ? '按当前用户权限访问工作区外文件；ACP 请求自动批准。目标与验收标准仍有效。' : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身访问控制。受阻时可调整权限。'}</p>
-    {editable ? <small>随计划确认后生效，后续执行无需重复确认；不会自动提权为管理员。</small> : null}
+    <p>{full ? <>按当前用户权限访问工作区外文件；ACP 请求自动批准。<br />目标与验收标准仍有效。</> : 'HiMind AI 隔离工作区；外部执行器自行控制访问。受阻时可调整权限。'}</p>
+    {editable ? <small>确认计划后生效，无需逐次确认；不会自动提权。</small> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
   </section>;
 }
@@ -111,7 +111,7 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
           <label><span>目标</span><textarea value={objective} onChange={event => setObjective(event.target.value)} placeholder="完成后应该看到什么结果？" /></label>
           <label><span>工作区根目录 *</span><input value={root} onChange={event => setRoot(event.target.value)} placeholder="项目的本地绝对路径" /></label>
           <label><span>执行权限</span><select value={permissionMode} onChange={event => setPermissionMode(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label>
-          <small>{permissionMode === 'full_access' ? '确认计划后，HiMind AI 或 ACP 执行器按当前系统用户权限运行，ACP 工具请求自动批准。不自动提权为管理员。' : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身的访问控制。'}</small>
+          <small>{permissionMode === 'full_access' ? <>确认计划后，HiMind AI 或 ACP 按当前用户权限运行。<br />ACP 请求自动批准；不会自动提权为管理员。</> : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身访问控制。'}</small>
           <label><span>允许修改的范围 *</span><textarea value={writeScope} onChange={event => setWriteScope(event.target.value)} placeholder="例如：frontend/src，行或逗号分隔" /></label>
           <label><span>完成标准</span><textarea value={acceptance} onChange={event => setAcceptance(event.target.value)} placeholder="每行一条可验证标准" /></label>
         </div>
@@ -393,7 +393,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         : mission.status==='failed' ? <button className="btn" onClick={()=>setTab('activity')}>查看失败原因</button> : null}
         <details className="mission-more-actions"><summary>任务操作</summary>
           {pendingBudget || wait?.can_increase_budget ? <button className="btn" onClick={()=>setBudgetExtensionOpen(true)}>{pendingBudget ? '重试原增额申请' : '主动增加预算并续跑'}</button> : null}
-          <p>续跑继续未完成任务；重核只检查同一实现；重做按方案修改交付。历史结果保留。</p>
+          <p>续跑继续未完成任务；重核只检查同一实现。<br />重做按方案修改交付，保留历史。</p>
           {mission.status==='active'?<button className="btn" disabled={controlling} onClick={()=>void controlMission('pause')}>暂停后续执行</button>:null}
           {COLLAB_ACTIVE_STATUSES.has(mission.status)?<button className="btn" disabled={controlling} onClick={()=>void controlMission('cancel')}>取消任务</button>:null}
           <button className="btn" onClick={()=>{setBusy(true);void poll(true).finally(()=>setBusy(false));}}>{busy?'刷新中':'刷新任务'}</button>
@@ -460,7 +460,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
                   : resumeAction?.kind === 'verification' ? resumeAction.explanation
                     : mission.status === 'waiting' ? '后续派发已暂停；未确认关联核验仍在运行，不启动新核验。'
                     : task.verification_run_id ? '实现专家已提交结果；已派发检查与独立核验，尚需读取运行状态。'
-                      : '实现专家已提交结果；系统将运行必需检查，并安排另一位专家核对。';
+                      : '实现已提交；系统将运行必需检查，并安排专家独立核验。';
                 const legacyOverride = legacyVerificationOverrideForTask(mission, events, task);
                 const retryAvailable = canRetryWaitingVerification(mission, events, task);
                 return (
@@ -476,7 +476,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
                       {(canRevisit || retryAvailable) && task.verification_passed === false
                         && !mission.tasks.some(child => child.spec.repair_of === task.spec.id && child.status !== 'canceled')
                         && events.some(event => event.task_id === task.spec.id && ['task_baseline_captured', 'verification_retry_requested'].includes(event.event_type))
-                        ? <button className="btn" disabled={Boolean(rechecking)} title={legacyOverride ? '本次明确覆盖只绑定已记录的暂停和运行失败事件；只重试同一实现的检查与独立核验' : '只重跑同一实现的必需检查与独立验收，不重做实现'} onClick={()=>void recheckTask(task.spec.id, task.verification_run_id, legacyOverride)}>{rechecking === task.spec.id ? '提交中' : legacyOverride ? '确认覆盖并重试核验' : mission.status === 'waiting' ? '重试核验并继续' : '重新核验同一实现'}</button> : null}
+                        ? <button className="btn" disabled={Boolean(rechecking)} title={legacyOverride ? '本次覆盖绑定指定暂停与失败事件，只重核同一交付' : '只重跑同一实现的必需检查与独立验收，不重做实现'} onClick={()=>void recheckTask(task.spec.id, task.verification_run_id, legacyOverride)}>{rechecking === task.spec.id ? '提交中' : legacyOverride ? '确认覆盖并重试核验' : mission.status === 'waiting' ? '重试核验并继续' : '重新核验同一实现'}</button> : null}
                     </div>
                   </div>
                 );
@@ -489,7 +489,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       {mission.status === 'active' && !verificationRunLive && mission.tasks.some(task => task.status === 'running' || task.status === 'awaiting_verification') ? (
         <div className="mission-recovery-control">
           <p>{mission.tasks.some(task => task.status === 'awaiting_verification')
-            ? '宿主会自动派发独立验收。可立即检查已提交结果并运行必需检查，不重做实现。'
+            ? '宿主自动派发独立验收；立即检查只核对交付，不重做。'
             : '继续原运行，避免重复执行。'}</p>
           <button type="button" className="btn" disabled={dispatching} onClick={() => void dispatchNext()}>
             {dispatching ? <BusyIndicator size={14} /> : <Activity size={14} />}
@@ -592,9 +592,9 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
   return <CollaborationDialog titleId="mission-budget-title" onClose={onClose}>
     <section className="collaboration-create-dialog collaboration-budget-dialog">
       <header><div><span>{missionWait(mission)?.reason === 'budget_exhausted' ? '预算已用尽' : '主动调整本任务预算'}</span><h2 id="mission-budget-title">{legacyOverrideCandidate ? '补充核验时限' : '增加预算并继续'}</h2></div><button type="button" className="btn" onClick={onClose}>关闭</button></header>
-      <p className="mission-budget-reason">{reason || '仅追加你明确填写的额度；系统将复核所有限制及环境，成功后仍可能等待处理。'}</p>
+      <p className="mission-budget-reason">{reason || '仅追加所填额度；系统复核限制与环境，可能仍需等待。'}</p>
       <MissionBudgetSummary mission={mission} events={events} historyComplete={historyComplete} now={now}/>
-      {saved ? <p role="status">有待确认的增额申请。原参数可重试；改参数会新增额度，请先刷新核对上次结果。</p> : null}
+      {saved ? <p role="status">有待确认的增额申请，可用原参数重试。<br />改参数会新增额度，请先刷新核对上次结果。</p> : null}
       <div className="collaboration-create-fields mission-budget-fields">
         {legacyOverrideCandidate ? <label><span>追加时长（分钟）</span><input type="number" min="1" max="525600" step="1" value={additionalMinutes} onChange={event => setAdditionalMinutes(event.target.value)} /></label> : <>
         <label><span>追加派发轮次</span><input type="number" min="0" step="1" value={additionalRounds} onChange={event => setAdditionalRounds(event.target.value)} /></label>
@@ -612,7 +612,7 @@ function MissionBudgetExtensionDialog({ mission, events, historyComplete, now, r
         <p className="mission-budget-reason" role="status">{budgetAction.description}</p>
       </> : null}
       {error ? <p className="error" role="alert">{error}</p> : null}
-      <footer><small>{legacyOverrideCandidate ? '不会重做实现或增加返工次数。' : '续跑尚未完成的任务；系统复核全部限额。响应丢失时请按原参数重试。'}</small><button type="button" className="btn btn-primary" disabled={busy || budgetAction.disabled} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '更新中' : budgetAction.label}</button></footer>
+      <footer><small>{legacyOverrideCandidate ? '不会重做实现或增加返工次数。' : '续跑未完成任务并复核限额；响应丢失可按原参数重试。'}</small><button type="button" className="btn btn-primary" disabled={busy || budgetAction.disabled} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '更新中' : budgetAction.label}</button></footer>
     </section>
   </CollaborationDialog>;
 }

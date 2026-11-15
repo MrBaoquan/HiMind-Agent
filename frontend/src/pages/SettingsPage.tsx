@@ -844,8 +844,8 @@ export function SettingsPage({
                   <div><strong>授权归属</strong><span>{independentMode ? '审批设置只保存在本机' : settings.owner_user_id ? '审批设置与当前工作台账号和这台电脑绑定' : '当前审批设置仅保存在本机'}</span></div>
                   <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '工作台未连接' : settings.owner_user_id ? '已绑定账号' : '仅本机'}</Pill>
                 </div>
-                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未连接 AI 工作台时，记录与提醒只存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
-                {approvalProfile === 'full_access' && settings.risk_acknowledged ? <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过；工作台侧授权与远程目录限制不受影响。</span></div> : null}
+                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未连接 AI 工作台时，记录与提醒只存在本机。<br />其他工具直接执行的操作不经过这里。</span></div> : null}
+                {approvalProfile === 'full_access' && settings.risk_acknowledged ? <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过。<br />工作台侧授权与远程目录限制不受影响。</span></div> : null}
 
                 <div className="approval-settings-group">
                   <div className="approval-group-heading"><strong>什么时候需要我确认</strong><span>单项例外会优先于整体设置</span></div>
@@ -1064,13 +1064,13 @@ export function SettingsPage({
               <p className="field-hint">
                 {skillSyncMode === 'copy'
                   ? '复制：每个 AI 工具目录下各存一份独立副本，日常用这个。'
-                  : '链接：工具目录指向本机技能库，改动即时生效；部分系统需先开启开发者模式。'}
+                  : <>链接：工具目录指向本机技能库，改动即时生效。<br />部分系统需先开启开发者模式。</>}
               </p>
               <div className="actions-row">
                 <button className="btn" type="button" disabled={!skillTargetRoot} title={skillTargetRoot || '技能目录尚未就绪'} onClick={() => void agentApi.openFolder(skillTargetRoot)}><FolderOpen size={15} />打开技能目录</button>
                 <code className="skill-target-path">{skillTargetRoot || '技能目录尚未就绪'}</code>
               </div>
-              <p className="field-hint">默认装到全局，所有工具可用；要单独装一份，用技能详情里的「安装到指定目录…」。</p>
+              <p className="field-hint">默认装到全局，所有工具可用。<br />要单独装一份，用技能详情里的「安装到指定目录…」。</p>
               {skillFeedback ? <div className="inline-feedback visible" role="status">{skillFeedback}</div> : null}
             </div>
           </section> : null}
@@ -1369,9 +1369,9 @@ function BackupRestoreConfirmation({ onClose, onConfirm }: { onClose: () => void
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="backup-restore-title" onClick={event => event.stopPropagation()}>
-        <div className="modal-header"><div><h3 id="backup-restore-title">从备份包恢复？</h3><p>会覆盖本机账号、凭据与已装能力；恢复前自动快照，包外文件不受影响。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="backup-restore-title">从备份包恢复？</h3><p>会覆盖本机账号、凭据与已装能力。<br />恢复前自动快照，包外文件不受影响。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="full-access-warning"><LockKeyhole size={20} /><div><strong>凭据按当前 Windows 账号重新加密</strong><span>包内凭据会用你填的口令改写成只对本机生效；口令不对时不覆盖任何文件。</span></div></div>
+          <div className="full-access-warning"><LockKeyhole size={20} /><div><strong>凭据按当前 Windows 账号重新加密</strong><span>包内凭据会用你填的口令改写成只对本机生效。<br />口令不对时不覆盖任何文件。</span></div></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><RotateCcw size={15} />选择备份包并恢复</button></div></div>
         </div>
       </div>
@@ -1396,7 +1396,7 @@ function RemoteRuntimeUnrestrictedConfirmation({ onClose, onConfirm }: { onClose
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="remote-runtime-unrestricted-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header"><div><h3 id="remote-runtime-unrestricted-title">允许远程任务访问全部文件？</h3><p>仅在任务确实需要访问项目目录以外的文件时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务将能访问当前 Windows 账户允许的本机资源</strong><span>可访问项目目录以外的文件和网络资源，仍受审批设置与 Windows 权限限制。</span></div></div>
+          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务将能访问当前 Windows 账户允许的本机资源</strong><span>可访问项目目录以外的文件和网络资源。<br />仍受审批设置与 Windows 权限限制。</span></div></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Bot size={15} />确认启用</button></div></div>
         </div>
       </div>
@@ -1442,7 +1442,7 @@ function ApprovalTrustConfirmation({ profile, onClose, onConfirm }: { profile: '
             <div className="approval-trust-scope-item"><Database size={17} /><div><strong>工作台数据</strong><span>删除项目或记录、解除关联、替换人员、发布变更。</span></div></div>
             <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方工具</strong><span>{fullAccess ? '所有受控的第三方操作。' : '高风险的外部写入和集成操作。'}</span></div></div>
           </div>
-          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '单项规则、系统保护目录和工作台权限仍然有效。' : '普通查询、修改和高风险操作将自动放行；最高风险操作仍会请求确认。'}</span></div></div>
+          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '单项规则、系统保护目录和工作台权限仍然有效。' : <>普通查询、修改和高风险操作将自动放行。<br />最高风险操作仍会请求确认。</>}</span></div></div>
           <div className="field-group approval-trust-duration">
             <label className="field-label" htmlFor="approval-trust-duration">授权有效期</label>
             <select id="approval-trust-duration" value={durationSeconds} onChange={event => setDurationSeconds(Number(event.target.value))}>

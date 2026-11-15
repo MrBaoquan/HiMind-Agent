@@ -85,7 +85,7 @@ try {
  assert.equal(await page.getByRole('button',{name:'查看验收详情',exact:true}).count(),1);
  await page.getByRole('button',{name:'查看验收详情',exact:true}).click();
  assert.equal(await page.getByRole('button',{name:'立即检查验收',exact:true}).count(),1);
- assert.equal(await page.getByText('宿主会自动派发独立验收。可立即检查已提交结果并运行必需检查，不重做实现。',{exact:true}).count(),1);
+ assert.equal(await page.getByText('宿主自动派发独立验收；立即检查只核对交付，不重做。',{exact:true}).count(),1);
  assert.equal(await page.getByText('已确认',{exact:true}).count(),1);
  await page.screenshot({path:resolve(evidence,'mission-awaiting-verification-desktop.png')});
  await page.setViewportSize({width:390,height:844});
