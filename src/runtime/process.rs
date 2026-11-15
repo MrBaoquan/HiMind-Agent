@@ -881,6 +881,8 @@ pub(crate) fn remove_file_if_present(path: &Path) {
 }
 
 pub(crate) fn terminate_process_tree(child: &mut Child) {
+    #[cfg(all(test, windows))]
+    if let Some(hook) = crate::runtime::owned_tree::BEFORE_TERMINATE.with(|slot| slot.borrow_mut().take()) { hook(); }
     #[cfg(windows)]
     {
         let mut command = hidden_command("taskkill");

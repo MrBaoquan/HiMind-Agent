@@ -982,23 +982,51 @@ mod tests {
     }
 
     #[cfg(windows)]
+    struct FixtureTerminateHook(Option<Box<dyn FnOnce()>>);
+    #[cfg(windows)]
+    impl FixtureTerminateHook {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            Self(crate::runtime::owned_tree::BEFORE_TERMINATE.with(|slot| slot.replace(Some(Box::new(hook)))))
+        }
+    }
+    #[cfg(windows)]
+    impl Drop for FixtureTerminateHook {
+        fn drop(&mut self) {
+            crate::runtime::owned_tree::BEFORE_TERMINATE.with(|slot| { slot.replace(self.0.take()); });
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn executor_workflow_large_input_no_reader_cancel_timeout_and_output_first() {
         use crate::runtime::process::codex_test_support::{Environment, ProcessProbe};
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
         let _lock = crate::store::paths::test_env_lock();
         let prompt = "中文😀\"$()\\shell\n".repeat(90000);
         for cancel in [false,true] {
             let env=Environment::new(); env.case(&json!({"no_reader":true,"output_before_input":true}));
             let root=env.root.clone();
+            let observed=Arc::new(AtomicBool::new(false));
+            let signal=observed.clone();
+            let (ready,retained)=mpsc::sync_channel(1);
+            let _terminate_hook=FixtureTerminateHook::install(move || {
+                // A PID receipt does not retain a process. Observe both handles
+                // before cancellation or the deadline destroys this fixture tree.
+                retained.recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("fixture observer did not retain parent and child before termination");
+            });
             let probe=std::thread::spawn(move || {
                 let parent=ProcessProbe::open(&root.join("root.pid"));
                 let child=ProcessProbe::open(&root.join("child.pid"));
+                assert!(parent.is_alive()); assert!(child.is_alive());
+                signal.store(true,Ordering::Release);
+                ready.send(()).expect("fixture termination handshake disconnected");
                 parent.assert_exited(); child.assert_exited();
             });
             let started=std::time::Instant::now();
             let error=execute_codex(env.root.to_str().unwrap(),&prompt,1,None,
                 crate::runtime::deepseek_harness::WorkflowAccess::Full,
-                &|| Ok(cancel && env.root.join("root.pid").exists())).unwrap_err();
+                &|| Ok(cancel && observed.load(Ordering::Acquire))).unwrap_err();
             assert!(started.elapsed()<std::time::Duration::from_secs(4),"{error}");
             assert!(error.to_string().contains(if cancel {"canceled"} else {"exceeded"}),"{error}");
             probe.join().unwrap();
@@ -1017,21 +1045,45 @@ mod tests {
         for cancel in [false,true] {
             let env=Environment::new(); env.case(&json!({"version_hang":true}));
             let root=env.root.clone();
-            let probe=std::thread::spawn(move || ProcessProbe::open(&root.join("version.pid")).assert_exited());
+            let observed=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal=observed.clone();
+            let (ready,retained)=std::sync::mpsc::sync_channel(1);
+            let _terminate_hook=FixtureTerminateHook::install(move || {
+                retained.recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("fixture observer did not retain discovery process before termination");
+            });
+            let probe=std::thread::spawn(move || {
+                let process=ProcessProbe::open(&root.join("version.pid"));
+                assert!(process.is_alive());
+                signal.store(true,std::sync::atomic::Ordering::Release);
+                ready.send(()).expect("discovery termination handshake disconnected");
+                process.assert_exited();
+            });
             let exe=std::env::var_os("HIMIND_CODEX_EXECUTABLE").unwrap();
             let started=std::time::Instant::now();
             let error=process::verify_command_with_cancel(&exe,&["--version"],std::time::Duration::from_millis(300),
-                &||Ok(cancel && env.root.join("version.pid").exists())).unwrap_err();
+                &||Ok(cancel && observed.load(std::sync::atomic::Ordering::Acquire))).unwrap_err();
             assert!(started.elapsed()<std::time::Duration::from_secs(3),"{error}");
             assert!(!env.root.join("root.pid").exists()); probe.join().unwrap();
         }
         let env=Environment::new();env.case(&json!({"version_tree":true}));
         let root=env.root.clone();
-        let probe=std::thread::spawn(move ||ProcessProbe::open(&root.join("child.pid")).assert_exited());
+        let (ready,retained)=std::sync::mpsc::sync_channel(1);
+        let terminate_hook=FixtureTerminateHook::install(move || {
+            retained.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("fixture observer did not retain discovery child before termination");
+        });
+        let probe=std::thread::spawn(move || {
+            let child=ProcessProbe::open(&root.join("child.pid"));
+            assert!(child.is_alive());
+            ready.send(()).expect("discovery child termination handshake disconnected");
+            child.assert_exited();
+        });
         let error=execute_codex(env.root.to_str().unwrap(),"fixture",5,None,
             crate::runtime::deepseek_harness::WorkflowAccess::Read,&||Ok(false)).unwrap_err();
         assert!(error.to_string().contains("drain deadline"),"{error}");
         assert!(!env.root.join("root.pid").exists());probe.join().unwrap();
+        drop(terminate_hook);
         let env=Environment::new();env.case(&json!({"version_hang":true}));
         let error=execute_codex(env.root.to_str().unwrap(),"fixture",5,None,
             crate::runtime::deepseek_harness::WorkflowAccess::Read,&||Ok(env.root.join("version.pid").exists())).unwrap_err();
