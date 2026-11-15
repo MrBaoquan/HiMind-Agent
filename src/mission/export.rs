@@ -54,7 +54,7 @@ fn scrubbed_task(task: &crate::mission::MissionTaskSpec, role_id: &str, id: &str
     WorkflowStep {
         id: id.to_string(), title: task.title.clone(), kind: "runtime".to_string(),
         capability_id: String::new(), runtime: Some(WorkflowRuntimeStep {
-            provider: task.execution.executor.clone(), prompt: prompt(task),
+            permission_mode: String::new(), provider: task.execution.executor.clone(), prompt: prompt(task),
             workspace_path: String::new(), result_schema: String::new(),
             allow_network: None, input_artifacts: vec![], tool_policy: "default".to_string(),
             model: task.execution.model.clone(), model_fallbacks: vec![], timeout_seconds: 900,
@@ -176,16 +176,17 @@ mod tests {
             depends_on: vec![], read_paths: vec!["src".to_string()],
             write_paths: vec!["src/lib.rs".to_string()], acceptance_criteria: vec!["tests pass".to_string()],
             required_checks: vec!["node --test".to_string()],
-            execution: ExecutionBinding { executor: "himind.builtin".to_string(), service_id: "svc".to_string(), model: "himind:svc:model".to_string(), role_id: "implementer".to_string() },
+            execution: ExecutionBinding { expert: None, executor: "himind.builtin".to_string(), service_id: "svc".to_string(), model: "himind:svc:model".to_string(), role_id: "implementer".to_string() },
             repair_of: String::new(),
         };
         MissionView {
             schema_version: "mission.v1".to_string(), mission_id: "mission_secret".to_string(), title: "Secret title".to_string(),
             objective: "Secret objective".to_string(), status: MissionStatus::Completed,
-            workspace: MissionWorkspace { root: "F:/secret/workspace".to_string(), read_scope: vec!["secret".to_string()], write_scope: vec!["secret".to_string()] },
+            workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/secret/workspace".to_string(), read_scope: vec!["secret".to_string()], write_scope: vec!["secret".to_string()] },
             acceptance_criteria: vec!["tests pass".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),
             plan_summary: "secret plan".to_string(), required_acceptance: vec!["tests pass".to_string()], proposed_tasks: vec![],
-            budget: Some(MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None }),
+            budget: Some(MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None, currency: None }),
+            cost_usage: Default::default(), effective_wait: None,
             usage: Some(crate::agent_core_contracts::LocalRunUsage { input_tokens: 1, output_tokens: 1, estimated_cost: 1.0, currency: "USD".to_string(), billing_owner: "secret".to_string() }),
             handoff: Some(crate::mission::MissionHandoff { idempotency_key: "secret-key".to_string(), source_client: "codex".to_string(), source_reference: "secret-thread".to_string(), source_message_refs: vec![], context_summary: "secret transcript".to_string(), request_sha256: "b".repeat(64), received_at: "2026-11-10T00:00:00Z".to_string() }),
             workflow: None, assignment: None, plan_mode: MissionPlanMode::Generated,

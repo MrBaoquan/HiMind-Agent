@@ -35,6 +35,9 @@ use crate::runtime::process;
 use crate::runtime::{execute_managed, AgentRunEnvelope};
 use crate::Options;
 
+mod catalog;
+pub(crate) use catalog::session_catalog;
+
 const ACP_PROTOCOL_VERSION: i64 = 1;
 const ACP_OUTPUT_LIMIT: usize = 64 * 1024;
 const ACP_SESSION_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
@@ -47,7 +50,7 @@ const ACP_CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const ACP_TRACE_ENVIRONMENT: &str = "HIMIND_ACP_TRACE";
 const ACP_TRACE_FULL_VALUE_LIMIT: usize = 16 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct AcpProfile {
     executable: String,
@@ -105,6 +108,7 @@ pub(crate) struct AcpExecution {
     pub(crate) denied_client_methods: Vec<String>,
     pub(crate) stderr: String,
     pub(crate) log_path: Option<String>,
+    pub(crate) usage: Option<crate::agent_core_contracts::LocalRunUsage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +265,7 @@ struct AcpSessionState {
     tool_call_count: usize,
     permission_requests: Vec<Value>,
     denied_client_methods: Vec<String>,
+    usage: Option<crate::agent_core_contracts::LocalRunUsage>,
 }
 
 /// ACP 会话的共享状态：连接线程（SDK 事件循环）写，等待线程读。
@@ -336,6 +341,7 @@ struct AcpSessionPlan {
     /// 只有声明了才去读 `session/new` 返回的 `config_options` 并下发
     /// `session/set_config_option`；未声明保持客户端自己的当前模型。
     requested_model: Option<String>,
+    probe_only: bool,
 }
 
 /// 注入给外部客户端的 HiMind MCP 描述。
@@ -356,10 +362,12 @@ struct AcpSessionOutcome {
     stop_reason: String,
     /// 会话最终生效的模型标识；客户端没暴露 model 配置项时为空。
     model: String,
+    model_choices: Vec<String>,
 }
 
 struct AcpProcess {
     child: Option<Child>,
+    tree: Option<crate::runtime::owned_tree::OwnedTree>,
     /// stdin 由写线程持有，但句柄留在共享槽位：会话收尾时取走它，agent 立刻看到
     /// EOF 自行退出，而不是只能靠杀进程。
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -682,6 +690,7 @@ fn execute_claimed(
             ACP_SESSION_TIMEOUT_SECONDS,
             &claim.run.id,
             None,
+            None,
             mcp,
             &mut is_canceled,
         )
@@ -714,6 +723,7 @@ pub(crate) fn execute_workflow(
     timeout_seconds: u64,
     run_id: &str,
     requested_model: Option<&str>,
+    permission_mode: &str,
     options: Option<&Options>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<AcpExecution, Box<dyn Error>> {
@@ -730,6 +740,7 @@ pub(crate) fn execute_workflow(
         timeout_seconds,
         run_id,
         requested_model,
+        (permission_mode == "full_access").then_some(PermissionPolicy::AllowOnce),
         mcp,
         &mut || is_canceled(),
     )
@@ -766,6 +777,7 @@ fn run_session(
     timeout_seconds: u64,
     run_id: &str,
     requested_model: Option<&str>,
+    policy_override: Option<PermissionPolicy>,
     mcp: Option<HimindMcpSpec>,
     is_canceled: &mut dyn FnMut() -> Result<bool, Box<dyn Error>>,
 ) -> Result<AcpExecution, Box<dyn Error>> {
@@ -773,7 +785,7 @@ fn run_session(
         return Err("ACP prompt is empty".into());
     }
     let profile = profile_for(provider)?;
-    let policy = profile_permission_policy(&profile)?;
+    let policy = policy_override.unwrap_or(profile_permission_policy(&profile)?);
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let attribution = AcpAttribution {
         provider: provider.to_string(),
@@ -801,10 +813,14 @@ fn run_session(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        probe_only: false,
         mcp,
     };
     let mut process = AcpProcess::spawn(&profile, plan, trace.clone())?;
-    let outcome = process.drive(timeout, is_canceled)?;
+    let outcome = match process.drive(timeout, is_canceled) {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(session_failure(process, &error.to_string()).into()),
+    };
     let mut state = process.shared.take_state();
     // 未知的 sessionUpdate 变体在 SDK 反序列化阶段就被丢弃，typed handler 收不到，
     // 因此 update_count 取「typed 计数」与「原始帧计数」的较大者。
@@ -836,6 +852,7 @@ fn run_session(
         denied_client_methods: state.denied_client_methods,
         stderr,
         log_path: trace.path_string(),
+        usage: state.usage,
     })
 }
 
@@ -846,7 +863,7 @@ impl AcpProcess {
         trace: AcpTrace,
     ) -> Result<Self, Box<dyn Error>> {
         let executable = resolve_executable(&profile.executable)?;
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&executable);
         command
             .args(&profile.args)
             .current_dir(&plan.workspace)
@@ -863,8 +880,16 @@ impl AcpProcess {
             }
             command.env(key, value);
         }
+        // Discovery must use an installed adapter. An npx bootstrap otherwise
+        // retries registry downloads while its inherited pipes keep cleanup
+        // waiting, blocking every executor's assignment directory.
+        if plan.probe_only && executable.file_stem().and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("npx"))
+        {
+            command.env("npm_config_offline", "true");
+        }
         process::configure_hidden_process(&mut command);
-        let mut child = command.spawn()?;
+        let (mut child, tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
         let stdin = child.stdin.take().ok_or("ACP agent stdin is unavailable")?;
         let stdout = child
             .stdout
@@ -900,6 +925,10 @@ impl AcpProcess {
                             reader_frames.fetch_add(1, Ordering::Relaxed);
                         }
                         reader_trace.record("in", &value);
+                        // Usage comes from the ACP response, never from the agent's prose.
+                        if let Some(usage) = value.pointer("/result/usage").and_then(acp_usage) {
+                            if let Ok(mut state) = reader_shared.state.lock() { state.usage = Some(usage); }
+                        }
                     }
                     if inbound_tx.unbounded_send(Ok(line)).is_err() {
                         break;
@@ -1080,6 +1109,7 @@ impl AcpProcess {
         };
         Ok(Self {
             child: Some(child),
+            tree: Some(tree),
             stdin,
             outgoing: Some(outgoing),
             shared,
@@ -1197,13 +1227,23 @@ impl AcpProcess {
         if let Some(mut child) = self.child.take() {
             process::terminate_process_tree(&mut child);
         }
+        // Release inherited writers before joining SDK/output readers, even
+        // when the root has already exited and cannot be found by PID.
+        self.tree.take();
     }
 }
+
 
 impl Drop for AcpProcess {
     fn drop(&mut self) {
         self.terminate();
     }
+}
+
+fn session_failure(process: AcpProcess, message: &str) -> String {
+    let stderr = process.finish().unwrap_or_else(|error| error.to_string());
+    let stderr = crate::approval::manager::redact_message(&process::summarize_output(stderr.trim(), 2_000));
+    if stderr.is_empty() { message.to_string() } else { format!("{message}; ACP stderr: {stderr}") }
 }
 
 /// 权限结果 → SDK 的类型化回包。落库沿用自研时期的形状：
@@ -1287,6 +1327,10 @@ async fn drive_session(
         .as_ref()
         .map(|option| option.current.clone())
         .unwrap_or_default();
+    let model_choices = model_config.as_ref().map(|config| config.choices.clone()).unwrap_or_default();
+    if plan.probe_only {
+        return Ok(AcpSessionOutcome { session_id, stop_reason: "catalog".into(), model: effective_model, model_choices });
+    }
     // 克隆一份：`plan` 是引用，而 `send_request(...).await` 要求参数不借自函数栈。
     if let Some(requested) = plan.requested_model.clone() {
         let requested = requested.as_str();
@@ -1296,7 +1340,7 @@ async fn drive_session(
                 plan.attribution.provider
             )
         })?;
-        if !option.choices.iter().any(|choice| choice == requested) {
+        if option.current != requested && !option.choices.iter().any(|choice| choice == requested) {
             let available = if option.choices.is_empty() {
                 "<none>".to_string()
             } else {
@@ -1342,6 +1386,20 @@ async fn drive_session(
         session_id,
         stop_reason,
         model: effective_model,
+        model_choices,
+    })
+}
+
+fn acp_usage(value: &Value) -> Option<crate::agent_core_contracts::LocalRunUsage> {
+    let input = value.get("inputTokens")?.as_u64()?;
+    let output = value.get("outputTokens")?.as_u64()?;
+    // ACP inputTokens excludes cached reads for some agents. Preserve the reported
+    // total without counting cache fields twice when they are already included.
+    let total = value.get("totalTokens").and_then(Value::as_u64).unwrap_or(input.saturating_add(output));
+    if total < output || total < input { return None; }
+    Some(crate::agent_core_contracts::LocalRunUsage {
+        input_tokens: total - output, output_tokens: output,
+        estimated_cost: 0.0, currency: String::new(), billing_owner: "user".into(),
     })
 }
 
@@ -1664,6 +1722,50 @@ fn execution_metadata(execution: &AcpExecution, attribution: &AcpAttribution) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a configured ACP executor; handshake only, no model prompt"]
+    fn real_acp_catalog_probe() {
+        let provider = std::env::var("HIMIND_ACP_SMOKE_PROVIDER").expect("explicit provider required");
+        let workspace = std::env::var("HIMIND_ACP_SMOKE_ROOT").expect("explicit workspace required");
+        let started = std::time::Instant::now();
+        let result = super::session_catalog(&provider, Some(&workspace));
+        eprintln!("catalog provider={provider} elapsed_ms={} models={:?}", started.elapsed().as_millis(), result.as_ref().map(|catalog| catalog.models.len()));
+        assert!(result.is_ok(), "{result:?}");
+    }
+    #[test]
+    fn acp_usage_preserves_actual_total_and_does_not_invent_cost() {
+        let usage = super::acp_usage(&serde_json::json!({"inputTokens":57058,"outputTokens":207,"totalTokens":83058,"cachedReadTokens":25728})).unwrap();
+        assert_eq!(usage.input_tokens + usage.output_tokens, 83058);
+        assert!(usage.currency.is_empty());
+        assert!(super::acp_usage(&serde_json::json!({"inputTokens":100,"outputTokens":20,"totalTokens":50})).is_none());
+        assert!(super::acp_usage(&serde_json::json!({"used":100})).is_none());
+    }
+
+    /// Opt-in: real configured ACP client, native tools, MCP injection, actual usage,
+    /// and a separate host-run assertion. Requires an explicit isolated directory.
+    #[test]
+    #[ignore = "requires installed/authenticated ACP executor and incurs model usage"]
+    fn real_acp_executor_smoke() {
+        let provider = std::env::var("HIMIND_ACP_SMOKE_PROVIDER").expect("explicit provider required");
+        let model = std::env::var("HIMIND_ACP_SMOKE_MODEL").expect("explicit model required");
+        let workspace = std::env::var("HIMIND_ACP_SMOKE_ROOT").expect("explicit isolated directory required");
+        assert!(std::path::Path::new(&workspace).join(".himind-acp-smoke").is_file(), "isolated smoke marker required");
+        let catalog = super::session_catalog(&provider, Some(&workspace)).unwrap();
+        assert!(catalog.models.contains(&model) || catalog.current_model == model);
+        let result = super::execute_workflow(&provider, &workspace,
+            "Work only in the current isolated directory. Create sum.mjs exporting sum(a,b) that adds two numbers. Create test.mjs using node:assert/strict to test sum(2,3) === 5 and sum(-3,3) === 0. Run node test.mjs in your shell. Do not use subagents. Return a short summary with the command and result.",
+            180, &format!("acp-smoke-{}-{}", provider.replace('.', "-"), super::unix_millis()), Some(&model), "full_access", Some(&crate::Options::from_env()), &|| Ok(false)).unwrap();
+        assert_eq!(result.model, model);
+        assert!(!result.session_id.is_empty());
+        assert!(result.tool_call_count > 0);
+        assert!(result.denied_client_methods.is_empty(), "{:?}", result.denied_client_methods);
+        assert!(result.usage.is_some(), "real usage required");
+        assert!(std::process::Command::new("node").arg("test.mjs").current_dir(&workspace).status().unwrap().success());
+        std::fs::write(std::path::Path::new(&workspace).join("host-result.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "provider":provider,"model":model,"session_id":result.session_id,"tools":result.tool_call_count,
+            "permissions":result.permission_requests.len(),"usage":result.usage,"host_check":"passed","log_path":result.log_path
+        })).unwrap()).unwrap();
+    }
     use super::{
         mcp_server_stdio, permission_outcome, select_model_config_option, AcpAttribution,
         AcpTrace, HimindMcpSpec, PermissionPolicy, ACP_TRACE_ENVIRONMENT,

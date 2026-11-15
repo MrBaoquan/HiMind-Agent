@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "build": "tsc --noEmit && vite build",
+    "build": "node scripts/remediation/service-ui-build.mjs",
     "dev": "vite --host 127.0.0.1",
     "check:start-form": "node --experimental-strip-types scripts/check-start-form.mts",
     "check:workflow-option-sources": "node --experimental-strip-types scripts/check-workflow-option-sources.mts",
@@ -10,6 +10,8 @@
     "check:market-catalog": "node --experimental-strip-types scripts/check-market-catalog.mts",
     "check:task-view": "node --experimental-strip-types scripts/check-task-view.mts",
     "check:mission-deep-link": "node --experimental-strip-types scripts/check-mission-deep-link.mts",
+    "check:mission-assignment-ui": "node --experimental-strip-types scripts/check-mission-assignment-ui.mts",
+    "check:mission-assignment-browser": "node scripts/check-mission-assignment.browser.mjs",
     "check:shell-structure": "node --experimental-strip-types scripts/check-shell-structure.mts",
     "check:icon-version": "node --experimental-strip-types scripts/check-icon-version.mts",
     "check:quick-access": "node --experimental-strip-types scripts/check-quick-access.mts",
@@ -31,10 +33,14 @@
     "check:engine": "node --experimental-strip-types scripts/check-engine.mts",
     "check:copy": "node --experimental-strip-types scripts/check-copy.mts",
     "check:design-tokens": "node scripts/check-design-tokens.mjs",
-    "check:ui": "npm run check:start-form && npm run check:workflow-option-sources && npm run check:run-view && npm run check:workflow-approval && npm run check:interaction-form && npm run check:notification-channels && npm run check:workflow-graph && npm run check:workflow-process && npm run check:market-catalog && npm run check:task-view && npm run check:mission-deep-link && npm run check:shell-structure && npm run check:icon-version && npm run check:quick-access && npm run check:status-copy && npm run check:extension-activation-status && npm run check:development-local-only && npm run check:ai-service-presets && npm run check:ai-balance-matching && npm run check:ai-service-routing && npm run check:gateway-profile-ui && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy && npm run check:design-tokens",
+    "check:workspace-ui-browser": "node scripts/check-workspace-ui.browser.mjs",
+    "check:session-history-browser": "node scripts/check-session-history.browser.mjs",
+    "check:ui": "npm run check:start-form && npm run check:workflow-option-sources && npm run check:run-view && npm run check:workflow-approval && npm run check:interaction-form && npm run check:notification-channels && npm run check:workflow-graph && npm run check:workflow-process && npm run check:market-catalog && npm run check:task-view && npm run check:task-center-model && npm run check:mission-deep-link && npm run check:mission-assignment-ui && npm run check:shell-structure && npm run check:icon-version && npm run check:quick-access && npm run check:status-copy && npm run check:extension-activation-status && npm run check:development-local-only && npm run check:ai-service-presets && npm run check:ai-balance-matching && npm run check:ai-service-routing && npm run check:gateway-profile-ui && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy && npm run check:design-tokens",
     "check:workflow-approval": "node --experimental-strip-types scripts/check-workflow-approval.mts",
     "check:interaction-form": "node --experimental-strip-types scripts/check-interaction-form.mts",
-    "check:notification-channels": "node --experimental-strip-types scripts/check-notification-channels.mts"
+    "check:notification-channels": "node --experimental-strip-types scripts/check-notification-channels.mts",
+    "check:task-center-model": "node --experimental-strip-types scripts/check-task-center-model.mts",
+    "check:task-center-browser": "node scripts/check-task-center.browser.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "latest",
@@ -48,6 +54,7 @@
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",
+    "playwright": "^1.65.0",
     "typescript": "latest",
     "vite": "latest"
   }

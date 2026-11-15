@@ -62,17 +62,55 @@ pub(crate) fn restore_backup(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn write_without_backup(path: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_inner(path, content)
+}
+
+// Test-only process termination: no unwinding or cleanup, so restart exercises
+// exactly the on-disk state at each boundary (including leftover staging files).
+#[cfg(test)]
+pub(crate) fn interruption_point(point: &str) {
+    if std::env::var("HIMIND_CONFIG_INTERRUPT").as_deref() == Ok(point) {
+        std::process::exit(86);
+    }
+}
+
 fn atomic_write_inner(path: &Path, content: &[u8]) -> io::Result<()> {
     let temporary = temporary_path(path);
     let result = (|| {
+        #[cfg(test)]
+        if path.file_name().and_then(|s| s.to_str()) == Some("ai-services.json") {
+            interruption_point("before_temporary");
+        }
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temporary)?;
+        #[cfg(test)]
+        let interrupt = |point| {
+            if path.file_name().and_then(|s| s.to_str()) == Some("ai-services.json") {
+                interruption_point(point);
+            }
+        };
+        #[cfg(test)]
+        interrupt("temporary_created");
         file.write_all(content)?;
+        #[cfg(test)]
+        interrupt("temporary_written");
         file.sync_all()?;
+        #[cfg(test)]
+        interrupt("temporary_flushed");
         drop(file);
-        replace_file(&temporary, path)
+        #[cfg(test)]
+        interrupt("before_replace");
+        replace_file(&temporary, path)?;
+        #[cfg(not(windows))]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        #[cfg(test)]
+        interrupt("after_replace");
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

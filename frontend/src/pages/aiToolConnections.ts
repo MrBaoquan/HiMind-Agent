@@ -30,6 +30,8 @@ export type ToolCapabilities = { mcp: boolean; model: boolean; exec: boolean };
 export type ToolState = 'attention' | 'idle' | 'ready';
 
 export type ToolConnection = {
+  ready: boolean;
+  needsAction: boolean;
   /** 稳定工具身份：MCP 目标 id / 模型客户端 target / ACP 的 `acp.<id>` 去掉前缀后同一个。 */
   key: string;
   name: string;
@@ -57,6 +59,7 @@ function displayName(key: string, mcp: McpTargetDescriptor | null, exec: AcpRunt
 }
 
 export function toolState(item: ToolConnection): ToolState {
+  if (item.model?.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(item.model.sync_state ?? '')) return 'attention';
   if (item.builtin) return 'ready';
   const mcp = item.mcp;
   if (mcp && (mcp.state === 'needs_repair' || mcp.state === 'invalid_config')) return 'attention';
@@ -95,6 +98,8 @@ export function buildToolConnections(input: {
         detected: false,
         builtin: key === BUILTIN_TOOL_KEY,
         state: 'idle',
+        ready: false,
+        needsAction: false,
       };
       map.set(key, item);
     }
@@ -112,8 +117,10 @@ export function buildToolConnections(input: {
       model: Boolean(item.model),
       exec: Boolean(item.exec) || execPresetKeys.has(item.key),
     };
-    item.detected = Boolean(item.mcp?.detected || item.model?.client_detected || item.exec);
+    item.detected = Boolean(item.mcp?.detected || item.model?.client_detected || item.model?.state === 'imported' || item.exec);
     item.state = toolState(item);
+    item.ready = item.builtin || item.mcp?.state === 'configured' || item.model?.state === 'imported' || Boolean(item.exec?.enabled);
+    item.needsAction = item.state === 'attention';
     return item;
   });
 
@@ -123,7 +130,7 @@ export function buildToolConnections(input: {
 /** 模型来源的展示名：把簿记里的 `managed` / `custom:<id>` / 空值翻成人话。 */
 export function modelSourceLabel(service: string | undefined | null, services: CustomAIService[], managed: ManagedAIServiceSummary): string {
   if (!service) return '未知来源';
-  if (service === 'managed') return managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
+  if (service === 'managed') return managed.available ? '工作台 AI 服务' : '工作台 AI 服务（未就绪）';
   if (service.startsWith('custom:')) {
     const id = service.slice('custom:'.length);
     return services.find((candidate) => candidate.id === id)?.display_name ?? '已删除的服务';

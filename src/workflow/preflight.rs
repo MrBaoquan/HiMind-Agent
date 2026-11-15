@@ -1186,6 +1186,7 @@ fn validate_tool_policy_support(
     runtime_reports: &[RuntimeInstallationReport],
     diagnostics: &mut Vec<WorkflowDiagnostic>,
 ) {
+    validate_files_only_support(package, &package.steps, runtime_reports, diagnostics);
     for (step_id, provider) in tool_none_steps(&package.steps) {
         if provider.is_empty() || provider == "auto" {
             // auto 会按 codex → copilot → builtin 的顺序解析，没有一个能被证明
@@ -1245,6 +1246,45 @@ fn validate_tool_policy_support(
                 true,
             );
         }
+    }
+}
+
+// Resolve the role overrides exactly as execution does. A role can inherit an
+// external step provider even when its own provider field is empty.
+fn validate_files_only_support(
+    package: &super::WorkflowPackage,
+    steps: &[super::WorkflowStep],
+    runtime_reports: &[RuntimeInstallationReport],
+    diagnostics: &mut Vec<WorkflowDiagnostic>,
+) {
+    let mut check = |id: &str, role_id: &str, runtime: &super::WorkflowRuntimeStep| {
+        let role = package.roles.get(role_id.trim());
+        let policy = role.map(|role| role.tool_policy.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.tool_policy.trim());
+        if policy != "files_only" && runtime.permission_mode != "full_access" { return; }
+        let provider = role.map(|role| role.runtime_provider.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.provider.trim());
+        if policy != "files_only" && runtime.permission_mode == "full_access" && (provider == "personal.codex" || crate::runtime::acp::is_provider(provider)) {
+            if !runtime_reports.iter().any(|report| report.provider == provider && report.status == "ready") {
+                push_blocker(diagnostics, "runtime.full_access_unsupported", "runtime", format!("executor {provider} is unavailable for step {id}"), "请检查所选执行器的安装和配置。", true);
+            }
+            return;
+        }
+        let builtin_ready = runtime_reports.iter().any(|report| report.provider == "himind.builtin" && report.status == "ready");
+        if !matches!(provider, "auto" | "himind.builtin") || !builtin_ready {
+            push_blocker(diagnostics, if runtime.permission_mode == "full_access" { "runtime.full_access_unsupported" } else { "runtime.files_only_unsupported" }, "runtime",
+                format!("workflow step {id} requires built-in permission/tool enforcement but provider {provider} cannot enforce it or HiMind AI is unavailable"),
+                "所选权限模式需要已安装且可用的 HiMind AI；请调整步骤或角色的执行器。", true);
+        }
+    };
+    for step in steps {
+        if let Some(runtime) = &step.runtime { check(&step.id, &step.role_id, runtime); }
+        if let Some(delegate) = &step.delegate {
+            for branch in &delegate.branches {
+                if let Some(runtime) = &branch.runtime { check(&format!("{}:{}", step.id, branch.id), &branch.role_id, runtime); }
+            }
+        }
+    }
+    for step in steps {
+        if let Some(config) = &step.loop_config { validate_files_only_support(package, &config.steps, runtime_reports, diagnostics); }
     }
 }
 
@@ -1866,6 +1906,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn files_only_preflight_checks_inherited_role_provider_and_builtin_availability() {
+        let mut package = package(Vec::new());
+        package.steps[0].role_id = "editor".into();
+        package.steps[0].runtime = Some(serde_json::from_value(json!({
+            "provider":"personal.codex", "prompt":"Edit the file"
+        })).unwrap());
+        package.roles.insert("editor".into(), serde_json::from_value(json!({"tool_policy":"files_only"})).unwrap());
+        let ready = vec![runtime_report("himind.builtin", "ready")];
+        let mut diagnostics = Vec::new();
+        validate_tool_policy_support(&package, &ready, &mut diagnostics);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
+        package.roles.get_mut("editor").unwrap().runtime_provider = "auto".into();
+        diagnostics.clear();
+        validate_tool_policy_support(&package, &ready, &mut diagnostics);
+        assert!(diagnostics.is_empty());
+        validate_tool_policy_support(&package, &[], &mut diagnostics);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
+    }
+
     fn capability(id: &str) -> CapabilityDescriptor {
         CapabilityDescriptor {
             id: id.to_string(),
@@ -1974,7 +2034,7 @@ mod tests {
         package.steps[0].capability_id.clear();
         package.steps[0].kind = "runtime".to_string();
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "auto".to_string(),
+            permission_mode: String::new(), provider: "auto".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -1996,11 +2056,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_full_access_preflight_requires_ready_provider_and_still_rejects_files_only() {
+        let mut package = package(Vec::new());
+        package.steps[0].role_id = "implementer".into();
+        package.roles.insert("implementer".into(), crate::workflow::WorkflowRole {
+            runtime_provider: "personal.codex".into(), tool_policy: "default".into(), ..Default::default()
+        });
+        package.steps[0].runtime = Some(serde_json::from_value(json!({
+            "provider":"auto", "permission_mode":"full_access", "prompt":"Implement"
+        })).unwrap());
+        let mut diagnostics = Vec::new();
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "unavailable")], &mut diagnostics);
+        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported"));
+        package.roles.get_mut("implementer").unwrap().tool_policy = "files_only".into();
+        diagnostics.clear();
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
+        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported" || item.code == "runtime.files_only_unsupported"));
+    }
+
+    #[test]
     fn explicit_runtime_provider_must_be_ready() {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2041,7 +2122,7 @@ mod tests {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2085,7 +2166,7 @@ mod tests {
         package.supported_runtimes = vec!["himind.builtin".to_string()];
         package.optional_providers = vec!["acp.claude".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "himind.builtin".to_string(),
+            permission_mode: String::new(), provider: "himind.builtin".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2135,7 +2216,7 @@ mod tests {
             "personal.github-copilot".to_string(),
         ];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "auto".to_string(),
+            permission_mode: String::new(), provider: "auto".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2167,7 +2248,7 @@ mod tests {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Activity, AlertCircle, CheckCircle2, Clock3, ExternalLink, Search, XCircle } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState, useRef, useLayoutEffect } from 'react';
+import { Activity, AlertCircle, Search } from 'lucide-react';
 // 状态图标链吃的是图标数据：同一个图标位在等待/运行/完成之间形变。
 import { CircleAlert, CircleCheck, CircleDashed, Clock, LoaderCircle as loaderIconData } from 'lucide';
 import { BusyIndicator } from '../components/BusyIndicator';
@@ -8,7 +8,6 @@ import { MorphIcon } from '../components/MorphIcon';
 import type { AgentActivityItem, AgentTaskHistoryItem, CurrentTaskStatus } from '../services/agentApi';
 import {
   TASK_ACTIVE_STATUSES,
-  TASK_ATTENTION_STATUSES,
   TASK_COMPLETED_STATUSES,
   formatAbsoluteTime,
   formatDuration,
@@ -34,14 +33,20 @@ import {
 } from './taskView';
 import { formatElapsedCn } from './workflowRunView';
 import { formatError } from '../types';
-import { CollaborationTaskPanel } from './MissionTeamPanel';
+import { CollaborationTaskDetail, CreateMissionDialog } from './MissionTeamPanel';
+import { useMissionCatalog, type MissionCatalog } from './useMissionCatalog';
+import { executionTodoId, activityNeedsUser, activityStatusLabel, projectTasks, missionTodo, workspaceKey, EMPTY_TASK_CONTEXT, type TaskListContext } from './taskCenterModel';
+import { missionActionActor, missionWait, missionResponsibility, missionNextAction, missionProgress, missionStage, missionStatusLabel, MISSION_STAGE_LABELS } from './missionView';
 
-type TaskFilter = 'all' | 'running' | 'completed' | 'attention';
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
-type SourceFilter = 'all' | ActivitySource;
 
 type TaskCenterPageProps = {
   currentTask: CurrentTaskStatus | null;
+  missionCatalog?: MissionCatalog;
+  initialContext?: TaskListContext;
+  onContextChange?: (context: TaskListContext) => void;
+  onMissionSelectionChange?: (missionId: string) => void;
+  onOpenWorkflowLibrary?: () => void;
   dashboardEnabled: boolean;
   /** Mission deep links select one collaboration task on first render. */
   initialMissionId?: string;
@@ -64,20 +69,12 @@ type TaskCenterPageProps = {
 
 const ACTIVE_STATUSES = TASK_ACTIVE_STATUSES;
 const COMPLETED_STATUSES = TASK_COMPLETED_STATUSES;
-const ATTENTION_STATUSES = TASK_ATTENTION_STATUSES;
-
-const FILTERS: { id: TaskFilter; label: string }[] = [
-  { id: 'all', label: '全部' },
-  { id: 'running', label: '进行中' },
-  { id: 'completed', label: '已完成' },
-  { id: 'attention', label: '需处理' },
-];
 
 const SOURCE_LABELS: Record<ActivitySource, string> = {
-  dashboard: '工作台下发',
-  workflow: '本机工作流',
-  skill: '技能',
-  schedule: '定时计划',
+  dashboard: '工作台任务',
+  workflow: '工作流运行',
+  skill: '技能运行',
+  schedule: '技能运行',
 };
 
 /** 列表项：把两种来源压平成同一套字段，行渲染只认这一种结构。 */
@@ -198,162 +195,131 @@ function activityTime(entry: ActivityEntry) {
   return entry.finishedAt || entry.updatedAt || entry.createdAt;
 }
 
-export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId, missionNavigationRevision, onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun, onCancelRun, onApproveRun, onRejectRun, onPauseRun, onResumePausedRun, onRetryStep }: TaskCenterPageProps) {
-  const [items, setItems] = useState<ActivityEntry[]>([]);
-  const [filter, setFilter] = useState<TaskFilter>('all');
-  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
-  const [query, setQuery] = useState('');
+export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId, missionNavigationRevision,
+  missionCatalog, initialContext = EMPTY_TASK_CONTEXT, onContextChange, onMissionSelectionChange, onOpenWorkflowLibrary,
+  onLoadTaskHistory, onLoadLocalActivity, onOpenDashboard, onOpenWorkflowRun, ...actions }: TaskCenterPageProps) {
+  const fallbackCatalog = useMissionCatalog(!missionCatalog);
+  const catalog = missionCatalog || fallbackCatalog;
+  const [items, setItems] = useState<AgentActivityItem[]>([]);
+  const [context, setContext] = useState(initialContext);
+  const contextRef = useRef(context); contextRef.current = context;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [missionId, setMissionId] = useState(initialMissionId || '');
-
+  const [activityId, setActivityId] = useState('');
+  const detailRef = useRef(false); detailRef.current = Boolean(missionId || activityId);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newMenu, setNewMenu] = useState(false);
+  const restoreScroll = useRef(true);
+  const main = () => document.querySelector<HTMLElement>('.main-content');
+  const rememberScroll = () => {
+    const next = { ...contextRef.current, scrollTop: detailRef.current ? contextRef.current.scrollTop : main()?.scrollTop ?? window.scrollY };
+    contextRef.current = next; setContext(next); onContextChange?.(next);
+  };
+  const openMission = (id: string) => {
+    if (id) rememberScroll(); else restoreScroll.current = true;
+    setMissionId(id); onMissionSelectionChange?.(id);
+  };
+  useEffect(() => { setMissionId(initialMissionId || ''); }, [initialMissionId, missionNavigationRevision]);
+  useEffect(() => { onContextChange?.(context); }, [context, onContextChange]);
   useEffect(() => {
-    // Empty is an intentional "show the task list" navigation, not a no-op.
-    setMissionId(initialMissionId || '');
-  }, [initialMissionId, missionNavigationRevision]);
-
-  // 本机记录是本地读取（快），工作台历史要打控制面接口（慢）。轮询按两个节奏走：
-  // 本机 5 秒，工作台历史 30 秒，避免每 5 秒发一次网络请求。
+    const host = main() || window;
+    const save = () => { if (detailRef.current) return; contextRef.current = { ...contextRef.current, scrollTop: main()?.scrollTop ?? window.scrollY }; };
+    host.addEventListener('scroll', save, {passive:true});
+    return () => { host.removeEventListener('scroll', save); onContextChange?.(contextRef.current); };
+  }, [onContextChange]);
   const load = useCallback(async (silent = false, includeRemote = true) => {
     if (!silent) setLoading(true);
     const [local, remote] = await Promise.allSettled([
       onLoadLocalActivity(),
       dashboardEnabled && includeRemote ? onLoadTaskHistory() : Promise.resolve([] as AgentTaskHistoryItem[]),
     ]);
-    const next: ActivityEntry[] = [];
-    if (local.status === 'fulfilled') next.push(...local.value.map(fromActivity));
-    if (remote.status === 'fulfilled' && includeRemote) next.push(...remote.value.map(fromTask));
-    next.sort((left, right) => Date.parse(activityTime(right)) - Date.parse(activityTime(left)));
-    // 未拉取工作台历史时，保留上一轮的记录，避免列表被清空后闪回。
-    setItems(current => includeRemote ? next : [...next, ...current.filter(item => item.source === 'dashboard')]);
-    const failed = [local, remote].filter(result => result.status === 'rejected').length;
-    if (includeRemote) {
-      setError(failed === 0 ? '' : failed === 2 ? '记录暂时读取失败，请稍后重试。' : '部分来源暂时读取失败，可稍后重试。');
-    } else if (local.status === 'rejected') {
-      setError('本机记录暂时读取失败，可稍后重试。');
-    }
-    setUpdatedAt(new Date());
-    if (!silent) setLoading(false);
+    setItems(current => {
+      const localItems = local.status === 'fulfilled' ? local.value : current.filter(i => i.source !== 'dashboard');
+      const remoteItems = includeRemote && remote.status === 'fulfilled'
+        ? remote.value.map(i => ({ ...i, source:'dashboard', title:taskTypeLabel(i.task_type), progress:i.progress ?? null }))
+        : current.filter(i => i.source === 'dashboard');
+      return [...localItems, ...remoteItems];
+    });
+    setError(local.status === 'rejected' || remote.status === 'rejected' ? '部分记录读取失败，保留上次结果。' : '');
+    setLoading(false);
   }, [dashboardEnabled, onLoadLocalActivity, onLoadTaskHistory]);
-
   useEffect(() => {
-    void load();
-    let tick = 0;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
-      tick += 1;
-      void load(true, tick % 6 === 0);
-    }, 5000);
+    void load(); let tick = 0;
+    const timer = window.setInterval(() => { if (document.visibilityState !== 'hidden') void load(true, ++tick % 6 === 0); }, 5000);
     return () => window.clearInterval(timer);
   }, [load]);
-
-  const active = items.filter(item => ACTIVE_STATUSES.has(item.status));
-  const completed = items.filter(item => COMPLETED_STATUSES.has(item.status));
-  const attention = items.filter(item => ATTENTION_STATUSES.has(item.status));
-  // 有任务在跑就按秒推进「现在」：进行中的行显示走动的「已运行」，相对时间也跟着走。
-  // 没有活动运行时不挂定时器，空转会让整页无谓重渲染。
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const {rows, related} = useMemo(() => projectTasks(catalog.missions, items, catalog.activities || items), [catalog.missions, catalog.activities, items]);
+  const missionActivities = (id: string) => [...new Map([
+    ...(related.get('mission:'+id) || []), ...(catalog.activities || []).filter(item => item.mission_id === id),
+  ].map(item => [item.workflow_run_id || item.id, item])).values()];
+  const scoped = rows.filter(row => (!context.workspace || (context.workspace === '__unknown' ? !row.workspace : workspaceKey(row.workspace) === context.workspace))
+    && (!context.method || row.method === context.method)
+    && (!context.query.trim() || (row.search + ' ' + row.client).toLowerCase().includes(context.query.trim().toLowerCase())));
+  const counts = {all:scoped.length, attention:scoped.filter(r=>r.needsUser).length, running:scoped.filter(r=>!r.ended).length, ended:scoped.filter(r=>r.ended).length};
+  const filtered = scoped.filter(row => context.view === 'all' || (context.view === 'attention' ? row.needsUser : context.view === 'ended' ? row.ended : !row.ended));
+  const workspaces = new Map(rows.filter(r=>r.workspace).map(r=>[workspaceKey(r.workspace), r.workspace]));
+  const update = (patch: Partial<TaskListContext>) => setContext(current => ({...current, ...patch, scrollTop:0}));
+  const [now, setNow] = useState(Date.now);
   useEffect(() => {
-    if (active.length === 0) return;
-    setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active.length]);
-  const currentItem = currentTask ? items.find(item => item.id === currentTask.task_id) : active[0];
-  const availableSources = useMemo(() => {
-    const present = new Set(items.map(item => item.source));
-    return (Object.keys(SOURCE_LABELS) as ActivitySource[]).filter(source => present.has(source));
-  }, [items]);
-  const filteredItems = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    return items.filter(item => {
-      const matchesFilter = filter === 'all'
-        || (filter === 'running' && ACTIVE_STATUSES.has(item.status))
-        || (filter === 'completed' && COMPLETED_STATUSES.has(item.status))
-        || (filter === 'attention' && ATTENTION_STATUSES.has(item.status));
-      if (!matchesFilter) return false;
-      if (sourceFilter !== 'all' && item.source !== sourceFilter) return false;
-      if (!normalizedQuery) return true;
-      return [item.id, item.title, item.subtitle, item.detail, item.error]
-        .filter(Boolean)
-        .some(value => String(value).toLowerCase().includes(normalizedQuery));
+    if (!rows.some(row => !row.ended)) return;
+    const timer=window.setInterval(()=>setNow(Date.now()),1000); return ()=>window.clearInterval(timer);
+  }, [rows.some(row => !row.ended)]);
+  useLayoutEffect(() => {
+    if (missionId || activityId || loading || catalog.loading || !restoreScroll.current) return;
+    const frame = requestAnimationFrame(() => {
+      const host = main(); if (host) host.scrollTop = contextRef.current.scrollTop; else window.scrollTo(0, contextRef.current.scrollTop);
+      restoreScroll.current = false;
     });
-  }, [filter, items, query, sourceFilter]);
-
-  return (
-    <div className="task-center-page">
-      <PageHeader
-        title="我的任务"
-        description={dashboardEnabled ? '查看 AI 对话、自动化工作流和工作台发起的任务。' : '查看 AI 对话和本机自动化工作流发起的任务。'}
-        actions={dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台</button> : undefined}
-      />
-      <CollaborationTaskPanel selectedMissionId={missionId} onOpenMission={setMissionId} onBackToTasks={() => setMissionId('')} />
-
-      {!missionId ? <section className="task-center-summary" aria-label="活动概览">
-        <SummaryItem label="进行中" value={active.length} tone="running" />
-        <SummaryItem label="需处理" value={attention.length} tone={attention.length ? 'attention' : 'neutral'} />
-        <SummaryItem label="已完成" value={completed.length} tone="success" />
-        <SummaryItem label="记录总数" value={items.length} tone="neutral" />
-      </section> : null}
-
-      {!missionId && active.length > 0 ? (
-        <section className="task-center-current" aria-labelledby="task-center-current-title">
-          <div className="task-center-section-heading"><div><span className="task-center-section-kicker"><Clock3 size={14} />实时状态</span><h3 id="task-center-current-title">正在进行</h3></div><span>{active.length} 项</span></div>
-          <div className="task-center-current-list">{active.map(item => <ActivityRow key={item.id} entry={item} featured={item.id === currentItem?.id} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} onCancelRun={onCancelRun} onApproveRun={onApproveRun} onRejectRun={onRejectRun} onPauseRun={onPauseRun} onResumePausedRun={onResumePausedRun} />)}</div>
-        </section>
-      ) : null}
-
-      {!missionId ? <section className="task-center-history" aria-labelledby="task-center-history-title">
-        <div className="task-center-section-heading">
-          <div><span className="task-center-section-kicker"><CheckCircle2 size={14} />可回看</span><h3 id="task-center-history-title">运行记录</h3></div>
-          <span>{loading ? <><BusyIndicator size={11} /> 更新中</> : updatedAt ? `${filteredItems.length} / ${items.length} · 更新于 ${updatedAt.toLocaleTimeString('zh-CN', { hour12: false })}` : `${filteredItems.length} / ${items.length}`}</span>
-        </div>
+    return () => cancelAnimationFrame(frame);
+  }, [missionId, activityId, loading, catalog.loading]);
+  const openRun = onOpenWorkflowRun ? (id:string) => { rememberScroll(); onOpenWorkflowRun(id); } : undefined;
+  const selectedActivity = items.find(i=>i.id===activityId);
+  return <div className="task-center-page">
+    <PageHeader title="我的任务" description="跟踪任务进展、处理待办、查看交付结果。" actions={!missionId && !activityId ? <div className="task-create-menu">
+      <button type="button" className="btn btn-primary" aria-expanded={newMenu} onClick={()=>setNewMenu(v=>!v)}>新建任务</button>
+      {newMenu ? <div className="task-create-options"><button className="btn" onClick={()=>{setNewMenu(false);setCreateOpen(true);}}>新建协作任务</button>{onOpenWorkflowLibrary ? <button className="btn" onClick={()=>{setNewMenu(false);onOpenWorkflowLibrary();}}>运行工作流</button> : null}{dashboardEnabled ? <button className="btn" onClick={onOpenDashboard}>打开工作台</button> : null}</div> : null}
+    </div> : undefined} />
+    {missionId ? <CollaborationTaskDetail key={missionId} missionId={missionId} openAssignmentRevision={missionNavigationRevision}
+      onBack={()=>openMission('')} onRefresh={catalog.refresh} onMissionChanged={catalog.upsert}
+      relatedActivities={missionActivities(missionId)} onOpenWorkflowRun={openRun} />
+    : selectedActivity ? <section className="mission-detail">
+      <button className="btn" onClick={()=>{restoreScroll.current=true;setActivityId('');}}>返回我的任务</button>
+      <header className="mission-detail-hero"><div><h2>{selectedActivity.title}</h2><p>{selectedActivity.subtitle || '执行记录'}</p></div><strong>{activityStatusLabel(selectedActivity) || taskStatusLabel(selectedActivity.status)}</strong></header>
+      <dl className="task-facts"><div><dt>工作区</dt><dd>{selectedActivity.workspace_root || '未记录'}</dd></div><div><dt>来源</dt><dd>{selectedActivity.source_client || (selectedActivity.source==='dashboard'?'工作台':'未记录')}</dd></div><div><dt>更新时间</dt><dd>{formatAbsoluteTime(selectedActivity.updated_at)}</dd></div></dl>
+      <section className="mission-detail-panel"><h3>概览</h3><p>{selectedActivity.error || selectedActivity.detail || '尚无进一步执行说明'}</p>{selectedActivity.output_path ? <><h3>交付物</h3><code className="task-evidence-path">{selectedActivity.output_path}</code></> : <p className="muted">未记录可展示的交付文件。</p>}</section>
+    </section> : <>
+      <section className="task-center-history" aria-label="任务列表">
         <div className="task-center-toolbar">
-          <div className="task-center-filter-stack">
-            <div className="task-center-filters" role="tablist" aria-label="状态筛选">
-              {FILTERS.map(option => {
-                const count = option.id === 'all' ? items.length : option.id === 'running' ? active.length : option.id === 'completed' ? completed.length : attention.length;
-                return <button type="button" role="tab" aria-selected={filter === option.id} className={filter === option.id ? 'active' : ''} key={option.id} onClick={() => setFilter(option.id)}><span>{option.label}</span><small>{count}</small></button>;
-              })}
-            </div>
-            {availableSources.length > 1 ? (
-              <div className="task-center-filters sources" role="tablist" aria-label="来源筛选">
-                <button type="button" role="tab" aria-selected={sourceFilter === 'all'} className={sourceFilter === 'all' ? 'active' : ''} onClick={() => setSourceFilter('all')}><span>全部来源</span><small>{items.length}</small></button>
-                {availableSources.map(source => {
-                  const count = items.filter(item => item.source === source).length;
-                  return <button type="button" role="tab" aria-selected={sourceFilter === source} className={sourceFilter === source ? 'active' : ''} key={source} onClick={() => setSourceFilter(source)}><span>{SOURCE_LABELS[source]}</span><small>{count}</small></button>;
-                })}
-              </div>
-            ) : null}
-          </div>
-          <label className="task-center-search"><Search size={15} aria-hidden="true" /><span className="sr-only">搜索记录</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索名称、编号或结果" /></label>
+          <label className="task-center-search"><Search size={15}/><span className="sr-only">搜索任务</span><input value={context.query} onChange={e=>update({query:e.target.value})} placeholder="搜索任务、目标、工作区或编号"/></label>
+          <label className="task-select-filter"><span>工作区</span><select aria-label="工作区筛选" value={context.workspace} onChange={e=>update({workspace:e.target.value})}><option value="">全部工作区</option>{[...workspaces].map(([key,value])=><option key={key} value={key}>{value}</option>)}<option value="__unknown">未记录工作区</option></select></label>
+          <details className="task-more-filters"><summary>更多筛选</summary><label>执行方式<select aria-label="执行方式筛选" value={context.method} onChange={e=>update({method:e.target.value})}><option value="">全部执行方式</option>{[...new Set(rows.map(r=>r.method))].map(v=><option key={v}>{v}</option>)}</select></label></details>
         </div>
-        {error ? <div className="task-center-alert" role="alert"><AlertCircle size={16} /><span>{error}</span><button type="button" className="btn" onClick={() => void load()}>重新读取</button></div> : null}
-        {loading && items.length === 0
-          ? <div className="task-center-loading"><BusyIndicator />正在读取运行记录</div>
-          : filteredItems.length > 0
-            ? <div className="task-center-list">{filteredItems.map(item => <ActivityRow key={item.id} entry={item} now={nowMs} onOpenWorkflowRun={onOpenWorkflowRun} onCancelRun={onCancelRun} onApproveRun={onApproveRun} onRejectRun={onRejectRun} onPauseRun={onPauseRun} onResumePausedRun={onResumePausedRun} />)}</div>
-            : <div className="task-center-empty">
-                <EmptyState
-                  icon={filter === 'attention' ? XCircle : Activity}
-                  title={items.length === 0 ? '还没有运行记录' : '没有匹配的记录'}
-                  text={items.length === 0
-                    ? dashboardEnabled
-                      ? '工作台下发任务或本机运行工作流/技能后，记录会显示在这里。'
-                      : '本机运行工作流或技能后，记录会显示在这里。'
-                    : '可以换一个状态、来源或搜索关键词。'}
-                />
-                {items.length === 0 && dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台发起任务</button> : null}
-              </div>}
-      </section> : null}
-    </div>
-  );
-}
-
-function SummaryItem({ label, value, tone }: { label: string; value: number; tone: 'running' | 'attention' | 'success' | 'neutral' }) {
-  // 有任务在跑时让这个数字一起呼吸：概览区也要能看出「现在是活的」。
-  return <div className={`task-center-summary-item ${tone}${tone === 'running' && value > 0 ? ' is-live' : ''}`}><span>{label}</span><strong>{value}</strong></div>;
+        <div className="task-center-filters" role="tablist" aria-label="任务视图">{([{id:'all',label:'全部'},{id:'attention',label:'待我处理'},{id:'running',label:'进行中'},{id:'ended',label:'已结束'}] as const).map(v=><button key={v.id} role="tab" aria-selected={context.view===v.id} className={context.view===v.id?'active':''} onClick={()=>update({view:v.id})}>{v.label}<small>{counts[v.id]}</small></button>)}</div>
+        <p className="task-list-scope">显示最近读取的 {rows.length} 项顶层任务；待我处理表示需要你的行动，可与进行中重叠。</p>
+        {error || catalog.error ? <div className="task-center-alert" role="alert"><AlertCircle size={16}/><span>{error || catalog.error}</span><button className="btn" onClick={()=>{void load();void catalog.refresh();}}>重新读取</button></div> : null}
+        {(loading || catalog.loading) && !rows.length ? <div className="task-center-loading"><BusyIndicator/>正在读取任务</div>
+          : filtered.length ? <div className="task-center-list">{filtered.map(row=>{
+            if (row.mission) {
+              const mission=row.mission; const progress=missionProgress(mission); const activities=missionActivities(mission.mission_id); const todo=missionTodo(mission, activities); const wait=missionWait(mission);
+              return <article className="task-center-row mission-task-entry" key={row.id} data-task-id={row.id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, activities)}>
+                <div className="task-center-row-main"><div className="task-center-row-title"><button type="button" className="task-title-link" onClick={()=>openMission(mission.mission_id)}>{row.title}</button><span className="task-center-source">协作任务</span><span className={'collaboration-task-status status-'+mission.status}>{missionStatusLabel(mission, [], activities)}</span></div>
+                <div className="task-center-row-meta"><span title={row.workspace}>{row.workspace || '未记录工作区'}</span><span>来源：{row.client}</span>{row.trigger?<span>{row.trigger}</span>:null}<time>{formatRelativeTime(row.updatedAt,now)}</time></div>
+                <p className="task-row-next">{missionNextAction(mission, [], activities)}</p><p className="task-row-next muted">{missionResponsibility(mission, activities)}</p><div className="task-center-row-meta"><span>阶段：{MISSION_STAGE_LABELS[missionStage(mission)]}</span>{progress.total?<span>{progress.done}/{progress.total} 项原始交付已通过验收 · {progress.awaitingVerification} 项待验收</span>:<span>未记录执行进度</span>}<button type="button" className="task-center-row-action" onClick={()=>openMission(mission.mission_id)}>{todo ? todo.action : '查看任务'}</button></div></div>
+              </article>;
+            }
+            const item=row.activity!; const entry=item.source==='dashboard'?fromTask(item as unknown as AgentTaskHistoryItem):fromActivity(item);
+            const children=related.get(row.id)||[];
+            if (children.length) entry.childrenRuns = entry.childrenRuns.filter(child=>!children.some(item=>item.workflow_run_id===child.runId));
+            return <div key={row.id} data-task-id={row.id} data-todo-id={activityNeedsUser(item) ? executionTodoId(item.workflow_run_id || item.id, item.current_step_id || '', item.pause_kind || '') : undefined} className="task-unified-entry"><ActivityRow entry={entry} now={now} featured={item.id===currentTask?.task_id} onOpenWorkflowRun={openRun} {...actions}/>
+              <div className="task-entry-context"><span title={row.workspace}>{row.workspace || '未记录工作区'}</span><span>来源：{row.client}</span><span>{row.method}{row.trigger?' · '+row.trigger:''}</span>{!item.workflow_run_id?<button className="task-center-row-action" onClick={()=>{rememberScroll();setActivityId(item.id);}}>查看任务</button>:null}</div>
+              {children.length ? <details className="task-related-runs"><summary>{children.length} 次关联执行（委派 / 重试）</summary>{children.map(child=><div key={child.id}><span>{child.title} · {activityStatusLabel(child)||taskStatusLabel(child.status)}</span>{openRun&&child.workflow_run_id?<button className="task-center-row-action" onClick={()=>openRun(child.workflow_run_id!)}>查看执行</button>:null}</div>)}</details>:null}
+            </div>;
+          })}</div> : <EmptyState icon={Activity} title={rows.length?'没有匹配的任务':'还没有任务'} text={rows.length?'调整搜索或筛选条件。':'新建协作任务或运行工作流后，在这里跟踪进展。'}/>}
+      </section>
+    </>}
+    {createOpen ? <CreateMissionDialog onClose={()=>setCreateOpen(false)} onCreated={mission=>{catalog.upsert(mission);setCreateOpen(false);openMission(mission.mission_id);void catalog.refresh();}}/>:null}
+  </div>;
 }
 
 type RowActions = {
@@ -391,7 +357,7 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun, onCancel
   // 恢复只对「用户主动暂停」出现，不能用来绕过审批或反馈等待。
   const canResume = Boolean(onResumePausedRun) && entry.status === 'waiting'
     && entry.pauseKind === 'user' && Boolean(entry.workflowRunId);
-  const awaitingApproval = entry.status === 'waiting' && entry.pauseKind !== 'user';
+  const awaitingApproval = entry.status === 'waiting' && entry.pauseKind === 'approval' && Boolean(entry.currentStepId);
   const canDecide = Boolean(onApproveRun && onRejectRun) && awaitingApproval && Boolean(entry.workflowRunId);
   // 重试只对失败且已停下的运行出现：跑着的时候重跑会和执行线程打架。
   const canRetry = Boolean(onRetryStep) && entry.status === 'failed'
@@ -427,7 +393,7 @@ function ActivityRow({ entry, featured = false, now, onOpenWorkflowRun, onCancel
           {shouldShowRoleBadge(entry.roleId) ? <span className="task-center-role" title={entry.roleId}>{roleLabel(entry.roleId)}</span> : null}
           {parentKind ? <span className={`task-center-parent ${entry.parentKind}`} title={entry.parentKind}>{parentKind}</span> : null}
           <span className={`task-center-source ${entry.source}`}>{entry.sourceLabel}</span>
-          <span className={`task-center-status ${tone}`}>{taskStatusLabel(entry.status)}</span>
+          <span className={`task-center-status ${tone}`}>{activityStatusLabel({status:entry.status,pause_kind:entry.pauseKind}) || taskStatusLabel(entry.status)}</span>
         </div>
         <div className="task-center-row-meta">
           <code title={entry.id}>{shortRunId(entry.id)}</code>

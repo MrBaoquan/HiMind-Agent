@@ -65,6 +65,11 @@ mod plugin_authoring;
 mod remote;
 mod runtime;
 mod scan;
+mod session_history;
+mod session_history_actions;
+mod session_history_inspect;
+mod session_history_tools;
+mod session_history_sources;
 mod scheduler;
 mod skill;
 mod skill_run;
@@ -3072,6 +3077,16 @@ impl RuntimeInstallLog {
 
 fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
+        Some("storage") => {
+            let status = match &arguments[1..] {
+                [action] if action == "status" => mission::runtime_storage_status()?,
+                [action, base] if action == "set" => {
+                    mission::configure_runtime_storage(Path::new(base))?
+                }
+                _ => return Err("usage: himind-agent runtime storage <status|set <absolute-local-directory>>".into()),
+            };
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Some("acp-profile") => {
             run_acp_profile_cli(&arguments[1..])?;
         }
@@ -3190,7 +3205,7 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
         }
         _ => {
             return Err(
-                "usage: himind-agent runtime <acp-profile <list|set|enable|disable|remove>|providers|status|install|check-update|update|uninstall> [--manifest <runtime-release.json>]".into(),
+                "usage: himind-agent runtime <storage <status|set <absolute-local-directory>>|acp-profile <list|set|enable|disable|remove>|providers|status|install|check-update|update|uninstall> [--manifest <runtime-release.json>]".into(),
             )
         }
     }

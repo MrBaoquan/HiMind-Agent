@@ -697,6 +697,54 @@ mod tests {
     }
 
     #[test]
+    fn serialized_runtime_runs_match_published_schema() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/local-run.schema.json"
+        )).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        // Serialize the actual runtime DTO, including defaulted fields and
+        // null usage, rather than an older hand-written JSON fixture.
+        let legacy = run();
+        let mut assigned = run();
+        assigned.parent_run_id = "parent-run".into();
+        assigned.parent_kind = LocalRunParentKind::Delegate;
+        assigned.status = LocalRunStatus::Waiting;
+        assigned.pause_kind = RunPauseKind::Feedback;
+        assigned.steps[0].runtime_provider = "personal.codex".into();
+        assigned.steps[0].model = "cli:codex:gpt-6.1-sol".into();
+        assigned.steps[0].role_id = "remediation.frontend".into();
+        assigned.usage = Some(LocalRunUsage {
+            input_tokens: 13, output_tokens: 5, estimated_cost: 0.0,
+            currency: String::new(), billing_owner: "personal".into(),
+        });
+        for (index, runtime_run) in [legacy, assigned].into_iter().enumerate() {
+            runtime_run.validate().unwrap();
+            let value = serde_json::to_value(runtime_run).unwrap();
+            if index == 0 {
+                assert_eq!(value["parent_kind"], "unspecified");
+                assert_eq!(value["pause_kind"], "none");
+                assert_eq!(value["steps"][0]["model"], "");
+                assert_eq!(value["steps"][0]["role_id"], "");
+                assert_eq!(value.get("usage"), Some(&Value::Null));
+            } else {
+                assert_eq!(value["parent_kind"], "delegate");
+                assert_eq!(value["pause_kind"], "feedback");
+                assert_eq!(value["steps"][0]["model"], "cli:codex:gpt-6.1-sol");
+                assert_eq!(value["steps"][0]["role_id"], "remediation.frontend");
+            }
+            let errors = validator.iter_errors(&value)
+                .map(|error| error.to_string()).collect::<Vec<_>>();
+            assert!(errors.is_empty(), "serialized runtime/schema drift: {errors:?}");
+            let mut unknown = value.clone();
+            unknown["undeclared_runtime_field"] = json!(true);
+            assert!(!validator.is_valid(&unknown));
+            let mut invalid_model = value;
+            invalid_model["steps"][0]["model"] = json!(42);
+            assert!(!validator.is_valid(&invalid_model));
+        }
+    }
+
+    #[test]
     fn workflow_package_schema_accepts_v1_compatibility_fixtures() {
         let schema: Value = serde_json::from_str(include_str!(
             "../contracts/agent-core/v1/workflow-package.schema.json"

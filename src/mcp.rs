@@ -48,6 +48,7 @@ const BOOTSTRAP_TOOL_IDS: &[&str] = &[
 
 #[derive(Default)]
 struct McpSessionState {
+    runtime_lease: Option<(String, String)>,
     activated_capabilities: BTreeSet<String>,
     /// Capability IDs pre-activated at MCP startup (from
     /// HIMIND_MCP_DEFAULT_ACTIVATE). Unlike dynamic activations they survive
@@ -262,6 +263,15 @@ pub(crate) enum McpServerAction {
 }
 
 impl McpServer {
+    pub(crate) fn inherit_runtime_lease(&mut self, client: &Value) -> Result<(), Box<dyn Error>> {
+        if let Some(lease) = client.get("runtime_lease") {
+            let id = lease.get("lease_id").and_then(Value::as_str).ok_or("runtime lease id is required")?;
+            let workspace = lease.get("workspace_root").and_then(Value::as_str).ok_or("runtime lease workspace is required")?;
+            crate::workspace_lease::validate_active(id, std::path::Path::new(workspace), "write")?;
+            self.session.runtime_lease = Some((id.into(), workspace.into()));
+        }
+        Ok(())
+    }
     pub(crate) fn new(gateway: CapabilityGateway, device_id: String) -> Self {
         Self::new_with_registry_updates(gateway, device_id, None)
     }
@@ -478,6 +488,7 @@ fn handle_request(
     // Preserve the old in-process helper contract for HTTP/Tauri and tests.
     // The real stdio loop uses a session-scoped projection below.
     let mut session = McpSessionState {
+        runtime_lease: None,
         activated_capabilities: gateway
             .list_capabilities(&mcp_invocation_context())
             .map_err(|error| format!("list MCP capabilities for legacy session: {error}"))?
@@ -697,6 +708,12 @@ fn handle_request_with_session(
                 )));
             }
             let context = mcp_invocation_context_for_session(session);
+            if let Some(result) = crate::workspace_lease::inherited_call(name, &arguments, session.runtime_lease.as_ref()) {
+                return match result {
+                    Ok(value) => mcp_tool_call_result(value),
+                    Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
+                };
+            }
             match gateway.invoke(&context, name, arguments) {
                 Ok(result) => Ok(mcp_tool_call_result(result)?),
                 Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
@@ -932,6 +949,9 @@ fn invoke_activated_capability(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if let Some(result) = crate::workspace_lease::inherited_call(capability_id, &arguments, session.runtime_lease.as_ref()) {
+        return result;
+    }
     gateway.invoke(
         &mcp_invocation_context_for_session(session),
         capability_id,
@@ -1458,7 +1478,10 @@ mod tests {
 
     fn cross_client_mission_e2e_body() {
         let _env_lock = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!(
+        let target_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+        let root = target_root.join("test-fixtures").join(format!(
             "himind-mission-cross-client-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -1473,6 +1496,21 @@ mod tests {
         let _fixture = EnvironmentRestore::set("HIMIND_WORKFLOW_RUNTIME_FIXTURE", "1");
         let _client_id = EnvironmentRestore::remove("HIMIND_AI_CLIENT_ID");
         let _default_activate = EnvironmentRestore::remove("HIMIND_MCP_DEFAULT_ACTIVATE");
+        crate::expert::save(crate::expert::ExpertDraftInput {
+            id: "com.himind.expert.fixture-auditor".to_string(),
+            name: "Fixture auditor".to_string(),
+            author: "HiMind test".to_string(),
+            categories: vec!["verification".to_string()],
+            version: "1.0.0".to_string(),
+            description: "Deterministic Expert used by the cross-client Mission test".to_string(),
+            supported_clients: vec!["codex".to_string(), "claude-code".to_string()],
+            skill_refs: Vec::new(),
+            workflow_refs: Vec::new(),
+            capability_refs: Vec::new(),
+            instructions: "执行确定性验证，保留宿主证据，不自行扩大任务范围。".to_string(),
+            output_contract: Default::default(),
+            harness: Default::default(),
+        }).unwrap();
 
         git(&workspace, &["init"]).unwrap();
         std::fs::write(workspace.join("README.md"), "cross-client mission e2e
@@ -1609,6 +1647,82 @@ mod tests {
         assert!(options_result["structuredContent"]["roles"]
             .as_array()
             .is_some_and(|roles| roles.iter().any(|role| role["role_id"] == "ui.auditor")));
+        let selected_expert = options_result["structuredContent"]["experts"]
+            .as_array()
+            .and_then(|experts| experts.first())
+            .cloned()
+            .expect("fixture Mission must expose an installed Expert");
+        let assignment_roles = options_result["structuredContent"]["roles"]
+            .as_array()
+            .expect("fixture Mission must expose workflow roles")
+            .iter()
+            .map(|role| {
+                json!({
+                    "expert": {
+                        "expert_id": selected_expert["id"],
+                        "expert_version": selected_expert["version"],
+                        "expert_digest": selected_expert["digest"]
+                    },
+                    "role_id": role["role_id"],
+                    "label": role["label"],
+                    "executor": "himind.fixture",
+                    "service_id": "",
+                    "model": ""
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut incomplete_assignment_roles = assignment_roles.clone();
+        incomplete_assignment_roles.pop();
+        let incomplete_assignment = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "mission.assignment.apply",
+            json!({
+                "mission_id": mission_id,
+                "input": {
+                    "roles": incomplete_assignment_roles,
+                    "task_roles": [{"task_id": "smoke", "role_id": "ui.auditor"}],
+                    "applied_by": "second-client",
+                    "recommended": false
+                }
+            }),
+        );
+        assert_eq!(incomplete_assignment["isError"], true, "every fixed workflow slot must be assigned: {incomplete_assignment}");
+        let missing_task_mapping = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "mission.assignment.apply",
+            json!({
+                "mission_id": mission_id,
+                "input": {
+                    "roles": assignment_roles.clone(),
+                    "task_roles": [],
+                    "applied_by": "second-client",
+                    "recommended": false
+                }
+            }),
+        );
+        assert_eq!(missing_task_mapping["isError"], true, "every imported task must map to an assigned slot: {missing_task_mapping}");
+        let mut invalid_assignment_roles = assignment_roles.clone();
+        invalid_assignment_roles[0]["service_id"] = json!("service-not-in-directory");
+        let rejected_binding = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "mission.assignment.apply",
+            json!({
+                "mission_id": mission_id,
+                "input": {
+                    "roles": invalid_assignment_roles,
+                    "task_roles": [{"task_id": "smoke", "role_id": "ui.auditor"}],
+                    "applied_by": "second-client",
+                    "recommended": false
+                }
+            }),
+        );
+        assert_eq!(rejected_binding["isError"], true, "invalid catalog binding must be rejected: {rejected_binding}");
         let assigned = call_tool_with_user_approval(
             &gateway,
             Arc::clone(&approval_manager),
@@ -1617,13 +1731,7 @@ mod tests {
             json!({
                 "mission_id": mission_id,
                 "input": {
-                    "roles": [{
-                        "role_id": "ui.auditor",
-                        "label": "Fixture auditor",
-                        "executor": "himind.fixture",
-                        "service_id": "",
-                        "model": ""
-                    }],
+                    "roles": assignment_roles,
                     "task_roles": [{"task_id": "smoke", "role_id": "ui.auditor"}],
                     "applied_by": "second-client",
                     "recommended": false
@@ -1635,18 +1743,54 @@ mod tests {
 
         let store = crate::mission::MissionStore::open_default().unwrap();
         let ready_to_confirm = store.get(&mission_id).unwrap();
-        let confirmed = store
-            .confirm_plan(
-                &mission_id,
-                &ready_to_confirm.plan_sha256,
-                &["smoke".to_string()],
-                &[".himind-workflow-fixture".to_string()],
-                &[],
-                &[],
-                "agent-ui",
-            )
-            .unwrap();
+        let confirm_input = json!({
+            "mission_id": mission_id,
+            "plan_sha256": ready_to_confirm.plan_sha256,
+            "selected_task_ids": ["smoke"],
+            "approved_paths": [".himind-workflow-fixture"],
+            "approved_absolute_read_paths": [],
+            "approved_absolute_write_paths": [],
+            "confirmed_by": "second-client"
+        });
+        let unapproved_confirmation = call_tool(
+            &gateway,
+            &mut claude,
+            "mission.plan.confirm",
+            confirm_input.clone(),
+        );
+        assert_eq!(unapproved_confirmation["isError"], true, "{unapproved_confirmation}");
+        assert_eq!(store.get(&mission_id).unwrap().status, crate::mission::MissionStatus::AwaitingConfirmation);
+        let confirmed = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "mission.plan.confirm",
+            confirm_input,
+        );
+        assert_eq!(confirmed["isError"], false, "{confirmed}");
+        assert_eq!(confirmed["structuredContent"]["status"], "active");
+        let confirmed: crate::mission::MissionView = serde_json::from_value(confirmed["structuredContent"].clone()).unwrap();
         assert_eq!(confirmed.status, crate::mission::MissionStatus::Active);
+
+        // The same host recovery works across clients; a model cannot assert
+        // its own permission approval or bypass the environment wait with resume.
+        store.suspend_runtime(&mission_id, "smoke", &json!({"code":"runtime_workspace_blocked"})).unwrap();
+        activate_for_client(&gateway, &mut codex, "runtime.workspace.");
+        activate_for_client(&gateway, &mut claude, "runtime.workspace.");
+        let diagnosis = call_tool(&gateway, &mut codex, "runtime.workspace.check", json!({"workspace":workspace.to_string_lossy()}));
+        assert_eq!(diagnosis["isError"], false, "{diagnosis}");
+        let resolve_input = json!({"workspace":workspace.to_string_lossy(),
+            "expected_fingerprint":diagnosis["structuredContent"]["fingerprint"],
+            "action":"files_only","mission_id":mission_id,"expected_plan_sha256":confirmed.plan_sha256});
+        let denied = call_tool(&gateway, &mut codex, "runtime.workspace.resolve", resolve_input.clone());
+        assert_eq!(denied["isError"], true, "{denied}");
+        assert_eq!(store.get(&mission_id).unwrap().status, crate::mission::MissionStatus::Waiting);
+        let resolved = call_tool_with_user_approval(&gateway, Arc::clone(&approval_manager),
+            &mut claude, "runtime.workspace.resolve", resolve_input);
+        assert_eq!(resolved["isError"], false, "{resolved}");
+        assert_eq!(resolved["structuredContent"]["mission"]["status"], "active");
+        assert_eq!(resolved["structuredContent"]["shell_verified"], false);
+        assert!(store.runtime_files_only(&mission_id, &confirmed.plan_sha256).unwrap());
 
         drop(codex);
         drop(claude);
@@ -1707,6 +1851,49 @@ mod tests {
         assert!(Path::new(candidate_path).is_file(), "export candidate was not persisted: {candidate_path}");
         assert!(!candidate_path.contains(&mission_id), "export used the Mission ID as its package identity");
 
+        // Full access is a Mission choice, not an ACL repair. Exercise the
+        // actual cross-client approval route without a permission fingerprint.
+        let full_mission = store.create(&serde_json::from_value(json!({
+            "title":"Full access recovery fixture", "workspace": {
+                "root":workspace.to_string_lossy(), "read_scope":["."], "write_scope":[".himind-workflow-fixture"]
+            }
+        })).unwrap()).unwrap();
+        let full_plan = store.propose_plan(&full_mission.mission_id, &serde_json::from_value(plan.clone()).unwrap()).unwrap();
+        let configured = call_tool(&gateway, &mut third_client, "mission.permission.set", json!({
+            "mission_id":full_mission.mission_id,"expected_plan_sha256":full_plan.plan_sha256,"permission_mode":"full_access"
+        }));
+        assert_eq!(configured["isError"],false,"{configured}");
+        let configured_hash = configured["structuredContent"]["plan_sha256"].as_str().unwrap();
+        assert_ne!(configured_hash,full_plan.plan_sha256);
+        assert_eq!(configured["structuredContent"]["status"],"awaiting_confirmation");
+        assert!(store.confirm_plan(&full_mission.mission_id,&full_plan.plan_sha256,&["smoke".into()],&[".himind-workflow-fixture".into()],&[],&[],"fixture-user").is_err());
+        // Recover a restricted task, so the action must change effective access.
+        let restricted = call_tool(&gateway, &mut third_client, "mission.permission.set", json!({
+            "mission_id":full_mission.mission_id,"expected_plan_sha256":configured_hash,"permission_mode":"workspace_write"
+        }));
+        assert_eq!(restricted["isError"],false,"{restricted}");
+        let full_active = store.confirm_plan(&full_mission.mission_id,
+            restricted["structuredContent"]["plan_sha256"].as_str().unwrap(),
+            &["smoke".into()],&[".himind-workflow-fixture".into()],&[],&[],"fixture-user").unwrap();
+        store.suspend_runtime(&full_mission.mission_id,"smoke",&json!({"code":"runtime_workspace_blocked"})).unwrap();
+        activate_for_client(&gateway,&mut third_client,"runtime.workspace.");
+        let full_resolution = json!({"workspace":workspace.to_string_lossy(),"action":"full_access",
+            "mission_id":full_mission.mission_id,"expected_plan_sha256":full_active.plan_sha256});
+        let denied = call_tool(&gateway,&mut third_client,"runtime.workspace.resolve",full_resolution.clone());
+        assert_eq!(denied["isError"],true,"{denied}");
+        assert_eq!(store.runtime_mode(&full_mission.mission_id,&full_active.plan_sha256).unwrap(),"default");
+        let mut fourth_client = initialize_client(&gateway,"Codex");
+        activate_for_client(&gateway,&mut fourth_client,"runtime.workspace.");
+        let full_resolved = call_tool_with_user_approval(&gateway,Arc::clone(&approval_manager),&mut fourth_client,
+            "runtime.workspace.resolve",full_resolution);
+        assert_eq!(full_resolved["isError"],false,"{full_resolved}");
+        assert_eq!(full_resolved["structuredContent"]["mode"],"full_access");
+        assert_eq!(full_resolved["structuredContent"]["mission"]["status"],"active");
+        assert_eq!(full_resolved["structuredContent"]["permission_prepared"],false);
+        assert!(full_resolved["structuredContent"]["repair"].is_null());
+        assert_eq!(crate::mission::MissionStore::open_default().unwrap().runtime_mode(&full_mission.mission_id,&full_active.plan_sha256).unwrap(),"full_access");
+        store.control(&full_mission.mission_id,"cancel").unwrap();
+        drop(fourth_client);
         drop(third_client);
         drop(store);
         let reopened = crate::mission::MissionStore::new(home.join("mission-runs.sqlite3"));
@@ -1720,6 +1907,7 @@ mod tests {
                 "mission_id": mission_id,
                 "clients": ["Codex", "Claude Code", "Qoder"],
                 "states_seen": ["awaiting_assignment", "awaiting_confirmation", "active", "completed"],
+                "plan_confirmed_through_mcp": true,
                 "idempotent_replay": true,
                 "conflicting_replay_rejected": true,
                 "source_sessions_closed_before_execution": true,
@@ -2740,7 +2928,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_mcp_exposes_mission_handoff_but_not_confirmation() {
+    fn connected_mcp_exposes_mission_plan_confirmation_with_approval() {
         let gateway = test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Connected);
         let result = handle_request(&gateway, "tools/list", json!({})).unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -2750,24 +2938,35 @@ mod tests {
             "mission.events.list",
             "mission.assignment.options",
             "mission.assignment.apply",
+            "mission.permission.set",
+            "mission.plan.confirm",
+            "mission.follow_up.add",
+            "mission.budget.extend",
+            "mission.verification.retry",
             "mission.control",
             "mission.workflow.export",
         ] {
             assert!(tools.iter().any(|tool| tool["name"] == name), "missing Mission control capability: {name}");
         }
         for (name, approval) in [
+            ("runtime.workspace.check", false),
+            ("runtime.workspace.resolve", true),
+            ("mission.permission.set", false),
             ("mission.get", false),
             ("mission.events.list", false),
             ("mission.assignment.options", false),
             ("mission.handoff.create", true),
             ("mission.assignment.apply", true),
+            ("mission.plan.confirm", true),
+            ("mission.follow_up.add", true),
+            ("mission.budget.extend", true),
+            ("mission.verification.retry", true),
             ("mission.control", true),
             ("mission.workflow.export", true),
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["approvalRequired"], approval, "{name}");
         }
-        assert!(!tools.iter().any(|tool| tool["name"] == "mission.plan.confirm"));
         assert!(!tools.iter().any(|tool| tool["name"] == "mission.paths.authorize"));
     }
 

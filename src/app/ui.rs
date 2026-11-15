@@ -22,7 +22,7 @@ use crate::app::builtin_ai_gateway::BuiltinAiCommandGateway;
 use crate::app::builtin_ai_model_sync::{
     BuiltinAiModelSync, BuiltinAiModelSyncResult, ModelSyncSnapshot,
 };
-use crate::app::builtin_ai_proxy::BuiltinAiProxy;
+use crate::app::builtin_ai_proxy::{BuiltinAiProxy, BuiltinAiProxyControl};
 use crate::app::builtin_ai_sync::BuiltinAiEventSync;
 use crate::app::commands::AgentState;
 use crate::approval::manager::ApprovalManager;
@@ -428,6 +428,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::test_mcp_server,
             super::commands::get_pending_approvals,
             super::commands::get_approval_history,
+            super::commands::get_mission_follow_up_review,
             super::commands::respond_approval,
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,
@@ -455,6 +456,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::start_builtin_ai_session,
             super::commands::get_builtin_ai_session_notice,
             super::commands::list_builtin_ai_sessions,
+            super::commands::list_workspace_session_history,
+            super::commands::get_workspace_session_transcript_page,
+            super::commands::get_workspace_session_resume_plan,
+            super::commands::resume_workspace_session,
+            super::commands::start_workspace_session_inspection,
+            super::commands::step_workspace_session_inspection,
+            super::commands::cancel_workspace_session_inspection,
             super::commands::stop_builtin_ai_session,
             super::commands::open_builtin_ai_web,
             super::commands::open_builtin_ai_window,
@@ -578,7 +586,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_agent_task_history,
             super::commands::list_local_activity,
             super::mission_commands::create_mission,
+            super::runtime_workspace::check_runtime_workspace,
+            super::runtime_workspace::set_mission_permission_mode,
+            super::runtime_workspace::resolve_runtime_workspace,
             super::mission_commands::control_mission,
+            super::mission_commands::increase_mission_budget,
             super::mission_commands::list_missions,
             super::mission_commands::get_mission,
             super::mission_commands::propose_mission_plan,
@@ -592,6 +604,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::mission_commands::export_mission_workflow,
             super::mission_commands::update_mission_task_execution,
             super::mission_dispatch::dispatch_next_mission_task,
+            super::mission_dispatch::retry_mission_verification,
             super::mission_commands::generate_mission_plan,
             super::mission_commands::generate_mission_follow_up,
             super::commands::get_plugin_catalog,
@@ -628,6 +641,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::fetch_saved_ai_service_models,
             super::commands::fetch_saved_ai_service_balance,
             super::commands::get_skill_catalog,
+            super::commands::read_skill_document,
             super::commands::import_local_skill,
             super::commands::import_github_skill,
             super::commands::import_github_skill_url,
@@ -2103,6 +2117,24 @@ pub(crate) fn builtin_ai_session_snapshots() -> Vec<BuiltinAiSessionSnapshot> {
         .collect();
     snapshots.sort_by(|left, right| left.workspace_root.cmp(&right.workspace_root));
     snapshots
+}
+
+pub(crate) fn builtin_ai_history_controls() -> Result<Vec<(String, BuiltinAiProxyControl)>, String>
+{
+    let sessions = builtin_ai_sessions()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用".to_string())?;
+    let mut controls = sessions
+        .values()
+        .map(|session| {
+            (
+                crate::extension_workspace::display_path(&session.workspace),
+                session.proxy.control(),
+            )
+        })
+        .collect::<Vec<_>>();
+    controls.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(controls)
 }
 
 fn first_builtin_ai_session_url() -> Option<String> {

@@ -3280,6 +3280,50 @@ pub(crate) fn cancel(
 ///
 /// `service` 为 `managed`（默认）时走 HiMind Dashboard 分发；
 /// 为 `custom:<id>` 时从本机自定义服务读取（API Key 经 DPAPI 解密）。
+pub(crate) fn custom_service_model_metadata(service_id: &str) -> Result<BTreeMap<String, crate::api::ai::AIModelMetadata>, Box<dyn Error>> {
+    let credential = resolve_credential(&Options::from_env(), "", "himind-runtime", &format!("custom:{service_id}"))?;
+    let mut metadata = credential.model_metadata;
+    if let Some(service) = crate::store::ai_services::list()?.into_iter().find(|service| service.id == service_id) {
+        let path = image_observations_path();
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(observations) = serde_json::from_slice::<BTreeMap<String, Value>>(&bytes) {
+                for model in std::iter::once(&service.model).chain(service.models.iter()) {
+                    if observations.get(&image_observation_key(&service, model)).is_some() {
+                        let entry = metadata.entry(model.clone()).or_default();
+                        if !entry.supports_image() { entry.input_modalities.push("image".into()); }
+                    }
+                }
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+fn image_observations_path() -> PathBuf {
+    crate::store::paths::agent_home().join("data/model-image-observations.json")
+}
+
+fn image_observation_key(service: &crate::store::ai_services::CustomAIService, model: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(format!("{}\n{}\n{}\n{}\n{}", service.id,
+        service.base_url, service.protocol.as_str(), service.updated_at, model).as_bytes()))
+}
+
+/// Only a successful image request records this fact. It is scoped to the
+/// service configuration and model, so it cannot enable every GPT alias or
+/// survive an unrelated provider configuration change.
+pub(crate) fn record_image_input_observed(service: &crate::store::ai_services::CustomAIService, model: &str) -> Result<(), Box<dyn Error>> {
+    let path = image_observations_path();
+    let _lock = crate::store::atomic_file::lock(&path)?;
+    let mut observations: BTreeMap<String, Value> = std::fs::read(&path).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    observations.insert(image_observation_key(service, model), json!({"service_id":service.id,
+        "model":model,"input":"image","source":"successful_image_request",
+        "observed_at":chrono::Utc::now().to_rfc3339()}));
+    crate::store::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&observations)?)?;
+    Ok(())
+}
+
 fn resolve_credential(
     options: &Options,
     expected_user_id: &str,
@@ -9525,6 +9569,7 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
 /// repairing here keeps the provider available after ordinary upgrades without
 /// requiring the user to repeat the import flow.
 pub(crate) fn reconcile_vscode_import(options: &Options) {
+    crate::store::ai_services::diagnose_startup();
     if !vscode_import_status_path(options).is_file() {
         return;
     }

@@ -82,8 +82,9 @@ function decodeEntry(value: string): CapabilityRouteEntry {
 /** 路由项的展示拆分：服务名与真正会用的模型。备用 chip 两行各放一段，
  *  菜单与 title 里拼回一整句。 */
 function entryParts(service: CustomAIService | undefined, capability: AIServiceCapability, model: string, fallbackId: string): { service: string; model: string } {
-  if (!service) return { service: fallbackId, model: model || '跟随服务默认' };
-  return { service: service.display_name, model: model || capabilityModel(service, capability) };
+  if (!service) return { service: fallbackId, model: model ? `${model}（服务未解析）` : '跟随服务默认（未解析）' };
+  const resolvedModel = capabilityModel(service, capability);
+  return { service: service.display_name, model: model || `跟随服务默认（${resolvedModel || '未解析'}）` };
 }
 
 /** 路由项的一行文案：服务名 + 真正会用的模型。 */
@@ -209,6 +210,7 @@ export function AiServiceRoutesPanel({
           {/* 页签已经写了「能力路由」，页头不再重复一遍 eyebrow；
               说明句收进标题的 title：它是解释，不是每次都要读的正文。 */}
           <h3 id="ai-routes-title" title="每个能力可以分别指定服务与模型；仅在同能力内降级">默认服务与备用顺序</h3>
+          <p className="ai-service-hint">这里是未显式选择时的 AI 服务默认与备用；任务显式选择优先，不覆盖已有任务。空模型跟随服务默认，无解析结果显示未解析。</p>
         </div>
         <button className="btn" onClick={onOpenServices}><Settings2 size={14} />管理 AI 服务</button>
       </header>
@@ -284,7 +286,7 @@ export function AiServiceRoutesPanel({
                 >
                   <option value="">自动选择</option>
                   {candidates.map(service => <option key={service.id} value={service.id}>{service.display_name}</option>)}
-                  {capability === 'chat' && managed.available ? <option value="" disabled>工作台模型服务（自动优先）</option> : null}
+                  {capability === 'chat' && managed.available ? <option value="" disabled>工作台 AI 服务（自动优先）</option> : null}
                 </select>
                 {showModelSelect ? <select
                   className="ai-service-route-select"

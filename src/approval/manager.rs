@@ -10,7 +10,7 @@ use super::types::*;
 
 const MAX_PENDING_APPROVALS: usize = 256;
 const APPROVAL_FACT_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_APPROVAL_TEXT_BYTES: usize = 16 * 1024;
+pub(super) const MAX_APPROVAL_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {

@@ -1,6 +1,24 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type { CatalogView } from '../pages/mcpCatalogView';
 
+// Only the host approval wrapper's target JSON may select a review.
+// Paths and nested/caller-supplied review references are never used.
+export function missionFollowUpReviewDigest(description: string): string | null {
+    const targets = description.split(/\r?\n/).filter(line => line.startsWith('目标：'));
+    if (targets.length !== 1) return null;
+    try {
+        const target: unknown = JSON.parse(targets[0].slice('目标：'.length));
+        if (!target || typeof target !== 'object' || Array.isArray(target)) return null;
+        const review = target as Record<string, unknown>;
+        return review.review_mode === 'full_review_required'
+            && typeof review.payload_sha256 === 'string'
+            && /^[0-9a-f]{64}$/.test(review.payload_sha256)
+            ? review.payload_sha256 : null;
+    } catch {
+        return null;
+    }
+}
+
 export type ExtensionIconInfo = {
   url: string;
   sha256: string;
@@ -148,6 +166,13 @@ export type AgentActivityItem = {
     finished_at?: string | null;
     updated_at: string;
     artifact_count?: number;
+    workspace_root?: string;
+    source_client?: string;
+    trigger_kind?: string;
+    /** Explicit persisted ownership, never inferred from a run ID. */
+    mission_id?: string;
+    mission_task_id?: string;
+    output_path?: string;
     workflow_run_id?: string;
     /** 当前步骤的执行角色；没有声明角色时为空，界面不渲染角色徽标。 */
     role_id?: string | null;
@@ -181,7 +206,10 @@ export type AgentActivityItem = {
 export type MissionStatus = 'draft' | 'awaiting_assignment' | 'planned' | 'awaiting_confirmation' | 'active' | 'waiting' | 'completed' | 'failed' | 'canceled';
 export type MissionTaskStatus = 'proposed' | 'blocked' | 'ready' | 'running' | 'awaiting_verification' | 'failed' | 'completed' | 'canceled';
 
+export type MissionExpertPin = { expert_id: string; expert_version: string; expert_digest: string };
+
 export type MissionExecutionBinding = {
+    expert?: MissionExpertPin | null;
     executor: string;
     model: string;
     role_id: string;
@@ -207,6 +235,32 @@ export type MissionBudget = {
     max_repair_attempts: number;
     max_total_tokens: number | null;
     max_cost: number | null;
+    currency?: string | null;
+};
+
+export type MissionEffectiveWait = {
+    contract_version: string;
+    plan_sha256: string;
+    cursor: number;
+    // verification_resume_required is the downstream producer contract; legacy
+    // v1 system_verification+can_resume is normalized by missionResumeAction.
+    reason: 'budget_exhausted' | 'environment_blocked' | 'manual_pause' | 'system_verification' | 'verification_resume_required' | 'unknown' | 'not_waiting' | string;
+    actor: 'user' | 'system' | 'unknown' | 'none' | string;
+    budget_reason: string | null;
+    environment_blocked: boolean;
+    can_increase_budget: boolean;
+    can_resume: boolean;
+};
+
+export type MissionBudgetIncrease = {
+    request_id: string;
+    expected_plan_sha256: string;
+    additional_rounds: number;
+    additional_repair_attempts?: number;
+    additional_minutes: number;
+    additional_tokens: number | null;
+    unlimited_tokens: boolean;
+    additional_cost: number | null;
 };
 
 export type MissionPlanProposal = {
@@ -218,6 +272,7 @@ export type MissionPlanProposal = {
 
 export type MissionWorkspace = {
     root: string;
+    permission_mode?: 'workspace_write' | 'full_access';
     read_scope: string[];
     write_scope: string[];
 };
@@ -227,7 +282,7 @@ export type MissionExecutionOption = {
     label: string;
     available: boolean;
     reason: string;
-    models: Array<{ alias: string; label: string }>;
+    models: Array<{ alias: string; label: string; service_id: string; service_label: string }>;
 };
 
 export type MissionWorkflowPin = {
@@ -255,6 +310,7 @@ export type MissionHandoffInput = {
 };
 
 export type MissionRoleAssignment = {
+    expert?: MissionExpertPin | null;
     role_id: string;
     label: string;
     executor: string;
@@ -291,6 +347,8 @@ export type MissionAssignmentOptions = {
     workflow_version: string;
     workflow_sha256: string;
     roles: MissionRoleOption[];
+    experts: ExpertSummary[];
+    executors: MissionExecutionOption[];
     source: string;
 };
 
@@ -315,6 +373,7 @@ export type MissionTaskView = {
     spec: MissionTaskSpec;
     status: MissionTaskStatus;
     attempt_run_id: string;
+    verification_run_id: string;
     verification_passed: boolean | null;
     evidence_refs: string[];
 };
@@ -352,6 +411,8 @@ export type MissionView = {
     proposed_tasks: MissionTaskSpec[];
     budget: MissionBudget | null;
     usage: LocalRunUsage | null;
+    cost_usage?: { buckets: Record<string, number>; unknown_runs: number; comparable: boolean };
+    effective_wait?: MissionEffectiveWait | null;
     handoff?: MissionHandoff | null;
     workflow?: MissionWorkflowPin | null;
     assignment?: MissionRoleAssignmentRecord | null;
@@ -381,10 +442,20 @@ export type LocalRunUsage = {
     billing_owner: string;
 };
 
+export interface RuntimeWorkspaceDiagnosis {
+    workspace: string;
+    status: 'permissions_ready' | 'permission_missing' | 'not_required';
+    fingerprint: string;
+    repairable: boolean;
+    message: string;
+    shell_verified: boolean;
+}
+
 export type MissionSnapshot = {
     mission: MissionView;
     events: MissionEvent[];
     cursor: number;
+    requires_snapshot?: boolean;
 };
 
 export type CatalogPage<T> = {
@@ -577,6 +648,7 @@ export type WorkflowArtifact = {
 };
 
 export type WorkflowPackage = {
+    roles?: Record<string, { label?: string; brief?: string }>;
     schema_version: string;
     id: string;
     version: string;
@@ -1324,6 +1396,93 @@ export type WorkspaceRegistryValidation = {
   missing_paths: string[];
   project_count: number;
   workspace_count: number;
+};
+
+export type SessionHistorySource = 'dsh' | 'acp' | 'claude_code' | 'codex' | 'opencode';
+export type WorkspaceSessionHistorySort = 'recent' | 'oldest' | 'title';
+
+export type WorkspaceSessionSummary = {
+  id: string;
+  source: SessionHistorySource;
+  native_id: string;
+  project_id?: string | null;
+  project_name?: string | null;
+  working_directory: string;
+  title: string;
+  updated_at?: string | null;
+  message_count?: number | null;
+  capabilities: {
+    can_preview: boolean;
+    can_open_original: boolean;
+    can_resume: boolean;
+  };
+};
+
+export type WorkspaceSessionHistory = {
+  sessions: WorkspaceSessionSummary[];
+  sources: Array<{
+    source: SessionHistorySource;
+    availability: 'available' | 'partial' | 'unavailable' | 'error';
+    session_count: number;
+    error_code?: string | null;
+  }>;
+  total: number;
+  next_cursor?: string | null;
+};
+
+export type WorkspaceSessionTranscriptMessage = {
+  id: string;
+  role: 'user' | 'assistant' | string;
+  content: string;
+  timestamp?: string | null;
+  files?: WorkspaceHistoryFile[];
+};
+
+export type WorkspaceHistoryFile = {
+  path: string;
+  operation: string;
+  kind: 'fragment' | 'patch' | 'reference' | 'recorded_content';
+  before?: string | null;
+  after?: string | null;
+  patch?: string | null;
+  truncated: boolean;
+};
+
+export type WorkspaceHistoryHit = {
+  session: WorkspaceSessionSummary;
+  message_id: string;
+  cursor?: string | null;
+  previous: Array<string | null>;
+  excerpt: string;
+  paths: string[];
+};
+
+export type WorkspaceHistoryInspection = {
+  token: string;
+  hits: WorkspaceHistoryHit[];
+  sources: WorkspaceSessionHistory['sources'];
+  scanned_pages: number;
+  scanned_sessions: number;
+  total_sessions: number;
+  done: boolean;
+  limited: boolean;
+  cancelled: boolean;
+  issues: string[];
+};
+
+export type WorkspaceSessionResumePlan = {
+  session_id: string;
+  client: string;
+  working_directory: string;
+  command: string;
+  available: boolean;
+};
+
+export type WorkspaceSessionTranscriptPage = {
+  session_id: string;
+  through_seq: number | null;
+  messages: WorkspaceSessionTranscriptMessage[];
+  next_cursor?: string | null;
 };
 
 export type AgentStorageCleanup = {
@@ -2272,6 +2431,18 @@ export type SkillRecord = {
     version_root: string;
     current: boolean;
     previous_version?: string | null;
+    /** 记录来自开发直挂注册表，而不是已安装到 builtin/managed/user 的副本。 */
+    development?: boolean;
+};
+
+/** 技能包根部的 SKILL.md 原文，只读预览用。 */
+export type SkillDocument = {
+    skill_id: string;
+    name: string;
+    version: string;
+    path: string;
+    size: number;
+    content: string;
 };
 
 export type SkillDependencyResolution = {
@@ -3662,7 +3833,16 @@ export const agentApi = {
         invoke<AuthoringWorkflowDraft>('export_mission_workflow', { missionId, workflowId, version, name, entrypoint }),
     listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
     getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),
+    checkRuntimeWorkspace: (workspace: string) => invoke<RuntimeWorkspaceDiagnosis>('check_runtime_workspace', { workspace }),
+    setMissionPermissionMode: (missionId: string, expectedPlanSha256: string, permissionMode: 'workspace_write' | 'full_access') =>
+        invoke<MissionView>('set_mission_permission_mode', { missionId, expectedPlanSha256, permissionMode }),
+    resolveRuntimeWorkspace: (input: { workspace: string; expected_fingerprint: string; action: 'full_access' | 'repair' | 'retry' | 'files_only'; mission_id: string; expected_plan_sha256: string }) =>
+        invoke<{ resolved: boolean; mission: MissionView | null }>('resolve_runtime_workspace', { input }),
     controlMission: (missionId: string, action: 'pause' | 'resume' | 'cancel') => invoke<MissionView>('control_mission', { missionId, action }),
+    retryMissionVerification: (missionId: string, taskId: string, input: { request_id: string; expected_plan_sha256: string; expected_verification_run_id: string }) =>
+        invoke<MissionView>('retry_mission_verification', { missionId, taskId, input }),
+    increaseMissionBudget: (missionId: string, input: MissionBudgetIncrease) =>
+        invoke<MissionView>('increase_mission_budget', { missionId, input }),
     proposeMissionPlan: (missionId: string, proposal: MissionPlanProposal) => invoke<MissionView>('propose_mission_plan', { missionId, proposal }),
     generateMissionPlan: (missionId: string) => invoke<MissionView>('generate_mission_plan', { missionId }),
     generateMissionFollowUp: (missionId: string) => invoke<MissionView>('generate_mission_follow_up', { missionId }),
@@ -4035,6 +4215,7 @@ export const agentApi = {
     activateSkillDraft: (skillId: string, version: string) => invoke<SkillActivationResult>('activate_skill_draft', { skillId, version }),
     submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
+    readSkillDocument: (skillId: string) => invoke<SkillDocument>('read_skill_document', { skillId }),
     /** 客户端 × 作用域 × 能力矩阵：功能开关的唯一答案来源。 */
     clientCapabilityMatrix: () => invoke<ClientCapabilityMatrix>('get_client_capability_matrix'),
     skillWorkspace: () => invoke<SkillWorkspaceStatus>('get_skill_workspace'),
@@ -4079,7 +4260,7 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string; allow_overwrite?: boolean }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -4104,6 +4285,7 @@ export const agentApi = {
             balanceAccessToken: input.balance_access_token,
             balanceUserId: input.balance_user_id,
             apiKey: input.api_key,
+            allowOverwrite: input.allow_overwrite ?? false,
         }),
     cloneAIService: (id: string) => invoke<CustomAIService>('clone_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
@@ -4113,6 +4295,7 @@ export const agentApi = {
     syncAIClient: (target: string, expectedRevision?: string, acceptDrift?: boolean) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision, acceptDrift }),
     syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
+    getMissionFollowUpReview: (digest: string) => invoke<unknown>('get_mission_follow_up_review', { digest }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
     setApprovalProfile: (profile: string, confirmed = false, durationSeconds?: number) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed, ...(durationSeconds !== undefined ? { durationSeconds } : {}) }),
     setApprovalNotificationMode: (mode: string) => invoke<{ profile: string; notification_mode: string }>('set_approval_notification_mode', { mode }),
@@ -4134,6 +4317,25 @@ export const agentApi = {
     openAgentDirectory: () => invoke('open_agent_directory'),
     storageReport: (keep?: number) => invoke<{ report: AgentStorageReport }>('get_agent_storage_report', { keep: keep ?? null }),
     workspaceRegistry: () => invoke<WorkspaceRegistrySnapshot>('get_workspace_registry'),
+    listWorkspaceSessionHistory: (projectId: string, cursor?: string, query?: string, source?: SessionHistorySource, sort?: WorkspaceSessionHistorySort) =>
+      invoke<WorkspaceSessionHistory>('list_workspace_session_history', {
+        projectId,
+        cursor: cursor ?? null,
+        query: query ?? null,
+        source: source ?? null,
+        sort: sort ?? 'recent',
+      }),
+    getWorkspaceSessionTranscriptPage: (projectId: string, sessionId: string, cursor?: string) =>
+      invoke<WorkspaceSessionTranscriptPage>('get_workspace_session_transcript_page', {
+        projectId,
+        sessionId,
+        cursor: cursor ?? null,
+      }),
+    getWorkspaceSessionResumePlan: (projectId: string, sessionId: string) => invoke<WorkspaceSessionResumePlan>('get_workspace_session_resume_plan', { projectId, sessionId }),
+    resumeWorkspaceSession: (projectId: string, sessionId: string) => invoke<void>('resume_workspace_session', { projectId, sessionId }),
+    startWorkspaceSessionInspection: (projectId: string, sessionId: string | undefined, query: string, mode: 'text' | 'prompts' | 'files', source?: SessionHistorySource) => invoke<string>('start_workspace_session_inspection', { projectId, sessionId: sessionId ?? null, query, mode, source: source ?? null }),
+    stepWorkspaceSessionInspection: (projectId: string, token: string) => invoke<WorkspaceHistoryInspection>('step_workspace_session_inspection', { projectId, token }),
+    cancelWorkspaceSessionInspection: (projectId: string, token: string) => invoke<void>('cancel_workspace_session_inspection', { projectId, token }),
     upsertWorkspaceProject: (input: Record<string, unknown>) => invoke<WorkspaceRegistryProject>('upsert_workspace_project', { input }),
     deleteWorkspaceProject: (projectId: string, force = false) => invoke<{ deleted: string }>('delete_workspace_project', { projectId, force }),
     bindWorkspacePath: (input: Record<string, unknown>) => invoke<unknown>('bind_workspace_path', { input }),

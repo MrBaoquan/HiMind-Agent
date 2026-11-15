@@ -233,8 +233,8 @@ assert.match(
 );
 assert.match(
   page,
-  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind !== 'user';/,
-  '审批入口只认 waiting 且非用户暂停',
+  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind === 'approval' && Boolean\(entry\.currentStepId\);/,
+  '审批必须是真实approval且有步骤标识',
 );
 assert.match(
   page,
@@ -254,7 +254,7 @@ assert.match(
 // 等审批的判定必须排除用户暂停，否则暂停中的运行会同时出现「继续」和「批准」。
 assert.match(
   page,
-  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind !== 'user';/,
+  /const awaitingApproval = entry\.status === 'waiting' && entry\.pauseKind === 'approval' && Boolean\(entry\.currentStepId\);/,
   '用户暂停的运行不得出现审批按钮',
 );
 assert.match(
@@ -270,3 +270,19 @@ assert.equal(
 );
 
 console.log('task view checks passed');
+
+// Environment waiting survives later telemetry and cannot leak across plans.
+import {missionRuntimeBlocked, missionStatusLabel, missionNextAction} from '../src/pages/missionView.ts';
+import type {MissionView, MissionEvent} from '../src/services/agentApi.ts';
+const environmentMission = {status:'waiting',plan_sha256:'current-plan', confirmation:{plan_sha256:'current-plan'}, effective_wait:{contract_version:'mission.wait.v1',plan_sha256:'current-plan',cursor:2,reason:'environment_blocked',actor:'user',environment_blocked:true,can_resume:false,can_increase_budget:true}} as MissionView;
+const runtimeEvents = [
+  {event_type:'runtime_workspace_blocked',payload:{plan_sha256:'current-plan'}},
+  {event_type:'task_progress',payload:{}},
+] as MissionEvent[];
+assert.equal(missionRuntimeBlocked(environmentMission,runtimeEvents),true);
+assert.equal(missionStatusLabel(environmentMission,runtimeEvents),'命令环境待处理');
+assert.equal(missionNextAction(environmentMission,runtimeEvents),'选择工作区授权或仅用文件工具继续');
+assert.equal(missionRuntimeBlocked({...environmentMission,plan_sha256:'new-plan'},runtimeEvents),false);
+assert.equal(missionRuntimeBlocked({...environmentMission,status:'completed'},runtimeEvents),false);
+assert.equal(missionRuntimeBlocked(environmentMission,[...runtimeEvents,{event_type:'runtime_workspace_resolved'} as MissionEvent]),true, 'historical events cannot override the authoritative DTO');
+assert.equal(missionRuntimeBlocked({...environmentMission,effective_wait:null},runtimeEvents),false, 'missing association stays unknown');

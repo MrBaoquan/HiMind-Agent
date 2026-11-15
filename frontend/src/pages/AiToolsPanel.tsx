@@ -132,12 +132,13 @@ export function AiToolsPanel({
   const managed: ManagedAIServiceSummary = aiServices?.managed ?? { available: false };
   // 对话主选就是对话路由的第一项（ADR 0023），不再读过渡期投影键。
   const activeServiceId = primaryRouteServiceId(aiServices?.custom?.capability_routes, 'chat');
-  const managedLabel = managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
+  const managedLabel = managed.available ? '工作台 AI 服务' : '工作台 AI 服务（未就绪）';
   const gatewayClients = gatewayStatus?.gateway_clients ?? [];
   const gatewayClientSet = new Set(gatewayClients.map((entry) => entry.client));
   const gatewayProfileByClient = new Map(gatewayClients.map((entry) => [entry.client, entry]));
   const clientStatusByTarget = new Map(clients.map((entry) => [entry.target, entry]));
-  const pendingClientSync = clients.filter((entry) => entry.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(entry.sync_state ?? ''));
+  const pendingClientSync = [...clientStatusByTarget.values()].filter((entry) => entry.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(entry.sync_state ?? ''));
+  const snapshotTime = useMemo(() => new Date().toISOString(), [targets, aiServices, acpProfiles]);
 
   const connections = useMemo(
     () => buildToolConnections({ targets, clients, acp: acpProfiles }),
@@ -148,17 +149,17 @@ export function AiToolsPanel({
   const hasAnySource = managed.available || customServices.length > 0;
   const detected = connections.filter((item) => item.detected);
   const attention = detected.filter((item) => item.state === 'attention');
-  const ready = detected.filter((item) => item.state === 'ready');
-  const idle = detected.filter((item) => item.state === 'idle');
+  const ready = detected.filter((item) => item.ready);
+  const idle = detected.filter((item) => !item.ready && !item.needsAction);
   const undetected = connections.filter((item) => !item.detected);
   const actionable = connections.filter((item) => item.mcp && item.mcp.detected && item.mcp.state !== 'configured' && item.mcp.supports_auto_configure);
 
   const visible = filter === 'attention' ? attention : filter === 'ready' ? ready : filter === 'idle' ? idle : detected;
 
-  const headline = attention.length ? `${attention.length} 个工具待处理` : '工具已就绪';
+  const headline = `${ready.length} 个工具可运行 · ${attention.length} 个需行动`;
   const headlineDescription = attention.length
     ? '接入、模型、执行在这里一次管好。'
-    : '接入、模型、执行都已接好。';
+    : `${idle.length} 个未接入；可运行与需行动可同时成立。`;
 
   const gatewayPortEditable = gatewayClients.length === 0;
   const [portDraft, setPortDraft] = useState('');
@@ -203,10 +204,10 @@ export function AiToolsPanel({
           const accepted = await confirm({
             title: `覆盖 ${target} 的外部修改？`,
             description: status?.drift_detail
-              || 'HiMind 托管字段已被修改，继续将覆盖这些改动。',
-            confirmText: '覆盖并更新',
+              || '当前接口未提供字段级差异；为避免覆盖未知改动，请取消并检查配置文件。',
+            confirmText: status?.drift_detail ? '确认差异并覆盖更新' : '返回检查配置',
           });
-          if (!accepted) return;
+          if (!accepted || !status?.drift_detail) return;
         }
         const result: AIProviderSyncResult = await agentApi.syncAIClient(
           target,
@@ -247,7 +248,7 @@ export function AiToolsPanel({
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">工具接入</span>
             <strong>{headline}</strong>
-            <span>{headlineDescription}</span>
+            <span>{headlineDescription} 快照：{snapshotTime}</span>
           </div>
         </div>
         {/* 计数只出现一次：工具多到摆得下筛选按钮时交给按钮，概览卡不再重复一遍。 */}
@@ -304,7 +305,7 @@ export function AiToolsPanel({
       <section className="ai-client-section">
         <div className="ai-section-heading">
           <div><h3>工具</h3><span>展开任一工具，管理它的接入、模型与执行接线。</span></div>
-          {detected.length >= FILTER_ROW_MIN_TOOLS ? (
+          {detected.length > 0 ? (
             <div className="ai-binding-filter" role="group" aria-label="筛选工具">
               <button type="button" aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>全部 <span>{detected.length}</span></button>
               <button type="button" aria-pressed={filter === 'attention'} onClick={() => setFilter('attention')}>待处理 <span>{attention.length}</span></button>
@@ -640,7 +641,7 @@ function ToolRow(props: {
                 {!hasUsableSource ? (
                   <button type="button" className="btn btn-primary ai-service-tool-btn" onClick={onOpenModelSources}><PlugZap size={14} />新增 AI 服务</button>
                 ) : modelImported ? <>
-                  {needsSync ? <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy} title={syncReasonText(clientStatus)} onClick={onSyncClient}>{rowBusy ? <BusyIndicator size={11} /> : <RefreshCw size={14} />}更新配置</button> : null}
+                  {needsSync ? <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy} title={syncReasonText(clientStatus)} onClick={onSyncClient}>{rowBusy ? <BusyIndicator size={11} /> : <RefreshCw size={14} />}{isDrifted(clientStatus) ? '查看差异' : '更新配置'}</button> : null}
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：真实地址与密钥会写回工具' : '切到网关：密钥留在 Agent'} onClick={() => void switchBindingMode(gatewayMode ? 'direct' : 'gateway')}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '取消后该工具恢复自己的模型配置，服务仍可再分发。', confirmText: '取消分发' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}取消分发</button>
                 </> : (

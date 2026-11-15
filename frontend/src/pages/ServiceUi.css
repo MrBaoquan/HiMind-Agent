@@ -1,0 +1,44 @@
+.ai-page .ai-client-copy > strong,
+.ai-service-modal .ai-service-preset-chip strong { font-size: var(--fs-body); }
+.ai-providers-view { min-width: 0; container: service-providers / inline-size; }
+@container service-providers (max-width: 479.98px) {
+  .ai-providers-view .ai-overview { grid-template-columns: minmax(0, 1fr); padding: var(--space-3); }
+  .ai-providers-view .ai-overview-actions { grid-column: 1; grid-row: auto; width: 100%; }
+  .ai-providers-view .ai-overview-actions .btn-primary { flex: 1; }
+}
+.ai-page .ai-section-heading h3,
+.ai-page .ai-routes-header h3,
+.ai-service-modal .modal-header h3 { font-size: var(--fs-title); }
+.ai-service-modal .ai-service-step,
+.ai-service-modal .ai-service-step b,
+.ai-service-modal .ai-service-field span,
+.ai-service-modal .ai-service-preset-chip span,
+.ai-service-modal .ai-service-preset-source,
+.ai-service-modal .ai-service-form-error,
+.ai-service-modal .ai-service-form-notice,
+.ai-service-modal .ai-capability-option strong,
+.ai-service-modal .ai-capability-option small,
+.ai-page .ai-service-connection-check,
+.ai-page .ai-service-balance-copy > small,
+.ai-page .ai-service-balance-copy > .ai-service-balance-label,
+.ai-page .ai-route-row-head,
+.ai-page .ai-route-axis,
+.ai-page .ai-route-state,
+.ai-page .ai-route-test { font-size: var(--fs-meta); }
+.ai-service-modal .ai-service-preset-chip { cursor: pointer; min-height: 32px; }
+.ai-service-modal .ai-service-preset-chip input { width: 16px; height: 16px; flex-shrink: 0; accent-color: var(--primary); }
+.ai-service-modal .ai-service-preset-tab { min-height: 32px; }
+.ai-page :is(button, a, select, input):focus-visible,
+.ai-service-modal :is(button, a, select, input):focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ai-service-modal .ai-service-preset-chip:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ai-service-modal .ai-service-step { flex-wrap: wrap; overflow-wrap: anywhere; }
+.ai-service-modal .ai-service-step:not(:last-child)::after { display: none; }
+.ai-service-modal .ai-service-preset-source { white-space: normal; }
+.ai-service-modal .ai-service-field input,
+.ai-service-modal .ai-service-field select { min-width: 0; border-color: var(--control-border); }
+.ai-page .ai-service-search,
+.ai-page .ai-service-filter { border-color: var(--control-border); }
+.ai-page .ai-route-fallback-chip :is(b, em) { white-space: normal; overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .ai-page *, .ai-service-modal * { animation: none !important; transition-property: opacity !important; transition-duration: 80ms !important; scroll-behavior: auto !important; }
+}

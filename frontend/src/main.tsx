@@ -38,6 +38,8 @@ const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'Schedule
 import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionActivationReceipt, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type GatewayProfile, type GatewayProfileInput, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 
 import { hydrateWorkflowOptionSources } from './pages/workflowOptionSources';
+import { useMissionCatalog } from './pages/useMissionCatalog';
+import { EMPTY_TASK_CONTEXT, missionTodo, workflowNeedsUser, type TaskListContext } from './pages/taskCenterModel';
 import { MISSION_OPEN_EVENT, missionIdFromBootstrap, type MissionOpenBootstrap } from './pages/missionDeepLink';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
 import { listen } from '@tauri-apps/api/event';
@@ -123,7 +125,7 @@ function settingsWindowQuery(): { panel: SettingsWindowPanel; section: SettingsS
       panel: route.panel,
       section: route.section,
       tab: route.tab,
-      aiTab: aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',
+      aiTab: aiTab === 'services' || aiTab === 'gateway' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',
     };
   } catch {
     return null;
@@ -256,6 +258,11 @@ function AgentApp() {
   const [schedulePresetTarget, setSchedulePresetTarget] = useState('');
   // 跨页面打开 Workflow Run 时保留目标，避免只能回到列表里手动查找。
   const [workflowRunTarget, setWorkflowRunTarget] = useState('');
+  const missionCatalog = useMissionCatalog(!isSettingsWindow);
+  const taskListContext = useRef<TaskListContext>(EMPTY_TASK_CONTEXT);
+  const [returnToTasks, setReturnToTasks] = useState(false);
+  const saveTaskListContext = useRef((context: TaskListContext) => { taskListContext.current = context; }).current;
+  const saveTaskMission = useRef((missionId: string) => { setMissionTarget(current => ({...current, missionId})); }).current;
   // Deep links carry a revision as well as an ID: reopening the same Mission after
   // returning to the list must still be observable by TaskCenterPage.
   const [missionTarget, setMissionTarget] = useState(() => ({ missionId: initialMissionOpen(), revision: 0 }));
@@ -2110,11 +2117,9 @@ function AgentApp() {
       workspaceRequestRevision={builtinAiWorkspaceRequest.revision}
     />;
 
-  const workflowApprovalCount = workflowCenter?.runs.filter(item => {
-    if (item.run.status !== 'waiting') return false;
-    const waitingKind = item.interaction_request?.kind || item.waiting_kind;
-    return waitingKind !== 'external_wait';
-  }).length || 0;
+  const workflowUserTodos = (workflowCenter?.runs || []).filter(workflowNeedsUser);
+  const missionTodos = missionCatalog.missions.flatMap(mission => { const todo = missionTodo(mission, missionCatalog.activities); return todo ? [todo] : []; });
+  const workflowApprovalCount = workflowUserTodos.length + missionTodos.length;
   // 顶栏状态入口、侧栏徽标、常驻运行条共用同一份口径：排队、运行、等待处理的运行都算「在跑」。
   const activeRuns = (workflowCenter?.runs || []).filter(item => ['queued', 'running', 'waiting'].includes(item.run.status));
   const activeRunCount = activeRuns.length;
@@ -2149,6 +2154,7 @@ function AgentApp() {
 
   function navigate(target: NavigationTarget) {
     const nextPage = typeof target === 'string' ? target : target.page;
+    setReturnToTasks(false);
     const missionId = typeof target !== 'string' ? missionIdFromBootstrap({ mission_id: target.missionId }) : '';
     if (missionId) {
       setMissionTarget(current => ({ missionId, revision: current.revision + 1 }));
@@ -2251,7 +2257,7 @@ function AgentApp() {
       onRemoveTarget={removeMcpTarget}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
-      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型来源已保存'); } catch (error) { notify('error', formatError(error, '保存模型来源失败')); throw error; } }}
+      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', 'AI 服务已保存'); } catch (error) { notify('error', formatError(error, '保存 AI 服务失败')); throw error; } }}
       onSetCapabilityRoutes={async (capability, entries) => {
         try {
           await agentApi.setCapabilityRoutes(capability, entries);
@@ -2263,15 +2269,15 @@ function AgentApp() {
           throw error;
         }
       }}
-      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型来源已删除', '删除模型来源失败')}
+      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, 'AI 服务已删除', '删除 AI 服务失败')}
       onCloneAIService={async (id) => {
         try {
           const cloned = await agentApi.cloneAIService(id);
           await refreshAIServices();
-          notify('success', `已克隆为「${cloned.display_name}」`);
+          notify('success', `AI 服务已复制为「${cloned.display_name}」`);
           return cloned;
         } catch (error) {
-          notify('error', formatError(error, '克隆模型来源失败'));
+          notify('error', formatError(error, '复制 AI 服务失败'));
           throw error;
         }
       }}
@@ -2330,8 +2336,11 @@ function AgentApp() {
     />;
     if (page === 'inbox') return <InboxPage
       approvals={approvals}
-      workflowRuns={(workflowCenter?.runs || []).filter(item => item.run.status === 'waiting')}
-      onRefresh={() => { void run(async () => { await Promise.all([refreshApprovals(), refreshWorkflowCenter()]); }); }}
+      workflowRuns={workflowUserTodos}
+      missionTodos={missionTodos}
+      missionError={missionCatalog.error}
+      onOpenMission={(missionId) => navigate({page:'tasks', missionId})}
+      onRefresh={() => { void run(async () => { await Promise.all([refreshApprovals(), refreshWorkflowCenter(), missionCatalog.refresh()]); }); }}
       onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await Promise.all([refreshApprovals(), refreshWorkflowCenter(false, true), refreshStatus()]); }, undefined, '审批处理失败')}
       onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
       onOpenApprovalHistory={() => navigate('approvals')}
@@ -2342,10 +2351,15 @@ function AgentApp() {
       currentTask={status?.current_task || null}
       initialMissionId={missionTarget.missionId}
       missionNavigationRevision={missionTarget.revision}
+      missionCatalog={missionCatalog}
+      initialContext={taskListContext.current}
+      onContextChange={saveTaskListContext}
+      onMissionSelectionChange={saveTaskMission}
+      onOpenWorkflowLibrary={() => { setReturnToTasks(true); setWorkflowRunTarget(''); setPage('workflows'); }}
       onLoadTaskHistory={agentApi.taskHistory}
       onLoadLocalActivity={agentApi.localActivity}
       onOpenDashboard={() => run(agentApi.openDashboard)}
-      onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
+      onOpenWorkflowRun={(runId) => { setReturnToTasks(true); setWorkflowRunTarget(runId); setPage('workflows'); }}
       onCancelRun={cancelWorkflowRun}
       onApproveRun={approveWorkflowRun}
       onRejectRun={rejectWorkflowRun}
@@ -2431,6 +2445,7 @@ function AgentApp() {
       mode="runs"
       onOpenCapabilities={() => openInstalled('workflow')}
       initialRunId={workflowRunTarget}
+      onBackToTasks={returnToTasks ? () => { setReturnToTasks(false); setPage('tasks'); } : undefined}
       loading={workflowLoading}
       error={workflowError}
       onRefresh={() => { void refreshWorkflowCenter(); }}
@@ -2630,6 +2645,7 @@ function AgentApp() {
       onPlanMarketplace={agentApi.planOrganizationSkillInstall}
       clientMatrix={clientMatrix}
       onLoadVersions={agentApi.skillVersions}
+      onLoadDocument={agentApi.readSkillDocument}
       onPickSkillLocation={agentApi.pickSkillLocation}
       onInstallMarketplace={(skillId, version, optionalPluginIds, clients, location) => runSkillOperation(`market:${skillId}`, async () => {
         const result = await agentApi.installOrganizationSkill(skillId, version, optionalPluginIds, undefined, undefined, undefined, clients, location || undefined);
@@ -2786,7 +2802,7 @@ function AgentApp() {
             refreshBuiltinAiToolContext(),
           ]);
           if (failures.length) {
-            notify('error', `一键构建：${succeeded.size}/${projects.length} 成功，${failures.length} 项失败，${skipped.length} 项跳过`);
+            notify('error', `构建完成：${succeeded.size}/${projects.length} 成功，${failures.length} 项失败，${skipped.length} 项跳过`);
           } else {
             notify('success', `已构建并激活 ${succeeded.size} 个本机开发版${skipped.length ? `，跳过 ${skipped.length} 项` : ''}`);
           }

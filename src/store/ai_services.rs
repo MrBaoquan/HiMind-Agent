@@ -219,6 +219,44 @@ fn normalize_endpoints(
     normalized
 }
 
+/// 保存时的端点归一：先按协议把 Base URL 规范成 API 根，再按协议族去重。
+/// 与读取时的 `normalize_endpoints` 不同，这里会剥掉误填的完整端点后缀。
+fn normalize_endpoints_for_save(
+    base_url: &str,
+    protocol: &AIServiceProtocol,
+    endpoints: Vec<AIServiceEndpoint>,
+) -> Result<Vec<AIServiceEndpoint>, Box<dyn Error>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    let candidates = if endpoints.is_empty() {
+        vec![AIServiceEndpoint::new(protocol.clone(), base_url.to_string())]
+    } else {
+        endpoints
+    };
+    for endpoint in candidates {
+        validate_base_url_for_save(&endpoint.base_url, &endpoint.protocol)?;
+        let protocol = endpoint
+            .protocol
+            .family()
+            .normalize_protocol(&endpoint.protocol);
+        let base_url = normalize_api_base_url(&endpoint.base_url, &protocol);
+        if base_url.is_empty() {
+            continue;
+        }
+        if seen.insert(protocol.family()) {
+            normalized.push(AIServiceEndpoint { protocol, base_url });
+        }
+    }
+    if normalized.is_empty() {
+        validate_base_url_for_save(base_url, protocol)?;
+        normalized.push(AIServiceEndpoint::new(
+            protocol.clone(),
+            normalize_api_base_url(base_url, protocol),
+        ));
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CustomAIService {
     pub id: String,
@@ -487,13 +525,37 @@ pub(crate) fn test_service_with_endpoints(
     }
 }
 
+// One lock identity covers the directory AND its route selection. Never acquire
+// it inside the unlocked helpers: callers hold it over the complete read/modify/write.
+fn directory_lock() -> Result<super::atomic_file::AtomicFileLock, Box<dyn Error>> {
+    Ok(super::atomic_file::lock(&store_path()?)?)
+}
+
 fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
+    let _lock = directory_lock()?;
+    load_all_unlocked()
+}
+
+fn load_all_unlocked() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
     let path = store_path()?;
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    let persisted: BTreeMap<String, PersistedCustomAIService> =
-        serde_json::from_slice(&fs::read(path)?)?;
+    let persisted = match parse_directory(&fs::read(&path)?) {
+        Ok(value) => value,
+        Err(_) => {
+            let backup = fs::read(super::atomic_file::backup_path(&path))?;
+            let valid = parse_directory(&backup)?;
+            // Keep the failed bytes for investigation; never rotate them into .bak.
+            super::atomic_file::write_without_backup(&path.with_extension("json.corrupt"), &fs::read(&path)?)?;
+            super::atomic_file::write_without_backup(&path, &backup)?;
+            use sha2::{Digest, Sha256};
+            let version = format!("{:x}", Sha256::digest(&backup));
+            super::atomic_file::write_without_backup(&path.with_extension("recovery.json"),
+                &serde_json::to_vec(&serde_json::json!({"code":"previous_valid_version_restored", "version_sha256":version}))?)?;
+            valid
+        }
+    };
     Ok(persisted
         .into_iter()
         .map(|(id, item)| {
@@ -520,13 +582,31 @@ fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
         .collect())
 }
 
+fn parse_directory(bytes: &[u8]) -> Result<BTreeMap<String, PersistedCustomAIService>, Box<dyn Error>> {
+    let values: BTreeMap<String, PersistedCustomAIService> = serde_json::from_slice(bytes)?;
+    for (id, service) in &values {
+        if normalize_id(id)? != *id || service.id != *id || service.display_name.trim().is_empty() {
+            return Err("invalid service snapshot identity".into());
+        }
+        validate_base_url(&service.base_url)?;
+        // Validate protected values without including credentials in diagnostics.
+        unprotect_secret_for_current_user(&service.encrypted_api_key)
+            .map_err(|_| "invalid protected credential in snapshot")?;
+        if let Some(token) = &service.encrypted_balance_access_token {
+            unprotect_secret_for_current_user(token)
+                .map_err(|_| "invalid protected balance credential in snapshot")?;
+        }
+    }
+    Ok(values)
+}
+
 fn save_all(services: &BTreeMap<String, CustomAIService>) -> Result<(), Box<dyn Error>> {
     let path = store_path()?;
     let persisted = services
         .iter()
         .map(|(id, item)| (id.clone(), PersistedCustomAIService::from(item)))
         .collect::<BTreeMap<_, _>>();
-    fs::write(path, serde_json::to_vec_pretty(&persisted)?)?;
+    super::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&persisted)?)?;
     Ok(())
 }
 
@@ -543,6 +623,65 @@ fn validate_base_url(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 保存时的 Base URL 校验：在通用校验之上拒绝 query/fragment，
+/// 并拦住“协议与完整端点路径明显不匹配”的写法。
+fn validate_base_url_for_save(
+    value: &str,
+    protocol: &AIServiceProtocol,
+) -> Result<(), Box<dyn Error>> {
+    validate_base_url(value)?;
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| "base_url 必须是合法的 http/https URL".to_string())?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "base_url 不应包含 query 或 fragment；请填写 API 根地址，例如 https://api.example.com/v1"
+                .into(),
+        );
+    }
+    if let Some(family) = endpoint_family_for_path(url.path()) {
+        if family != protocol.family() {
+            let expected = match family {
+                AIServiceProtocolFamily::Anthropic => "Anthropic Messages",
+                AIServiceProtocolFamily::OpenAi => "OpenAI 兼容",
+            };
+            return Err(format!(
+                "base_url 看起来是 {expected} 端点，但接口类型是 {}；请填写 API 根地址，或切换接口类型",
+                protocol.as_str()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// 路径是否以某个已知的完整推理端点结尾；用于保存时识别误填。
+fn endpoint_family_for_path(path: &str) -> Option<AIServiceProtocolFamily> {
+    let path = path.trim_end_matches('/');
+    if path.ends_with("/v1/messages") || path.ends_with("/messages") {
+        return Some(AIServiceProtocolFamily::Anthropic);
+    }
+    if path.ends_with("/v1/chat/completions")
+        || path.ends_with("/chat/completions")
+        || path.ends_with("/v1/responses")
+        || path.ends_with("/responses")
+    {
+        return Some(AIServiceProtocolFamily::OpenAi);
+    }
+    None
+}
+
+/// 远端明文 HTTP 会让 API Key 在局域网/公网上裸奔；只允许回环地址。
+fn is_remote_http_base_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 fn normalize_id(id: &str) -> Result<String, Box<dyn Error>> {
     let id = id.trim().to_string();
     if id.is_empty() || id.len() > 64 {
@@ -555,6 +694,15 @@ fn normalize_id(id: &str) -> Result<String, Box<dyn Error>> {
         return Err("服务 ID 只允许字母、数字、下划线和连字符".into());
     }
     Ok(id)
+}
+
+/// 判断服务 ID 是否已存在；保存命令用它阻止新增静默覆盖。
+pub(crate) fn exists(id: &str) -> Result<bool, Box<dyn Error>> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Ok(false);
+    }
+    Ok(load_all()?.contains_key(id))
 }
 
 pub(crate) fn list() -> Result<Vec<CustomAIService>, Box<dyn Error>> {
@@ -571,14 +719,36 @@ pub(crate) fn list() -> Result<Vec<CustomAIService>, Box<dyn Error>> {
     Ok(services)
 }
 
+/// Startup diagnostics are intentionally read-only for references. The directory
+/// loader may restore a validated encrypted previous version, but routes are never
+/// reassigned or silently repaired here; an explicit delete retry converges them.
+pub(crate) fn diagnose_startup() {
+    match public_snapshot() {
+        Ok(snapshot) => {
+            if snapshot["consistency_diagnostics"].as_array().is_some_and(|items| !items.is_empty()) {
+                eprintln!("AI service configuration: dangling_service_reference; retry deletion or explicitly edit routes");
+            }
+        }
+        Err(_) => eprintln!("AI service configuration: invalid_snapshot; explicit configuration repair required"),
+    }
+}
+
 pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
-    let services = list()?;
-    let routes = load_selection()?.capability_routes;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?.into_values().collect::<Vec<_>>();
+    services.sort_by(|left, right| right.created_at.cmp(&left.created_at).then_with(|| left.id.cmp(&right.id)));
+    let routes = load_selection_unlocked()?.capability_routes;
+    // Read-only startup/settings diagnostic: never select a replacement service.
+    let diagnostics = routes.iter().flat_map(|(capability, entries)| {
+        entries.iter().filter(|entry| !services.iter().any(|s| s.id == entry.service_id))
+            .map(move |entry| serde_json::json!({"code":"dangling_service_reference", "capability":capability, "service_id":entry.service_id}))
+    }).collect::<Vec<_>>();
     Ok(serde_json::json!({
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
         "balances": crate::store::ai_service_balances::list(),
         // 唯一事实源：每个能力一条有序路由表（ADR 0023）。
         "capability_routes": routes,
+        "consistency_diagnostics": diagnostics,
     }))
 }
 
@@ -841,19 +1011,32 @@ fn upsert_internal(
     balance_user_id: Option<String>,
 ) -> Result<CustomAIService, Box<dyn Error>> {
     let id = normalize_id(&input.id)?;
-    validate_base_url(&input.base_url)?;
+    validate_base_url_for_save(&input.base_url, &input.protocol)?;
     if input.display_name.trim().is_empty() {
         return Err("display_name 不能为空".into());
     }
     // 端点列表是事实源，标量只是它的第一条投影：先归一，再看标量该写什么。
-    let endpoints = normalize_endpoints(&input.base_url, &input.protocol, input.endpoints);
-    for endpoint in &endpoints {
-        validate_base_url(&endpoint.base_url)?;
-    }
+    let endpoints =
+        normalize_endpoints_for_save(&input.base_url, &input.protocol, input.endpoints)?;
     let primary_endpoint = endpoints
         .first()
         .cloned()
-        .expect("normalize_endpoints always returns at least one endpoint");
+        .expect("normalize_endpoints_for_save always returns at least one endpoint");
+    // 远端明文 HTTP 不阻止保存（局域网自建服务仍可能需要），但必须在日志里留下告警。
+    let mut warned_http = std::collections::BTreeSet::new();
+    for endpoint in &endpoints {
+        if is_remote_http_base_url(&endpoint.base_url)
+            && warned_http.insert(endpoint.base_url.clone())
+        {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "AI 服务 {} 使用远端 HTTP Base URL，API Key 将以明文传输：{}",
+                    id, endpoint.base_url
+                ),
+            );
+        }
+    }
     let has_media_model = !input.image_model.trim().is_empty()
         || input
             .media
@@ -863,7 +1046,8 @@ fn upsert_internal(
         return Err("至少配置一个对话或媒体模型".into());
     }
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let existing = services.get(&id);
     let normalized_base_url = primary_endpoint.base_url.clone();
     let balance_profile_id = profile_override
@@ -1040,7 +1224,8 @@ fn next_copy_name(source_name: &str, services: &BTreeMap<String, CustomAIService
 /// 不经过前端明文；路由、默认服务与客户端分发关系不复制。
 pub(crate) fn duplicate(id: &str) -> Result<CustomAIService, Box<dyn Error>> {
     let source_id = normalize_id(id)?;
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let source = services
         .get(&source_id)
         .cloned()
@@ -1059,14 +1244,20 @@ pub(crate) fn duplicate(id: &str) -> Result<CustomAIService, Box<dyn Error>> {
 
 pub(crate) fn remove(id: &str) -> Result<bool, Box<dyn Error>> {
     let id = id.trim();
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let removed = services.remove(id).is_some();
     if removed {
         save_all(&services)?;
-        let _ = crate::store::ai_service_balances::remove(id);
+    }
+    let _ = crate::store::ai_service_balances::remove(id);
+    // Retry cleanup even when the directory commit already removed this ID.
+    #[cfg(test)]
+    super::atomic_file::interruption_point("directory_committed");
+    {
         // 硬迁移后路由表是唯一事实源：删服务必须同时清掉所有能力里的引用，
         // 否则会留下指向不存在服务的悬空路由项。
-        let mut selection = load_selection()?;
+        let mut selection = load_selection_unlocked()?;
         let referenced = selection
             .capability_routes
             .values()
@@ -1240,7 +1431,7 @@ fn normalize_capability_routes(
     capability: &str,
     entries: Vec<CapabilityRouteEntry>,
 ) -> Result<Vec<CapabilityRouteEntry>, Box<dyn Error>> {
-    let services = load_all()?;
+    let services = load_all_unlocked()?;
     let mut seen = std::collections::BTreeSet::new();
     let mut normalized = Vec::new();
     for entry in entries {
@@ -1797,6 +1988,11 @@ impl LegacyAIServiceSelection {
 const SELECTION_SCHEMA_VERSION: u32 = 2;
 
 fn load_selection() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
+    let _lock = directory_lock()?;
+    load_selection_unlocked()
+}
+
+fn load_selection_unlocked() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
     let path = selection_path()?;
     if !path.is_file() {
         return Ok(PersistedAIServiceSelection {
@@ -1859,8 +2055,9 @@ pub(crate) fn set_capability_routes(
     if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
         return Err(format!("不支持的能力：{capability}").into());
     }
+    let _lock = directory_lock()?;
     let normalized = normalize_capability_routes(capability, entries)?;
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     if normalized.is_empty() {
         selection.capability_routes.remove(capability);
     } else {
@@ -1902,18 +2099,19 @@ pub(crate) fn set_media_service(
         )
         .into());
     }
+    let _lock = directory_lock()?;
     let id = id.trim();
     let selected = if id.is_empty() {
         None
     } else {
         let id = normalize_id(id)?;
         Some(
-            load_all()?
+            load_all_unlocked()?
                 .remove(&id)
                 .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
         )
     };
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     let value = selected.as_ref().map(|service| service.id.clone());
     set_primary_route(&mut selection, capability, value.as_deref());
     write_selection(&selection)?;
@@ -1975,18 +2173,19 @@ pub(crate) fn active_service_with_secret(
 /// 因此它在非测试构建里根本不存在。
 #[cfg(test)]
 pub(crate) fn set_active(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let _lock = directory_lock()?;
     let id = id.trim();
     let selected = if id.is_empty() {
         None
     } else {
         let id = normalize_id(id)?;
         Some(
-            load_all()?
+            load_all_unlocked()?
                 .remove(&id)
                 .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
         )
     };
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     let value = selected.as_ref().map(|service| service.id.clone());
     set_primary_route(&mut selection, CAP_CHAT, value.as_deref());
     write_selection(&selection)?;
@@ -1999,32 +2198,98 @@ fn selection_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(dir.join(SELECTION_FILE))
 }
 
-/// Anthropic 协议里的 API 根地址：去掉末尾斜杠，并剥掉可选的末尾 `/v1`。
+/// 上游端点类型。URL 拼接只认这一组稳定后缀，避免各调用方各写一套 `/v1` 规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamEndpoint {
+    Models,
+    ChatCompletions,
+    Responses,
+    Messages,
+}
+
+impl UpstreamEndpoint {
+    fn path(self, protocol: &AIServiceProtocol) -> &'static str {
+        match (protocol, self) {
+            (AIServiceProtocol::Anthropic, Self::Messages) => "/v1/messages",
+            (AIServiceProtocol::Anthropic, Self::Models) => "/v1/models",
+            // 非 Anthropic 上游不会走 Messages；保留兜底，避免拼出空路径。
+            (AIServiceProtocol::Anthropic, _) => "/v1/messages",
+            (_, Self::ChatCompletions) => "/chat/completions",
+            (_, Self::Responses) => "/responses",
+            (_, Self::Models) => "/models",
+            (_, Self::Messages) => "/v1/messages",
+        }
+    }
+}
+
+/// 把用户填写的 Base URL 规范成“API 根”：
+/// - 去掉 query/fragment 和末尾斜杠；
+/// - 剥掉误填的完整端点后缀（`/v1/messages`、`/responses` 等）；
+/// - Anthropic 再剥掉末尾 `/v1`（网关/探测会自行补 `/v1/...`）；
+/// - OpenAI 兼容地址如果是裸主机，则补 `/v1`，已有版本前缀（`/v1`、`/api/v3`）保持原样。
+pub(crate) fn normalize_api_base_url(base_url: &str, protocol: &AIServiceProtocol) -> String {
+    let trimmed = base_url.trim();
+    let Ok(mut url) = url::Url::parse(trimmed) else {
+        return trimmed.trim_end_matches('/').to_string();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut path = url.path().trim_end_matches('/').to_string();
+    let suffixes: &[&str] = if protocol.is_anthropic() {
+        &["/v1/messages", "/messages", "/v1/models", "/models", "/v1"]
+    } else {
+        &[
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/responses",
+            "/responses",
+            "/v1/models",
+            "/models",
+        ]
+    };
+    for suffix in suffixes {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    if !protocol.is_anthropic() && (path.is_empty() || path == "/") {
+        path = "/v1".to_string();
+    }
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+/// 按协议和端点类型生成最终上游地址。所有转发/探测/模型列表必须走这里。
+pub(crate) fn upstream_endpoint_url(
+    base_url: &str,
+    protocol: &AIServiceProtocol,
+    endpoint: UpstreamEndpoint,
+) -> String {
+    let base = normalize_api_base_url(base_url, protocol);
+    format!("{base}{}", endpoint.path(protocol))
+}
+
+/// Anthropic 协议里的 API 根地址：去掉末尾斜杠，并剥掉可选的 `/v1` 或完整端点。
 ///
 /// GCMP Anthropic 类模板给出的是 API 根地址（如 `https://api.moonshot.cn/anthropic`），
 /// 手工填写时用户常按 OpenAI 习惯带上 `/v1`，两种写法指向同一根。Anthropic SDK
 /// 系客户端（Claude Code、DSH）会在根地址后自行追加 `/v1/messages`，因此写入这些
 /// 客户端前必须回到根地址；只有需要显式带 `/v1` 的客户端（OpenCode/AI SDK）才补回去。
 pub(crate) fn anthropic_api_root(base_url: &str) -> String {
-    let base = base_url.trim().trim_end_matches('/');
-    base.strip_suffix("/v1").unwrap_or(base).to_string()
-}
-
-/// Anthropic 原生模型列表地址 `{api_root}/v1/models`。
-fn anthropic_models_url(base_url: &str) -> String {
-    format!("{}/v1/models", anthropic_api_root(base_url))
+    normalize_api_base_url(base_url, &AIServiceProtocol::Anthropic)
 }
 
 /// 火山方舟 Agent Plan 是套餐推理入口，只提供 Messages 推理，不提供 `/models`
 /// 发现接口。用 `x-api-key` 访问不存在的模型列表会先被鉴权层拒绝成 401，极易被
 /// 误判为 Key 无效；因此这里单独识别，连接检查改走最小 Messages 探测。
 pub(crate) fn is_volcengine_agent_plan(base_url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(base_url.trim()) else {
+    let normalized = normalize_api_base_url(base_url, &AIServiceProtocol::Anthropic);
+    let Ok(parsed) = url::Url::parse(&normalized) else {
         return false;
     };
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = parsed.path().trim_end_matches('/');
-    let path = path.strip_suffix("/v1").unwrap_or(path);
     host.ends_with(".volces.com") && path == "/api/plan"
 }
 
@@ -2045,7 +2310,8 @@ pub(crate) fn fetch_models(
     protocol: AIServiceProtocol,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     validate_base_url(base_url)?;
-    if is_volcengine_agent_plan(base_url) {
+    let base_url = normalize_api_base_url(base_url, &protocol);
+    if is_volcengine_agent_plan(&base_url) {
         return Err(
             "火山方舟 Agent Plan 不提供 /models 模型列表接口；请使用目录预设模型，连接检查会改为发起 1 Token 的 Messages 探测"
                 .into(),
@@ -2061,16 +2327,14 @@ pub(crate) fn fetch_models(
         client_builder = client_builder.no_proxy();
     }
     let client = client_builder.build()?;
+    let models_url = upstream_endpoint_url(&base_url, &protocol, UpstreamEndpoint::Models);
     let request = match protocol {
         AIServiceProtocol::Anthropic => client
-            .get(anthropic_models_url(base_url))
+            .get(models_url.as_str())
             .header("x-api-key", api_key.trim())
             .header("anthropic-version", ANTHROPIC_API_VERSION),
         AIServiceProtocol::OpenaiChat | AIServiceProtocol::OpenaiResponses => {
-            let base = base_url.trim().trim_end_matches('/');
-            client
-                .get(format!("{base}/models"))
-                .bearer_auth(api_key.trim())
+            client.get(models_url.as_str()).bearer_auth(api_key.trim())
         }
     };
     let response = request
@@ -2112,6 +2376,7 @@ pub(crate) fn probe_chat_connection(
     model: &str,
 ) -> Result<(), Box<dyn Error>> {
     validate_base_url(base_url)?;
+    let base_url = normalize_api_base_url(base_url, &protocol);
     let model = model.trim();
     if model.is_empty() {
         return Err("连接探测需要先配置默认模型".into());
@@ -2126,9 +2391,15 @@ pub(crate) fn probe_chat_connection(
         client_builder = client_builder.no_proxy();
     }
     let client = client_builder.build()?;
+    let endpoint = match protocol {
+        AIServiceProtocol::Anthropic => UpstreamEndpoint::Messages,
+        AIServiceProtocol::OpenaiChat => UpstreamEndpoint::ChatCompletions,
+        AIServiceProtocol::OpenaiResponses => UpstreamEndpoint::Responses,
+    };
+    let url = upstream_endpoint_url(&base_url, &protocol, endpoint);
     let request = match protocol {
         AIServiceProtocol::Anthropic => client
-            .post(format!("{}/v1/messages", anthropic_api_root(base_url)))
+            .post(url.as_str())
             .header("x-api-key", api_key.trim())
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .json(&serde_json::json!({
@@ -2137,10 +2408,7 @@ pub(crate) fn probe_chat_connection(
                 "messages": [{ "role": "user", "content": "ping" }],
             })),
         AIServiceProtocol::OpenaiChat => client
-            .post(format!(
-                "{}/chat/completions",
-                base_url.trim().trim_end_matches('/')
-            ))
+            .post(url.as_str())
             .bearer_auth(api_key.trim())
             .json(&serde_json::json!({
                 "model": model,
@@ -2148,10 +2416,7 @@ pub(crate) fn probe_chat_connection(
                 "messages": [{ "role": "user", "content": "ping" }],
             })),
         AIServiceProtocol::OpenaiResponses => client
-            .post(format!(
-                "{}/responses",
-                base_url.trim().trim_end_matches('/')
-            ))
+            .post(url.as_str())
             .bearer_auth(api_key.trim())
             .json(&serde_json::json!({
                 "model": model,
@@ -2283,6 +2548,102 @@ mod tests {
             api_key: api_key.to_string(),
             endpoints: Vec::new(),
         }
+    }
+
+    fn remediation_input(id: &str) -> CustomAIServiceInput {
+        let mut input = balance_test_service("sk-fictional-remediation");
+        input.id = id.into();
+        input
+    }
+
+    #[test]
+    fn remediation_child() {
+        let Ok(operation) = std::env::var("HIMIND_CONFIG_CHILD") else { return; };
+        match operation.as_str() {
+            "update" => { super::upsert(remediation_input("new")).unwrap(); }
+            "delete" => { super::remove("old").unwrap(); }
+            _ => panic!("unknown child operation"),
+        }
+    }
+
+    #[test]
+    fn remediation_process_interruptions_and_delete_retry() {
+        with_isolated_home(|| {
+            let root = super::store_path().unwrap().parent().unwrap().to_path_buf();
+            for point in ["before_temporary", "temporary_created", "temporary_written", "temporary_flushed", "before_replace", "after_replace", "directory_committed"] {
+                // Fresh child directory per boundary, always beneath the isolated test root.
+                let case = root.join(point);
+                std::env::set_var("HIMIND_AGENT_HOME", &case);
+                super::upsert(remediation_input("old")).unwrap();
+                super::upsert(remediation_input("keep")).unwrap();
+                super::set_capability_routes(CAP_CHAT, vec![super::CapabilityRouteEntry::new("old", ""), super::CapabilityRouteEntry::new("keep", "")]).unwrap();
+                let operation = if point == "directory_committed" { "delete" } else { "update" };
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "store::ai_services::tests::remediation_child", "--nocapture"])
+                    .env("HIMIND_AGENT_HOME", &case)
+                    .env("HIMIND_CONFIG_CHILD", operation)
+                    .env("HIMIND_CONFIG_INTERRUPT", point).output().unwrap();
+                assert_eq!(output.status.code(), Some(86), "boundary {point}: {}", String::from_utf8_lossy(&output.stderr));
+                assert!(super::load_all().unwrap().contains_key("keep"));
+                if point == "directory_committed" {
+                    let before = std::fs::read(super::selection_path().unwrap()).unwrap();
+                    let snapshot = super::public_snapshot().unwrap();
+                    assert_eq!(snapshot["consistency_diagnostics"].as_array().unwrap().len(), 1);
+                    assert_eq!(before, std::fs::read(super::selection_path().unwrap()).unwrap());
+                    assert!(!super::remove("old").unwrap());
+                    assert!(!super::remove("old").unwrap());
+                    assert_eq!(super::capability_routes(CAP_CHAT).unwrap(), vec![super::CapabilityRouteEntry::new("keep", "")]);
+                    super::remove("keep").unwrap();
+                    assert!(super::active_id().unwrap().is_none());
+                    assert!(super::public_snapshot().unwrap()["consistency_diagnostics"].as_array().unwrap().is_empty());
+                }
+                println!("interruption={point} child_exit=86 restart=ok");
+            }
+            std::env::set_var("HIMIND_AGENT_HOME", root);
+        });
+    }
+
+    #[test]
+    fn remediation_concurrent_different_services_no_lost_updates() {
+        with_isolated_home(|| {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let threads = ["left", "right"].into_iter().map(|id| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for n in 0..12 {
+                        let mut input = remediation_input(id);
+                        input.display_name = format!("{id}-{n}");
+                        super::upsert(input).unwrap();
+                    }
+                })
+            }).collect::<Vec<_>>();
+            barrier.wait();
+            for thread in threads { thread.join().unwrap(); }
+            let all = super::load_all().unwrap();
+            assert_eq!(all["left"].display_name, "left-11");
+            assert_eq!(all["right"].display_name, "right-11");
+        });
+    }
+
+    #[test]
+    fn remediation_recovery_rejects_corrupt_snapshot_and_records_safe_version() {
+        with_isolated_home(|| {
+            super::upsert(remediation_input("old")).unwrap();
+            super::upsert(remediation_input("new")).unwrap();
+            let path = super::store_path().unwrap();
+            std::fs::write(&path, b"broken-current").unwrap();
+            assert_eq!(super::load_all().unwrap().len(), 1);
+            let report = std::fs::read_to_string(path.with_extension("recovery.json")).unwrap();
+            assert!(!report.contains("sk-fictional"));
+            assert!(report.contains("version_sha256"));
+            assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), b"broken-current");
+            std::fs::write(&path, b"broken-again").unwrap();
+            std::fs::write(super::super::atomic_file::backup_path(&path), br#"{"bad":{"id":"other"}}"#).unwrap();
+            assert!(super::load_all().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"broken-again");
+
+        });
     }
 
     #[test]
@@ -3323,6 +3684,17 @@ mod tests {
     }
 
     #[test]
+    fn service_exists_detects_saved_ids() {
+        with_isolated_home(|| {
+            assert!(!super::exists("deepseek-account").unwrap());
+            super::upsert(balance_test_service("sk-exists")).expect("save service");
+            assert!(super::exists("deepseek-account").unwrap());
+            assert!(super::exists(" deepseek-account ").unwrap());
+            assert!(!super::exists("").unwrap());
+        });
+    }
+
+    #[test]
     fn fetch_models_parses_openai_models_payload() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -3396,6 +3768,44 @@ mod tests {
     }
 
     #[test]
+    fn fetch_models_does_not_duplicate_full_messages_base_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"data":[{"id":"deepseek-v4.1-flash-1017"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        // 用户误把完整 Messages 端点填进 Base URL：模型列表必须回到 `/v1/models`。
+        let models = super::fetch_models(
+            &format!("http://{addr}/v1/messages"),
+            "sk-test",
+            AIServiceProtocol::Anthropic,
+        )
+        .expect("fetch models");
+        assert_eq!(models, vec!["deepseek-v4.1-flash-1017".to_string()]);
+        let request = received.lock().unwrap().clone();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.contains("/v1/messages/v1/models"),
+            "duplicated endpoint: {request}"
+        );
+    }
+
+    #[test]
     fn identifies_volcengine_agent_plan_as_catalog_only() {
         assert!(super::is_volcengine_agent_plan(
             "https://ark.cn-beijing.volces.com/api/plan"
@@ -3450,6 +3860,43 @@ mod tests {
         assert!(normalized.contains("anthropic-version: 2023-06-01"));
         assert!(normalized.contains("\"max_tokens\":1"));
         assert!(normalized.contains("\"content\":\"ping\""));
+    }
+
+    #[test]
+    fn probe_chat_connection_does_not_duplicate_full_messages_base_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 8192];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"type":"message","content":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        super::probe_chat_connection(
+            &format!("http://{addr}/v1/messages"),
+            "sk-test",
+            AIServiceProtocol::Anthropic,
+            "deepseek-v4.1-flash-1017",
+        )
+        .expect("probe succeeds");
+        let request = received.lock().unwrap().clone();
+        assert!(
+            request.starts_with("POST /v1/messages "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.contains("/v1/messages/v1/messages"),
+            "duplicated endpoint: {request}"
+        );
     }
 
     #[test]
@@ -3580,6 +4027,144 @@ mod tests {
     }
 
     /// 旧配置文件没有 `endpoints`：读时必须补出单端点，且标量仍是投影。
+    #[test]
+    fn save_normalizes_full_endpoint_base_urls() {
+        with_isolated_home(|| {
+            let anthropic = super::upsert(CustomAIServiceInput {
+                id: "anthropic-full".to_string(),
+                display_name: "Anthropic Full".to_string(),
+                base_url: "https://vectide.cn/v1/messages".to_string(),
+                protocol: AIServiceProtocol::Anthropic,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save anthropic");
+            assert_eq!(anthropic.base_url, "https://vectide.cn");
+            assert_eq!(anthropic.protocol, AIServiceProtocol::Anthropic);
+            assert_eq!(anthropic.endpoints[0].base_url, "https://vectide.cn");
+
+            let openai = super::upsert(CustomAIServiceInput {
+                id: "openai-full".to_string(),
+                display_name: "OpenAI Full".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save openai");
+            assert_eq!(openai.base_url, "https://api.example.com/v1");
+            assert_eq!(openai.protocol, AIServiceProtocol::OpenaiResponses);
+        });
+    }
+
+    #[test]
+    fn save_rejects_query_and_fragment_in_base_url() {
+        with_isolated_home(|| {
+            for (index, base_url) in [
+                "https://api.example.com/v1?x=1",
+                "https://api.example.com/v1#frag",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let error = super::upsert(CustomAIServiceInput {
+                    id: format!("bad-url-{index}"),
+                    display_name: "Bad URL".to_string(),
+                    base_url: base_url.to_string(),
+                    protocol: AIServiceProtocol::OpenaiResponses,
+                    model: "m".to_string(),
+                    models: vec!["m".to_string()],
+                    endpoints: Vec::new(),
+                    image_model: String::new(),
+                    image_adapter: String::new(),
+                    media: Default::default(),
+                    api_key: "sk-test".to_string(),
+                })
+                .expect_err("query/fragment must be rejected");
+                let message = error.to_string();
+                assert!(
+                    message.contains("query") && message.contains("fragment"),
+                    "{message}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn save_rejects_protocol_endpoint_family_mismatch() {
+        with_isolated_home(|| {
+            let error = super::upsert(CustomAIServiceInput {
+                id: "mismatch".to_string(),
+                display_name: "Mismatch".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::Anthropic,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect_err("protocol/endpoint mismatch must be rejected");
+            assert!(error.to_string().contains("接口类型"), "{error}");
+        });
+    }
+
+    #[test]
+    fn remote_http_warning_only_for_non_loopback() {
+        assert!(super::is_remote_http_base_url(
+            "http://192.168.1.10:8080/v1"
+        ));
+        assert!(super::is_remote_http_base_url("http://example.com/v1"));
+        assert!(!super::is_remote_http_base_url("http://localhost:8080/v1"));
+        assert!(!super::is_remote_http_base_url("http://127.0.0.1:8080/v1"));
+        assert!(!super::is_remote_http_base_url("http://[::1]:8080/v1"));
+        assert!(!super::is_remote_http_base_url("https://example.com/v1"));
+    }
+
+    #[test]
+    fn save_normalizes_secondary_endpoints_before_dedupe() {
+        with_isolated_home(|| {
+            let saved = super::upsert(CustomAIServiceInput {
+                id: "multi-full".to_string(),
+                display_name: "Multi Full".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                endpoints: vec![
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::OpenaiResponses,
+                        "https://api.example.com/v1/responses",
+                    ),
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::Anthropic,
+                        "https://api.example.com/v1/messages",
+                    ),
+                ],
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save multi endpoint");
+            assert_eq!(saved.endpoints.len(), 2);
+            assert_eq!(saved.endpoints[0].base_url, "https://api.example.com/v1");
+            assert_eq!(saved.endpoints[1].base_url, "https://api.example.com");
+        });
+    }
+
     #[test]
     fn legacy_service_without_endpoints_upgrades_to_single_endpoint() {
         let legacy = serde_json::json!({

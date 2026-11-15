@@ -1048,6 +1048,11 @@ pub(crate) fn get_approval_history(
 }
 
 #[tauri::command]
+pub(crate) fn get_mission_follow_up_review(digest: String) -> Result<serde_json::Value, String> {
+    crate::approval::policy::read_mission_follow_up_review(&digest)
+}
+
+#[tauri::command]
 pub(crate) fn respond_approval(
     state: State<'_, AgentState>,
     id: String,
@@ -3421,7 +3426,17 @@ pub(crate) fn save_ai_service(
     // 可选端点：同一服务可以同时提供 OpenAI 兼容与 Anthropic 两个地址。
     // 留空时由 `protocol` + `base_url` 合成单端点，旧前端无需改动。
     endpoints: Option<Vec<EndpointInput>>,
+    // 新增时目标 ID 已存在：必须显式确认覆盖。编辑已有服务由前端传 true。
+    allow_overwrite: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let requested_id = id.trim().to_string();
+    if !allow_overwrite.unwrap_or(false)
+        && crate::store::ai_services::exists(&requested_id).map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "服务 ID「{requested_id}」已存在；如要覆盖，请显式确认后重试。"
+        ));
+    }
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
     let endpoints_from_form = endpoints
         .unwrap_or_default()
@@ -3862,6 +3877,43 @@ pub(crate) async fn get_skill_catalog(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// 读取技能库里某个技能的 SKILL.md 原文，供「我的能力 → 技能」预览。
+///
+/// 只读技能包根部的 SKILL.md，不接受任意路径；开发直挂记录同样可读。
+#[tauri::command]
+pub(crate) fn read_skill_document(skill_id: String) -> Result<serde_json::Value, String> {
+    crate::skill::manifest::validate_skill_id(&skill_id).map_err(|error| error.to_string())?;
+    let store = crate::skill::store::SkillStore::new();
+    store
+        .bootstrap_builtin_skills()
+        .map_err(|error| error.to_string())?;
+    let record = store
+        .get_record(&skill_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("技能不存在：{skill_id}"))?;
+    let path = record.version_root.join("SKILL.md");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| format!("技能包中没有 SKILL.md：{skill_id}"))?;
+    if !metadata.is_file() {
+        return Err(format!("技能包中没有 SKILL.md：{skill_id}"));
+    }
+    // 技能包本身有校验和与体积约束；这里再加一道上限，避免异常包把单次预览拖成整页卡死。
+    const MAX_DOCUMENT_BYTES: u64 = 1_000_000;
+    if metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err("SKILL.md 超过 1 MB，暂不支持在应用内预览".to_string());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读取 SKILL.md 失败：{error}"))?;
+    Ok(json!({
+        "skill_id": record.manifest.id,
+        "name": record.manifest.name,
+        "version": record.manifest.version,
+        "path": crate::skill::target::display_path(&path),
+        "size": metadata.len(),
+        "content": content,
+    }))
 }
 
 #[tauri::command]
@@ -9225,6 +9277,442 @@ pub(crate) async fn get_workspace_registry() -> Result<serde_json::Value, String
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn list_workspace_session_history(
+    project_id: String,
+    cursor: Option<String>,
+    query: Option<String>,
+    source: Option<String>,
+    sort: Option<String>,
+) -> Result<crate::session_history::SessionHistorySnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_history_snapshot(project_id, cursor, query, source, sort, 50)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn workspace_history_snapshot(
+    project_id: String,
+    cursor: Option<String>,
+    query: Option<String>,
+    source: Option<String>,
+    sort: Option<String>,
+    page_size: usize,
+) -> Result<crate::session_history::SessionHistorySnapshot, String> {
+    const MAX_OFFSET: usize = 1_000_000;
+    let offset = cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "SESSION_CURSOR_INVALID".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if offset > MAX_OFFSET {
+        return Err("SESSION_CURSOR_INVALID".to_string());
+    }
+    let query = query
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .to_lowercase();
+    let source_filter = source
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| match value.trim() {
+            "dsh" => Ok(crate::session_history::SessionSource::Dsh),
+            "acp" => Ok(crate::session_history::SessionSource::Acp),
+            "claude_code" => Ok(crate::session_history::SessionSource::ClaudeCode),
+            "codex" => Ok(crate::session_history::SessionSource::Codex),
+            "opencode" => Ok(crate::session_history::SessionSource::OpenCode),
+            _ => Err("SESSION_SOURCE_INVALID".to_string()),
+        })
+        .transpose()?;
+    let sort = match sort.as_deref().unwrap_or("recent") {
+        "recent" => crate::session_history::SessionHistorySort::Recent,
+        "oldest" => crate::session_history::SessionHistorySort::Oldest,
+        "title" => crate::session_history::SessionHistorySort::Title,
+        _ => return Err("SESSION_SORT_INVALID".to_string()),
+    };
+    let registry =
+        crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
+    if registry.project(&project_id).is_none() {
+        return Err("PROJECT_NOT_FOUND".to_string());
+    }
+
+    let controls = crate::app::ui::builtin_ai_history_controls()?;
+    let mut sessions = Vec::new();
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for (_, control) in &controls {
+        let result = control
+            .call_runtime_api("session/list", json!({ "_request": {} }))
+            .and_then(|response| {
+                crate::app::builtin_ai_proxy::runtime_result_value(
+                    &response,
+                    "读取 HiMind AI 会话列表",
+                )
+                .map(serde_json::Value::clone)
+            })
+            .and_then(|value| crate::session_history::dsh_session_summaries(&registry, &value));
+        match result {
+            Ok(items) => {
+                successes += 1;
+                sessions.extend(items);
+            }
+            Err(_) => failures += 1,
+        }
+    }
+
+    let (availability, error_code) = if controls.is_empty() {
+        (
+            crate::session_history::SourceAvailability::Unavailable,
+            Some("runtime_not_running".to_string()),
+        )
+    } else if failures == 0 {
+        (crate::session_history::SourceAvailability::Available, None)
+    } else if successes == 0 {
+        (
+            crate::session_history::SourceAvailability::Error,
+            Some("runtime_query_failed".to_string()),
+        )
+    } else {
+        (
+            crate::session_history::SourceAvailability::Partial,
+            Some("runtime_query_partial".to_string()),
+        )
+    };
+
+    let mut sources = vec![crate::session_history::SessionSourceStatus {
+        source: crate::session_history::SessionSource::Dsh,
+        availability,
+        session_count: 0,
+        error_code,
+    }];
+    let claude = crate::session_history_sources::scan_claude_code(&registry);
+    sessions.extend(claude.sessions);
+    sources.push(claude.status);
+    let acp = crate::session_history_sources::scan_acp(&registry);
+    sessions.extend(acp.sessions);
+    sources.push(acp.status);
+    let codex = crate::session_history_sources::scan_codex(&registry);
+    sessions.extend(codex.sessions);
+    sources.push(codex.status);
+    let opencode = crate::session_history_sources::scan_opencode(&registry);
+    sessions.extend(opencode.sessions);
+    sources.push(opencode.status);
+
+    let claude_available = crate::session_history_actions::available(
+        crate::session_history::SessionSource::ClaudeCode,
+        "probe",
+    );
+    let codex_available = crate::session_history_actions::available(
+        crate::session_history::SessionSource::Codex,
+        "probe",
+    );
+    for session in &mut sessions {
+        session.capabilities.can_resume =
+            crate::session_history_actions::valid_resume_id(&session.native_id)
+                && match session.source {
+                    crate::session_history::SessionSource::ClaudeCode => claude_available,
+                    crate::session_history::SessionSource::Codex => codex_available,
+                    _ => false,
+                };
+    }
+    Ok(crate::session_history::project_history_snapshot(
+        &project_id,
+        &query,
+        source_filter,
+        sort,
+        offset,
+        page_size,
+        sessions,
+        sources,
+    ))
+}
+
+#[tauri::command]
+pub(crate) async fn get_workspace_session_transcript_page(
+    project_id: String,
+    session_id: String,
+    cursor: Option<String>,
+) -> Result<crate::session_history::SessionTranscriptPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_transcript_page(project_id, session_id, cursor)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn workspace_transcript_page(
+    project_id: String,
+    session_id: String,
+    cursor: Option<String>,
+) -> Result<crate::session_history::SessionTranscriptPage, String> {
+    const PAGE_SIZE: usize = 50;
+    let (source_id, native_id) = session_id
+        .split_once(':')
+        .ok_or_else(|| "SESSION_ID_INVALID".to_string())?;
+    let source = match source_id {
+        "dsh" => crate::session_history::SessionSource::Dsh,
+        "acp" => crate::session_history::SessionSource::Acp,
+        "claude_code" => crate::session_history::SessionSource::ClaudeCode,
+        "codex" => crate::session_history::SessionSource::Codex,
+        "opencode" => crate::session_history::SessionSource::OpenCode,
+        _ => return Err("SESSION_PREVIEW_UNAVAILABLE".to_string()),
+    };
+    if source.stable_session_id(native_id)? != session_id {
+        return Err("SESSION_ID_INVALID".to_string());
+    }
+    let requested_cursor = cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .ok_or_else(|| "SESSION_CURSOR_INVALID".to_string())
+        })
+        .transpose()?;
+    let registry =
+        crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
+    if registry.project(&project_id).is_none() {
+        return Err("PROJECT_NOT_FOUND".to_string());
+    }
+
+    if source == crate::session_history::SessionSource::Acp {
+        let stored = crate::store::acp_sessions::load_for_history(native_id)
+            .map_err(|_| "ACP_SESSION_UNAVAILABLE".to_string())?
+            .ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
+        let turns = stored
+            .turns
+            .into_iter()
+            .map(|turn| (turn.user, turn.assistant))
+            .collect::<Vec<_>>();
+        let end_offset = requested_cursor
+            .map(|value| usize::try_from(value).map_err(|_| "SESSION_CURSOR_INVALID".to_string()))
+            .transpose()?;
+        return crate::session_history_sources::acp_transcript_page_for_project(
+            &registry,
+            &project_id,
+            native_id,
+            &stored.cwd,
+            &turns,
+            end_offset,
+            PAGE_SIZE,
+        );
+    }
+
+    if matches!(
+        source,
+        crate::session_history::SessionSource::ClaudeCode
+            | crate::session_history::SessionSource::Codex
+    ) {
+        return match source {
+            crate::session_history::SessionSource::ClaudeCode => {
+                crate::session_history_sources::claude_transcript_page_for_project(
+                    &registry,
+                    &project_id,
+                    native_id,
+                    requested_cursor,
+                    PAGE_SIZE,
+                )
+            }
+            crate::session_history::SessionSource::Codex => {
+                crate::session_history_sources::codex_transcript_page_for_project(
+                    &registry,
+                    &project_id,
+                    native_id,
+                    requested_cursor,
+                    PAGE_SIZE,
+                )
+            }
+            _ => unreachable!(),
+        };
+    }
+
+    if source == crate::session_history::SessionSource::OpenCode {
+        let end_offset = requested_cursor
+            .map(|value| usize::try_from(value).map_err(|_| "SESSION_CURSOR_INVALID".to_string()))
+            .transpose()?;
+        return crate::session_history_sources::opencode_transcript_page_for_project(
+            &registry,
+            &project_id,
+            native_id,
+            end_offset,
+            PAGE_SIZE,
+        );
+    }
+
+    let controls = crate::app::ui::builtin_ai_history_controls()?;
+    if controls.is_empty() {
+        return Err("runtime_not_running".to_string());
+    }
+    let mut failures = 0usize;
+    for (_, control) in controls {
+        let listing = control
+            .call_runtime_api("session/list", json!({ "_request": {} }))
+            .and_then(|response| {
+                crate::app::builtin_ai_proxy::runtime_result_value(
+                    &response,
+                    "读取 HiMind AI 会话列表",
+                )
+                .map(serde_json::Value::clone)
+            });
+        let listing = match listing {
+            Ok(value) => value,
+            Err(_) => {
+                failures += 1;
+                continue;
+            }
+        };
+        let latest_seq = match crate::session_history::dsh_projected_session_as_of_seq(
+            &registry,
+            &listing,
+            native_id,
+            &project_id,
+        ) {
+            Ok(Some(sequence)) => sequence,
+            Ok(None) => continue,
+            Err(_) => {
+                failures += 1;
+                continue;
+            }
+        };
+        let through_seq = requested_cursor
+            .map(|value| i64::try_from(value).map_err(|_| "SESSION_CURSOR_INVALID".to_string()))
+            .transpose()?
+            .unwrap_or(latest_seq);
+        if through_seq > latest_seq {
+            return Err("SESSION_CURSOR_INVALID".to_string());
+        }
+        let response = control
+            .call_runtime_api(
+                "session/page",
+                json!({
+                    "request": {
+                        "address": {"kind": "session", "sessionId": native_id},
+                        "throughSeq": through_seq,
+                        "maxMessages": PAGE_SIZE + 1
+                    }
+                }),
+            )
+            .and_then(|response| {
+                crate::app::builtin_ai_proxy::runtime_result_value(
+                    &response,
+                    "读取 HiMind AI 会话消息页",
+                )
+                .map(serde_json::Value::clone)
+            });
+        match response.and_then(|value| {
+            crate::session_history::dsh_transcript_page(&session_id, through_seq, &value, PAGE_SIZE)
+        }) {
+            Ok(page) => return Ok(page),
+            Err(_) => failures += 1,
+        }
+    }
+    if failures > 0 {
+        Err("runtime_query_failed".to_string())
+    } else {
+        Err("SESSION_NOT_FOUND".to_string())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn get_workspace_session_resume_plan(
+    project_id: String,
+    session_id: String,
+) -> Result<crate::session_history_actions::ResumePlan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::session_history_actions::resolve(&project_id, &session_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn resume_workspace_session(
+    project_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = crate::session_history_actions::resolve(&project_id, &session_id)?;
+        crate::session_history_actions::launch(&plan)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn start_workspace_session_inspection(
+    project_id: String,
+    session_id: Option<String>,
+    query: String,
+    mode: String,
+    source: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut snapshot = workspace_history_snapshot(
+            project_id.clone(),
+            None,
+            None,
+            source.clone(),
+            None,
+            if session_id.is_some() || mode == "files" {
+                usize::MAX
+            } else {
+                2000
+            },
+        )?;
+        snapshot.sources.retain(|status| {
+            source.as_deref().is_none_or(|id| status.source.id() == id)
+                && (mode != "files"
+                    || matches!(
+                        status.source,
+                        crate::session_history::SessionSource::ClaudeCode
+                            | crate::session_history::SessionSource::Codex
+                    ))
+        });
+        crate::session_history_inspect::start(project_id, snapshot, session_id, query, mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn step_workspace_session_inspection(
+    project_id: String,
+    token: String,
+) -> Result<crate::session_history_inspect::InspectBatch, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::session_history_inspect::step(&project_id, &token, |session, cursor| {
+            workspace_transcript_page(project_id.clone(), session.into(), cursor)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn cancel_workspace_session_inspection(
+    project_id: String,
+    token: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::session_history_inspect::cancel(&project_id, &token)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

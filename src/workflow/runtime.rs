@@ -1,6 +1,5 @@
 use serde_json::{json, Value};
 use std::error::Error;
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use super::{WorkflowPackage, WorkflowStep, WorkflowStepExecution};
@@ -16,6 +15,17 @@ pub(crate) fn execute_runtime_step(
     input: &Value,
     options: Option<&Options>,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+    execute_runtime_step_with_resources(package, step, input, options, is_canceled, None)
+}
+
+pub(crate) fn execute_runtime_step_with_resources(
+    package: &WorkflowPackage,
+    step: &WorkflowStep,
+    input: &Value,
+    options: Option<&Options>,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    resources: Option<&crate::mission::CheckRuntimeResources>,
 ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
     let runtime = step
         .runtime
@@ -48,7 +58,8 @@ pub(crate) fn execute_runtime_step(
         });
     // auto 的含义是「挑一个能干这活的本机 Runtime」——干不了的就不该成为候选。
     // 传 tool_policy 进去，让 none 约束参与候选筛选，而不是先挑中再报错。
-    let provider = resolve_provider(provider_name, tool_policy)?;
+    let provider = resolve_provider(if runtime.permission_mode == "full_access" && provider_name == "auto" { "himind.builtin" } else { provider_name }, tool_policy)?;
+    super::validate_runtime_permission_mode(&provider, &runtime.permission_mode)?;
     enforce_runtime_network_policy(&provider, runtime.allow_network)?;
     let disable_tools = enforce_runtime_tool_policy(&provider, tool_policy)?;
     enforce_model_namespace(&provider, model_alias)?;
@@ -67,18 +78,7 @@ pub(crate) fn execute_runtime_step(
         Some(role) => build_prompt(&format!("{}{}", role_prompt_prefix(role), base_prompt), &prompt_input),
         None => build_prompt(base_prompt, &prompt_input),
     };
-    // 运行时提示是通过命令行传给 Runtime 的，Windows 上整条命令行有 ~32KB 上限；
-    // 超了会以 "os error 206" 这种看不出原因的方式失败，这里提前给出可读错误。
-    const MAX_RUNTIME_PROMPT_CHARS: usize = 24_000;
-    if prompt.chars().count() > MAX_RUNTIME_PROMPT_CHARS {
-        return Err(format!(
-            "workflow runtime step {} prompt is too long ({} chars, limit {}): shrink the step input or let the upstream step emit a smaller artifact",
-            step.id,
-            prompt.chars().count(),
-            MAX_RUNTIME_PROMPT_CHARS
-        )
-        .into());
-    }
+    validate_prompt_transport(&provider, &step.id, &prompt)?;
     let timeout_seconds = if runtime.timeout_seconds == 0 {
         DEFAULT_RUNTIME_TIMEOUT_SECONDS
     } else {
@@ -90,17 +90,22 @@ pub(crate) fn execute_runtime_step(
         .unwrap_or_default();
     let mut runtime_facts: Option<(String, String, String)> = None;
     let mut acp_facts: Option<Value> = None;
+    let mut codex_facts: Option<Value> = None;
     let mut usage = None;
     let output = match provider.as_str() {
         "personal.codex" => {
             // `cli:codex:<id>` 里的 id 原样转给 Codex；没声明就沿用 Codex 自己的默认模型。
             let cli_model = strip_cli_model_prefix(model_alias);
-            let text = execute_codex(
+            let outcome = execute_codex_outcome_with_resources(
                 &workspace,
                 &prompt,
                 timeout_seconds,
                 cli_model,
+                workflow_access_with_permission(&step.risk_level, tool_policy, &runtime.permission_mode),
                 is_canceled,
+                std::time::Duration::from_secs(15),
+                resources,
+                Some(&format!("{run_id}:{}:{}",step.id,input.pointer("/workflow_context/runtime_attempt").and_then(Value::as_u64).unwrap_or(1))),
             )?;
             if let Some(model) = cli_model {
                 runtime_facts = Some((
@@ -109,7 +114,12 @@ pub(crate) fn execute_runtime_step(
                     String::new(),
                 ));
             }
-            text
+            usage = outcome.usage;
+            codex_facts = Some(json!({"provider":"personal.codex","session_id":outcome.session_id,
+                "version":outcome.version,"usage_receipt":outcome.usage_receipt,
+                "model_source":if cli_model.is_some() {"explicit_cli"} else {"personal_cli_config"},
+                "cost":null,"cost_status":"unknown"}));
+            outcome.text
         }
         "personal.github-copilot" => {
             let cli_model = strip_cli_model_prefix(model_alias);
@@ -131,7 +141,7 @@ pub(crate) fn execute_runtime_step(
         }
         "himind.fixture" => fixture_runtime_output(&step.id, &workspace, input)?,
         "himind.builtin" => {
-            let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home(
+            let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home_with_resources(
                 options
                     .ok_or("himind.builtin runtime step is unavailable without Agent options")?,
                 &workspace,
@@ -141,8 +151,9 @@ pub(crate) fn execute_runtime_step(
                 run_id,
                 step.id.as_str(),
                 model_alias,
-                workflow_access_for_risk(&step.risk_level),
+                workflow_access_with_permission(&step.risk_level, tool_policy, &runtime.permission_mode),
                 is_canceled,
+                resources,
             )?;
             // 把“实际用了哪个模型/哪类服务”写进步骤输出，随运行事实一起留痕。
             runtime_facts = Some((
@@ -164,6 +175,7 @@ pub(crate) fn execute_runtime_step(
                 timeout_seconds,
                 run_id,
                 acp_model,
+                &runtime.permission_mode,
                 options,
                 is_canceled,
             )?;
@@ -187,16 +199,44 @@ pub(crate) fn execute_runtime_step(
                 "denied_client_methods": execution.denied_client_methods,
                 "log_path": execution.log_path,
             }));
+            usage = execution.usage;
             execution.final_text
         }
         value => return Err(format!("unsupported workflow runtime provider: {value}").into()),
     };
-    let structured = parse_runtime_payload(&output);
+    // Mission's declared final is a JSON report. Do not salvage an inner/last
+    // line from a truncated outer object using the text-friendly Workflow
+    // fallback. Ordinary workflows retain their existing text semantics.
+    let structured = if package.id.starts_with("com.himind.mission.") {
+        let raw = output.trim();
+        let json = if raw.starts_with("```") && raw.ends_with("```") {
+            strip_code_fence(raw).unwrap_or(raw)
+        } else { raw };
+        let report = serde_json::from_str::<Value>(json).ok().filter(|value|
+            value.is_object() && value.get("passed").and_then(Value::as_bool).is_some());
+        if report.is_none() {
+            return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                provenance:codex_facts,
+                message: "Mission runtime requires one complete JSON report with boolean passed".into(),
+                usage, report: None,
+            }));
+        }
+        report
+    } else { parse_runtime_payload(&output) };
+    if (!runtime.result_schema.trim().is_empty() && structured.is_none())
+        || structured.as_ref().is_some_and(|value| value.get("passed").and_then(Value::as_bool) == Some(false)) {
+        return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+            provenance:codex_facts,
+            message: "Runtime returned an invalid structured result or passed=false".into(),
+            usage, report: structured,
+        }));
+    }
     let mut result = json!({
         "schema_version": "workflow_runtime_result.v1",
         "provider": provider,
         "workspace": workspace,
         "summary": output,
+        "final_message": output,
     });
     if let Some((model, service_source, endpoint)) = runtime_facts {
         if let Some(object) = result.as_object_mut() {
@@ -210,14 +250,22 @@ pub(crate) fn execute_runtime_step(
             object.insert("acp".to_string(), facts);
         }
     }
+    if let Some(facts) = codex_facts {
+        result.as_object_mut().unwrap().insert("codex".to_string(), facts);
+    }
     if let Some(structured) = structured {
         if let (Some(result), Some(structured)) = (result.as_object_mut(), structured.as_object()) {
             for (key, value) in structured {
+                if ["schema_version","provider","workspace","model","service_source","endpoint","acp","codex","final_message"].contains(&key.as_str()) { continue; }
                 result.insert(key.clone(), value.clone());
             }
         }
     }
-    validate_runtime_output(package, runtime.result_schema.trim(), &result)?;
+    validate_runtime_output(package, runtime.result_schema.trim(), &result).map_err(|error|
+        Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+            message:error.to_string(),report:None,usage:usage.clone(),
+            provenance:Some(json!({"provider":provider,"codex":result.get("codex"),"model":result.get("model")})),
+        }) as Box<dyn Error>)?;
     Ok(WorkflowStepExecution {
         output: result,
         artifacts: Vec::new(),
@@ -225,38 +273,35 @@ pub(crate) fn execute_runtime_step(
     })
 }
 
-fn parse_runtime_payload(output: &str) -> Option<Value> {
+fn validate_prompt_transport(provider: &str, step_id: &str, prompt: &str) -> Result<(), Box<dyn Error>> {
+    // Only Copilot puts the prompt in argv (-p). Codex and builtin use stdin;
+    // ACP sends a protocol message. Windows counts UTF-16 code units.
+    const MAX_ARGV_PROMPT_UNITS: usize = 24_000;
+    if provider == "personal.github-copilot" {
+        let units = prompt.encode_utf16().count();
+        if units > MAX_ARGV_PROMPT_UNITS {
+            return Err(format!("workflow runtime step {step_id} prompt exceeds the {provider} command-line budget ({units} UTF-16 units, limit {MAX_ARGV_PROMPT_UNITS}): use input artifacts or a runtime with stdin/protocol input").into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_runtime_payload(output: &str) -> Option<Value> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return None;
     }
     // 模型习惯把 JSON 包在 ``` 代码块里，这属于格式差异而不是内容错误：
     // 先剥掉围栏再解析，避免“答案正确但被判成失败”。
-    let candidates = std::iter::once(trimmed)
-        .chain(strip_code_fence(trimmed))
-        .chain(
-            trimmed
-                .lines()
-                .rev()
-                .map(str::trim)
-                .filter(|line| line.starts_with('{')),
-        );
-    candidates
-        .into_iter()
-        .find_map(|candidate| serde_json::from_str::<Value>(candidate).ok())
-        .filter(Value::is_object)
+    serde_json::from_str::<Value>(strip_code_fence(trimmed).unwrap_or(trimmed))
+        .ok().filter(Value::is_object)
 }
 
 /// 去掉 ```json … ``` 围栏（含无语言标记的 ``` … ```），返回其中的内容。
 fn strip_code_fence(value: &str) -> Option<&str> {
-    let without_open = value
-        .strip_prefix("```json")
-        .or_else(|| value.strip_prefix("```JSON"))
-        .or_else(|| value.strip_prefix("```Json"))
-        .or_else(|| value.strip_prefix("```"))?;
-    let inner = without_open.trim_start_matches(['\r', '\n', ' ', '\t']);
-    let end = inner.rfind("```")?;
-    Some(inner[..end].trim())
+    let (opening, rest) = value.split_once('\n')?;
+    if !["```", "```json", "```JSON", "```Json"].contains(&opening.trim_end_matches('\r')) { return None; }
+    Some(rest.trim_end().strip_suffix("```")?.trim())
 }
 
 fn validate_runtime_output(
@@ -297,7 +342,10 @@ fn resolve_provider(provider: &str, tool_policy: &str) -> Result<String, Box<dyn
     // 否则会出现「auto 挑中 codex，运行到一半报 cannot enforce tool_policy=none」——
     // 那是最难排查的一类失败：预检说能动、真跑才炸。
     let require_no_tools = tool_policy.trim() == "none";
-    let candidate_ok = |name: &str| !require_no_tools || super::runtime_supports_tool_none(name);
+    let candidate_ok = |name: &str| {
+        if tool_policy.trim() == "files_only" { name == "himind.builtin" }
+        else { !require_no_tools || super::runtime_supports_tool_none(name) }
+    };
 
     if std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1")
         && candidate_ok("himind.fixture")
@@ -406,6 +454,22 @@ fn workflow_access_for_risk(risk_level: &str) -> crate::runtime::deepseek_harnes
     }
 }
 
+fn workflow_access_for_policy(risk_level: &str, tool_policy: &str) -> crate::runtime::deepseek_harness::WorkflowAccess {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match (workflow_access_for_risk(risk_level), tool_policy.trim()) {
+        (WorkflowAccess::Write, "files_only") => WorkflowAccess::FilesOnly,
+        (access, _) => access,
+    }
+}
+
+fn workflow_access_with_permission(risk_level: &str, tool_policy: &str, permission_mode: &str) -> crate::runtime::deepseek_harness::WorkflowAccess {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match workflow_access_for_policy(risk_level, tool_policy) {
+        WorkflowAccess::Write if permission_mode == "full_access" => WorkflowAccess::Full,
+        access => access,
+    }
+}
+
 fn enforce_runtime_network_policy(
     provider: &str,
     allow_network: Option<bool>,
@@ -428,6 +492,7 @@ fn enforce_runtime_network_policy(
 fn enforce_runtime_tool_policy(provider: &str, tool_policy: &str) -> Result<bool, Box<dyn Error>> {
     match tool_policy.trim() {
         "" | "default" => Ok(false),
+        "files_only" if provider == "himind.builtin" => Ok(false),
         "none" => {
             // 与预检共用同一份判据：预检说能跑、运行期才拒绝，是最难排查的一类失败。
             if super::runtime_supports_tool_none(provider) {
@@ -734,25 +799,71 @@ fn redact_runtime_context(value: &Value) -> Value {
     }
 }
 
+#[cfg(test)]
+use crate::runtime::codex_transport::{codex_error_class, CodexCompletion};
+
 fn execute_codex(
     workspace: &str,
     prompt: &str,
     timeout_seconds: u64,
     model: Option<&str>,
+    access: crate::runtime::deepseek_harness::WorkflowAccess,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<String, Box<dyn Error>> {
-    let (executable, _) = codex::resolve_codex_executable()?;
+    execute_codex_with_shutdown_limit(workspace, prompt, timeout_seconds, model, access, is_canceled,
+        std::time::Duration::from_secs(15))
+}
+
+fn execute_codex_with_shutdown_limit(
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    model: Option<&str>,
+    access: crate::runtime::deepseek_harness::WorkflowAccess,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    shutdown_limit: std::time::Duration,
+) -> Result<String, Box<dyn Error>> {
+    execute_codex_with_resources(workspace, prompt, timeout_seconds, model, access, is_canceled, shutdown_limit, None)
+}
+
+fn execute_codex_with_resources(
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    model: Option<&str>,
+    access: crate::runtime::deepseek_harness::WorkflowAccess,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    shutdown_limit: std::time::Duration,
+    resources: Option<&crate::mission::CheckRuntimeResources>,
+) -> Result<String, Box<dyn Error>> {
+    execute_codex_outcome_with_resources(workspace, prompt, timeout_seconds, model, access,
+        is_canceled, shutdown_limit, resources, None).map(|outcome| outcome.text)
+}
+
+fn execute_codex_outcome_with_resources(
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    model: Option<&str>,
+    access: crate::runtime::deepseek_harness::WorkflowAccess,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    shutdown_limit: std::time::Duration,
+    resources: Option<&crate::mission::CheckRuntimeResources>,
+    run_identity: Option<&str>,
+) -> Result<crate::runtime::codex_transport::CodexOutcome, Box<dyn Error>> {
+    let (executable, version) = codex::resolve_codex_executable_with_cancel(is_canceled)?;
     let result_path = process::safe_temp_path(
         &format!("workflow-codex-{}", rand::random::<u64>()),
         "result.txt",
     )?;
     process::remove_file_if_present(&result_path);
+    let sandbox = codex_workflow_sandbox(access)?;
     let mut command = Command::new(executable);
     command.args([
         "-C",
         workspace,
         "-s",
-        "workspace-write",
+        sandbox,
         "-a",
         "never",
     ]);
@@ -774,64 +885,24 @@ fn execute_codex(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(resources) = resources { resources.apply(&mut command)?; }
     process::remove_himind_secret_environment(&mut command);
     process::configure_hidden_process(&mut command);
-    let mut child = command.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(error) = stdin.write_all(prompt.as_bytes()) {
-            process::terminate_process_tree(&mut child);
-            process::remove_file_if_present(&result_path);
-            return Err(format!("failed to send workflow instruction to Codex: {error}").into());
-        }
-    } else {
-        process::terminate_process_tree(&mut child);
-        process::remove_file_if_present(&result_path);
-        return Err("Codex runtime stdin was not available".into());
-    }
-    let stdout = child.stdout.take().map(process::capture_output);
-    let stderr = child.stderr.take().map(process::capture_output);
-    let status = process::wait_for_child_with_timeout_and_cancel(
-        &mut child,
-        "HIMIND_CODEX_TIMEOUT_SECONDS",
-        timeout_seconds,
-        "Codex workflow runtime",
-        || is_canceled(),
-    );
-    let stdout = process::join_output(stdout);
-    let stderr = process::join_output(stderr);
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => {
-            process::remove_file_if_present(&result_path);
-            return Err(error);
-        }
-    };
-    if !status.success() {
-        process::remove_file_if_present(&result_path);
-        let detail = if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        };
-        return Err(format!(
-            "Codex runtime step failed: {}",
-            process::summarize_output(detail.trim(), RUNTIME_OUTPUT_LIMIT)
-        )
-        .into());
-    }
-    if result_path.is_file() {
-        let result = std::fs::read_to_string(&result_path)?;
-        process::remove_file_if_present(&result_path);
-        return Ok(process::summarize_output(
-            result.trim(),
-            RUNTIME_OUTPUT_LIMIT,
-        ));
-    }
+    let outcome = crate::runtime::codex_transport::execute(
+        &mut command, prompt, &result_path, timeout_seconds, is_canceled, shutdown_limit,
+        run_identity.unwrap_or(result_path.to_str().ok_or("Codex result identity is not UTF-8")?), "");
     process::remove_file_if_present(&result_path);
-    Ok(process::summarize_output(
-        stdout.trim(),
-        RUNTIME_OUTPUT_LIMIT,
-    ))
+    outcome.map(|mut outcome| {outcome.version=version.trim().to_string();outcome})
+}
+
+fn codex_workflow_sandbox(access: crate::runtime::deepseek_harness::WorkflowAccess) -> Result<&'static str, Box<dyn Error>> {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match access {
+        WorkflowAccess::Read => Ok("read-only"),
+        WorkflowAccess::Write => Ok("workspace-write"),
+        WorkflowAccess::Full => Ok("danger-full-access"),
+        WorkflowAccess::FilesOnly => Err("Codex cannot enforce files_only access".into()),
+    }
 }
 
 fn execute_copilot(
@@ -854,7 +925,7 @@ fn execute_copilot(
         .stderr(Stdio::piped());
     process::remove_himind_secret_environment(&mut command);
     process::configure_hidden_process(&mut command);
-    let mut child = command.spawn()?;
+    let (mut child, _tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
     let stdout = child.stdout.take().map(process::capture_output);
     let stderr = child.stderr.take().map(process::capture_output);
     let status = process::wait_for_child_with_timeout_and_cancel(
@@ -864,6 +935,7 @@ fn execute_copilot(
         "GitHub Copilot workflow runtime",
         || is_canceled(),
     )?;
+    drop(_tree);
     let stdout = process::join_output(stdout);
     let stderr = process::join_output(stderr);
     if !status.success() {
@@ -887,6 +959,429 @@ fn execute_copilot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_prompt_transport_and_strict_payload() {
+        let prompt = "中文😀\"$()\\shell\n".repeat(9000);
+        assert!(prompt.encode_utf16().count() > 32767);
+        for provider in ["personal.codex","himind.builtin","acp.claude"] {
+            validate_prompt_transport(provider,"step",&prompt).unwrap();
+        }
+        assert!(validate_prompt_transport("personal.github-copilot","step",&prompt).is_err());
+        for bad in ["{\"passed\":false,\"details\":\n{\"passed\":true}",
+            "```json\n{\"passed\":true}\n```\ntrailing", "prefix\n{\"passed\":true}"] {
+            assert!(parse_runtime_payload(bad).is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_workflow_large_input_no_reader_cancel_timeout_and_output_first() {
+        use crate::runtime::process::codex_test_support::{Environment, ProcessProbe};
+        let _lock = crate::store::paths::test_env_lock();
+        let prompt = "中文😀\"$()\\shell\n".repeat(90000);
+        for cancel in [false,true] {
+            let env=Environment::new(); env.case(&json!({"no_reader":true,"output_before_input":true}));
+            let root=env.root.clone();
+            let probe=std::thread::spawn(move || {
+                let parent=ProcessProbe::open(&root.join("root.pid"));
+                let child=ProcessProbe::open(&root.join("child.pid"));
+                parent.assert_exited(); child.assert_exited();
+            });
+            let started=std::time::Instant::now();
+            let error=execute_codex(env.root.to_str().unwrap(),&prompt,1,None,
+                crate::runtime::deepseek_harness::WorkflowAccess::Full,
+                &|| Ok(cancel && env.root.join("root.pid").exists())).unwrap_err();
+            assert!(started.elapsed()<std::time::Duration::from_secs(4),"{error}");
+            assert!(error.to_string().contains(if cancel {"canceled"} else {"exceeded"}),"{error}");
+            probe.join().unwrap();
+        }
+        let env=Environment::new(); env.case(&json!({"output_before_input":true}));
+        execute_codex(env.root.to_str().unwrap(),&prompt,5,None,
+            crate::runtime::deepseek_harness::WorkflowAccess::Read,&||Ok(false)).unwrap();
+        assert_eq!(std::fs::read_to_string(env.root.join("stdin.txt")).unwrap(),prompt);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_discovery_cancel_and_timeout_do_not_launch_exec() {
+        use crate::runtime::process::codex_test_support::{Environment, ProcessProbe};
+        let _lock = crate::store::paths::test_env_lock();
+        for cancel in [false,true] {
+            let env=Environment::new(); env.case(&json!({"version_hang":true}));
+            let root=env.root.clone();
+            let probe=std::thread::spawn(move || ProcessProbe::open(&root.join("version.pid")).assert_exited());
+            let exe=std::env::var_os("HIMIND_CODEX_EXECUTABLE").unwrap();
+            let started=std::time::Instant::now();
+            let error=process::verify_command_with_cancel(&exe,&["--version"],std::time::Duration::from_millis(300),
+                &||Ok(cancel && env.root.join("version.pid").exists())).unwrap_err();
+            assert!(started.elapsed()<std::time::Duration::from_secs(3),"{error}");
+            assert!(!env.root.join("root.pid").exists()); probe.join().unwrap();
+        }
+        let env=Environment::new();env.case(&json!({"version_tree":true}));
+        let root=env.root.clone();
+        let probe=std::thread::spawn(move ||ProcessProbe::open(&root.join("child.pid")).assert_exited());
+        let error=execute_codex(env.root.to_str().unwrap(),"fixture",5,None,
+            crate::runtime::deepseek_harness::WorkflowAccess::Read,&||Ok(false)).unwrap_err();
+        assert!(error.to_string().contains("drain deadline"),"{error}");
+        assert!(!env.root.join("root.pid").exists());probe.join().unwrap();
+        let env=Environment::new();env.case(&json!({"version_hang":true}));
+        let error=execute_codex(env.root.to_str().unwrap(),"fixture",5,None,
+            crate::runtime::deepseek_harness::WorkflowAccess::Read,&||Ok(env.root.join("version.pid").exists())).unwrap_err();
+        assert!(error.to_string().contains("canceled"),"{error}");
+        assert!(!env.root.join("root.pid").exists());
+    }
+
+    #[test]
+    fn codex_completion_error_notification_is_not_terminal() {
+        let mut state = CodexCompletion::default();
+        state.observe(br#"{"type":"turn.started"}"#);
+        state.observe(br#"{"type":"error","message":"fixture retry notification"}"#);
+        assert!(!state.failed, "a CLI notification is not turn.failed");
+        assert!(state.terminal_at.is_none(), "a notification must not start the shutdown deadline");
+        assert_eq!(state.error_notifications, 1);
+        assert!(state.diagnostics().contains("cli_error_event=error; error_notifications=1; terminal_event=none"));
+        assert!(!state.diagnostics().contains("fixture retry notification"));
+        state.observe(br#"{"type":"item.completed","item":{"type":"agent_message","text":"valid final"}}"#);
+        state.observe(br#"{"type":"turn.completed"}"#);
+        assert!(state.completed && !state.failed);
+        assert_eq!(state.final_message.as_deref(), Some("valid final"));
+        assert!(state.terminal_at.is_some());
+    }
+
+    #[test]
+    fn codex_completion_completed_requires_prior_final_for_shutdown() {
+        let mut state = CodexCompletion::default();
+        state.observe(br#"{"type":"turn.completed"}"#);
+        assert!(state.terminal_at.is_none(), "completed without a final must not claim a bound terminal turn");
+        state.observe(br#"{"type":"item.completed","item":{"type":"agent_message","text":"late final"}}"#);
+        assert!(state.final_message.is_none(), "an out-of-order final must not retroactively bind completion");
+        state.observe(br#"{"type":"turn.failed"}"#);
+        assert!(state.failed && state.terminal_at.is_some());
+    }
+
+    #[test]
+    fn codex_protocol_projects_large_tool_output_and_validates_its_tail() {
+        let mut state = CodexCompletion::default();
+        let line = json!({"type":"item.completed","item":{"type":"command_execution",
+            "aggregated_output":format!("{}{}", "x".repeat(900*1024), r#"{"type":"turn.failed"}"#)}}).to_string();
+        assert!(state.observe_reader(&mut line.as_bytes()));
+        assert!(!state.failed && !state.completed && state.final_message.is_none());
+        assert!(!state.observe_reader(&mut format!("{line}junk").as_bytes()));
+        assert!(!state.observe_reader(&mut &line.as_bytes()[..line.len()-1]));
+        assert!(!state.observe_reader(&mut br#"{"type":"turn.completed"}{}"#.as_slice()));
+        assert!(!state.completed, "valid prefix of a malformed record cannot complete a turn");
+        let oversized = json!({"type":"item.completed","item":{"type":"agent_message","text":"x".repeat(RUNTIME_OUTPUT_LIMIT+1)}}).to_string();
+        assert!(state.observe_reader(&mut oversized.as_bytes()));
+        assert!(state.final_message.is_none(), "spooling must not expand the final answer limit");
+    }
+
+    #[test]
+    fn codex_failure_classification_retains_no_arbitrary_error_message() {
+        let mut state = CodexCompletion::default();
+        state.observe(br#"{"type":"error","message":"Reconnecting status 503 Service Unavailable, secret=fixture-private"}"#);
+        assert!(state.diagnostics().contains("error_class=upstream_service_unavailable"));
+        state.observe(br#"{"type":"turn.failed","error":{"message":"unexpected status 503 Service Unavailable, secret=fixture-private"}}"#);
+        assert!(state.failed);
+        assert!(!state.diagnostics().contains("fixture-private"));
+        assert_eq!(codex_error_class("secret503"), "unclassified");
+    }
+
+    #[test]
+    fn codex_control_protocol_requires_object_event_item_and_error() {
+        let mut state = CodexCompletion::default();
+        for invalid in [r#"["turn.completed",null,null,null]"#,
+            r#"{"type":"item.completed","item":["agent_message",null,"final"]}"#,
+            r#"{"type":"turn.failed","error":["failure"]}"#] {
+            assert!(!state.observe_reader(&mut invalid.as_bytes()));
+        }
+        assert!(!state.failed && !state.completed && state.final_message.is_none());
+    }
+
+    #[cfg(windows)]
+    fn recoverable_error_cli_fixture() -> crate::runtime::process::codex_test_support::Environment {
+        // Event order/shapes bound to the installed Codex synthetic-upstream
+        // probe stdout SHA256 15ed4d543a3b2d3f6315156b3542a3d6f82fa0d2e036a60be29776b6c8bbed1d
+        // (control/codex-recoverable-cli-probe/1794494556233699500-ef98ee).
+        // Test text/ids are synthetic; this is not repair1's missing stdout.
+        use std::sync::LazyLock;
+        static EXECUTABLE: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+            let root = std::env::temp_dir().join(format!("codex-retry-fixture-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&root).unwrap();
+            let source = root.join("fake.rs");
+            std::fs::write(&source, r##"
+use std::{env,fs,io::{Read,Write},thread,time::Duration};
+fn main() {
+ let args:Vec<String>=env::args().collect();
+ if args.iter().any(|a|a=="--version") {println!("codex-cli 0.167.0-retry-fixture");return;}
+ let root=env::current_dir().unwrap();
+ let case=fs::read_to_string(root.join("case.json")).unwrap();
+ let has=|name:&str|case.contains(&format!("\"{name}\":true"));
+ let mut input=String::new();std::io::stdin().read_to_string(&mut input).unwrap();
+ fs::write(root.join("root.pid"),std::process::id().to_string()).unwrap();
+ println!("{{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}}");
+ for id in ["notice-1","notice-2"] {println!("{{\"type\":\"item.completed\",\"item\":{{\"id\":\"{id}\",\"type\":\"error\",\"message\":\"fixture notice\"}}}}");}
+ println!("{{\"type\":\"turn.started\"}}");
+ for n in 1..=2 {println!("{{\"type\":\"error\",\"message\":\"Reconnecting... {n}/3 (fixture synthetic stream closed)\"}}");}
+ std::io::stdout().flush().unwrap();
+ fs::write(root.join("notification"),b"ready").unwrap();
+ if has("wait_for_cancel") {
+  // The caller cancels after observing notification. Hold this boundary
+  // until it actually terminates the owned process; scheduler/taskkill
+  // latency must not turn the fixture's 900ms work into a completion race.
+  let started=std::time::Instant::now();
+  while !root.join("release_work").exists() {
+   assert!(started.elapsed()<Duration::from_secs(8),"cancel was not delivered");
+   thread::sleep(Duration::from_millis(5));
+  }
+ }
+ if has("turn_failed") {
+  println!("{{\"type\":\"turn.failed\",\"error\":{{\"message\":\"fixture failed turn\"}}}}");
+  std::io::stdout().flush().unwrap();thread::sleep(Duration::from_secs(8));return;
+ }
+ // Work for 900ms after notification, well past the test's 200ms shutdown
+ // grace. These are complete protocol events, not a simulated state assertion.
+ for _ in 0..if has("long_work"){40}else{12} {
+  thread::sleep(Duration::from_millis(75));
+  println!("{{\"type\":\"item.started\",\"item\":{{\"id\":\"working\",\"type\":\"command_execution\"}}}}");
+  std::io::stdout().flush().unwrap();
+ }
+ let text=r#"{"passed":true,"summary":"fixture recovered"}"#;
+ let path=&args.windows(2).find(|a|a[0]=="-o").unwrap()[1];
+ if !has("no_final") {fs::write(path,format!("{text}\r\n")).unwrap();}
+ let escaped=text.replace('"',"\\\"");
+ if !has("no_final") {println!("{{\"type\":\"item.completed\",\"item\":{{\"id\":\"final\",\"type\":\"agent_message\",\"text\":\"{}\"}}}}",escaped);}
+ // Complete fixture filesystem work before publishing the terminal event.
+ // The real 200ms shutdown deadline must measure process shutdown, not a
+ // post-terminal fixture disk write contending with other regression suites.
+ fs::write(root.join("finished"),b"complete").unwrap();
+ if !has("no_completed") {println!("{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}");}
+ std::io::stdout().flush().unwrap();
+}
+"##).unwrap();
+            let exe = root.join("fake-codex-retry.exe");
+            let output = process::hidden_command("rustc").arg(&source)
+                .args(["--edition=2021", "-C", "debuginfo=0", "-o"]).arg(&exe).output().unwrap();
+            assert!(output.status.success(), "fixture compile: {}", String::from_utf8_lossy(&output.stderr));
+            exe
+        });
+        let env = crate::runtime::process::codex_test_support::Environment::new();
+        std::env::set_var("HIMIND_CODEX_EXECUTABLE", &*EXECUTABLE);
+        env
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_recoverable_error_keeps_working_past_shutdown_grace() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = recoverable_error_cli_fixture();
+        env.case(&json!({}));
+        let started = std::time::Instant::now();
+        let text = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+            std::time::Duration::from_millis(200)).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(800));
+        assert!(env.root.join("finished").is_file(), "CLI must reach its real final and zero exit");
+        assert_eq!(parse_runtime_payload(&text).unwrap()["passed"], true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_turn_failed_after_notification_still_has_bounded_shutdown() {
+        use crate::runtime::process::codex_test_support::ProcessProbe;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = recoverable_error_cli_fixture();
+        env.case(&json!({"turn_failed":true}));
+        let root = env.root.clone();
+        let probe = std::thread::spawn(move || {
+            let process = ProcessProbe::open(&root.join("root.pid"));
+            process.assert_exited();
+        });
+        let started = std::time::Instant::now();
+        let error = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+            std::time::Duration::from_millis(200)).unwrap_err();
+        probe.join().unwrap();
+        println!("failed_notification_shutdown_elapsed_ms={}",started.elapsed().as_millis());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(error.to_string().contains("shutdown deadline"), "{error}");
+        assert!(error.to_string().contains("error_notifications=2; terminal_event=turn.failed"), "{error}");
+        assert!(!env.root.join("finished").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_cancel_after_recoverable_notification_remains_canceled() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = recoverable_error_cli_fixture();
+        env.case(&json!({"wait_for_cancel":true}));
+        let error = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read,
+            &|| Ok(env.root.join("notification").is_file()), std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(env.root.join("notification").exists());
+        assert!(error.to_string().contains("was canceled"), "{error}");
+        assert!(!env.root.join("finished").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_recoverable_notifications_zero_exit_without_bound_final_is_rejected() {
+        let _lock = crate::store::paths::test_env_lock();
+        for case in [json!({"no_final":true}), json!({"no_completed":true}),
+            json!({"no_final":true,"no_completed":true})] {
+            let env = recoverable_error_cli_fixture();
+            env.case(&case);
+            let error = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+                None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+                std::time::Duration::from_millis(200)).unwrap_err();
+            assert!(env.root.join("finished").exists(), "CLI must finish normally, not be killed on notification");
+            assert!(!error.to_string().contains("shutdown deadline"), "{error}");
+            assert!(error.to_string().contains("error_notifications=2; terminal_event=none"), "{error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_recoverable_notification_obeys_execution_timeout() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = recoverable_error_cli_fixture();
+        env.case(&json!({"long_work":true}));
+        let error = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 1,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+            std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(error.to_string().contains("exceeded 1 seconds"), "{error}");
+        assert!(error.to_string().contains("error_notifications=2; terminal_event=none"), "{error}");
+        assert!(!env.root.join("finished").exists());
+    }
+
+    #[test]
+    fn codex_terminal_protocol_requires_complete_agent_message_and_turn() {
+        let mut state = CodexCompletion::default();
+        state.observe(br#"{"type":"turn.completed"}"#);
+        assert!(state.completed);
+        assert!(state.final_message.is_none());
+        let mut state = CodexCompletion::default();
+        state.observe(br#"{"type":"turn.started"}"#);
+        state.observe(br#"{"type":"item.completed","item":{"type":"agent_message","phase":"commentary","text":"not a final"}}"#);
+        assert!(state.final_message.is_none());
+        state.observe(br#"{"type":"item.completed","item":{"type":"agent_message","text":"final"}}"#);
+        assert!(!state.completed);
+        state.observe(br#"{"type":"turn.completed"}"#);
+        assert_eq!(state.final_message.as_deref(), Some("final"));
+        state.observe(br#"{"type":"turn.failed"}"#);
+        assert!(state.failed);
+        state.observe(br#"{"type":"turn.completed"}"#);
+        assert!(state.failed, "a later completed event cannot reverse failure");
+        state.observe(br#"{"type":"turn.started"}"#);
+        assert!(state.failed, "another turn cannot erase the terminal failure");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_final_protocol_and_shutdown_are_fail_closed() {
+        use crate::runtime::process::codex_test_support::{Environment, ProcessProbe};
+        let _lock = crate::store::paths::test_env_lock();
+        for (name, case, expected) in [
+            ("positive", json!({}), "positive"),
+            ("negative", json!({"negative":true}), "negative"),
+            ("missing", json!({"missing":true}), "error"),
+            ("truncated", json!({"truncated":true}), "error"),
+            ("nonzero", json!({"nonzero":true,"negative":true}), "error"),
+            ("no-turn", json!({"no_turn":true}), "error"),
+            ("no-agent", json!({"no_agent":true}), "error"),
+            ("many-events", json!({"many_events":true}), "positive"),
+            ("stderr-no-newline", json!({"stderr_no_newline":true}), "positive"),
+            ("large-line", json!({"large_line":true}), "positive"),
+            ("large-line-negative", json!({"large_line":true,"negative":true}), "negative"),
+            ("malformed-large-line", json!({"bad_large_line":true}), "error"),
+            ("large-line-missing-final", json!({"large_line":true,"missing":true}), "error"),
+            ("truncated-event", json!({"truncated_event":true}), "error"),
+            ("shutdown-hang", json!({"hang":true,"tree":true}), "error"),
+        ] {
+            let env = Environment::new();
+            env.case(&case);
+            let root = env.root.clone();
+            let probes = if case["tree"] == true {
+                Some(std::thread::spawn(move || {
+                    let parent = ProcessProbe::open(&root.join("root.pid"));
+                    let child = ProcessProbe::open(&root.join("child.pid"));
+                    parent.assert_exited(); child.assert_exited();
+                }))
+            } else { None };
+            let started = std::time::Instant::now();
+            let result = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+                None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+                std::time::Duration::from_millis(500));
+            if let Some(probes) = probes { probes.join().unwrap(); }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "{name}: unbounded shutdown");
+            match expected {
+                "positive" => assert_eq!(parse_runtime_payload(&result.unwrap()).unwrap()["passed"], true),
+                "negative" => assert_eq!(parse_runtime_payload(&result.unwrap()).unwrap()["passed"], false),
+                _ => {
+                    let error = result.unwrap_err();
+                    if name == "nonzero" {
+                        let failure = error.downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>().unwrap();
+                        assert_eq!(failure.report.as_ref().unwrap()["passed"], false);
+                        assert!(failure.message.contains("exit=7"));
+                    }
+                    if name == "shutdown-hang" { assert!(error.to_string().contains("shutdown deadline")); }
+                    if name == "shutdown-hang" { assert!(error.to_string().contains("terminal_event=turn.completed")); }
+                    if name == "malformed-large-line" { assert!(error.to_string().contains("could not be read")); }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_exited_root_with_inherited_pipes_does_not_block_dispatch() {
+        use crate::runtime::process::codex_test_support::{Environment, ProcessProbe};
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        env.case(&json!({"tree":true,"inherit_writer":true}));
+        let root = env.root.clone();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = observed.clone();
+        let probe = std::thread::spawn(move || {
+            let parent = ProcessProbe::open(&root.join("root.pid"));
+            let child = ProcessProbe::open(&root.join("child.pid"));
+            parent.assert_exited();
+            assert!(child.is_alive(), "test must hold both inherited pipe writers after root exit");
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Retain the exact descendant handle across product cleanup.
+            child.assert_exited();
+        });
+        crate::runtime::codex_transport::AFTER_ROOT_EXIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let started = std::time::Instant::now();
+            while !observed.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(started.elapsed() < std::time::Duration::from_secs(3), "descendant was not independently observed");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })));
+        let started = std::time::Instant::now();
+        let result = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 6,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+            std::time::Duration::from_millis(500));
+        crate::runtime::codex_transport::AFTER_ROOT_EXIT.with(|hook| *hook.borrow_mut() = None);
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("drain deadline"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        probe.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_cli_cancel_wins_over_emitted_final_and_exit() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        env.case(&json!({}));
+        let error = execute_codex_with_shutdown_limit(env.root.to_str().unwrap(), "fixture", 5,
+            None, crate::runtime::deepseek_harness::WorkflowAccess::Read,
+            &|| Ok(env.root.join("emitted").exists()), std::time::Duration::from_millis(500)).unwrap_err();
+        assert!(env.root.join("emitted").is_file(), "the CLI must really have emitted its final");
+        assert!(error.to_string().contains("was canceled"), "{error}");
+    }
 
     #[test]
     fn runtime_payload_parses_fenced_json() {
@@ -929,6 +1424,18 @@ mod tests {
         let prompt = build_prompt("任务说明", &reduced);
         assert!(prompt.contains("tech-radar-snapshot"));
         assert!(!prompt.contains("entry_id"));
+    }
+
+    #[test]
+    fn files_only_policy_cannot_escalate_read_or_use_external_providers() {
+        use crate::runtime::deepseek_harness::WorkflowAccess;
+        assert_eq!(workflow_access_for_policy("R2", "files_only"), WorkflowAccess::FilesOnly);
+        assert_eq!(workflow_access_for_policy("R1", "files_only"), WorkflowAccess::Read);
+        assert_eq!(workflow_access_for_policy("R2", "default"), WorkflowAccess::Write);
+        assert!(!enforce_runtime_tool_policy("himind.builtin", "files_only").unwrap());
+        for provider in ["personal.codex", "personal.github-copilot", "acp.claude"] {
+            assert!(enforce_runtime_tool_policy(provider, "files_only").is_err());
+        }
     }
 
     #[test]
@@ -1147,6 +1654,33 @@ mod tests {
             enforce_model_namespace("acp.claude", Some("himind:svc:x")).unwrap_err();
         assert!(acp_with_himind.to_string().contains("himind:"), "{acp_with_himind}");
         assert!(enforce_model_namespace("himind.builtin", Some("bare-model")).is_err());
+    }
+
+    #[test]
+    fn codex_workflow_access_preserves_read_only_verification_and_explicit_full_access() {
+        for (risk, mode, expected) in [
+            ("local_write", "", "workspace-write"),
+            ("local_write", "workspace_write", "workspace-write"),
+            ("local_write", "full_access", "danger-full-access"),
+            ("read_only", "full_access", "read-only"),
+            ("R1", "", "read-only"),
+        ] {
+            assert_eq!(codex_workflow_sandbox(workflow_access_with_permission(risk, "default", mode)).unwrap(), expected);
+        }
+        assert!(codex_workflow_sandbox(workflow_access_with_permission("local_write", "files_only", "full_access")).is_err());
+    }
+
+    #[test]
+    fn full_access_requires_explicit_mode_and_preserves_read_and_files_only_limits() {
+        use crate::runtime::deepseek_harness::WorkflowAccess;
+        assert_eq!(workflow_access_with_permission("R2","default","full_access"),WorkflowAccess::Full);
+        assert_eq!(workflow_access_with_permission("R2","default",""),WorkflowAccess::Write);
+        assert_eq!(workflow_access_with_permission("R1","default","full_access"),WorkflowAccess::Read);
+        assert_eq!(workflow_access_with_permission("R2","files_only","full_access"),WorkflowAccess::FilesOnly);
+        assert!(super::super::validate_runtime_permission_mode("personal.codex","full_access").is_ok());
+        assert!(super::super::validate_runtime_permission_mode("personal.github-copilot","full_access").is_err());
+        assert!(super::super::validate_runtime_permission_mode("acp.claude","full_access").is_ok());
+        assert!(super::super::validate_runtime_permission_mode("acp.opencode","full_access").is_ok());
     }
 
     #[test]

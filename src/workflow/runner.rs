@@ -622,10 +622,31 @@ impl WorkflowRunner {
         package.validate().map_err(std::io::Error::other)?;
         let merged_workflow_input = super::with_launch_defaults(package, workflow_input);
         let workflow_input = &merged_workflow_input;
+        let _lease = if run.status.is_terminal() {None} else {Some(RunLeaseGuard::acquire(self.ledger.clone(), &run.run_id)?)};
+        self.recover_codex_receipts(&mut run)?;
+        // A committed usage receipt attests billing only. If a worker died
+        // before recording the business outcome, preserve that failed attempt
+        // and require an explicit retry with a fresh monotonically growing ID.
+        for step in &package.steps {
+            let state=run.steps.iter().find(|s|s.step_id==step.id).ok_or("workflow step missing")?;
+            let recorded_outcome=self.ledger.list_events(&run.run_id)?.iter().any(|e|e.step_id==step.id
+                && e.payload["runtime_attempt"].as_u64()==Some(state.attempt as u64)
+                && matches!(e.event_type,RuntimeEventType::ToolCompleted|RuntimeEventType::Error));
+            if matches!(state.status,LocalStepStatus::Running|LocalStepStatus::Pending) && !recorded_outcome && crate::runtime::codex_usage::read_receipt(
+                &crate::runtime::codex_usage::default_root(),&format!("{}:{}:{}",run.run_id,step.id,state.attempt))?.is_some() {
+                let attempt=state.attempt;
+                let state=run.steps.iter_mut().find(|s|s.step_id==step.id).unwrap();
+                state.status=LocalStepStatus::Failed;
+                state.error="receipt recovered after interrupted caller; business outcome unknown".into();
+                run.status=LocalRunStatus::Failed;run.error=state.error.clone();
+                self.persist_run(&mut run)?;
+                self.append_event(&run,step,RuntimeEventType::Error,serde_json::json!({"error":run.error,
+                    "runtime_attempt":attempt,"receipt_recovery_only":true,"business_success":false}))?;
+            }
+        }
         if run.status.is_terminal() {
             return Ok(outcome(run, String::new(), Vec::new()));
         }
-        let _lease = RunLeaseGuard::acquire(self.ledger.clone(), &run.run_id)?;
         let mut completed_steps = Vec::new();
 
         loop {
@@ -737,6 +758,11 @@ impl WorkflowRunner {
             run.status = LocalRunStatus::Running;
             run.updated_at = timestamp();
             self.persist_run(&mut run)?;
+            if step.runtime.is_some() {
+                let attempt=run.steps.iter().find(|s|s.step_id==step.id).unwrap().attempt;
+                crate::runtime::codex_usage_delivery::bind(&self.ledger,&crate::runtime::codex_usage::default_root(),
+                    &format!("{}:{}:{attempt}",run.run_id,step.id),&run.run_id,&step.id,attempt)?;
+            }
             self.append_event(
                 &run,
                 step,
@@ -782,22 +808,41 @@ impl WorkflowRunner {
                     })),
                 ))
             } else {
-                let step_input = execution_input_from_context(
+                let mut step_input = execution_input_from_context(
                     package,
                     &run,
                     workflow_input,
                     &condition_context,
                     step,
                 )?;
+                step_input["workflow_context"]["runtime_attempt"] = serde_json::json!(
+                    run.steps.iter().find(|candidate|candidate.step_id==step.id).map(|step|step.attempt).unwrap_or(1));
                 step_input_snapshot = summarize_step_input(&step_input);
                 executor
                     .execute(package, step, &step_input)
                     .map(WorkflowStepOutcome::Execution)
             };
-            if let Ok(WorkflowStepOutcome::Execution(execution)) = &result {
-                if execution.usage.is_some() {
-                    run.usage = execution.usage.clone();
+            #[cfg(test)]
+            {
+                let attempt=run.steps.iter().find(|s|s.step_id==step.id).unwrap().attempt;
+                if crate::runtime::codex_usage::read_receipt(&crate::runtime::codex_usage::default_root(),
+                    &format!("{}:{}:{attempt}",run.run_id,step.id))?.is_some() {
+                    crate::runtime::codex_usage_delivery::fail_after_receipt_commit()?;
                 }
+            }
+            self.recover_codex_receipts(&mut run)?;
+            let step_usage = match &result {
+                Ok(WorkflowStepOutcome::Execution(execution)) => execution.usage.clone(),
+                Err(error) => error.downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>()
+                    .and_then(|failure|failure.usage.clone()),
+                _ => None,
+            };
+            let runtime_attempt = run.steps.iter().find(|candidate|candidate.step_id==step.id)
+                .map(|step|step.attempt).unwrap_or(1);
+            if let Some(usage) = &step_usage {
+                let committed=crate::runtime::codex_usage_delivery::publish_attempt_usage(
+                    &self.ledger,&run.run_id,&step.id,runtime_attempt,usage)?;
+                run.usage=committed.usage;
             }
             if let Some(current) = self.ledger.get_run(&run.run_id)? {
                 if current.status == LocalRunStatus::Canceled {
@@ -870,6 +915,7 @@ impl WorkflowRunner {
                                     "error": message,
                                     "degraded": true,
                                     "on_failure": step.on_failure,
+                                    "runtime_usage": step_usage,"runtime_attempt":runtime_attempt,
                                 }),
                             )?;
                             continue;
@@ -885,7 +931,7 @@ impl WorkflowRunner {
                             &run,
                             step,
                             RuntimeEventType::Error,
-                            serde_json::json!({"error": message}),
+                            serde_json::json!({"error": message,"runtime_usage":step_usage,"runtime_attempt":runtime_attempt}),
                         )?;
                         // 运行失败也推出去：夜间定时任务挂掉时，没人守着界面。
                         notify_run_failed(package, &run, step, &message);
@@ -911,6 +957,7 @@ impl WorkflowRunner {
                         serde_json::json!({
                             "output_recorded": !execution.output.is_null(),
                             "output": execution.output,
+                            "runtime_usage": step_usage,"runtime_attempt":runtime_attempt,
                             "artifact_ids": run.artifacts.iter().map(|artifact| &artifact.artifact_id).collect::<Vec<_>>(),
                             // 结构化证据：回答「谁依据什么做了什么判断」，
                             // 不依赖各 Runtime 互不相同的原始对话格式。
@@ -927,6 +974,12 @@ impl WorkflowRunner {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    let mut runtime_report = None;
+                    let mut runtime_provenance = None;
+                    if let Some(failure) = error.downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>() {
+                        runtime_report = failure.report.clone();
+                        runtime_provenance = failure.provenance.clone();
+                    }
                     if tolerates_failure(step) {
                         // The workflow declared this step as degradable, so a
                         // failure is recorded on the step and the run keeps
@@ -946,6 +999,9 @@ impl WorkflowRunner {
                                 "error": message,
                                 "degraded": true,
                                 "on_failure": step.on_failure,
+                                "runtime_report": runtime_report,
+                                "runtime_usage": step_usage,"runtime_attempt":runtime_attempt,
+                                "runtime_provenance":runtime_provenance,
                             }),
                         )?;
                         continue;
@@ -961,7 +1017,7 @@ impl WorkflowRunner {
                         &run,
                         step,
                         RuntimeEventType::Error,
-                        serde_json::json!({"error": message}),
+                        serde_json::json!({"error": message, "runtime_report": runtime_report,"runtime_usage":step_usage,"runtime_attempt":runtime_attempt,"runtime_provenance":runtime_provenance}),
                     )?;
                     return Ok(outcome(run, String::new(), completed_steps));
                 }
@@ -1856,6 +1912,7 @@ impl WorkflowRunner {
         mut run: LocalRun,
         step_id: &str,
     ) -> Result<LocalRun, Box<dyn Error>> {
+        self.recover_codex_receipts(&mut run)?;
         let step_id = step_id.trim();
         if step_id.is_empty() {
             return Err("retry_step requires a step id".into());
@@ -1903,7 +1960,8 @@ impl WorkflowRunner {
             step.started_at = String::new();
             step.finished_at = String::new();
             step.error = String::new();
-            step.attempt = 0;
+            // Attempt IDs also bind immutable provider receipts. Never reuse an
+            // ID after retry, including a restart between receipt and outcome.
             reset += 1;
         }
         // 目标步骤与下游的审批记录作废：输入变了，之前的批准不再适用。
@@ -1927,6 +1985,19 @@ impl WorkflowRunner {
             }),
         )?;
         Ok(run)
+    }
+
+    fn recover_codex_receipts(&self, run:&mut LocalRun) -> Result<(),Box<dyn Error>> {
+        for step in &run.steps {
+            for attempt in 1..=step.attempt {
+                let identity=format!("{}:{}:{attempt}",run.run_id,step.step_id);
+                if let Some(recovered)=crate::runtime::codex_usage_delivery::recover(&self.ledger,
+                    &crate::runtime::codex_usage::default_root(),&identity,&run.run_id,&step.step_id,attempt)? {
+                    run.usage=recovered.usage;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 读回运行对应的包；包缺失或已卸载时返回错误，由调用方退化处理。
@@ -1973,13 +2044,14 @@ impl WorkflowRunner {
 
     pub(crate) fn cancel(
         &self,
-        mut run: LocalRun,
+        run: LocalRun,
         reason: &str,
     ) -> Result<LocalRun, Box<dyn Error>> {
-        if run.status.is_terminal() {
-            return Ok(run);
-        }
         let canceled_at = timestamp();
+        #[cfg(test)]
+        CANCEL_BEFORE_UPDATE.with(|hook| {if let Some(hook)=hook.borrow_mut().take() {hook();}});
+        let (run,changed)=crate::runtime::codex_usage_delivery::update_caller(&self.ledger,&run.run_id,|run| {
+        if run.status.is_terminal() {return false;}
         for step in &mut run.steps {
             if matches!(
                 step.status,
@@ -2000,14 +2072,12 @@ impl WorkflowRunner {
         run.error = reason.to_string();
         run.current_step_id.clear();
         run.updated_at = canceled_at.clone();
-        if let Err(error) = self.persist_run(&mut run) {
-            if let Some(existing) = self.ledger.get_run(&run.run_id)? {
-                if existing.status.is_terminal() {
-                    return Ok(existing);
-                }
-            }
-            return Err(error);
-        }
+        true
+        })?;
+        #[cfg(test)]
+        CANCEL_AFTER_UPDATE.with(|hook| {if let Some(hook)=hook.borrow_mut().take() {hook();}});
+        if !changed {return Ok(run);}
+        // update_caller atomically queued the latest cancellation projection.
         let sequence = self.ledger.next_runtime_sequence(&run.run_id)?;
         self.ledger.append_event(&RuntimeEvent {
             schema_version: RUNTIME_EVENT_SCHEMA_VERSION.to_string(),
@@ -2090,6 +2160,14 @@ impl WorkflowRunner {
         })?;
         Ok(())
     }
+}
+
+// Deterministic scheduling at the actual cancel entry/commit boundary. Never
+// enabled by environment variables in production builds.
+#[cfg(test)]
+thread_local! {
+    static CANCEL_BEFORE_UPDATE:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const {std::cell::RefCell::new(None)};
+    static CANCEL_AFTER_UPDATE:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const {std::cell::RefCell::new(None)};
 }
 
 fn requirement_satisfied(requirement: &str, seed_artifacts: &[String], input: &Value) -> bool {
@@ -2352,6 +2430,33 @@ fn tolerates_failure(step: &WorkflowStep) -> bool {
 
 fn degraded_failure_message(message: &str) -> String {
     format!("degraded after failure: {}", message.trim())
+}
+
+/// Recompute from durable attempt snapshots. Replay replaces one snapshot;
+/// a new paid retry remains additive, even when it belongs to the same step.
+/// Mixed/unknown currencies remain incomparable; a token count is not a price.
+fn reconcile_step_usage(ledger: &LocalRunLedger, run_id: &str, step_id: &str, attempt: u32, usage: &LocalRunUsage)
+    -> Result<LocalRunUsage, Box<dyn Error>> {
+    let mut by_step = std::collections::BTreeMap::<(String,u64),LocalRunUsage>::new();
+    for event in ledger.list_events(run_id)? {
+        if let Some(value) = event.payload.get("runtime_usage").filter(|value|!value.is_null()) {
+            let attempt=event.payload.get("runtime_attempt").and_then(Value::as_u64).unwrap_or(1);
+            by_step.insert((event.step_id,attempt),serde_json::from_value(value.clone())?);
+        }
+    }
+    by_step.insert((step_id.to_string(),attempt as u64),usage.clone());
+    let mut total=LocalRunUsage{input_tokens:0,output_tokens:0,estimated_cost:0.0,
+        currency:usage.currency.clone(),billing_owner:usage.billing_owner.clone()};
+    let comparable=by_step.values().all(|row|!row.currency.trim().is_empty() && row.currency==usage.currency
+        && row.estimated_cost.is_finite() && row.estimated_cost>=0.0);
+    for row in by_step.values() {
+        total.input_tokens=total.input_tokens.saturating_add(row.input_tokens);
+        total.output_tokens=total.output_tokens.saturating_add(row.output_tokens);
+        if comparable {total.estimated_cost+=row.estimated_cost;}
+    }
+    if !comparable {total.currency.clear();total.estimated_cost=0.0;}
+    if by_step.values().any(|row|row.billing_owner!=usage.billing_owner) {total.billing_owner="mixed".into();}
+    Ok(total)
 }
 
 fn step_failure(
@@ -3753,8 +3858,526 @@ mod tests {
     }
 
     #[test]
+    fn runner_preserves_negative_runtime_report_and_usage_while_remaining_failed() {
+        struct NegativeReview;
+        impl WorkflowStepExecutor for NegativeReview {
+            fn execute(&self, _: &WorkflowPackage, _: &WorkflowStep, _: &Value)
+                -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                    provenance:None,
+                    message: "CLI exited 1 with a negative review".into(),
+                    report: Some(serde_json::json!({"passed":false,"reasons":["missing evidence"]})),
+                    usage: Some(crate::agent_core_contracts::LocalRunUsage {
+                        input_tokens:17, output_tokens:3, estimated_cost:0.0,
+                        currency:String::new(), billing_owner:"test".into(),
+                    }),
+                }))
+            }
+        }
+        let runner = WorkflowRunner::with_ledger(ledger("negative-runtime-review"));
+        let package = package();
+        let run = runner.start("agent-1", &package, "negative-review", &serde_json::json!({})).unwrap();
+        let outcome = runner.run_ready(&package, run, &serde_json::json!({}), &NegativeReview).unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Failed);
+        assert_eq!(outcome.run.usage.unwrap().input_tokens, 17);
+        let events = runner.ledger.list_events(&outcome.run.run_id).unwrap();
+        assert!(!events.iter().any(|event| event.event_type == RuntimeEventType::ToolCompleted));
+        assert!(events.iter().any(|event| event.event_type == RuntimeEventType::Error
+            && event.payload["runtime_report"]["passed"] == false
+            && event.payload["runtime_report"]["reasons"][0] == "missing evidence"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_workflow_receipt_commit_crash_recovers_once_after_restart() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock=crate::store::paths::test_env_lock();
+        let env=Environment::new();env.case(&serde_json::json!({}));
+        let mut package=package();package.steps.truncate(1);
+        package.steps[0].kind="runtime".into();package.steps[0].capability_id.clear();
+        package.steps[0].runtime=Some(serde_json::from_value(serde_json::json!({"provider":"personal.codex",
+            "prompt":"receipt boundary fixture","workspace_path":env.root,"timeout_seconds":5})).unwrap());
+        struct Runtime;
+        impl WorkflowStepExecutor for Runtime {
+            fn execute(&self,p:&WorkflowPackage,s:&WorkflowStep,i:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                super::super::execute_runtime_step(p,s,i,None,&||Ok(false))
+            }
+        }
+        let ledger=LocalRunLedger::new(env.root.join("caller.sqlite3"));
+        let runner=WorkflowRunner::with_ledger(ledger.clone());
+        let run=runner.start("fixture",&package,"receipt-boundary",&serde_json::json!({})).unwrap();
+        let run_id=run.run_id.clone();
+        crate::runtime::codex_usage_delivery::AFTER_COMMIT.with(|v|v.set(true));
+        assert!(runner.run_ready(&package,run,&serde_json::json!({}),&Runtime).err().unwrap().to_string().contains("injected crash"));
+        let crashed=ledger.get_run(&run_id).unwrap().unwrap();
+        assert_eq!(crashed.steps[0].attempt,1);assert_eq!(crashed.status,LocalRunStatus::Running);assert!(crashed.usage.is_none());
+        let receipt_id=format!("{run_id}:{}:1",package.steps[0].id);
+        let receipt=crate::runtime::codex_usage::read_receipt(&crate::runtime::codex_usage::default_root(),&receipt_id).unwrap().unwrap();
+        assert!(crate::runtime::codex_usage::increment(&receipt).is_some());
+        std::fs::write(env.root.join("package.json"),serde_json::to_vec(&package).unwrap()).unwrap();
+        let output=crate::runtime::process::hidden_command(std::env::current_exe().unwrap()).args([
+            "workflow::runner::tests::receipt_recovery_restart_worker","--exact","--ignored","--nocapture"])
+            .env("RECEIPT_RESTART_ROOT",&env.root).env("RECEIPT_RESTART_RUN",&run_id).output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored"));
+        let restarted=WorkflowRunner::with_ledger(LocalRunLedger::new(ledger.path()));
+        let failed=restarted.ledger.get_run(&run_id).unwrap().unwrap();
+        assert_eq!(failed.status,LocalRunStatus::Failed);
+        assert_eq!(failed.usage.as_ref().unwrap().input_tokens,crate::runtime::codex_usage::increment(&receipt).unwrap().input_tokens);
+        let mut replay=failed.clone();restarted.recover_codex_receipts(&mut replay).unwrap();
+        assert_eq!(replay.usage,failed.usage);
+        let events=ledger.list_events(&run_id).unwrap();
+        assert_eq!(events.iter().filter(|e|e.payload["usage_receipt"]["run_id"]==receipt_id).count(),1);
+        assert!(events.iter().any(|e|e.event_type==RuntimeEventType::Error && e.payload["receipt_recovery_only"]==true));
+        assert!(!events.iter().any(|e|e.event_type==RuntimeEventType::ToolCompleted));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite() {
+        use crate::runtime::process::codex_test_support::{Environment,wait_file};
+        use std::process::Stdio;
+        let _lock=crate::store::paths::test_env_lock();
+        for legacy_overwrite in [false,true] {
+            let env=Environment::new();env.case(&serde_json::json!({"usage_40_4":true}));
+            let mut package=package();package.steps.truncate(1);package.source_root=env.root.clone();
+            package.steps[0].kind="runtime".into();package.steps[0].capability_id.clear();
+            package.steps[0].runtime=Some(serde_json::from_value(serde_json::json!({"provider":"personal.codex",
+                "prompt":"AC-05 deterministic CLI fixture, not a live model","workspace_path":env.root,"timeout_seconds":5})).unwrap());
+            let ledger=LocalRunLedger::new(env.root.join("caller.sqlite3"));
+            let runner=WorkflowRunner::with_ledger(ledger.clone());
+            let run=runner.start("fixture",&package,"cancel-ack",&serde_json::json!({})).unwrap();
+            std::fs::write(env.root.join("package.json"),serde_json::to_vec(&package).unwrap()).unwrap();
+            let mut command=crate::runtime::process::hidden_command(std::env::current_exe().unwrap());
+            command.args(["workflow::runner::tests::cancel_projection_process_worker","--exact","--ignored","--nocapture"])
+                .env("CANCEL_PROJECTION_ROOT",&env.root).env("CANCEL_PROJECTION_RUN",&run.run_id)
+                .env("CANCEL_PROJECTION_MODE",if legacy_overwrite {"legacy"}else{"current"})
+                .stdout(Stdio::from(std::fs::File::create(env.root.join("interrupted-worker.log")).unwrap())).stderr(Stdio::inherit());
+            let (mut child,tree)=crate::runtime::owned_tree::OwnedTree::spawn(&mut command).unwrap();
+            wait_file(&env.root.join("cancel-committed"));
+            assert!(child.try_wait().unwrap().is_none(),"worker must still be alive at committed barrier");
+            let before=ledger.get_run(&run.run_id).unwrap().unwrap();
+            assert_eq!(before.status,LocalRunStatus::Canceled);
+            if legacy_overwrite {assert!(before.usage.is_none());} else {
+                assert_eq!((before.usage.as_ref().unwrap().input_tokens,before.usage.as_ref().unwrap().output_tokens),(40,4));
+            }
+            child.kill().unwrap();let death=child.wait().unwrap();assert!(!death.success());drop(tree);
+            // A separate OS process runs the same startup recovery entry. This
+            // is real process termination, unlike AFTER_COMMIT error injection.
+            let output=crate::runtime::process::hidden_command(std::env::current_exe().unwrap())
+                .args(["workflow::runner::tests::cancel_projection_process_worker","--exact","--ignored","--nocapture"])
+                .env("CANCEL_PROJECTION_ROOT",&env.root).env("CANCEL_PROJECTION_RUN",&run.run_id)
+                .env("CANCEL_PROJECTION_MODE","restart").output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored"));
+            assert_eq!(std::fs::read_to_string(env.root.join("provider.invocations")).unwrap().lines().count(),1);
+            let after=ledger.get_run(&run.run_id).unwrap().unwrap();
+            assert_eq!(after.status,LocalRunStatus::Canceled);
+            assert_eq!((after.usage.unwrap().input_tokens,ledger.get_run(&run.run_id).unwrap().unwrap().usage.unwrap().output_tokens),(40,4));
+            let events=ledger.list_events(&run.run_id).unwrap();
+            assert_eq!(events.iter().filter(|e|e.payload.get("usage_receipt").is_some()).count(),1);
+            assert!(!events.iter().any(|e|e.event_type==RuntimeEventType::ToolCompleted));
+            println!("AC-05 actual_WorkflowRunner_cancel; stale_read=true; delivery_and_ACK=true; legacy_stale_save={legacy_overwrite}; OS_process_killed=true; restart_and_concurrent_recovery=true; usage=40/4; receipt_events=1; provider_calls=1; business_success=false");
+        }
+    }
+
+    #[test]
+    #[ignore="only AC-05 parent invokes this real process barrier/restart worker"]
+    fn cancel_projection_process_worker() {
+        let root=PathBuf::from(std::env::var_os("CANCEL_PROJECTION_ROOT").unwrap());
+        let run_id=std::env::var("CANCEL_PROJECTION_RUN").unwrap();
+        let mode=std::env::var("CANCEL_PROJECTION_MODE").unwrap();
+        let ledger=LocalRunLedger::new(root.join("caller.sqlite3"));
+        if mode=="restart" {
+            std::thread::scope(|scope| {
+                let handles=(0..4).map(|_|scope.spawn(|| {
+                    assert_eq!(crate::runtime::codex_usage_delivery::recover_bound(&crate::runtime::codex_usage::default_root()).unwrap(),1);
+                })).collect::<Vec<_>>();
+                for h in handles {h.join().unwrap();}
+            });
+            for _ in 0..2 {assert_eq!(crate::runtime::codex_usage_delivery::recover_bound(&crate::runtime::codex_usage::default_root()).unwrap(),1);}
+            let current=ledger.get_run(&run_id).unwrap().unwrap();
+            assert_eq!(current.status,LocalRunStatus::Canceled);
+            assert_eq!((current.usage.as_ref().unwrap().input_tokens,current.usage.as_ref().unwrap().output_tokens),(40,4));
+            return;
+        }
+        let package:WorkflowPackage=serde_json::from_slice(&std::fs::read(root.join("package.json")).unwrap()).unwrap();
+        struct Runtime {ledger:LocalRunLedger,root:PathBuf,run:String,legacy:bool}
+        impl WorkflowStepExecutor for Runtime {
+            fn execute(&self,p:&WorkflowPackage,s:&WorkflowStep,i:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                let stale=self.ledger.get_run(&self.run)?.unwrap();
+                assert_eq!(stale.status,LocalRunStatus::Running);assert!(stale.usage.is_none());
+                let result=super::super::execute_runtime_step(p,s,i,None,&||Ok(false))?;
+                let ledger=self.ledger.clone();let run=self.run.clone();let step=s.id.clone();
+                CANCEL_BEFORE_UPDATE.with(|hook|*hook.borrow_mut()=Some(Box::new(move || {
+                    let id=format!("{run}:{step}:1");
+                    let delivered=crate::runtime::codex_usage_delivery::recover(&ledger,&crate::runtime::codex_usage::default_root(),&id,&run,&step,1).unwrap().unwrap();
+                    assert_eq!(delivered.usage.unwrap().input_tokens,40);
+                    let db=rusqlite::Connection::open(crate::runtime::codex_usage::default_root().join("usage.sqlite3")).unwrap();
+                    assert_eq!(db.query_row("SELECT delivered FROM caller_bindings WHERE run=?1",[id],|r|r.get::<_,u32>(0)).unwrap(),1);
+                })));
+                let root=self.root.clone();let ledger=self.ledger.clone();let legacy=self.legacy;let stale_id=stale.run_id.clone();
+                CANCEL_AFTER_UPDATE.with(|hook|*hook.borrow_mut()=Some(Box::new(move || {
+                    if legacy {
+                        // Explicit fault injection of the old full-snapshot
+                        // writer AFTER ACK; not current cancel implementation.
+                        let mut damaged=ledger.get_run(&stale_id).unwrap().unwrap();
+                        damaged.usage=None;ledger.save_run(&damaged).unwrap();
+                    }
+                    std::fs::write(root.join("cancel-committed"),b"durable").unwrap();
+                    loop {std::thread::sleep(Duration::from_millis(20));}
+                })));
+                // Same cancel entry called by capability/service; service lookup
+                // itself is reviewed, not claimed as a live MCP invocation.
+                WorkflowRunner::with_ledger(self.ledger.clone()).cancel(stale,"AC-05 canceled").unwrap();
+                Ok(result)
+            }
+        }
+        let runner=WorkflowRunner::with_ledger(ledger.clone());
+        let run=ledger.get_run(&run_id).unwrap().unwrap();
+        runner.run_ready(&package,run,&serde_json::json!({}),&Runtime{ledger,root,run:run_id,legacy:mode=="legacy"}).unwrap();
+        panic!("parent must kill worker before late-cancel compensation");
+    }
+
+    #[test]
+    #[ignore="invoked by receipt boundary restart test"]
+    fn receipt_recovery_restart_worker() {
+        let root=std::path::PathBuf::from(std::env::var_os("RECEIPT_RESTART_ROOT").unwrap());
+        let run_id=std::env::var("RECEIPT_RESTART_RUN").unwrap();
+        let package:WorkflowPackage=serde_json::from_slice(&std::fs::read(root.join("package.json")).unwrap()).unwrap();
+        struct Never;
+        impl WorkflowStepExecutor for Never {
+            fn execute(&self,_:&WorkflowPackage,_:&WorkflowStep,_:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {panic!("receipt recovery must not reexecute provider");}
+        }
+        let runner=WorkflowRunner::with_ledger(LocalRunLedger::new(root.join("caller.sqlite3")));
+        assert_eq!(crate::runtime::codex_usage_delivery::recover_bound(&crate::runtime::codex_usage::default_root()).unwrap(),1);
+        // Exercise the host's real startup reconciliation, which requeues a
+        // running step before WorkflowRunner sees the committed receipt.
+        runner.ledger.recover_running_runs(true,200).unwrap();
+        let run=runner.ledger.get_run(&run_id).unwrap().unwrap();
+        let result=runner.run_ready(&package,run,&serde_json::json!({}),&Never).unwrap();
+        assert_eq!(result.run.status,LocalRunStatus::Failed);assert!(result.run.usage.is_some());
+        let again=runner.run_ready(&package,result.run,&serde_json::json!({}),&Never).unwrap();
+        assert_eq!(again.run.status,LocalRunStatus::Failed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_ordinary_runtime_runner_rejects_matching_truncated_and_negative_finals() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock=crate::store::paths::test_env_lock();
+        for (case,success) in [(serde_json::json!({"fallback_json":true}),false),
+            (serde_json::json!({"negative":true}),false),(serde_json::json!({}),true)] {
+            let env=Environment::new();env.case(&case);
+            std::fs::write(env.root.join("schema.json"),r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#).unwrap();
+            let mut package=package(); package.steps.truncate(2);
+            package.source_root=env.root.clone();
+            package.steps[0].kind="runtime".into();
+            package.steps[0].capability_id.clear();
+            package.steps[0].runtime=Some(serde_json::from_value(serde_json::json!({
+                "provider":"personal.codex","prompt":"fixture","workspace_path":env.root,
+                "result_schema":"schema.json","timeout_seconds":5
+            })).unwrap());
+            struct RealRuntime(std::cell::Cell<u32>);
+            impl WorkflowStepExecutor for RealRuntime {
+                fn execute(&self,package:&WorkflowPackage,step:&WorkflowStep,input:&Value)
+                    -> Result<WorkflowStepExecution,Box<dyn Error>> {
+                    if step.runtime.is_some() {return super::super::execute_runtime_step(package,step,input,None,&||Ok(false));}
+                    self.0.set(self.0.get()+1);Ok(WorkflowStepExecution::output(serde_json::json!({})))
+                }
+            }
+            let executor=RealRuntime(std::cell::Cell::new(0));
+            let runner=WorkflowRunner::with_ledger(ledger("executor-ordinary"));
+            let run=runner.start("fixture",&package,"ordinary",&serde_json::json!({})).unwrap();
+            let outcome=runner.run_ready(&package,run,&serde_json::json!({}),&executor).unwrap();
+            assert_eq!(outcome.run.status,if success {LocalRunStatus::Succeeded}else{LocalRunStatus::Failed});
+            assert_eq!(executor.0.get(),u32::from(success),"no downstream dispatch on invalid/negative final");
+            assert_eq!(outcome.run.usage.as_ref().unwrap().input_tokens,1);
+            let restored=runner.ledger.get_run(&outcome.run.run_id).unwrap().unwrap();
+            assert_eq!(restored.status,outcome.run.status);
+        }
+    }
+
+    #[test]
+    fn executor_cancel_rebuild_preserves_comparable_cost_and_unknown_currency() {
+        for (label, second_currency, expected_currency, expected_cost) in [
+            ("known", "USD", "USD", 2.0), ("unknown", "", "", 0.0), ("mixed", "EUR", "", 0.0),
+        ] {
+            let runner=WorkflowRunner::with_ledger(ledger(&format!("cancel-cost-{label}")));
+            let package=package();
+            let stale=runner.start("fixture",&package,label,&serde_json::json!({})).unwrap();
+            assert!(stale.usage.is_none());
+            for (index,currency) in ["USD",second_currency].iter().enumerate() {
+                let usage=crate::agent_core_contracts::LocalRunUsage {
+                    input_tokens:10*(index as u64+1),output_tokens:1,estimated_cost:1.0,
+                    currency:(*currency).into(),billing_owner:"user".into(),
+                };
+                runner.append_event(&stale,&package.steps[index],RuntimeEventType::UsageRecorded,
+                    serde_json::json!({"runtime_usage":usage,"runtime_attempt":1})).unwrap();
+            }
+            for _ in 0..2 {
+                let canceled=runner.cancel(stale.clone(),"fixture cancellation").unwrap();
+                assert_eq!(canceled.status,LocalRunStatus::Canceled);
+                let total=canceled.usage.unwrap();
+                assert_eq!((total.input_tokens,total.output_tokens),(30,2));
+                assert_eq!(total.currency,expected_currency);
+                assert_eq!(total.estimated_cost,expected_cost);
+                assert_eq!(total.billing_owner,"user");
+            }
+        }
+    }
+
+    fn paid_usage(cost:f64,owner:&str)->LocalRunUsage {
+        LocalRunUsage {input_tokens:(cost as u64)*10,output_tokens:cost as u64,
+            estimated_cost:cost,currency:"USD".into(),billing_owner:owner.into()}
+    }
+
+    #[test]
+    fn executor_fail_when_paid_usage_survives_both_branches_and_manual_cancel() {
+        struct Paid {mixed:bool}
+        impl WorkflowStepExecutor for Paid {
+            fn execute(&self,_:&WorkflowPackage,s:&WorkflowStep,_:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                let second=s.id=="STEP-2";
+                Ok(WorkflowStepExecution {output:serde_json::json!({"passed":!second}),artifacts:vec![],
+                    usage:Some(paid_usage(if second {2.0}else{1.0},if second && self.mixed {"user"}else{"local"}))})
+            }
+        }
+        for tolerate in [false,true] {for mixed in [false,true] {
+            let mut p=package();
+            p.steps[1].fail_when=Some(super::super::WorkflowCondition {operator:"equals".into(),
+                path:"steps.STEP-2.passed".into(),value:serde_json::json!(false),conditions:vec![]});
+            if tolerate {p.steps[1].on_failure="continue".into();}
+            let runner=WorkflowRunner::with_ledger(ledger("paid-fail-when"));
+            let run=runner.start("fixture",&p,"paid-fail-when",&serde_json::json!({})).unwrap();
+            let result=runner.run_ready(&p,run,&serde_json::json!({}),&Paid{mixed}).unwrap();
+            assert_eq!(result.run.status,if tolerate {LocalRunStatus::Waiting}else{LocalRunStatus::Failed});
+            let restarted=WorkflowRunner::with_ledger(LocalRunLedger::new(runner.ledger.path()));
+            let canceled=restarted.cancel(result.run,"paid failure cancellation").unwrap();
+            assert_eq!(canceled.status,if tolerate {LocalRunStatus::Canceled}else{LocalRunStatus::Failed});
+            assert_eq!(canceled.usage,Some(LocalRunUsage {billing_owner:if mixed {"mixed".into()}else{"local".into()},..paid_usage(3.0,"local")}));
+            let events=runner.ledger.list_events(&canceled.run_id).unwrap();
+            assert!(events.iter().any(|e|e.event_type==RuntimeEventType::Error && e.step_id=="STEP-2"
+                && e.payload["runtime_attempt"]==1 && e.payload["runtime_usage"]["estimated_cost"]==2.0));
+        }}
+    }
+
+    #[test]
+    fn executor_ordinary_publish_snapshot_event_cancel_barrier_is_atomic() {
+        use std::sync::{Arc,Mutex,mpsc};
+        for error_path in [false,true] {
+            let mut p=package();p.steps.truncate(2);
+            let runner=WorkflowRunner::with_ledger(ledger("ordinary-publish"));
+            let run=runner.start("fixture",&p,"ordinary-publish",&serde_json::json!({})).unwrap();
+            let handle=Arc::new(Mutex::new(None));
+            struct Paid {ledger:LocalRunLedger,run:String,handle:Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,error_path:bool}
+            impl WorkflowStepExecutor for Paid {
+                fn execute(&self,_:&WorkflowPackage,s:&WorkflowStep,_:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                    let second=s.id=="STEP-2";
+                    if second {
+                        let ledger=self.ledger.clone();let run_id=self.run.clone();let handle=self.handle.clone();
+                        crate::runtime::codex_usage_delivery::BEFORE_ATTEMPT_EVENT.with(|hook|*hook.borrow_mut()=Some(Box::new(move |uncommitted| {
+                            assert_eq!(uncommitted.usage.as_ref().unwrap().estimated_cost,3.0);
+                            // The snapshot is USD3 inside the product transaction,
+                            // while another connection still sees A and no B event.
+                            let stale=ledger.get_run(&run_id).unwrap().unwrap();
+                            assert_eq!(stale.usage.as_ref().unwrap().estimated_cost,1.0);
+                            assert!(!ledger.list_events(&run_id).unwrap().iter().any(|e|e.step_id=="STEP-2" && e.payload["runtime_usage"].is_object()));
+                            let (ready_tx,ready_rx)=mpsc::channel();
+                            *handle.lock().unwrap()=Some(std::thread::spawn(move || {
+                                ready_tx.send(()).unwrap();
+                                let canceled=WorkflowRunner::with_ledger(ledger).cancel(stale,"publish barrier cancel").unwrap();
+                                assert_eq!(canceled.status,LocalRunStatus::Canceled);
+                                assert_eq!(canceled.usage,Some(paid_usage(3.0,"local")));
+                            }));
+                            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                            crate::runtime::codex_usage_delivery::AFTER_ATTEMPT_COMMIT.with(|after|*after.borrow_mut()=Some(Box::new(move || {
+                                handle.lock().unwrap().take().unwrap().join().unwrap();
+                            })));
+                        })));
+                    }
+                    if second && self.error_path {return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                        message:"paid provider failure".into(),usage:Some(paid_usage(2.0,"local")),report:None,provenance:None}));}
+                    Ok(WorkflowStepExecution {output:serde_json::json!({}),artifacts:vec![],usage:Some(paid_usage(if second {2.0}else{1.0},"local"))})
+                }
+            }
+            let id=run.run_id.clone();
+            let result=runner.run_ready(&p,run,&serde_json::json!({}),&Paid {ledger:runner.ledger.clone(),run:id.clone(),handle:handle.clone(),error_path});
+            // Cancel may win before or after the runner's next stale write;
+            // neither scheduling order can split the paid-work transaction.
+            assert!(handle.lock().unwrap().is_none(),"cancel completed at product commit barrier");
+            if let Err(error)=result {assert!(error.to_string().contains("terminal local run"));}
+            let restarted=WorkflowRunner::with_ledger(LocalRunLedger::new(runner.ledger.path()));
+            for _ in 0..3 {
+                let restored=crate::runtime::codex_usage_delivery::publish_attempt_usage(&restarted.ledger,&id,"STEP-2",1,&paid_usage(2.0,"local")).unwrap();
+                assert_eq!(restored.status,LocalRunStatus::Canceled);assert_eq!(restored.usage,Some(paid_usage(3.0,"local")));
+                assert_eq!(restarted.cancel(restored,"repeat").unwrap().status,LocalRunStatus::Canceled);
+            }
+            let output=crate::runtime::process::hidden_command(std::env::current_exe().unwrap())
+                .args(["workflow::runner::tests::ordinary_usage_restart_worker","--exact","--ignored","--nocapture"])
+                .env("ORDINARY_RESTART_DB",runner.ledger.path()).env("ORDINARY_RESTART_RUN",&id).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
+            assert_eq!(runner.ledger.list_events(&id).unwrap().iter().filter(|e|e.event_id==format!("{id}:attempt-usage:STEP-2:1")).count(),1);
+        }
+    }
+
+    #[test]
+    #[ignore="invoked only by ordinary publication/cancel parent after committed barrier"]
+    fn ordinary_usage_restart_worker() {
+        let ledger=LocalRunLedger::new(std::env::var_os("ORDINARY_RESTART_DB").unwrap());
+        let id=std::env::var("ORDINARY_RESTART_RUN").unwrap();
+        for _ in 0..3 {
+            let run=crate::runtime::codex_usage_delivery::publish_attempt_usage(&ledger,&id,"STEP-2",1,&paid_usage(2.0,"local")).unwrap();
+            assert_eq!(run.status,LocalRunStatus::Canceled);assert_eq!(run.usage,Some(paid_usage(3.0,"local")));
+            WorkflowRunner::with_ledger(ledger.clone()).cancel(run,"restart replay").unwrap();
+        }
+    }
+
+    #[test]
+    fn executor_late_ordinary_usage_after_completed_cancel_projects_once() {
+        for error_path in [false,true] {
+            let runner=WorkflowRunner::with_ledger(ledger("late-ordinary"));
+            let mut p=package();p.steps.truncate(2);
+            let run=runner.start("fixture",&p,"late-ordinary",&serde_json::json!({})).unwrap();
+            struct Paid {ledger:LocalRunLedger,id:String,error_path:bool}
+            impl WorkflowStepExecutor for Paid {
+                fn execute(&self,_:&WorkflowPackage,s:&WorkflowStep,_:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                    if s.id=="STEP-2" {
+                        let (release,ready)=std::sync::mpsc::sync_channel(0);
+                        let ledger=self.ledger.clone();let id=self.id.clone();
+                        let cancel=std::thread::spawn(move || {
+                            let runner=WorkflowRunner::with_ledger(ledger.clone());
+                            let canceled=runner.cancel(ledger.get_run(&id).unwrap().unwrap(),"actual completed cancellation").unwrap();
+                            assert_eq!(canceled.status,LocalRunStatus::Canceled);
+                            let db=rusqlite::Connection::open(ledger.path()).unwrap();
+                            let raw:String=db.query_row("SELECT payload_json FROM projection_outbox WHERE aggregate_id=?1 ORDER BY id DESC LIMIT 1",[&id],|r|r.get(0)).unwrap();
+                            let value:Value=serde_json::from_str(&raw).unwrap();
+                            assert_eq!(value["run"]["usage"]["estimated_cost"],1.0);
+                            assert_eq!(value["run"]["status"],"canceled");
+                            db.execute("UPDATE projection_outbox SET status='projected' WHERE aggregate_id=?1",[&id]).unwrap();
+                            release.send(()).unwrap();
+                        });
+                        ready.recv_timeout(Duration::from_secs(5)).unwrap();cancel.join().unwrap();
+                        if self.error_path {return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                            message:"late paid failure".into(),usage:Some(paid_usage(2.0,"local")),report:None,provenance:None}));}
+                    }
+                    Ok(WorkflowStepExecution {output:serde_json::json!({}),artifacts:vec![],usage:Some(paid_usage(if s.id=="STEP-2" {2.0}else{1.0},"local"))})
+                }
+            }
+            let id=run.run_id.clone();
+            let result=runner.run_ready(&p,run,&serde_json::json!({}),&Paid{ledger:runner.ledger.clone(),id:id.clone(),error_path}).unwrap().run;
+            assert_eq!(result.status,LocalRunStatus::Canceled);assert_eq!(result.usage,Some(paid_usage(3.0,"local")));
+            assert_eq!(runner.ledger.get_run(&id).unwrap().unwrap().usage,result.usage);
+            let db=rusqlite::Connection::open(runner.ledger.path()).unwrap();
+            let raw:String=db.query_row("SELECT payload_json FROM projection_outbox WHERE aggregate_id=?1 ORDER BY id DESC LIMIT 1",[&id],|r|r.get(0)).unwrap();
+            let value:Value=serde_json::from_str(&raw).unwrap();assert_eq!(value["run"],serde_json::to_value(&result).unwrap());
+            db.execute("UPDATE projection_outbox SET status='projected' WHERE aggregate_id=?1",[&id]).unwrap();
+            for _ in 0..3 {
+                let restored=crate::runtime::codex_usage_delivery::publish_attempt_usage(&runner.ledger,&id,"STEP-2",1,&paid_usage(2.0,"local")).unwrap();
+                runner.cancel(restored,"terminal no-op").unwrap();
+                let state:(String,String)=db.query_row("SELECT status,payload_json FROM projection_outbox WHERE aggregate_id=?1 ORDER BY id DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(state,("projected".into(),raw.clone()));
+            }
+            assert_eq!(runner.ledger.list_events(&id).unwrap().iter().filter(|e|e.event_id==format!("{id}:attempt-usage:STEP-2:1")).count(),1);
+        }
+    }
+
+    #[test]
+    fn executor_terminal_cancel_is_transactional_noop_for_stale_and_current_callers() {
+        for status in [LocalRunStatus::Succeeded,LocalRunStatus::Failed,LocalRunStatus::Canceled] {
+            let runner=WorkflowRunner::with_ledger(ledger("terminal-noop"));let p=package();
+            let stale=runner.start("fixture",&p,"terminal-noop",&serde_json::json!({})).unwrap();
+            let mut terminal=stale.clone();terminal.status=status.clone();terminal.current_step_id.clear();
+            terminal.error="preserved failure history".into();runner.ledger.save_run(&terminal).unwrap();
+            runner.append_event(&terminal,&p.steps[0],RuntimeEventType::UsageRecorded,
+                serde_json::json!({"runtime_usage":paid_usage(1.0,"local"),"runtime_attempt":1})).unwrap();
+            crate::agent_core_service::AgentCoreRunRecorder::with_ledger(runner.ledger.clone()).project(&terminal).unwrap();
+            let db=rusqlite::Connection::open(runner.ledger.path()).unwrap();
+            db.execute_batch("UPDATE projection_outbox SET status='projected'; CREATE TRIGGER reject_noop_update BEFORE UPDATE ON local_runs BEGIN SELECT RAISE(ABORT,'terminal no-op must not UPDATE'); END;").unwrap();
+            let snapshot=|| {
+                ["local_runs","runtime_events","projection_outbox"].map(|table| {
+                    let mut q=db.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+                    let columns=q.column_count();let rows=q.query_map([],|r|Ok((0..columns).map(|i|format!("{:?}",r.get_ref(i).unwrap())).collect::<Vec<_>>())).unwrap()
+                        .collect::<Result<Vec<_>,_>>().unwrap();rows
+                })
+            };
+            let before=snapshot();
+            for caller in [stale,terminal.clone()] {
+                assert_eq!(serde_json::to_value(runner.cancel(caller,"must not replace").unwrap()).unwrap(),serde_json::to_value(&terminal).unwrap());
+                assert_eq!(snapshot(),before,"payload/events/outbox all stay byte-identical");
+            }
+        }
+    }
+
+    #[test]
+    fn executor_paid_attempt_delivery_replay_is_additive_and_preserves_owner() {
+        for mixed in [false,true] {
+            let runner=WorkflowRunner::with_ledger(ledger("paid-attempt-replay"));let p=package();
+            let run=runner.start("fixture",&p,"paid-attempt-replay",&serde_json::json!({})).unwrap();
+            let first=crate::runtime::codex_usage_delivery::publish_attempt_usage(&runner.ledger,&run.run_id,"STEP-1",1,&paid_usage(1.0,"local")).unwrap();
+            assert_eq!(first.usage,Some(paid_usage(1.0,"local")));
+            for _ in 0..2 {crate::runtime::codex_usage_delivery::publish_attempt_usage(&runner.ledger,&run.run_id,"STEP-1",2,&paid_usage(2.0,if mixed {"user"}else{"local"})).unwrap();}
+            let restored=WorkflowRunner::with_ledger(LocalRunLedger::new(runner.ledger.path())).cancel(run,"restart cancel").unwrap();
+            assert_eq!(restored.usage,Some(LocalRunUsage {billing_owner:if mixed {"mixed".into()}else{"local".into()},..paid_usage(3.0,"local")}));
+        }
+    }
+
+    #[test]
+    fn executor_ordinary_retry_entry_preserves_paid_failure_and_does_not_reexecute_completed_attempt() {
+        struct PaidRetry(std::cell::Cell<u32>);
+        impl WorkflowStepExecutor for PaidRetry {
+            fn execute(&self,_:&WorkflowPackage,_:&WorkflowStep,input:&Value)->Result<WorkflowStepExecution,Box<dyn Error>> {
+                self.0.set(self.0.get()+1);
+                let attempt=input["workflow_context"]["runtime_attempt"].as_u64().unwrap();
+                if attempt==1 {return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                    message:"original paid failure".into(),usage:Some(paid_usage(1.0,"local")),provenance:None,report:None}));}
+                assert_eq!(attempt,2);
+                Ok(WorkflowStepExecution {output:serde_json::json!({}),artifacts:vec![],usage:Some(paid_usage(2.0,"local"))})
+            }
+        }
+        let runner=WorkflowRunner::with_ledger(ledger("paid-retry-entry"));let mut p=package();p.steps.remove(1);
+        p.id="com.himind.workflow.paid-retry-uninstalled-fixture".into();
+        p.steps[0].on_failure="continue".into();p.steps[1].depends_on=vec!["STEP-1".into()];
+        let provider=PaidRetry(std::cell::Cell::new(0));
+        let run=runner.start("fixture",&p,"paid-retry-entry",&serde_json::json!({})).unwrap();
+        let failed=runner.run_ready(&p,run,&serde_json::json!({}),&provider).unwrap().run;
+        assert_eq!(failed.status,LocalRunStatus::Waiting);assert_eq!(failed.steps[0].status,LocalStepStatus::Skipped);
+        assert_eq!(failed.usage,Some(paid_usage(1.0,"local")));
+        let retry=runner.retry_step(failed,"STEP-1").unwrap();
+        let restarted=WorkflowRunner::with_ledger(LocalRunLedger::new(runner.ledger.path()));
+        let done=restarted.run_ready(&p,retry,&serde_json::json!({}),&provider).unwrap().run;
+        assert_eq!(done.status,LocalRunStatus::Waiting);assert_eq!(done.usage,Some(paid_usage(3.0,"local")));
+        for _ in 0..2 {assert_eq!(restarted.run_ready(&p,done.clone(),&serde_json::json!({}),&provider).unwrap().run.usage,done.usage);}
+        assert_eq!(provider.0.get(),2);
+        assert!(runner.ledger.list_events(&done.run_id).unwrap().iter().any(|e|e.payload["error"]=="degraded after failure: original paid failure"));
+    }
+
+    #[test]
+    fn executor_usage_replay_retry_restart_and_unknown_currency() {
+        let runner=WorkflowRunner::with_ledger(ledger("executor-usage"));
+        let package=package();
+        let run=runner.start("fixture",&package,"usage",&serde_json::json!({})).unwrap();
+        let usage=|tokens,currency:&str| crate::agent_core_contracts::LocalRunUsage {
+            input_tokens:tokens,output_tokens:1,estimated_cost:1.0,currency:currency.into(),billing_owner:"user".into(),
+        };
+        for (step,attempt,tokens) in [(0,1,10),(1,1,20),(1,1,20)] {
+            runner.append_event(&run,&package.steps[step],RuntimeEventType::UsageRecorded,
+                serde_json::json!({"runtime_usage":usage(tokens,"USD"),"runtime_attempt":attempt})).unwrap();
+        }
+        let restarted=WorkflowRunner::with_ledger(runner.ledger.clone());
+        let total=super::reconcile_step_usage(&restarted.ledger,&run.run_id,&package.steps[0].id,2,&usage(7,"USD")).unwrap();
+        assert_eq!(total.input_tokens,37,"new retry is additive, duplicate snapshot is idempotent");
+        assert_eq!(total.estimated_cost,3.0);
+        let unknown=super::reconcile_step_usage(&restarted.ledger,&run.run_id,&package.steps[0].id,2,&usage(7,"")).unwrap();
+        assert_eq!(unknown.input_tokens,37);
+        assert!(unknown.currency.is_empty(),"unknown cost must not be a comparable USD zero");
+    }
+
+    #[test]
     fn runner_preserves_cancellation_that_arrives_during_a_step() {
-        struct SlowExecutor;
+        struct SlowExecutor {
+            entered: mpsc::Sender<()>,
+            canceled: mpsc::Receiver<()>,
+        }
         impl WorkflowStepExecutor for SlowExecutor {
             fn execute(
                 &self,
@@ -3762,8 +4385,17 @@ mod tests {
                 _step: &WorkflowStep,
                 _input: &Value,
             ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
-                thread::sleep(Duration::from_millis(300));
-                Ok(WorkflowStepExecution::output(Value::Null))
+                self.entered.send(())?;
+                // The cancellation must occur after this paid step entered,
+                // and commit before it returns. Wall-clock sleeps allowed the
+                // cancel thread to win before entry under parallel test load,
+                // legitimately producing no usage and testing another path.
+                self.canceled.recv_timeout(Duration::from_secs(10))?;
+                let mut execution=WorkflowStepExecution::output(Value::Null);
+                execution.usage=Some(crate::agent_core_contracts::LocalRunUsage {
+                    input_tokens:5,output_tokens:2,estimated_cost:0.0,currency:String::new(),billing_owner:"user".into(),
+                });
+                Ok(execution)
             }
         }
 
@@ -3779,20 +4411,25 @@ mod tests {
             .unwrap();
         let run_id = run.run_id.clone();
         let cancel_runner = WorkflowRunner::with_ledger(runner.ledger.clone());
+        let (entered, started) = mpsc::channel();
+        let (canceled, committed) = mpsc::channel();
         let cancel_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
             let current = cancel_runner.ledger.get_run(&run_id).unwrap().unwrap();
             cancel_runner
                 .cancel(current, "canceled during workflow step")
                 .unwrap();
+            canceled.send(()).unwrap();
         });
         let outcome = runner
-            .run_ready(&package, run, &serde_json::json!({}), &SlowExecutor)
+            .run_ready(&package, run, &serde_json::json!({}), &SlowExecutor { entered, canceled: committed })
             .unwrap();
         cancel_handle.join().unwrap();
         assert_eq!(outcome.run.status, LocalRunStatus::Canceled);
         assert_eq!(outcome.run.error, "canceled during workflow step");
         assert!(outcome.completed_steps.is_empty());
+        assert_eq!(outcome.run.usage.as_ref().unwrap().input_tokens,5);
+        assert_eq!(runner.ledger.get_run(&outcome.run.run_id).unwrap().unwrap().usage.unwrap().output_tokens,2);
     }
 
     /// 步骤实际使用的模型必须落到 `LocalRunStep.model`：前端据此显示
@@ -3835,7 +4472,7 @@ mod tests {
                 kind: "runtime".to_string(),
                 capability_id: String::new(),
                 runtime: Some(super::super::WorkflowRuntimeStep {
-                    provider: "himind.builtin".to_string(),
+                    permission_mode: String::new(), provider: "himind.builtin".to_string(),
                     prompt: "a".to_string(),
                     workspace_path: String::new(),
                     result_schema: String::new(),
@@ -3865,7 +4502,7 @@ mod tests {
                 kind: "runtime".to_string(),
                 capability_id: String::new(),
                 runtime: Some(super::super::WorkflowRuntimeStep {
-                    provider: "acp.claude".to_string(),
+                    permission_mode: String::new(), provider: "acp.claude".to_string(),
                     prompt: "b".to_string(),
                     workspace_path: String::new(),
                     result_schema: String::new(),
@@ -5115,7 +5752,7 @@ mod tests {
         assert_eq!(retried.pause_kind, RunPauseKind::None);
         let step2 = retried.steps.iter().find(|s| s.step_id == "STEP-2").unwrap();
         assert_eq!(step2.status, LocalStepStatus::Pending);
-        assert_eq!(step2.attempt, 0, "重试要把尝试次数归零");
+        assert_eq!(step2.attempt, blocked.run.steps.iter().find(|s|s.step_id=="STEP-2").unwrap().attempt, "retry must preserve immutable attempt identities");
         assert!(step2.started_at.is_empty());
         // 下游 APPROVE 也重置，且它的审批记录作废。
         let approve = retried.steps.iter().find(|s| s.step_id == "APPROVE").unwrap();

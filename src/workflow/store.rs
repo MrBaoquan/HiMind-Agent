@@ -1286,7 +1286,7 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use rand::rngs::OsRng;
-    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
     use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
     fn source_package() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1999,7 +1999,20 @@ mod tests {
         ));
         fs::create_dir_all(&trusted_root).unwrap();
         let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        // Key generation is expensive and variable in debug builds. The worker
+        // may prepare a test-only key in its generated resource root; signature
+        // creation and the real install/verifier still run on every invocation.
+        let private_key = if let Some(path)=std::env::var_os("HIMIND_EXECUTOR_TEST_RSA_KEY") {
+            let path=PathBuf::from(path);
+            let root=PathBuf::from(std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("test resource root")).canonicalize().unwrap();
+            assert!(path.parent().unwrap().canonicalize().unwrap().starts_with(&root));
+            if path.is_file() {RsaPrivateKey::read_pkcs8_pem_file(&path).unwrap()} else {
+                let key=RsaPrivateKey::new(&mut rng,2048).unwrap();
+                fs::write(&path,key.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes()).unwrap();key
+            }
+        } else {RsaPrivateKey::new(&mut rng,2048).unwrap()};
+        private_key.validate().unwrap();
+        assert_eq!(rsa::traits::PublicKeyParts::n(&private_key).bits(),2048);
         let public_key = RsaPublicKey::from(&private_key);
         fs::write(
             trusted_root.join(format!("{key_id}.pem")),
