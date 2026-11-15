@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, Blocks, CheckCircle2, CircleAlert, Clock3, Copy, FileText, FolderOpen, FolderPlus, GitBranch, Hammer, Inbox, MessageCircle, MoreHorizontal, Plus, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
+import { ArrowLeft, Blocks, CheckCircle2, ChevronDown, CircleAlert, Clock3, Copy, FileText, FolderOpen, FolderPlus, GitBranch, Hammer, Inbox, MessageCircle, MoreHorizontal, Plus, RefreshCw, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
@@ -54,16 +54,17 @@ type WorkspaceItem = {
   running: boolean;
 };
 
-/// 「一键构建」的运行进度：建到第几个、正在建哪个扩展。
+/// 工作区构建的运行进度：建到第几个、正在建哪个扩展。
 type WorkspaceBuildProgress = {
   done: number;
   total: number;
   name: string;
   targetCount?: number;
   dependencyCount?: number;
+  scope?: 'incremental' | 'full';
 };
 
-/// 「一键构建」里失败的那条扩展及其原因，由父层跑完整批后一次性交回。
+/// 工作区构建里失败的那条扩展及其原因，由父层跑完整批后一次性交回。
 type WorkspaceBuildFailure = { name: string; message: string };
 
 /// 整批构建的结果：成功数、失败项、因为依赖没建起来而跳过的项。
@@ -124,7 +125,7 @@ type DevelopmentPageProps = {
   onOpenProject: () => Promise<void>;
   onAssociateProject: (project: ExtensionRemoteProject) => Promise<void>;
   onBuild: (projectId: string, onProgress?: (stage: ExtensionBuildStage) => void) => Promise<void>;
-  /// 工作区级「一键构建」：按给定顺序跑同一条构建流水线，被依赖者没成功就跳过依赖者。
+  /// 工作区级批量构建：按给定顺序跑同一条构建流水线，被依赖者没成功就跳过依赖者。
   /// 单个扩展失败不打断后面的；失败与跳过原样交回页面，由本页一次性说明。
   onBuildWorkspace: (projects: WorkspaceBuildItem[], onProgress?: (progress: WorkspaceBuildProgress) => void) => Promise<WorkspaceBuildOutcome>;
   onDevelopWithAi: (project: ExtensionProject) => void;
@@ -164,7 +165,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   const [runningSessions, setRunningSessions] = useState<Set<string>>(() => new Set());
   const [actionError, setActionError] = useState('');
   const [actionWarning, setActionWarning] = useState('');
-  /// 「一键构建」的运行状态：非空表示正在按顺序构建当前工作区里的扩展。
+  /// 工作区构建的运行状态：非空表示正在按顺序构建当前工作区里的扩展。
   const [workspaceBuild, setWorkspaceBuild] = useState<WorkspaceBuildProgress | null>(null);
   /// 构建执行源：装了扩展开发工具走插件执行器，没装就走内核实现。
   const [readiness, setReadiness] = useState<ExtensionDevelopmentReadiness | null>(null);
@@ -236,12 +237,23 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     () => models.filter(project => workspaceKeyFor(project, workspaceItems) === activeKey),
     [activeKey, models, workspaceItems],
   );
-  // 「一键构建」只覆盖源码目录还在的扩展：远端协作项目、目录已被移走的项目没有
+  // 工作区批量构建只覆盖源码目录还在的扩展：远端协作项目、目录已被移走的项目没有
   // 可构建的源码，混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
   const buildableProjects = useMemo(
     () => workspaceProjects.filter(project => project.local?.workspace_available),
     [workspaceProjects],
   );
+  // 增量构建只补当前版本还没构建过的项目；全量构建才覆盖整个工作区。
+  const unbuiltProjects = useMemo(
+    () => buildableProjects.filter(projectNeedsBuild),
+    [buildableProjects],
+  );
+  const buildPrimaryProjects = unbuiltProjects.length ? unbuiltProjects : buildableProjects;
+  const buildPrimaryLabel = !buildableProjects.length
+    ? '暂无可构建'
+    : unbuiltProjects.length
+      ? `增量构建（${unbuiltProjects.length}）`
+      : '全量构建';
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return workspaceProjects.filter(project => {
@@ -295,14 +307,23 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     try { await props.onAddWorkspace(); }
     catch (reason) { setActionError(failureText(reason, '添加工作区失败')); }
   };
-  /// 一键构建：后端先把当前工作区的目标扩展连同插件/技能依赖解析成拓扑计划，
-  /// 再按计划自动构建并激活。依赖不在本工作区但已登记本地源时也会自动加入。
-  const buildWorkspace = async (retryIds?: string[]) => {
+  /// 工作区批量构建：增量只补未构建，全量覆盖整个工作区。
+  /// 后端先把目标扩展连同插件/技能依赖解析成拓扑计划，再按计划自动构建并激活。
+  const buildWorkspace = async (scope: 'incremental' | 'full' = 'incremental', retryIds?: string[]) => {
     if (!activeItem || workspaceBuild) return;
     const pool = retryIds?.length
       ? buildableProjects.filter(project => retryIds.includes(project.local!.id))
-      : buildableProjects;
+      : (scope === 'incremental' ? unbuiltProjects : buildableProjects);
     if (!pool.length) return;
+    if (scope === 'full' && pool.length > 1) {
+      const accepted = await confirm({
+        title: `全量构建 ${pool.length} 个扩展？`,
+        description: '将重新构建并启用全部扩展，耗时较长。',
+        confirmText: '全量构建',
+      });
+      if (!accepted) return;
+    }
+    const label = scope === 'incremental' ? '增量构建' : '全量构建';
     setActionError('');
     setActionWarning('');
     setFailedBatch([]);
@@ -326,6 +347,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
         name: items[0].name,
         targetCount: pool.length,
         dependencyCount,
+        scope,
       });
       const outcome = await props.onBuildWorkspace(items, progress => {
         setWorkspaceBuild(current => current ? { ...current, ...progress } : progress);
@@ -350,21 +372,21 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
         failureParts.push(`依赖阻断 ${plan.blockers.length} 项：${plan.blockers.map(blocker => blocker.message).join('；')}`);
       }
       if (failures.length || skipped.length || plan.blockers.length) {
-        setActionError(`一键构建：${succeeded}/${items.length} 成功；${failureParts.join('；')}`);
+        setActionError(`${label}：${succeeded}/${items.length} 成功；${failureParts.join('；')}`);
       }
       const warningParts: string[] = [];
       if (items.length > pool.length) warningParts.push(`自动补建依赖 ${items.length - pool.length} 个`);
       if (plan.reused.length) warningParts.push(`复用已生效依赖 ${plan.reused.length} 个`);
       if (plan.warnings.length) warningParts.push(...plan.warnings);
       if (!failures.length && !skipped.length && !plan.blockers.length && warningParts.length) {
-        setActionWarning(`一键构建已完成：${warningParts.join('；')}`);
+        setActionWarning(`${label}已完成：${warningParts.join('；')}`);
       }
       if (retryable.length) {
         setActionWarning(`${retryable.length} 项是网络/超时类错误，可直接重试失败项`);
       }
       setFailedBatch(failures.length ? pool.map(project => ({ id: project.local!.id, name: project.name })) : []);
     } catch (reason) {
-      setActionError(failureText(reason, '一键构建失败'));
+      setActionError(failureText(reason, `${label}失败`));
     } finally {
       setWorkspaceBuild(null);
     }
@@ -393,16 +415,20 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
 
   return <div className="development-page">
       <PageHeader title="扩展开发" description={props.dashboardEnabled ? '创建、开发、测试并分发自己的 Agent 能力。' : '创建、开发和测试自己的 Agent 能力。'} actions={<>
-      {/* 添加工作区在这一页只有这一个入口：左栏不再挂 +，空态只负责指路。 */}
-      <button className="btn" title="添加本机开发目录" disabled={busy} onClick={() => void addWorkspace()}><FolderPlus size={15} />添加工作区</button>
-      {/* 页头动作给出文字标签，主操作仍是「新建扩展」一个；工作区和扩展列表在进入页面时读取。 */}
-      <button className="btn" title="选择 HiMind 项目或扩展聚合仓库" disabled={busy} onClick={() => void props.onOpenProject()}><FolderOpen size={15} />添加已有项目</button>
+      {/* 有左栏时，添加动作收进左栏的「+」；没有左栏时页头只留一个「添加」下拉。
+          页头主操作始终是「新建扩展」，不再让三个同级按钮平分注意力。 */}
+      {hasRail ? null : <ActionMenu label="添加" icon={<FolderPlus size={15} />} title="添加工作区或已有项目" disabled={busy} panelWidth={220}>
+        {close => <>
+          <ActionMenuItem icon={<FolderPlus size={15} />} label="添加工作区" onClick={() => { close(); void addWorkspace(); }} />
+          <ActionMenuItem icon={<FolderOpen size={15} />} label="添加已有项目" onClick={() => { close(); void props.onOpenProject(); }} />
+        </>}
+      </ActionMenu>}
       <button className="btn btn-primary" title="新建扩展" disabled={busy} onClick={() => setCreateOpen(true)}><Plus size={15} />新建扩展</button>
     </>} />
     {props.dashboardEnabled && props.invitations.length ? <InvitationInbox invitations={props.invitations} busyAction={props.busyAction} onRespond={props.onRespondInvitation} /> : null}
     {props.projectsError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>项目列表读取失败</strong><span>{props.projectsError}</span></div><button className="btn" onClick={props.onRefresh}>重试</button></div> : null}
     {actionError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>操作未完成</strong><span>{actionError}</span></div>
-      {failedBatch.length ? <button className="btn" disabled={busy} onClick={() => void buildWorkspace(failedBatch.map(item => item.id))}>重试失败项（{failedBatch.length}）</button> : null}
+      {failedBatch.length ? <button className="btn" disabled={busy} onClick={() => void buildWorkspace('incremental', failedBatch.map(item => item.id))}>重试失败项（{failedBatch.length}）</button> : null}
       <button className="btn" onClick={() => setActionError('')}>关闭</button></div> : null}
     {actionWarning ? <div className="development-notice"><CircleAlert size={16} /><div><strong>构建完成，有提示</strong><span>{actionWarning}</span></div><button className="btn" onClick={() => setActionWarning('')}>关闭</button></div> : null}
     {/* 构建、校验与打包已收回内核：没装扩展开发工具也能干活，但插件类扩展要 Go。 */}
@@ -410,7 +436,12 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     {readiness && !readiness.kernel.go.installed ? <div className="development-notice"><CircleAlert size={16} /><div><strong>Go 工具链未就绪</strong><span>插件类扩展需要 go 在 PATH 中；技能、工作流、专家、项目规则不受影响。</span></div></div> : null}
     {props.loading ? <div className="development-body development-body-loading" role="status"><BusyIndicator size={16} /><span>正在读取工作区和扩展</span></div> : <div className={`development-body ${hasRail ? 'has-rail' : ''}`}>
       {hasRail ? <aside className="development-rail" aria-label="开发工作区">
-        <div className="development-rail-head"><strong>工作区</strong></div>
+        <div className="development-rail-head"><strong>工作区</strong><ActionMenu variant="icon" icon={<Plus size={15} />} title="添加工作区或已有项目" disabled={busy} panelWidth={220}>
+          {close => <>
+            <ActionMenuItem icon={<FolderPlus size={15} />} label="添加工作区" onClick={() => { close(); void addWorkspace(); }} />
+            <ActionMenuItem icon={<FolderOpen size={15} />} label="添加已有项目" onClick={() => { close(); void props.onOpenProject(); }} />
+          </>}
+        </ActionMenu></div>
         <div className="development-rail-body">
           {workspaceItems.map(item => <WorkspaceRow
             key={item.key}
@@ -429,15 +460,26 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           <div className="development-workspace-copy">
             <strong>{props.loading ? '正在读取…' : activeItem?.label || '还没有工作区'}</strong>
             <small className={headProblem ? 'is-problem' : undefined} title={headPath || undefined}>{headMeta}</small>
-            {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在一键构建 ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.dependencyCount ? `（本工作区 ${workspaceBuild.targetCount} + 自动依赖 ${workspaceBuild.dependencyCount}）` : ''}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
+            {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在${workspaceBuild.scope === 'full' ? '全量构建' : '增量构建'} ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.dependencyCount ? `（本工作区 ${workspaceBuild.targetCount} + 自动依赖 ${workspaceBuild.dependencyCount}）` : ''}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
           </div>
           {activeItem ? <div className="development-workspace-actions">
+            {/* 构建是这一页最高频的动作，直接给主按钮；范围放在右侧下拉里，
+                默认增量构建，避免每次一键都把所有扩展重跑一遍。 */}
+            <div className="development-build-split">
+              <button type="button" className="btn btn-primary" title={!buildableProjects.length ? '当前工作区没有可构建的扩展' : unbuiltProjects.length ? `增量构建：只构建 ${unbuiltProjects.length} 个未构建或版本已变化的扩展` : `全量构建：构建全部 ${buildableProjects.length} 个扩展`} disabled={busy || !buildableProjects.length || Boolean(workspaceBuild)} onClick={() => void buildWorkspace(unbuiltProjects.length ? 'incremental' : 'full')}>
+                {workspaceBuild ? <BusyIndicator size={15} /> : <Hammer size={15} />}
+                {workspaceBuild ? `构建 ${workspaceBuild.done}/${workspaceBuild.total}` : buildPrimaryLabel}
+              </button>
+              <ActionMenu variant="primary" icon={<ChevronDown size={15} />} title="选择构建方式" disabled={busy || !buildableProjects.length || Boolean(workspaceBuild)} panelWidth={224}>
+                {close => <>
+                  <ActionMenuItem icon={<Hammer size={15} />} label={`增量构建（${unbuiltProjects.length}）`} disabled={!unbuiltProjects.length} onClick={() => { close(); void buildWorkspace('incremental'); }} />
+                  <ActionMenuItem icon={<RefreshCw size={15} />} label={`全量构建（${buildableProjects.length}）`} disabled={!buildableProjects.length} onClick={() => { close(); void buildWorkspace('full'); }} />
+                </>}
+              </ActionMenu>
+            </div>
             {/* 这一层是「整个仓库」，下面详情里是「单个扩展」。两个都叫「用 AI 开发」时
                 会话落在哪个目录看不出区别，所以这里写清范围，并按次级动作处理。 */}
             <button className="btn development-workspace-develop" title={activeItem.available ? `在 ${activeItem.root} 里开一条 AI 会话` : '目录当前不可用，先在文件资源管理器里恢复它'} disabled={busy || !activeItem.available} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
-            {/* 工作区级的批量动作：整个目录一个个点构建太费事，这里一次跑完。
-                「构建后是否自动安装」是 Agent 设置项（设置 → 通用 → 扩展开发），这里不再重复放开关。 */}
-            <button className="btn" title={buildableProjects.length ? `构建并启用这个工作区里的 ${buildableProjects.length} 个扩展` : '这个工作区里还没有可构建的扩展'} disabled={busy || !buildableProjects.length} onClick={() => void buildWorkspace()}>{workspaceBuild ? <BusyIndicator size={15} /> : <Hammer size={15} />}{workspaceBuild ? `构建 ${workspaceBuild.done}/${workspaceBuild.total}` : '一键构建'}</button>
             {/* 有左栏时，每个工作区的操作在它自己那一行；没有左栏时只能放到这里。 */}
             {hasRail ? null : <ActionMenu variant="icon" icon={<MoreHorizontal size={16} />} title="工作区操作">
               {close => <>
@@ -464,7 +506,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           </div>
         </div> : null}
         {!activeItem ? <div className="development-workspace-empty">
-          <EmptyState icon={FolderPlus} title="还没有开发工作区" text="用页头的「添加工作区」挑一个本机目录，就能在里面开发扩展。" />
+          <EmptyState icon={FolderPlus} title="还没有开发工作区" text="添加一个本机目录，就能在里面开发扩展。" />
         </div> : !workspaceProjects.length ? <div className="development-workspace-empty">
           <EmptyState icon={Blocks} title="这个工作区还没有扩展" text="新建一个扩展，或者让 AI 直接在这个目录里开始开发。" />
           {!activeItem ? null : <div className="development-workspace-empty-actions">
@@ -595,17 +637,14 @@ function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorize
       <header className="development-detail-header">
       <div className="development-detail-title"><ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={46} /><div><div><h3>{project.name}</h3></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
       <div className="development-detail-actions">
-        {/* 一屏只留一个文字主按钮：「用 AI 开发」是这个页面最常见的下一步。
-            打开目录、构建都是低频动作，收进 ⋯，免得三个文字按钮把标题挤窄；
-            构建在批量工具条里也有入口，这里不重复强调。 */}
-        {project.local?.workspace_available ? <button className="btn btn-primary" title="在这个项目目录里开一条 AI 会话" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} />用 AI 开发</button> : <button className="btn btn-primary" title="选择协作项目的本地目录" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} />关联本地项目</button>}
-        <ActionMenu variant="icon" icon={buildStage ? <BusyIndicator size={16} /> : <MoreHorizontal size={16} />} title={`${project.name} · 更多操作`} disabled={busy} panelWidth={196}>
-          {close => <>
-            {project.local?.workspace_available ? <ActionMenuItem icon={<FolderOpen size={15} />} label="打开目录" onClick={() => { close(); onOpenFolder(project.local!.workspace_path); }} /> : null}
-            {project.local?.workspace_available ? <ActionMenuItem icon={<Hammer size={15} />} label={buildStage ? '正在构建' : '构建并生成测试制品'} disabled={busy} onClick={() => { close(); void buildProject(); }} /> : null}
-            {project.local?.workspace_available ? null : <ActionMenuItem icon={<FolderOpen size={15} />} label="关联本地目录" onClick={() => { close(); void (project.remote ? onAssociateProject(project.remote) : onOpenProject()); }} />}
-          </>}
-        </ActionMenu>
+        {project.local?.workspace_available ? <>
+          {/* 构建是最高频动作，放在第一位并保持主按钮；「打开目录」这类辅助动作收进 ⋯。 */}
+          <button className="btn btn-primary" title={buildStage ? '正在构建项目' : '构建并生成测试制品'} disabled={busy} onClick={() => void buildProject()}>{buildStage ? <BusyIndicator size={15} /> : <Hammer size={15} />}{buildStage ? '构建中' : '构建'}</button>
+          <button className="btn" title="在这个项目目录里开一条 AI 会话" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} />用 AI 开发</button>
+          <ActionMenu variant="icon" icon={<MoreHorizontal size={16} />} title={`${project.name} · 更多操作`} disabled={busy} panelWidth={196}>
+            {close => <ActionMenuItem icon={<FolderOpen size={15} />} label="打开目录" onClick={() => { close(); onOpenFolder(project.local!.workspace_path); }} />}
+          </ActionMenu>
+        </> : <button className="btn btn-primary" title="选择协作项目的本地目录" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} />关联本地项目</button>}
       </div>
     </header>
     <div className="extension-detail-tabs development-detail-tabs" role="tablist">
@@ -1038,6 +1077,13 @@ function projectSourceReady(project: ProjectModel) {
   return !source.source_repository || Boolean(source.source_commit.trim());
 }
 function projectUpdatedAt(project: ProjectModel) { const values = [project.local?.updated_at || '', project.remote?.updated_at || '', ...project.drafts.map(item => item.value.updated_at), ...project.submissions.map(item => item.value.updated_at)].sort(); return values[values.length - 1] || ''; }
+
+/// 工作区增量构建默认补哪些项目：从未构建，或当前版本和最近构建版本不一致。
+function projectNeedsBuild(project: ProjectModel) {
+  if (!project.local?.workspace_available) return false;
+  const draft = currentDraft(project);
+  return !draft || draftVersion(draft) !== project.local.version;
+}
 
 function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: DraftRef, submission?: SubmissionRef, activation?: ExtensionActivationReceipt): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
   if (!project.local) return { label: '未关联', tone: 'warn' };

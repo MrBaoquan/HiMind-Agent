@@ -1,0 +1,44 @@
+{
+  "captured_at": "2026-11-13T15:59:31.8373923+08:00",
+  "status": "built_verified_not_deployed",
+  "build_exit_code": 0,
+  "version": "0.3.92",
+  "build_channel": "local",
+  "source_file_count": 301,
+  "changed_files": [],
+  "added_or_removed_files": [],
+  "artifacts": [
+    {
+      "name": "himind-agent.exe",
+      "path": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent.exe",
+      "bytes": 63772672,
+      "sha256": "8E1D46675BB2C4A0364F00522DC3495FC07F19E4BF96F4B877B7C58356028124",
+      "file_version": "0.3.92",
+      "product_version": "0.3.92",
+      "last_write": "2026-11-13T15:56:55.0253223+08:00"
+    },
+    {
+      "name": "himind-agent-mcp.exe",
+      "path": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent-mcp.exe",
+      "bytes": 671232,
+      "sha256": "CA3ECE428B4241B34A3DAEE4BE6BEE198E6097C5809ACEC72552A6A88FB76E53",
+      "file_version": "0.3.92",
+      "product_version": "0.3.92",
+      "last_write": "2026-11-13T15:57:03.2569889+08:00"
+    },
+    {
+      "name": "himind-agent-launcher.exe",
+      "path": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent-launcher.exe",
+      "bytes": 729600,
+      "sha256": "B11AD1B027CF8CB0505F37A8B8B497098D53C79124F5379A1E4791A5C49E098F",
+      "file_version": "0.3.92",
+      "product_version": "0.3.92",
+      "last_write": "2026-11-13T15:57:07.2073052+08:00"
+    }
+  ],
+  "launched": false,
+  "deployed": false,
+  "native_webview_accepted": false,
+  "registry_migration_applied": false,
+  "includes_existing_worktree_changes": true
+}

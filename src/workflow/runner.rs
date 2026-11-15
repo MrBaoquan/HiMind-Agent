@@ -927,6 +927,11 @@ impl WorkflowRunner {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    let mut runtime_report = None;
+                    if let Some(failure) = error.downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>() {
+                        if failure.usage.is_some() { run.usage = failure.usage.clone(); }
+                        runtime_report = failure.report.clone();
+                    }
                     if tolerates_failure(step) {
                         // The workflow declared this step as degradable, so a
                         // failure is recorded on the step and the run keeps
@@ -946,6 +951,7 @@ impl WorkflowRunner {
                                 "error": message,
                                 "degraded": true,
                                 "on_failure": step.on_failure,
+                                "runtime_report": runtime_report,
                             }),
                         )?;
                         continue;
@@ -961,7 +967,7 @@ impl WorkflowRunner {
                         &run,
                         step,
                         RuntimeEventType::Error,
-                        serde_json::json!({"error": message}),
+                        serde_json::json!({"error": message, "runtime_report": runtime_report}),
                     )?;
                     return Ok(outcome(run, String::new(), completed_steps));
                 }
@@ -3753,6 +3759,35 @@ mod tests {
     }
 
     #[test]
+    fn runner_preserves_negative_runtime_report_and_usage_while_remaining_failed() {
+        struct NegativeReview;
+        impl WorkflowStepExecutor for NegativeReview {
+            fn execute(&self, _: &WorkflowPackage, _: &WorkflowStep, _: &Value)
+                -> Result<WorkflowStepExecution, Box<dyn Error>> {
+                Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
+                    message: "CLI exited 1 with a negative review".into(),
+                    report: Some(serde_json::json!({"passed":false,"reasons":["missing evidence"]})),
+                    usage: Some(crate::agent_core_contracts::LocalRunUsage {
+                        input_tokens:17, output_tokens:3, estimated_cost:0.0,
+                        currency:String::new(), billing_owner:"test".into(),
+                    }),
+                }))
+            }
+        }
+        let runner = WorkflowRunner::with_ledger(ledger("negative-runtime-review"));
+        let package = package();
+        let run = runner.start("agent-1", &package, "negative-review", &serde_json::json!({})).unwrap();
+        let outcome = runner.run_ready(&package, run, &serde_json::json!({}), &NegativeReview).unwrap();
+        assert_eq!(outcome.run.status, LocalRunStatus::Failed);
+        assert_eq!(outcome.run.usage.unwrap().input_tokens, 17);
+        let events = runner.ledger.list_events(&outcome.run.run_id).unwrap();
+        assert!(!events.iter().any(|event| event.event_type == RuntimeEventType::ToolCompleted));
+        assert!(events.iter().any(|event| event.event_type == RuntimeEventType::Error
+            && event.payload["runtime_report"]["passed"] == false
+            && event.payload["runtime_report"]["reasons"][0] == "missing evidence"));
+    }
+
+    #[test]
     fn runner_preserves_cancellation_that_arrives_during_a_step() {
         struct SlowExecutor;
         impl WorkflowStepExecutor for SlowExecutor {
@@ -3835,7 +3870,7 @@ mod tests {
                 kind: "runtime".to_string(),
                 capability_id: String::new(),
                 runtime: Some(super::super::WorkflowRuntimeStep {
-                    provider: "himind.builtin".to_string(),
+                    permission_mode: String::new(), provider: "himind.builtin".to_string(),
                     prompt: "a".to_string(),
                     workspace_path: String::new(),
                     result_schema: String::new(),
@@ -3865,7 +3900,7 @@ mod tests {
                 kind: "runtime".to_string(),
                 capability_id: String::new(),
                 runtime: Some(super::super::WorkflowRuntimeStep {
-                    provider: "acp.claude".to_string(),
+                    permission_mode: String::new(), provider: "acp.claude".to_string(),
                     prompt: "b".to_string(),
                     workspace_path: String::new(),
                     result_schema: String::new(),

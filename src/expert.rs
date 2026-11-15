@@ -1572,7 +1572,7 @@ fn default_expert_contents() -> Vec<String> {
     vec!["EXPERT.md".into()]
 }
 
-fn digest(definition: &ExpertDefinition) -> Result<String, Box<dyn Error>> {
+pub(crate) fn digest(definition: &ExpertDefinition) -> Result<String, Box<dyn Error>> {
     Ok(format!(
         "sha256:{:x}",
         Sha256::digest(serde_json::to_vec(definition)?)

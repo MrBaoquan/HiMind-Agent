@@ -580,14 +580,9 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
     let ready = cli_compatible && compatible_with_agent;
     RuntimeInstallationReport {
         provider: PROVIDER_BUILTIN.to_string(),
-        version: if version.is_empty() {
-            runtime_state
-                .as_ref()
-                .map(|state| state.version.clone())
-                .unwrap_or_default()
-        } else {
-            version
-        },
+        version: runtime_state.as_ref().filter(|state| executable.as_ref().is_some_and(|path|
+            Path::new(path).canonicalize().ok() == Path::new(&state.executable_path).canonicalize().ok()))
+            .map(|state| state.version.clone()).unwrap_or(version.clone()),
         status: if ready { "ready" } else { "unavailable" }.to_string(),
         capabilities: json!({
             "managed_execution": true,
@@ -595,6 +590,7 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
             "ai_proxy": true,
             "runtime_contract": 1,
             "engine_id": RUNTIME_ENGINE_ID,
+            "engine_version": version,
             "cli_compatible": cli_compatible,
             "compatible_with_agent": compatible_with_agent,
             "min_agent_version": runtime_state
@@ -637,6 +633,8 @@ fn bundled_runtime_manifest() -> Option<PathBuf> {
 #[derive(serde::Deserialize)]
 struct ExpectedRuntimeManifest {
     version: String,
+    #[serde(default)]
+    engine_version: String,
     file_name: String,
     sha256: String,
 }
@@ -727,8 +725,12 @@ fn installed_runtime_identity(expected: &ExpectedRuntimeManifest) -> (String, bo
         .and_then(|value| parse_runtime_version(&value));
     let version_matches = state.version == expected.version
         && managed_executable_path(&executable)
-        && actual_version.as_deref() == Some(expected.version.as_str());
+        && runtime_engine_version_matches(expected, actual_version.as_deref());
     (state.version, version_matches)
+}
+
+fn runtime_engine_version_matches(expected: &ExpectedRuntimeManifest, actual: Option<&str>) -> bool {
+    actual == Some(if expected.engine_version.is_empty() { expected.version.as_str() } else { expected.engine_version.as_str() })
 }
 
 /// Ensure the installed Runtime is exactly the release embedded into this Agent.
@@ -867,10 +869,9 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
             .err()
     });
     let compatible_with_agent = compatibility_error.is_none();
-    let installed_version = runtime_state
-        .as_ref()
-        .map(|state| state.version.clone())
-        .unwrap_or_default();
+    let installed_version = runtime_state.as_ref().filter(|state| executable.as_ref().is_some_and(|path|
+        Path::new(path).canonicalize().ok() == Path::new(&state.executable_path).canonicalize().ok()))
+        .map(|state| state.version.clone()).unwrap_or_default();
     let status = if cli_compatible && compatible_with_agent {
         "ready"
     } else if cli_compatible {
@@ -881,11 +882,7 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
     DeepSeekHarnessRuntimeStatus {
         provider: PROVIDER_BUILTIN.to_string(),
         status: status.to_string(),
-        version: if version.is_empty() {
-            installed_version
-        } else {
-            version
-        },
+        version: if installed_version.is_empty() { version } else { installed_version },
         cli_compatible,
         executable_path: executable
             .map(|value| value.to_string_lossy().to_string())
@@ -1277,6 +1274,20 @@ pub(crate) struct WorkflowRuntimeOutcome {
     pub usage: Option<crate::agent_core_contracts::LocalRunUsage>,
 }
 
+#[derive(Debug)]
+pub(crate) struct WorkflowRuntimeFailure {
+    pub message: String,
+    pub usage: Option<crate::agent_core_contracts::LocalRunUsage>,
+    /// A nonzero CLI exit can carry a completed negative review. Retain it as
+    /// evidence without converting the failed process into a successful run.
+    pub report: Option<Value>,
+}
+
+impl std::fmt::Display for WorkflowRuntimeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+impl Error for WorkflowRuntimeFailure {}
+
 pub(crate) fn execute_workflow(
     options: &Options,
     workspace: &str,
@@ -1348,13 +1359,18 @@ pub(crate) enum WorkflowAccess {
     Read,
     /// 可写：模型可以在工作区内改文件。
     Write,
+    /// 用户选择保留文件操作，禁用 Shell 和可间接执行命令的工具。
+    FilesOnly,
+    /// User-authorized command execution with the current OS user's access.
+    Full,
 }
 
 impl WorkflowAccess {
     fn dsh_mode(self) -> &'static str {
         match self {
             WorkflowAccess::Read => "read-only",
-            WorkflowAccess::Write => "workspace-write",
+            WorkflowAccess::Write | WorkflowAccess::FilesOnly => "workspace-write",
+            WorkflowAccess::Full => "danger-full-access",
         }
     }
 }
@@ -1401,6 +1417,9 @@ fn execute_workflow_with(
     if prompt.is_empty() {
         return Err("DSH workflow prompt is empty".into());
     }
+    if !disable_tools && access == WorkflowAccess::Write {
+        crate::app::runtime_workspace::prepare(&workspace.to_string_lossy())?;
+    }
     let requested_model = model_alias
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1418,11 +1437,18 @@ fn execute_workflow_with(
     // 平台强制的事实。
     let patch = if disable_tools {
         write_no_tools_overlay(&launch.agent_patch)?
+    } else if matches!(access, WorkflowAccess::Read | WorkflowAccess::FilesOnly) {
+        write_read_only_overlay(&launch.agent_patch)?
+    } else if matches!(home_mode, LaunchHome::Run { run_id, .. } if run_id.starts_with("workflow_run_mission_")) {
+        write_mission_methods_overlay(&launch.agent_patch)?
     } else {
         launch.agent_patch.clone()
     };
 
     let mut command = dsh_command(launch.executable.as_os_str());
+    let prompt = if !disable_tools && matches!(access, WorkflowAccess::Write | WorkflowAccess::Full) {
+        format!("{prompt}\n\nHiMind image evidence: if read_image refuses an authorized image because its extension differs from its bytes, preserve the original. Activate MCP capability media.image.read using system.capability.activate, then call system.capability.invoke with id=media.image.read and arguments={{workspace_root: the assigned workspace, path: the original image path}}. This returns image pixels to your current model; it does not call another service or modify evidence. If unavailable, state the observation limit honestly.")
+    } else { prompt.to_string() };
     command
         .args([
             OsString::from("--profile"),
@@ -1451,19 +1477,38 @@ fn execute_workflow_with(
     process::remove_himind_secret_environment(&mut command);
     command.env("DEEPSEEK_API_KEY", &launch.api_key);
     command.env("DEEPSEEK_BASE_URL", &launch.base_url);
+    let lease_session = match home_mode {
+        LaunchHome::Run { run_id, step_id } => format!("{run_id}/{step_id}"),
+        _ => format!("workflow-{}-{}", std::process::id(), rand::random::<u64>()),
+    };
+    let _workspace_lease = if !disable_tools && access != WorkflowAccess::Read {
+        let lease = crate::workspace_lease::RuntimeLeaseGuard::acquire(&workspace, &lease_session, timeout_seconds)?;
+        lease.configure_child(&mut command);
+        Some(lease)
+    } else { None };
     process::configure_hidden_process(&mut command);
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().map(process::capture_output);
     let stderr = child.stderr.take().map(process::capture_output);
-    let status = process::wait_for_child_with_timeout_and_cancel(
+    let status_result = process::wait_for_child_with_timeout_and_cancel(
         &mut child,
         "HIMIND_DSH_TIMEOUT_SECONDS",
         timeout_seconds,
         "DeepSeek Harness workflow runtime",
         || is_canceled(),
-    )?;
+    );
     let stdout = process::join_output(stdout);
     let stderr = process::join_output(stderr);
+    let usage_home = match home_mode {
+        LaunchHome::Run { step_id, .. } if !step_id.trim().is_empty() => launch
+            .home.parent().and_then(Path::parent).unwrap_or(&launch.home),
+        _ => &launch.home,
+    };
+    let usage_result = crate::mission::read_projection_usage(usage_home);
+    let status = status_result.map_err(|error| Box::new(WorkflowRuntimeFailure {
+        message: error.to_string(), usage: usage_result.as_ref().ok().cloned().flatten(),
+        report: None,
+    }) as Box<dyn Error>)?;
     if !status.success() {
         // 以前只拼 stderr（空则回落到 stdout）。两者都为空时错误就变成
         // "DSH workflow runtime failed: " —— 排查时完全无信息可用。
@@ -1487,26 +1532,23 @@ fn execute_workflow_with(
         } else {
             format!("DSH workflow runtime failed (exit {exit}): {summarized}")
         };
-        return Err(message.into());
+        return Err(Box::new(WorkflowRuntimeFailure { message,
+            usage: usage_result.as_ref().ok().cloned().flatten(),
+            report: workflow_failure_report(&stdout, &stderr) }));
     }
-    // Step homes are nested at `<run>/steps/<step>`. Workflow persistence uses
-    // `<run>/storages`, so usage must be read one level above `steps`, not from
-    // the leaf. This keeps a successful Runtime from being misclassified as
-    // "usage unavailable" and incorrectly failing a token-budgeted Mission.
-    let usage_home = match home_mode {
-        LaunchHome::Run { step_id, .. } if !step_id.trim().is_empty() => launch
-            .home
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or(&launch.home),
-        _ => &launch.home,
-    };
     Ok(WorkflowRuntimeOutcome {
         text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
         model: launch.default_model.clone(),
         service_source: launch.service_source,
         endpoint: endpoint_host(&launch.base_url),
-        usage: crate::mission::read_projection_usage(usage_home)?,
+        usage: usage_result?,
+    })
+}
+
+fn workflow_failure_report(stdout: &str, stderr: &str) -> Option<Value> {
+    [stdout, stderr].into_iter().find_map(|text| {
+        let report: Value = serde_json::from_str(text.trim()).ok()?;
+        (report.is_object() && report.get("passed").is_some_and(Value::is_boolean)).then_some(report)
     })
 }
 
@@ -2600,8 +2642,8 @@ fn dsh_command(executable: &std::ffi::OsStr) -> Command {
 }
 
 /// Point DSH's native Office configuration at the immutable Runtime that is
-/// actually launching this process.  No PATH mutation or system executable
-/// discovery is involved, and external Runtime paths remain supported.
+/// actually launching this process. Runtimes declaring the restricted-pipe
+/// patch also select their bundled Node for shell commands through PATH.
 pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &Path) {
     let Some(runtime_root) = executable.parent().and_then(Path::parent) else {
         return;
@@ -2612,6 +2654,26 @@ pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &
         runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
     );
     command.env("NODE_PATH", runtime_root.join("node_modules"));
+    // Shared system-temp ACL lock files can retain permissions from unrelated
+    // sandbox clients. Keep host-side runtime locks in this Agent's own temp
+    // namespace; the sandbox runner still creates a separate confined child.
+    #[cfg(windows)]
+    {
+        let temp = crate::store::paths::agent_home().join("cache/dsh-temp");
+        if fs::create_dir_all(&temp).is_ok() { command.env("TEMP", &temp).env("TMP", &temp); }
+    }
+    // Only runtimes carrying the signed pipe-compatibility patch select their
+    // bundled Node for shell tools. Otherwise `node --test` would still resolve
+    // an unpatched global Node and fail despite a successful runtime self-test.
+    let patched_node = fs::read(runtime_root.join("runtime.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|manifest| manifest["node_patches"].as_array()
+            .is_some_and(|patches| patches.iter().any(|patch| patch == "restricted-pipe-dacl")));
+    if patched_node {
+        let paths = std::iter::once(runtime_root.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())).collect::<Vec<_>>();
+        if let Ok(path) = std::env::join_paths(paths) { command.env("PATH", path); }
+    }
+
     command.env("NO_PROXY", loopback_no_proxy());
     command.env("NODE_ENV", "production");
     // Node 22+ (the Runtime now bundles 24) can persist V8 compile cache across
@@ -3276,6 +3338,38 @@ const NO_TOOLS_DISABLED_ROWS: &[&str] = &[
     "himind-agent-mcp",
 ];
 
+// Headless read-only reviewers have no approval channel. Expose file readers
+// and search, but no shell, skills, delegation or external mutation tools that
+// can request an escalation and trap the model in an endless retry loop.
+const READ_ONLY_DISABLED_ROWS: &[&str] = &[
+    "tool-pwsh", "tool-bash", "tool-web", "tool-skill", "tool-todo", "tool-goal",
+    "tool-jobs", "tool-workflow", "tool-ralph", "tool-subagent", "tool-subagent-fork",
+    "tool-subagent-control", "tool-subagent-list-agents", "tool-present", "plan-mode",
+    "user-questions", "himind-agent-mcp",
+];
+
+fn write_read_only_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let base = fs::read_to_string(base_patch)?;
+    let mut overlay = base.trim_end().to_string();
+    for row in READ_ONLY_DISABLED_ROWS {
+        overlay.push_str(&format!("\n- id: {row}\n  disabled: true\n"));
+    }
+    let name = base_patch.file_name().and_then(|name| name.to_str()).unwrap_or("agent.patch.yml");
+    let path = base_patch.with_file_name(format!("{}-read-only.patch.yml", name.trim_end_matches(".patch.yml")));
+    fs::write(&path, overlay)?;
+    Ok(path)
+}
+
+fn write_mission_methods_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    // Mission roles already contain the pinned expert instructions. Loading
+    // arbitrary host skills would silently change that method during a run.
+    // Keep the assigned model, file tools, Shell and MCP image/lease tools.
+    let base = fs::read_to_string(base_patch)?;
+    let path = base_patch.with_extension("mission-methods.yml");
+    fs::write(&path, format!("{}\n- id: tool-skill\n  disabled: true\n", base.trim_end()))?;
+    Ok(path)
+}
+
 /// 生成（或刷新）禁用全部工具行的 overlay，返回可传给 `--patch` 的路径。
 ///
 /// 从**本次会话**的 overlay 派生，因此 `HIMIND_AI_WORKSPACE` 与会话一致；
@@ -3819,11 +3913,30 @@ fn append_local_gateway_profile(
     );
     let mut seen = HashSet::new();
     catalog.retain(|model| seen.insert(model.clone()));
+    let mut metadata_by_service = std::collections::BTreeMap::new();
+    let selected_service = default_model.strip_prefix("himind:").and_then(|value| value.split_once(':')).map(|(service, _)| service);
     for model in catalog {
+        let mut parts = model.splitn(3, ':');
+        let metadata = if parts.next() == Some("himind") {
+            let service = parts.next().unwrap_or_default();
+            let upstream = parts.next().unwrap_or_default();
+            let metadata = metadata_by_service.entry(service.to_string()).or_insert_with(||
+                if Some(service) == selected_service {
+                    crate::app::ai_provider_import::custom_service_model_metadata(service).unwrap_or_default()
+                } else { std::collections::BTreeMap::new() });
+            metadata.get(upstream).cloned().unwrap_or_else(|| crate::api::ai::known_model_metadata(upstream))
+        } else { crate::api::ai::known_model_metadata(&model) };
         let model = yaml_scalar(&model);
         patch.push_str(&format!(
             "          - id: {model}\n            name: {model}\n"
         ));
+        if metadata.supports_image() { patch.push_str("            input: [text, image]\n"); }
+        if let Some(context) = metadata.context_window {
+            patch.push_str(&format!("            contextWindow: {context}\n"));
+        }
+        if let Some(output) = metadata.max_output_tokens {
+            patch.push_str(&format!("            maxTokens: {output}\n"));
+        }
     }
     Ok(())
 }
@@ -4830,6 +4943,24 @@ fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
         .join(safe_run_segment(run_id)?))
 }
 
+pub(crate) fn recorded_workflow_usage(run_id: &str) -> Result<Option<crate::agent_core_contracts::LocalRunUsage>, Box<dyn Error>> {
+    let root = dsh_runs_root()?;
+    if !root.is_dir() { return Ok(None); }
+    let segment = safe_run_segment(run_id)?;
+    let mut total: Option<crate::agent_core_contracts::LocalRunUsage> = None;
+    for version in fs::read_dir(root)?.take(32) {
+        let version = version?;
+        if !version.file_type()?.is_dir() { continue; }
+        if let Some(usage) = crate::mission::read_projection_usage(&version.path().join(&segment))? {
+            if let Some(total) = &mut total {
+                total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+            } else { total = Some(usage); }
+        }
+    }
+    Ok(total)
+}
+
 /// 某个 workflow step 独占的 run home：`<runs>/<version>/<run>/steps/<step>`。
 ///
 /// 与 [`dsh_run_home`] 同前缀，只是多一层 `steps/`，因此同一套清理与迁移逻辑
@@ -5131,6 +5262,52 @@ mod tests {
         ] {
             assert!(super::NO_TOOLS_DISABLED_ROWS.contains(&row));
         }
+    }
+
+    #[test]
+    fn read_only_overlay_preserves_file_readers_and_removes_escalating_tools() {
+        let root = std::env::temp_dir().join(format!("himind-read-only-overlay-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = root.join("agent.review.patch.yml");
+        std::fs::write(&base, "- id: agent-default-model\n  config:\n    model: demo\n").unwrap();
+        let path = super::write_read_only_overlay(&base).unwrap();
+        assert_eq!(path.file_name().unwrap(), "agent.review-read-only.patch.yml");
+        let overlay: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let rows = overlay.as_sequence().unwrap();
+        for id in ["tool-pwsh", "tool-bash", "tool-skill", "himind-agent-mcp", "tool-subagent"] {
+            assert!(rows.iter().any(|row| row["id"] == id && row["disabled"] == true));
+        }
+        for id in ["tool-fs", "tool-fs-search"] {
+            assert!(!rows.iter().any(|row| row["id"] == id && row["disabled"] == true));
+        }
+        assert!(std::fs::read_to_string(base).unwrap().contains("model: demo"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mission_methods_overlay_keeps_assigned_model_shell_files_and_mcp() {
+        let root = std::env::temp_dir().join(format!("himind-mission-methods-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = root.join("agent.patch.yml");
+        let source = "- id: agent-default-model\n  config:\n    model: pinned\n- id: tool-pwsh\n  disabled: false\n- id: tool-fs\n  disabled: false\n- id: himind-agent-mcp\n  disabled: false\n";
+        std::fs::write(&base, source).unwrap();
+        let overlay = std::fs::read_to_string(super::write_mission_methods_overlay(&base).unwrap()).unwrap();
+        let rows: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let disabled = rows.as_sequence().unwrap().iter().filter(|row| row["disabled"] == true)
+            .map(|row| row["id"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(disabled, vec!["tool-skill"]);
+        assert!(overlay.contains("model: pinned"));
+        assert_eq!(std::fs::read_to_string(&base).unwrap(), source);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_cli_report_preserves_negative_output_without_accepting_log_fragments() {
+        let report = r#"{"passed":false,"reasons":["missing evidence"]}"#;
+        assert_eq!(super::workflow_failure_report(report, "diagnostic").unwrap()["passed"], false);
+        assert_eq!(super::workflow_failure_report("", report).unwrap()["reasons"][0], "missing evidence");
+        assert!(super::workflow_failure_report("diagnostic {\"passed\":false}", "timeout").is_none());
+        assert!(super::workflow_failure_report(r#"{"passed":"false"}"#, "").is_none());
     }
 
     #[test]
@@ -7364,13 +7541,30 @@ mod tests {
     #[test]
     fn embedded_runtime_manifest_pins_an_exact_release() {
         let manifest = super::expected_runtime_manifest().unwrap();
-        assert_eq!(manifest.version, "0.2.2-rc.1");
+        assert_eq!(manifest.version, "0.2.2-rc.1.himind.1");
         assert_eq!(
             manifest.file_name,
-            "deepseek-harness-runtime-0.2.2-rc.1-windows-x64.zip"
+            "deepseek-harness-runtime-0.2.2-rc.1.himind.1-windows-x64.zip"
         );
         assert_eq!(manifest.sha256.len(), 64);
         assert!(manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(super::runtime_engine_version_matches(&manifest, Some("0.2.2-rc.1")));
+        assert!(!super::runtime_engine_version_matches(&manifest, Some("0.2.1")));
+        assert!(!super::runtime_engine_version_matches(&manifest, None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the signed Runtime revision installed outside a Low integrity build directory"]
+    fn installed_runtime_revision_identity_and_status_use_package_version() {
+        let expected=super::expected_runtime_manifest().unwrap();
+        let (version,matches)=super::installed_runtime_identity(&expected);
+        assert_eq!(version,expected.version);
+        assert!(matches,"installed package and engine identities differ from the pinned release");
+        let report=super::status();
+        assert!(report.cli_compatible,"{}",report.message);
+        assert_eq!(report.version,expected.version);
+        assert_eq!(super::probe().version,expected.version);
     }
 
     #[test]
@@ -7385,7 +7579,7 @@ mod tests {
 
         let derived = json!({
             "version": expected.version.clone(),
-            "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64-install-stored.zip",
+            "file_name": expected.file_name.replace(".zip", "-install-stored.zip"),
             "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
             "source_package_file_name": expected.file_name.clone(),
             "source_package_sha256": expected.sha256.clone(),
@@ -7394,12 +7588,31 @@ mod tests {
 
         let wrong_source = json!({
             "version": expected.version.clone(),
-            "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64-install-stored.zip",
+            "file_name": expected.file_name.replace(".zip", "-install-stored.zip"),
             "sha256": "9bd28b601130197b94a424ff6651972acf7f9e788a68bb073444f8f930de26e1",
             "source_package_file_name": expected.file_name.clone(),
             "source_package_sha256": "0".repeat(64),
         });
         assert!(!manifest_value_matches_expected(&wrong_source, &expected));
+    }
+
+    #[test]
+    fn runtime_environment_selects_patched_node_only_when_declared() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("himind-patched-node-path-{}-{}", std::process::id(), rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("bin/dsh.cmd");
+        let mut ordinary = std::process::Command::new("dsh");
+        configure_runtime_environment(&mut ordinary, &executable);
+        assert!(!ordinary.get_envs().any(|(key, _)| key == "PATH"));
+        fs::write(root.join("runtime.json"), r#"{"node_patches":["restricted-pipe-dacl"]}"#).unwrap();
+        let mut patched = std::process::Command::new("dsh");
+        configure_runtime_environment(&mut patched, &executable);
+        let selected = patched.get_envs().find(|(key, _)| *key == "PATH").and_then(|(_, value)| value).unwrap();
+        let paths = std::env::split_paths(selected).collect::<Vec<_>>();
+        assert_eq!(paths.first(), Some(&root));
+        assert_eq!(&paths[1..], std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

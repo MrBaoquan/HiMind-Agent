@@ -1,0 +1,12 @@
+{
+  "kind": "human_confirmation",
+  "received_at": "2026-11-13T15:32:50.6418730+08:00",
+  "question": "更新后的合成预览：新版中文别名和左侧导航是否通过验收；原生运行态另行验收",
+  "answer": "新版中文别名和导航通过验收",
+  "accepted_scope": [
+    "Chinese project aliases",
+    "single-line left navigation"
+  ],
+  "native_webview_accepted": false,
+  "deployment_authorized": false
+}

@@ -1,0 +1,48 @@
+{
+  "mode": "review_only_not_authorized",
+  "prepared_at": "2026-11-13T16:17:32.7424901+08:00",
+  "version": "0.3.92",
+  "candidate_manifest": "F:\\WebProjects\\项目看板\\himind-agent\\.himind\\long-tasks\\20261113-workspace-project-hierarchy\\evidence\\round11-native-candidate.json",
+  "candidate_manifest_sha256": "DDC64683299C014C4000A9B01A55B922400544231392B8E2FF3A187BC3EFC47B",
+  "operations": [
+    {
+      "name": "himind-agent.exe",
+      "source": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent.exe",
+      "source_sha256": "8E1D46675BB2C4A0364F00522DC3495FC07F19E4BF96F4B877B7C58356028124",
+      "destination": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\versions\\0.3.92\\himind-agent.exe",
+      "expected_installed_sha256": "1ED9524B1ADDCB101BDBA2E7F9D5D924B566B05C6CD5028E491D8CC0CFB3B693",
+      "backup": "F:\\WebProjects\\项目看板\\himind-agent\\.himind\\long-tasks\\20261113-workspace-project-hierarchy\\before\\round15-installation\\programs\\himind-agent.exe",
+      "backup_sha256": "1ED9524B1ADDCB101BDBA2E7F9D5D924B566B05C6CD5028E491D8CC0CFB3B693"
+    },
+    {
+      "name": "himind-agent-mcp.exe",
+      "source": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent-mcp.exe",
+      "source_sha256": "CA3ECE428B4241B34A3DAEE4BE6BEE198E6097C5809ACEC72552A6A88FB76E53",
+      "destination": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\versions\\0.3.92\\himind-agent-mcp.exe",
+      "expected_installed_sha256": "A20763BCA06A461C9BB0C09BFF16E67CAE2E19F7F5AC9438537944702463EEB7",
+      "backup": "F:\\WebProjects\\项目看板\\himind-agent\\.himind\\long-tasks\\20261113-workspace-project-hierarchy\\before\\round15-installation\\programs\\himind-agent-mcp.exe",
+      "backup_sha256": "A20763BCA06A461C9BB0C09BFF16E67CAE2E19F7F5AC9438537944702463EEB7"
+    },
+    {
+      "name": "himind-agent-launcher.exe",
+      "source": "F:\\WebProjects\\项目看板\\himind-agent\\target\\workspace-hierarchy-candidate\\release\\himind-agent-launcher.exe",
+      "source_sha256": "B11AD1B027CF8CB0505F37A8B8B497098D53C79124F5379A1E4791A5C49E098F",
+      "destination": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\himind-agent-launcher.exe",
+      "expected_installed_sha256": "482766B136010717794B54F3AE4E2D49584AC489F8C9748BCC407D148C45D203",
+      "backup": "F:\\WebProjects\\项目看板\\himind-agent\\.himind\\long-tasks\\20261113-workspace-project-hierarchy\\before\\round15-installation\\programs\\himind-agent-launcher.exe",
+      "backup_sha256": "482766B136010717794B54F3AE4E2D49584AC489F8C9748BCC407D148C45D203"
+    }
+  ],
+  "active_version_file": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\active-version",
+  "active_version_backup": "F:\\WebProjects\\项目看板\\himind-agent\\.himind\\long-tasks\\20261113-workspace-project-hierarchy\\before\\round15-installation\\programs\\active-version",
+  "active_version_sha256": "C2AA32C6F1F91A7FD3B9D2A9649966E712042D10A4FB6B45DF7E877BE2E2F252",
+  "restart_local_port": 18181,
+  "health_must_match_new_pid": true,
+  "runtime_action": "unchanged",
+  "workspace_registry_action": "unchanged; do not apply migration proposal",
+  "state_or_credentials_action": "no manual changes",
+  "install_or_restart_performed": false,
+  "rollback": "on copy or health failure, restore verified backups and restart the previous installed main program",
+  "concurrent_change_policy": "recheck every installed and candidate hash immediately before stopping; abort on drift",
+  "includes_existing_worktree_changes": true
+}

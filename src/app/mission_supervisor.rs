@@ -87,8 +87,11 @@ pub(crate) fn needs_host_follow_up(mission: &MissionView, events: &[MissionEvent
     let Some(fingerprint) = failed_follow_up_fingerprint(mission) else {
         return false;
     };
+    let retry_after = events.iter().filter(|event| matches!(event.event_type.as_str(), "mission_resume" | "budget_extended"))
+        .map(|event| event.sequence).max().unwrap_or(0);
     !events.iter().any(|event| {
         event.event_type == "mission_follow_up_failed"
+            && event.sequence > retry_after
             && event.payload.get("fingerprint").and_then(serde_json::Value::as_str) == Some(fingerprint.as_str())
     })
 }
@@ -128,17 +131,26 @@ where
 {
     let missions = store.list(SCAN_LIMIT)?;
     let mut errors = Vec::new();
+    for mission in &missions {
+        if mission.status == MissionStatus::Active && !mission.tasks.iter().any(|task| task.status == TaskStatus::Running) {
+            if let Some(reason) = store.follow_up_budget_exhaustion_reason(mission)? {
+                store.record_budget_exhausted(&mission.mission_id, &reason)?;
+            }
+        }
+    }
     for mission_id in dispatchable_ids(&missions) {
         if let Err(message) = dispatch(&mission_id) {
             let _ = store.append_event(&mission_id, "mission_supervisor_error", "",
-                &format!("宿主调度未能推进任务：{message}"), serde_json::json!({"error": message}));
+                &error_summary("系统暂时无法继续执行：", &message), serde_json::json!({"error": message}));
             errors.push((mission_id, message));
         }
     }
     for mission in &missions {
+        if store.get(&mission.mission_id)?.status != MissionStatus::Active { continue; }
         let Some(fingerprint) = failed_follow_up_fingerprint(mission) else { continue; };
         let events = store.snapshot(&mission.mission_id, 0)?.events;
         if !needs_host_follow_up(mission, &events) {
+            store.wait_for_follow_up(&mission.mission_id, "先前返工生成失败", &fingerprint)?;
             continue;
         }
         if let Err(message) = follow_up(&mission.mission_id) {
@@ -146,13 +158,20 @@ where
                 &mission.mission_id,
                 "mission_follow_up_failed",
                 "",
-                &format!("宿主未能生成有界跟进任务：{message}"),
+                &error_summary("系统暂时无法生成跟进任务：", &message),
                 serde_json::json!({"error": message, "fingerprint": fingerprint}),
             );
+            store.wait_for_follow_up(&mission.mission_id, &message, &fingerprint)?;
             errors.push((mission.mission_id.clone(), message));
         }
     }
     Ok(errors)
+}
+
+fn error_summary(prefix: &str, message: &str) -> String {
+    // Keep full diagnostics in the payload; an oversized summary must never
+    // prevent the user from seeing that dispatch failed.
+    format!("{prefix}{message}").chars().take(1900).collect()
 }
 
 /// Spawn the process-lifetime supervisor. The stop flag is used by tests or a
@@ -208,7 +227,7 @@ mod tests {
             id: "task".to_string(), title: "Task".to_string(), objective: String::new(),
             depends_on: vec![], read_paths: vec![], write_paths: vec![],
             acceptance_criteria: vec!["ok".to_string()], required_checks: vec!["node --test".to_string()],
-            execution: ExecutionBinding {
+            execution: ExecutionBinding { expert: None,
                 executor: "himind.builtin".to_string(), model: String::new(),
                 role_id: "implementer".to_string(), service_id: String::new(),
             }, repair_of: String::new(),
@@ -216,7 +235,7 @@ mod tests {
         MissionView {
             schema_version: "mission.v1".to_string(), mission_id: id.to_string(), title: "Task".to_string(),
             objective: String::new(), status,
-            workspace: MissionWorkspace { root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
+            workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
             acceptance_criteria: vec!["ok".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),
             plan_summary: String::new(), required_acceptance: vec![], proposed_tasks: vec![],
             budget: Some(MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None }),
@@ -237,7 +256,7 @@ mod tests {
         let created = store.create(&crate::mission::MissionCreateInput {
             title: title.to_string(),
             objective: String::new(),
-            workspace: MissionWorkspace { root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
+            workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
@@ -265,14 +284,17 @@ mod tests {
         let mut visited = Vec::new();
         let errors = scan_with(&store, |mission_id| {
             visited.push(mission_id.to_string());
-            if mission_id == broken { Err("isolated failure".to_string()) } else { Ok(()) }
+            if mission_id == broken { Err("中文错误".repeat(1000)) } else { Ok(()) }
         }, |_| Ok(())).unwrap();
         assert_eq!(visited.len(), 2);
         assert!(visited.contains(&broken));
         assert!(visited.contains(&healthy));
-        assert_eq!(errors, vec![(broken.clone(), "isolated failure".to_string())]);
+        assert_eq!(errors, vec![(broken.clone(), "中文错误".repeat(1000))]);
         let snapshot = store.snapshot(&broken, 0).unwrap();
         assert!(snapshot.events.iter().any(|event| event.event_type == "mission_supervisor_error"));
+        let event = snapshot.events.iter().find(|event| event.event_type == "mission_supervisor_error").unwrap();
+        assert!(event.summary.chars().count() <= 1900);
+        assert_eq!(event.payload["error"], "中文错误".repeat(1000));
         let healthy_snapshot = store.snapshot(&healthy, 0).unwrap();
         assert!(!healthy_snapshot.events.iter().any(|event| event.event_type == "mission_supervisor_error"));
     }
@@ -281,7 +303,7 @@ mod tests {
         let created = store.create(&crate::mission::MissionCreateInput {
             title: "needs repair".to_string(),
             objective: String::new(),
-            workspace: MissionWorkspace { root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
+            workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
@@ -324,6 +346,12 @@ mod tests {
         }).unwrap();
         assert!(second_calls.is_empty(), "the same failed fingerprint must not retry every tick");
         assert!(!needs_host_follow_up(&store.get(&mission_id).unwrap(), &events));
+        assert_eq!(store.get(&mission_id).unwrap().status, MissionStatus::Waiting);
+        store.control(&mission_id, "resume").unwrap();
+        let resumed_events = store.snapshot(&mission_id, 0).unwrap().events;
+        assert!(needs_host_follow_up(&store.get(&mission_id).unwrap(), &resumed_events));
+        scan_with(&store, |_| Ok(()), |id| { second_calls.push(id.to_string()); Ok(()) }).unwrap();
+        assert_eq!(second_calls, vec![mission_id]);
         let _ = fs::remove_dir_all(root);
     }
 

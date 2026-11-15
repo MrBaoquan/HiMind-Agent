@@ -1,0 +1,1303 @@
+{
+  "scope": "Current source rendered with real components and synthetic data; no persistent mutations",
+  "errors": [],
+  "layouts": [
+    {
+      "label": "projects-1280",
+      "viewport": 1280,
+      "documentWidth": 1280,
+      "bodyWidth": 1280,
+      "detail": {
+        "x": 545.875,
+        "y": 173.796875,
+        "width": 703.125,
+        "height": 3433.78125,
+        "scrollWidth": 703,
+        "clientWidth": 703,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 567.875,
+        "y": 479.578125,
+        "width": 659.125,
+        "height": 3108,
+        "scrollWidth": 659,
+        "clientWidth": 659,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 567.875,
+        "y": 525.578125,
+        "width": 565,
+        "height": 34,
+        "scrollWidth": 568,
+        "clientWidth": 565,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    {
+      "label": "projects-1024",
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "bodyWidth": 1024,
+      "detail": {
+        "x": 465,
+        "y": 173.796875,
+        "width": 528,
+        "height": 3496.78125,
+        "scrollWidth": 528,
+        "clientWidth": 528,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 487,
+        "y": 512.578125,
+        "width": 484,
+        "height": 3138,
+        "scrollWidth": 487,
+        "clientWidth": 484,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 487,
+        "y": 558.578125,
+        "width": 484,
+        "height": 34,
+        "scrollWidth": 487,
+        "clientWidth": 484,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    {
+      "label": "projects-768",
+      "viewport": 768,
+      "documentWidth": 768,
+      "bodyWidth": 768,
+      "detail": {
+        "x": 295.90625,
+        "y": 121.796875,
+        "width": 455.09375,
+        "height": 3556.28125,
+        "scrollWidth": 455,
+        "clientWidth": 455,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 311.90625,
+        "y": 524.078125,
+        "width": 423.09375,
+        "height": 3138,
+        "scrollWidth": 438,
+        "clientWidth": 423,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 311.90625,
+        "y": 570.078125,
+        "width": 423.09375,
+        "height": 34,
+        "scrollWidth": 438,
+        "clientWidth": 423,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    {
+      "label": "projects-560",
+      "viewport": 560,
+      "documentWidth": 560,
+      "bodyWidth": 560,
+      "detail": {
+        "x": 17,
+        "y": 463.796875,
+        "width": 526,
+        "height": 6361.78125,
+        "scrollWidth": 526,
+        "clientWidth": 526,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 31,
+        "y": 873.578125,
+        "width": 498,
+        "height": 5938,
+        "scrollWidth": 501,
+        "clientWidth": 498,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 31,
+        "y": 919.578125,
+        "width": 498,
+        "height": 34,
+        "scrollWidth": 501,
+        "clientWidth": 498,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    {
+      "label": "projects-400",
+      "viewport": 400,
+      "documentWidth": 400,
+      "bodyWidth": 400,
+      "detail": {
+        "x": 17,
+        "y": 507.796875,
+        "width": 366,
+        "height": 6458.28125,
+        "scrollWidth": 366,
+        "clientWidth": 366,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 31,
+        "y": 950.578125,
+        "width": 338,
+        "height": 6001.5,
+        "scrollWidth": 341,
+        "clientWidth": 338,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 31,
+        "y": 996.578125,
+        "width": 338,
+        "height": 73,
+        "scrollWidth": 341,
+        "clientWidth": 338,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    {
+      "label": "projects-320",
+      "viewport": 320,
+      "documentWidth": 320,
+      "bodyWidth": 320,
+      "detail": {
+        "x": 17,
+        "y": 507.796875,
+        "width": 286,
+        "height": 6521.28125,
+        "scrollWidth": 286,
+        "clientWidth": 286,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 31,
+        "y": 983.578125,
+        "width": 258,
+        "height": 6031.5,
+        "scrollWidth": 261,
+        "clientWidth": 258,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 31,
+        "y": 1029.578125,
+        "width": 258,
+        "height": 73,
+        "scrollWidth": 261,
+        "clientWidth": 258,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    }
+  ],
+  "modal": {
+    "afterOpen": {
+      "activeTag": "BUTTON",
+      "activeText": "新建项目",
+      "inside": false
+    },
+    "escapeClosed": false,
+    "tabAfterLast": {
+      "inside": false,
+      "tag": "BODY",
+      "text": "审查用桌面外壳工作区目录关联帮助 Agent 识别项目，不改变会话权限。检查目录新建项目项"
+    },
+    "afterClose": {
+      "tag": "BODY",
+      "text": "审查用桌面外壳工作区目录关联帮助 Agent 识别项目，不改变会话权限。检查目录"
+    },
+    "saveError": {
+      "text": "Error: Audit fixture: persistent mutations are disabled",
+      "inside": false,
+      "role": null,
+      "x": 214,
+      "y": 122.796875,
+      "right": 994,
+      "dialogLeft": 604
+    }
+  },
+  "states": {
+    "preview": {
+      "top": 3664.578125,
+      "bottom": 4282.578125,
+      "viewportHeight": 900,
+      "visible": false,
+      "active": "预览会话：Synthetic session 001",
+      "mainScroll": 0,
+      "bodyScroll": 0
+    },
+    "previewAfterClose": {
+      "tag": "BODY",
+      "label": null
+    },
+    "directory1024": {
+      "label": "directories-1024",
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "bodyWidth": 1024,
+      "detail": null,
+      "history": null,
+      "tools": null,
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        }
+      ]
+    },
+    "smallTargets": [
+      {
+        "text": "审查项目",
+        "width": 48,
+        "height": 18
+      },
+      {
+        "text": "审查项目",
+        "width": 48,
+        "height": 18
+      }
+    ],
+    "directory320": {
+      "label": "directories-320",
+      "viewport": 320,
+      "documentWidth": 320,
+      "bodyWidth": 320,
+      "detail": null,
+      "history": null,
+      "tools": null,
+      "overflow": [
+        {
+          "selector": "table workspace-registry-table",
+          "tag": "TABLE",
+          "right": 637,
+          "width": 620
+        },
+        {
+          "selector": "",
+          "tag": "THEAD",
+          "right": 637,
+          "width": 620
+        },
+        {
+          "selector": "",
+          "tag": "TR",
+          "right": 637,
+          "width": 620
+        },
+        {
+          "selector": "",
+          "tag": "TH",
+          "right": 409,
+          "width": 127.28125
+        },
+        {
+          "selector": "",
+          "tag": "TH",
+          "right": 519,
+          "width": 110
+        },
+        {
+          "selector": "",
+          "tag": "TH",
+          "right": 637,
+          "width": 118
+        },
+        {
+          "selector": "",
+          "tag": "TBODY",
+          "right": 637,
+          "width": 620
+        },
+        {
+          "selector": "",
+          "tag": "TR",
+          "right": 637,
+          "width": 620
+        },
+        {
+          "selector": "",
+          "tag": "TD",
+          "right": 409,
+          "width": 127.28125
+        },
+        {
+          "selector": "workspace-registry-project-link",
+          "tag": "BUTTON",
+          "right": 341.71875,
+          "width": 48
+        },
+        {
+          "selector": "",
+          "tag": "TD",
+          "right": 519,
+          "width": 110
+        },
+        {
+          "selector": "pill success",
+          "tag": "SPAN",
+          "right": 485,
+          "width": 64
+        }
+      ],
+      "smallText": [
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        }
+      ]
+    },
+    "pending320": {
+      "label": "pending-320",
+      "viewport": 320,
+      "documentWidth": 320,
+      "bodyWidth": 320,
+      "detail": null,
+      "history": null,
+      "tools": null,
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "",
+          "size": "10px",
+          "text": "建议项目"
+        }
+      ]
+    },
+    "keyboardTab": {
+      "active": "目录清单2",
+      "selected": "true"
+    },
+    "keyboardAfterProjectTab": {
+      "tag": "BUTTON",
+      "label": null
+    },
+    "noProjectMatch": "没有匹配的项目或目录。",
+    "noSessionMatch": "没有匹配的会话",
+    "historyError": "SESSION_CURSOR_INVALID",
+    "wireSources": [
+      "HiMind AI · 未检测到",
+      "ACP · 11",
+      "Claude Code · 11",
+      "Codex · 部分不可用",
+      "undefined · 读取失败"
+    ],
+    "refresh": {
+      "afterMs": 239,
+      "disabled": false,
+      "ariaBusy": null,
+      "loadingVisible": 0
+    },
+    "emptyText": "还没有项目新建项目后，可以为它添加一个或多个本机目录。新建项目",
+    "registryError": "Error: SYNTHETIC_REGISTRY_READ_FAILURE",
+    "registryErrorRole": null,
+    "darkMode": {
+      "colorScheme": "light",
+      "bg": "rgb(245, 246, 244)"
+    },
+    "textSpacing": {
+      "label": "text-spacing-1024",
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "bodyWidth": 1024,
+      "detail": {
+        "x": 465,
+        "y": 201,
+        "width": 528,
+        "height": 3529.5,
+        "scrollWidth": 528,
+        "clientWidth": 528,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 487,
+        "y": 570,
+        "width": 484,
+        "height": 3140.5,
+        "scrollWidth": 487,
+        "clientWidth": 484,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 487,
+        "y": 618.5,
+        "width": 484,
+        "height": 34,
+        "scrollWidth": 487,
+        "clientWidth": 484,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    },
+    "zoom200": {
+      "label": "css-zoom-200-percent",
+      "viewport": 1024,
+      "documentWidth": 1559,
+      "bodyWidth": 680,
+      "detail": {
+        "x": 930,
+        "y": 435.59375,
+        "width": 368,
+        "height": 13669.59375,
+        "scrollWidth": 460,
+        "clientWidth": 184,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "auto"
+      },
+      "history": {
+        "x": 974,
+        "y": 5899.1875,
+        "width": 280,
+        "height": 8166,
+        "scrollWidth": 438,
+        "clientWidth": 140,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "tools": {
+        "x": 974,
+        "y": 5991.1875,
+        "width": 280,
+        "height": 68,
+        "scrollWidth": 438,
+        "clientWidth": 140,
+        "fontSize": "13px",
+        "color": "rgb(23, 26, 31)",
+        "background": "rgba(0, 0, 0, 0)",
+        "overflow": "visible"
+      },
+      "overflow": [
+        {
+          "selector": "workspace-registry-head",
+          "tag": "HEADER",
+          "right": 1300,
+          "width": 872
+        },
+        {
+          "selector": "workspace-registry-tabs",
+          "tag": "NAV",
+          "right": 1300,
+          "width": 872
+        },
+        {
+          "selector": "",
+          "tag": "BUTTON",
+          "right": 1036,
+          "width": 232
+        },
+        {
+          "selector": "workspace-registry-view workspace-registry-project-layout",
+          "tag": "DIV",
+          "right": 1300,
+          "width": 872
+        },
+        {
+          "selector": "workspace-registry-project-detail",
+          "tag": "SECTION",
+          "right": 1298,
+          "width": 368
+        },
+        {
+          "selector": "workspace-registry-detail-head",
+          "tag": "HEADER",
+          "right": 1254,
+          "width": 280
+        },
+        {
+          "selector": "workspace-registry-detail-title",
+          "tag": "DIV",
+          "right": 1238,
+          "width": 264
+        },
+        {
+          "selector": "workspace-registry-project-title-line",
+          "tag": "DIV",
+          "right": 1238,
+          "width": 264
+        },
+        {
+          "selector": "",
+          "tag": "H3",
+          "right": 1118,
+          "width": 144
+        },
+        {
+          "selector": "pill neutral",
+          "tag": "SPAN",
+          "right": 1238,
+          "width": 104
+        },
+        {
+          "selector": "",
+          "tag": "P",
+          "right": 1238,
+          "width": 264
+        },
+        {
+          "selector": "btn",
+          "tag": "BUTTON",
+          "right": 1166,
+          "width": 192
+        }
+      ],
+      "smallText": [
+        {
+          "selector": "active",
+          "size": "11px",
+          "text": "3"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "1"
+        },
+        {
+          "selector": "workspace-registry-browser-head",
+          "size": "11px",
+          "text": "3 个项目"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count",
+          "size": "10px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "workspace-registry-node-copy",
+          "size": "10px",
+          "text": "产品"
+        },
+        {
+          "selector": "workspace-registry-node-count empty",
+          "size": "10px",
+          "text": "未添加目录"
+        },
+        {
+          "selector": "",
+          "size": "11px",
+          "text": "2 个目录"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/workspace/very-long-di"
+        },
+        {
+          "selector": "workspace-registry-path",
+          "size": "11px",
+          "text": "F:/synthetic/worktree"
+        },
+        {
+          "selector": "workspace-registry-detail-path-copy",
+          "size": "10px",
+          "text": "工作树"
+        },
+        {
+          "selector": "workspace-session-history-total",
+          "size": "11px",
+          "text": "55"
+        }
+      ]
+    }
+  },
+  "generatedAt": "2026-11-11T15:53:44.419Z"
+}

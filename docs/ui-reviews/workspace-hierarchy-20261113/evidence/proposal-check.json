@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "mode": "proposal_only_not_applied",
+  "roots": 1,
+  "children": 5,
+  "directory_bindings": 6,
+  "unique_binding_ids": 6,
+  "contains_f_drive": true,
+  "contains_o_drive": true,
+  "scope": "proposal internal consistency only; no live registry read or write"
+}

@@ -77,6 +77,9 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
                 | "extension.review.decide"
                 | "mission.handoff.create"
                 | "mission.assignment.apply"
+                | "mission.plan.confirm"
+                | "mission.budget.extend"
+                | "mission.verification.retry"
                 | "mission.control"
                 | "mission.workflow.export"
         )
@@ -123,6 +126,14 @@ pub(crate) fn risk_rank(value: &str) -> u8 {
 }
 
 pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value) -> String {
+    if capability_id == "mission.plan.confirm" {
+        return mission_plan_confirmation_target(input)
+            .unwrap_or_else(|_| "计划确认信息无效或超出显示限制".to_string());
+    }
+    if capability_id == "mission.budget.extend" {
+        return mission_budget_extension_target(input)
+            .unwrap_or_else(|_| "预算调整信息无效或超出显示限制".to_string());
+    }
     let key = if capability_id.contains("project") {
         "project_id"
     } else if capability_id.contains("exhibit") {
@@ -153,6 +164,39 @@ pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value)
         .collect()
 }
 
+pub(crate) fn mission_plan_confirmation_target(
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    let field = |name: &str| {
+        input.get(name).cloned().ok_or_else(|| format!("missing {name}"))
+    };
+    let details = serde_json::json!({
+        "mission_id": field("mission_id")?,
+        "plan_sha256": field("plan_sha256")?,
+        "selected_task_ids": field("selected_task_ids")?,
+        "approved_paths": field("approved_paths")?,
+        "approved_absolute_read_paths": field("approved_absolute_read_paths")?,
+        "approved_absolute_write_paths": field("approved_absolute_write_paths")?,
+    });
+    let text = serde_json::to_string_pretty(&details).map_err(|error| error.to_string())?;
+    if text.len() > 4_000 {
+        return Err("plan confirmation scope exceeds the approval display limit".to_string());
+    }
+    Ok(text)
+}
+
+pub(crate) fn mission_budget_extension_target(input: &serde_json::Value) -> Result<String, String> {
+    let mission_id = input.get("mission_id").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing mission_id".to_string())?;
+    let request = input.get("input").cloned().ok_or_else(|| "missing input".to_string())?;
+    let details = serde_json::json!({ "mission_id": mission_id, "budget_increase": request });
+    let text = serde_json::to_string_pretty(&details).map_err(|error| error.to_string())?;
+    if text.len() > 4_000 {
+        return Err("budget extension details exceed the approval display limit".to_string());
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +211,17 @@ mod tests {
             effective_risk_level("system.filesystem.delete", "read_only"),
             "R3"
         );
+    }
+
+    #[test]
+    fn mission_budget_extension_requires_r3_and_shows_the_requested_limits() {
+        assert_eq!(effective_risk_level("mission.budget.extend", "R1"), "R3");
+        let target = mission_budget_extension_target(&serde_json::json!({
+            "mission_id": "mission_test",
+            "input": {"additional_tokens": 1000, "unlimited_tokens": false}
+        })).unwrap();
+        assert!(target.contains("mission_test"));
+        assert!(target.contains("1000"));
     }
 
     #[test]
@@ -204,6 +259,7 @@ mod tests {
             effective_risk_level("extension.review.decide", "admin_action"),
             "R3"
         );
+        assert_eq!(effective_risk_level("mission.plan.confirm", "local_write"), "R3");
     }
 
     #[test]
@@ -267,6 +323,35 @@ mod tests {
             ),
             "skill-1"
         );
+    }
+
+    #[test]
+    fn plan_confirmation_target_shows_hash_tasks_and_exact_path_grants() {
+        let input = serde_json::json!({
+            "mission_id":"mission-test",
+            "plan_sha256":"a".repeat(64),
+            "selected_task_ids":["fix", "review"],
+            "approved_paths":["src/attention.mjs", "REVIEW.md"],
+            "approved_absolute_read_paths":[],
+            "approved_absolute_write_paths":[]
+        });
+        let target = target_description("mission.plan.confirm", &input);
+        for value in ["mission-test", "plan_sha256", "selected_task_ids", "src/attention.mjs", "REVIEW.md", "approved_absolute_write_paths"] {
+            assert!(target.contains(value), "approval summary omitted {value}: {target}");
+        }
+    }
+
+    #[test]
+    fn plan_confirmation_target_fails_closed_when_full_scope_cannot_be_displayed() {
+        let input = serde_json::json!({
+            "mission_id":"mission-test",
+            "plan_sha256":"a".repeat(64),
+            "selected_task_ids":["fix"],
+            "approved_paths":["x".repeat(4_100)],
+            "approved_absolute_read_paths":[],
+            "approved_absolute_write_paths":[]
+        });
+        assert!(mission_plan_confirmation_target(&input).is_err());
     }
 
     #[test]

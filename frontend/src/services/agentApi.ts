@@ -148,6 +148,13 @@ export type AgentActivityItem = {
     finished_at?: string | null;
     updated_at: string;
     artifact_count?: number;
+    workspace_root?: string;
+    source_client?: string;
+    trigger_kind?: string;
+    /** Explicit persisted ownership, never inferred from a run ID. */
+    mission_id?: string;
+    mission_task_id?: string;
+    output_path?: string;
     workflow_run_id?: string;
     /** 当前步骤的执行角色；没有声明角色时为空，界面不渲染角色徽标。 */
     role_id?: string | null;
@@ -181,7 +188,10 @@ export type AgentActivityItem = {
 export type MissionStatus = 'draft' | 'awaiting_assignment' | 'planned' | 'awaiting_confirmation' | 'active' | 'waiting' | 'completed' | 'failed' | 'canceled';
 export type MissionTaskStatus = 'proposed' | 'blocked' | 'ready' | 'running' | 'awaiting_verification' | 'failed' | 'completed' | 'canceled';
 
+export type MissionExpertPin = { expert_id: string; expert_version: string; expert_digest: string };
+
 export type MissionExecutionBinding = {
+    expert?: MissionExpertPin | null;
     executor: string;
     model: string;
     role_id: string;
@@ -209,6 +219,17 @@ export type MissionBudget = {
     max_cost: number | null;
 };
 
+export type MissionBudgetIncrease = {
+    request_id: string;
+    expected_plan_sha256: string;
+    additional_rounds: number;
+    additional_repair_attempts?: number;
+    additional_minutes: number;
+    additional_tokens: number | null;
+    unlimited_tokens: boolean;
+    additional_cost: number | null;
+};
+
 export type MissionPlanProposal = {
     summary: string;
     tasks: MissionTaskSpec[];
@@ -218,6 +239,7 @@ export type MissionPlanProposal = {
 
 export type MissionWorkspace = {
     root: string;
+    permission_mode?: 'workspace_write' | 'full_access';
     read_scope: string[];
     write_scope: string[];
 };
@@ -227,7 +249,7 @@ export type MissionExecutionOption = {
     label: string;
     available: boolean;
     reason: string;
-    models: Array<{ alias: string; label: string }>;
+    models: Array<{ alias: string; label: string; service_id: string; service_label: string }>;
 };
 
 export type MissionWorkflowPin = {
@@ -255,6 +277,7 @@ export type MissionHandoffInput = {
 };
 
 export type MissionRoleAssignment = {
+    expert?: MissionExpertPin | null;
     role_id: string;
     label: string;
     executor: string;
@@ -291,6 +314,8 @@ export type MissionAssignmentOptions = {
     workflow_version: string;
     workflow_sha256: string;
     roles: MissionRoleOption[];
+    experts: ExpertSummary[];
+    executors: MissionExecutionOption[];
     source: string;
 };
 
@@ -315,6 +340,7 @@ export type MissionTaskView = {
     spec: MissionTaskSpec;
     status: MissionTaskStatus;
     attempt_run_id: string;
+    verification_run_id: string;
     verification_passed: boolean | null;
     evidence_refs: string[];
 };
@@ -380,6 +406,15 @@ export type LocalRunUsage = {
     currency: string;
     billing_owner: string;
 };
+
+export interface RuntimeWorkspaceDiagnosis {
+    workspace: string;
+    status: 'permissions_ready' | 'permission_missing' | 'not_required';
+    fingerprint: string;
+    repairable: boolean;
+    message: string;
+    shell_verified: boolean;
+}
 
 export type MissionSnapshot = {
     mission: MissionView;
@@ -577,6 +612,7 @@ export type WorkflowArtifact = {
 };
 
 export type WorkflowPackage = {
+    roles?: Record<string, { label?: string; brief?: string }>;
     schema_version: string;
     id: string;
     version: string;
@@ -2374,6 +2410,18 @@ export type SkillRecord = {
     version_root: string;
     current: boolean;
     previous_version?: string | null;
+    /** 记录来自开发直挂注册表，而不是已安装到 builtin/managed/user 的副本。 */
+    development?: boolean;
+};
+
+/** 技能包根部的 SKILL.md 原文，只读预览用。 */
+export type SkillDocument = {
+    skill_id: string;
+    name: string;
+    version: string;
+    path: string;
+    size: number;
+    content: string;
 };
 
 export type SkillDependencyResolution = {
@@ -3764,7 +3812,16 @@ export const agentApi = {
         invoke<AuthoringWorkflowDraft>('export_mission_workflow', { missionId, workflowId, version, name, entrypoint }),
     listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
     getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),
+    checkRuntimeWorkspace: (workspace: string) => invoke<RuntimeWorkspaceDiagnosis>('check_runtime_workspace', { workspace }),
+    setMissionPermissionMode: (missionId: string, expectedPlanSha256: string, permissionMode: 'workspace_write' | 'full_access') =>
+        invoke<MissionView>('set_mission_permission_mode', { missionId, expectedPlanSha256, permissionMode }),
+    resolveRuntimeWorkspace: (input: { workspace: string; expected_fingerprint: string; action: 'full_access' | 'repair' | 'retry' | 'files_only'; mission_id: string; expected_plan_sha256: string }) =>
+        invoke<{ resolved: boolean; mission: MissionView | null }>('resolve_runtime_workspace', { input }),
     controlMission: (missionId: string, action: 'pause' | 'resume' | 'cancel') => invoke<MissionView>('control_mission', { missionId, action }),
+    retryMissionVerification: (missionId: string, taskId: string, input: { request_id: string; expected_plan_sha256: string; expected_verification_run_id: string }) =>
+        invoke<MissionView>('retry_mission_verification', { missionId, taskId, input }),
+    increaseMissionBudget: (missionId: string, input: MissionBudgetIncrease) =>
+        invoke<MissionView>('increase_mission_budget', { missionId, input }),
     proposeMissionPlan: (missionId: string, proposal: MissionPlanProposal) => invoke<MissionView>('propose_mission_plan', { missionId, proposal }),
     generateMissionPlan: (missionId: string) => invoke<MissionView>('generate_mission_plan', { missionId }),
     generateMissionFollowUp: (missionId: string) => invoke<MissionView>('generate_mission_follow_up', { missionId }),
@@ -4137,6 +4194,7 @@ export const agentApi = {
     activateSkillDraft: (skillId: string, version: string) => invoke<SkillActivationResult>('activate_skill_draft', { skillId, version }),
     submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
+    readSkillDocument: (skillId: string) => invoke<SkillDocument>('read_skill_document', { skillId }),
     /** 客户端 × 作用域 × 能力矩阵：功能开关的唯一答案来源。 */
     clientCapabilityMatrix: () => invoke<ClientCapabilityMatrix>('get_client_capability_matrix'),
     skillWorkspace: () => invoke<SkillWorkspaceStatus>('get_skill_workspace'),
@@ -4181,7 +4239,7 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string; allow_overwrite?: boolean }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -4206,6 +4264,7 @@ export const agentApi = {
             balanceAccessToken: input.balance_access_token,
             balanceUserId: input.balance_user_id,
             apiKey: input.api_key,
+            allowOverwrite: input.allow_overwrite ?? false,
         }),
     cloneAIService: (id: string) => invoke<CustomAIService>('clone_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),

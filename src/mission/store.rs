@@ -8,13 +8,85 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::contract::{
-    absolute_path_approved, is_absolute_path, normalized_paths, path_allowed, plan_hash, require_id, require_sha256, require_text,
+    absolute_path_approved, is_absolute_path, normalized_paths, path_allowed, plan_hash_for_workspace as plan_hash, require_id, require_sha256, require_text,
     apply_assignment_to_plan, validate_assignment, validate_create, validate_handoff_input,
     validate_proposal, validate_task_paths, validate_selection_with_scopes, validate_task_graph,
     MissionAssignment, MissionAssignmentInput, MissionConfirmation, MissionCreateInput,
-    MissionEvent, MissionHandoff, MissionHandoffInput, MissionPlanMode, MissionPlanProposal,
+    MissionBudgetIncrease, MissionVerificationRetry, MissionEvent, MissionHandoff, MissionHandoffInput, MissionPlanMode, MissionPlanProposal,
     MissionStatus, MissionTaskSpec, MissionTaskView, MissionView, MissionWorkflowPin, TaskStatus,
 };
+
+/// Follow both dependency edges and, when requested, a repair's original task.
+fn task_reaches(tasks: &[MissionTaskSpec], from: &str, target: &str, repairs: bool) -> bool {
+    let mut pending = vec![from.to_string()];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) { continue; }
+        if let Some(task) = tasks.iter().find(|task| task.id == id) {
+            for next in task.depends_on.iter().chain(repairs.then_some(&task.repair_of).into_iter()) {
+                if next == target { return true; }
+                if !next.is_empty() { pending.push(next.clone()); }
+            }
+        }
+    }
+    false
+}
+
+fn delivery_root<'a>(tasks: &'a [MissionTaskSpec], id: &'a str) -> &'a str {
+    let mut current = id;
+    let mut seen = BTreeSet::new();
+    while seen.insert(current) {
+        let Some(task) = tasks.iter().find(|task| task.id == current) else { break; };
+        if task.repair_of.is_empty() { break; }
+        current = &task.repair_of;
+    }
+    current
+}
+
+/// A failed downstream review may send a completed producer back to its
+/// assigned expert only together with a dependent, separate review retry.
+fn review_rework_targets(mission: &MissionView, tasks: &[MissionTaskSpec]) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let existing = mission.tasks.iter().map(|task| task.spec.clone()).collect::<Vec<_>>();
+    let mut reopened = BTreeSet::new();
+    for revision in tasks {
+        let parent = mission.tasks.iter().find(|task| task.spec.id == revision.repair_of).ok_or("repair target missing")?;
+        if parent.status != TaskStatus::Completed { continue; }
+        let reviewed = tasks.iter().any(|review| {
+            mission.tasks.iter().any(|failed| failed.spec.id == review.repair_of
+                && failed.status == TaskStatus::Failed
+                && task_reaches(&existing, &failed.spec.id, &parent.spec.id, true))
+                && task_reaches(tasks, &review.id, &revision.id, false)
+        });
+        if !reviewed { return Err("completed producer revision requires a dependent retry of its failed downstream review".into()); }
+        reopened.insert(parent.spec.id.clone());
+    }
+    if !reopened.is_empty() {
+        if mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Ready | TaskStatus::AwaitingVerification)) {
+            return Err("wait for active work before reopening reviewed deliveries".into());
+        }
+        for task in &mission.tasks {
+            // Completed repair attempts are historical validations of the same
+            // delivery. Revising its root supersedes that delivery once, without
+            // pretending those old attempts failed or replaying every attempt.
+            let covered = reopened.iter().any(|id|
+                delivery_root(&existing, &task.spec.id) == delivery_root(&existing, id));
+            if task.status == TaskStatus::Completed && !covered
+                && reopened.iter().any(|id| task_reaches(&existing, &task.spec.id, id, false)) {
+                return Err("revision must also revalidate completed downstream deliveries".into());
+            }
+        }
+        for downstream in tasks.iter().filter(|task| reopened.contains(&task.repair_of)) {
+            for upstream in tasks.iter().filter(|task| reopened.contains(&task.repair_of)) {
+                if delivery_root(&existing, &downstream.repair_of) != delivery_root(&existing, &upstream.repair_of)
+                    && task_reaches(&existing, &downstream.repair_of, &upstream.repair_of, true)
+                    && !task_reaches(tasks, &downstream.id, &upstream.id, false) {
+                    return Err("downstream delivery revision must depend on its upstream revision".into());
+                }
+            }
+        }
+    }
+    Ok(reopened)
+}
 
 pub(crate) const MISSION_DB_FILE: &str = "mission-runs.sqlite3";
 const MAX_EVENTS: usize = 10_000;
@@ -78,7 +150,7 @@ impl MissionStore {
         };
         let proposal = input.imported_plan.clone();
         let plan_sha256 = proposal.as_ref().map(|proposal| plan_hash(
-            &mission_id, &input.workspace.root, &input.acceptance_criteria, proposal,
+            &mission_id, &input.workspace, &input.acceptance_criteria, proposal,
         )).transpose()?.unwrap_or_default();
         let revision = if proposal.is_some() { 1 } else { 0 };
         let mut connection = self.connection()?;
@@ -133,6 +205,9 @@ impl MissionStore {
     /// run: imported plans move to confirmation, generated plans remain planned
     /// until the workflow proposes a task graph.
     pub(crate) fn assign_roles(&self, mission_id: &str, input: &MissionAssignmentInput) -> Result<MissionView, Box<dyn Error>> {
+        let catalog = crate::app::mission_commands::mission_assignment_options_sync(mission_id)
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        crate::mission::validate_catalog_assignment(input, &catalog)?;
         let workflows = crate::workflow::WorkflowStore::open_default()?;
         self.assign_roles_with_store(mission_id, input, &workflows)
     }
@@ -144,9 +219,23 @@ impl MissionStore {
         workflows: &crate::workflow::WorkflowStore,
     ) -> Result<MissionView, Box<dyn Error>> {
         validate_assignment(input)?;
-        let (mission, mut proposal) = self.get_with_plan(mission_id)?;
+        for role in &input.roles {
+            let pin = role.expert.as_ref().ok_or("请为每项职责选择已安装专家")?;
+            crate::mission::validate_expert_pin(pin)?;
+        }
+        let (mission, proposal) = self.get_with_optional_plan(mission_id)?;
         if !matches!(mission.status, MissionStatus::AwaitingAssignment | MissionStatus::Planned | MissionStatus::AwaitingConfirmation) {
             return Err("mission is not awaiting role assignment".into());
+        }
+        if let Some(plan) = proposal.as_ref() {
+            for task in &plan.tasks {
+                if !input.task_roles.iter().any(|mapping| mapping.task_id == task.id) {
+                    return Err(format!("task {} must select an assigned expert role", task.id).into());
+                }
+            }
+            if input.task_roles.iter().any(|mapping| !plan.tasks.iter().any(|task| task.id == mapping.task_id)) {
+                return Err("task role mapping references a task outside the imported plan".into());
+            }
         }
         let workflow = mission.workflow.as_ref().ok_or("workflow-pinned mission has no workflow pin")?;
         let (package, _) = workflows.load_pinned_version(
@@ -154,14 +243,16 @@ impl MissionStore {
             &workflow.workflow_version,
             &workflow.workflow_sha256,
         )?;
-        let allowed_roles = package.roles.keys().cloned().collect::<BTreeSet<_>>();
-        if allowed_roles.is_empty() {
-            let roles = package.steps.iter().map(|step| step.role_id.as_str()).filter(|role| !role.is_empty()).map(str::to_string).collect::<BTreeSet<_>>();
-            if input.roles.iter().any(|role| !roles.contains(&role.role_id)) {
-                return Err("assignment contains a role not declared by the pinned workflow".into());
-            }
-        } else if input.roles.iter().any(|role| !allowed_roles.contains(&role.role_id)) {
-            return Err("assignment contains a role not declared by the pinned workflow".into());
+        let allowed_roles = if package.roles.is_empty() {
+            package.steps.iter().map(|step| step.role_id.trim()).filter(|role| !role.is_empty())
+                .map(str::to_string).collect::<BTreeSet<_>>()
+        } else { package.roles.keys().cloned().collect::<BTreeSet<_>>() };
+        let assigned_roles = input.roles.iter().map(|role| role.role_id.clone()).collect::<BTreeSet<_>>();
+        if assigned_roles != allowed_roles {
+            return Err("assignment must cover every role declared by the pinned workflow".into());
+        }
+        if input.roles.iter().any(|role| !package.accepts_provider(&role.executor)) {
+            return Err("assigned executor is not accepted by the pinned workflow".into());
         }
         let assignment = MissionAssignment {
             roles: input.roles.clone(), task_roles: input.task_roles.clone(),
@@ -169,17 +260,19 @@ impl MissionStore {
             applied_at: now_stamp(), recommended: input.recommended,
         };
         let imported = mission.plan_mode == MissionPlanMode::Imported;
-        let next_status = if imported { MissionStatus::AwaitingConfirmation } else { MissionStatus::Planned };
+        let has_plan = proposal.as_ref().is_some_and(|plan| !plan.tasks.is_empty());
+        let next_status = if has_plan { MissionStatus::AwaitingConfirmation } else { MissionStatus::Planned };
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if imported {
-            if proposal.tasks.is_empty() {
-                return Err("imported mission has no plan to assign".into());
-            }
-            proposal = apply_assignment_to_plan(&proposal, input)?;
-            let hash = plan_hash(&mission_id, &mission.workspace.root, &mission.acceptance_criteria, &proposal)?;
+        if imported && !has_plan {
+            return Err("imported mission has no plan to assign".into());
+        }
+        if let Some(plan) = proposal.as_ref().filter(|plan| !plan.tasks.is_empty()) {
+            let proposal = apply_assignment_to_plan(plan, input)?;
+            let hash = plan_hash(&mission_id, &mission.workspace, &mission.acceptance_criteria, &proposal)?;
             transaction.execute(
-                "UPDATE mission_runs SET assignment_json = ?2, status = ?3, plan_sha256 = ?4, plan_json = ?5, updated_at = ?6 WHERE mission_id = ?1",
+                "UPDATE mission_runs SET assignment_json = ?2, status = ?3, plan_sha256 = ?4, plan_json = ?5,
+                    confirmation_json = NULL, plan_revision = plan_revision + 1, updated_at = ?6 WHERE mission_id = ?1",
                 params![mission_id, serde_json::to_string(&assignment)?, next_status.as_str(), hash, serde_json::to_string(&proposal)?, assignment.applied_at],
             )?;
         } else {
@@ -250,17 +343,127 @@ impl MissionStore {
             .ok_or_else(|| format!("mission not found: {mission_id}").into())
     }
 
+    pub(crate) fn set_permission_mode(&self, mission_id: &str, expected_plan: &str, mode: &str) -> Result<MissionView, Box<dyn Error>> {
+        if !matches!(mode,"workspace_write"|"full_access") { return Err("不支持的执行权限模式".into()); }
+        let (mission, proposal) = self.get_with_optional_plan(mission_id)?;
+        if !matches!(mission.status, MissionStatus::Draft | MissionStatus::AwaitingAssignment | MissionStatus::Planned | MissionStatus::AwaitingConfirmation) {
+            return Err("开始执行后不能在配置页更改权限；请在环境恢复入口选择".into());
+        }
+        if mission.plan_sha256 != expected_plan { return Err("任务计划已变化，请重新加载".into()); }
+        let mut workspace = mission.workspace.clone();
+        workspace.permission_mode = mode.into();
+        let hash = proposal.as_ref().map(|plan| plan_hash(mission_id,&workspace,&mission.acceptance_criteria,plan)).transpose()?.unwrap_or_default();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_mission(&transaction,mission_id)?.ok_or("mission not found")?;
+        if current.plan_sha256 != expected_plan || current.status != mission.status || current.workspace != mission.workspace {
+            return Err("任务在操作期间已变化，请重新加载".into());
+        }
+        let now = now_stamp();
+        transaction.execute("UPDATE mission_runs SET workspace_json=?2,plan_sha256=?3,confirmation_json=NULL,plan_revision=plan_revision+?4,updated_at=?5 WHERE mission_id=?1",
+            params![mission_id,serde_json::to_string(&workspace)?,hash,if proposal.is_some(){1}else{0},now])?;
+        append_event_tx(&transaction,mission_id,"mission_permission_changed","",
+            if mode=="full_access" {"执行权限已设为完全访问，等待确认计划后生效"} else {"执行权限已设为工作区访问，等待确认计划后生效"},
+            serde_json::json!({"permission_mode":mode,"plan_sha256":hash}),&now)?;
+        transaction.commit()?;
+        self.get(mission_id)
+    }
+
+    pub(crate) fn runtime_blocked(&self, mission_id: &str) -> Result<bool, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = self.get(mission_id)?;
+        runtime_blocked_on(&connection, &mission)
+    }
+
+    pub(crate) fn runtime_files_only(&self, mission_id: &str, plan_sha256: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.runtime_mode(mission_id, plan_sha256)? == "files_only")
+    }
+
+    pub(crate) fn runtime_mode(&self, mission_id: &str, plan_sha256: &str) -> Result<String, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let payload: Option<String> = connection.query_row(
+            "SELECT payload_json FROM mission_events WHERE mission_id=?1 AND event_type='runtime_workspace_resolved' ORDER BY sequence DESC LIMIT 1",
+            params![mission_id], |row| row.get(0)).optional()?;
+        let value: serde_json::Value = payload.map(|text| serde_json::from_str(&text)).transpose()?.unwrap_or_default();
+        if value["plan_sha256"] == plan_sha256 {
+            if let Some(mode) = value["mode"].as_str() { return Ok(mode.to_string()); }
+        }
+        let mission = self.get(mission_id)?;
+        Ok(if mission.plan_sha256 == plan_sha256 && mission.workspace.permission_mode == "full_access" { "full_access" } else { "default" }.to_string())
+    }
+
+    pub(crate) fn suspend_runtime(&self, mission_id: &str, task_id: &str, diagnosis: &serde_json::Value) -> Result<MissionView, Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+        if mission.status != MissionStatus::Active { return Ok(mission); }
+        let now = now_stamp();
+        transaction.execute("UPDATE mission_runs SET status='waiting',updated_at=?2 WHERE mission_id=?1", params![mission_id,now])?;
+        append_event_tx(&transaction, mission_id, "runtime_workspace_blocked", task_id,
+            "命令环境待处理：专家尚未开始，请选择工作区授权或仅用文件工具继续",
+            serde_json::json!({"environment":diagnosis,"plan_sha256":mission.plan_sha256}), &now)?;
+        transaction.commit()?;
+        self.get(mission_id)
+    }
+
+    pub(crate) fn resolve_runtime_block(&self, mission_id: &str, plan_sha256: &str, mode: &str, evidence: &serde_json::Value) -> Result<MissionView, Box<dyn Error>> {
+        if !matches!(mode,"default"|"files_only"|"full_access") { return Err("invalid runtime recovery mode".into()); }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+        if mission.status != MissionStatus::Waiting || mission.plan_sha256 != plan_sha256 || !runtime_blocked_on(&transaction, &mission)? {
+            return Err("runtime recovery no longer matches the waiting task and confirmed plan".into());
+        }
+        let budget_reason = budget_exhaustion_reason_on(&transaction, &mission)?;
+        let now=now_stamp();
+        transaction.execute("UPDATE mission_runs SET status=?3,updated_at=?2 WHERE mission_id=?1",params![mission_id,now,
+            if budget_reason.is_some() { "waiting" } else { "active" }])?;
+        append_event_tx(&transaction,mission_id,"runtime_workspace_resolved","",
+            if mode=="files_only" {"用户选择仅用文件工具继续，命令工具保持禁用"} else if mode=="full_access" {"用户授权本任务完全访问，按当前系统用户权限继续"} else {"工作区沙箱权限已准备，恢复原任务"},
+            serde_json::json!({"mode":mode,"plan_sha256":plan_sha256,"evidence":evidence}),&now)?;
+        if let Some(reason) = budget_reason {
+            append_event_tx(&transaction, mission_id, "budget_exhausted", "", &reason,
+                serde_json::json!({"reason":reason}), &now)?;
+        }
+        transaction.commit()?;
+        self.get(mission_id)
+    }
+
     pub(crate) fn control(&self, mission_id: &str, action: &str) -> Result<MissionView, Box<dyn Error>> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+        if action == "resume" && runtime_blocked_on(&transaction, &mission)? {
+            return Err("命令环境尚未处理，请先选择工作区授权、重新检查或仅用文件工具继续".into());
+        }
+        if action == "resume" && mission.status == MissionStatus::Waiting {
+            if let Some(reason) = budget_exhaustion_reason_on(&transaction, &mission)? {
+                let latest_event: Option<String> = transaction.query_row(
+                    "SELECT event_type FROM mission_events WHERE mission_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    params![mission_id],
+                    |row| row.get(0),
+                ).optional()?;
+                let now = now_stamp();
+                if latest_event.as_deref() != Some("budget_exhausted") {
+                    transaction.execute(
+                        "UPDATE mission_runs SET updated_at = ?2 WHERE mission_id = ?1",
+                        params![mission_id, now],
+                    )?;
+                    append_event_tx(
+                        &transaction, mission_id, "budget_exhausted", "", &reason,
+                        serde_json::json!({"reason": reason}), &now,
+                    )?;
+                }
+                transaction.commit()?;
+                return Err(reason.into());
+            }
+        }
         let next = match (action, mission.status) {
             ("pause", MissionStatus::Active) => MissionStatus::Waiting,
-            ("resume", MissionStatus::Waiting) => {
-                if let Some(reason) = budget_exhaustion_reason_on(&transaction, &mission)? { return Err(reason.into()); }
-                MissionStatus::Active
-            }
+            ("resume", MissionStatus::Waiting) => MissionStatus::Active,
             ("cancel", status) if !matches!(status, MissionStatus::Completed | MissionStatus::Canceled) => MissionStatus::Canceled,
+            ("resume", MissionStatus::Active) if mission.tasks.iter().any(|task| task.status == TaskStatus::Failed)
+                && !mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Running | TaskStatus::AwaitingVerification)) => MissionStatus::Active,
             ("pause", MissionStatus::Waiting) | ("resume", MissionStatus::Active) | ("cancel", MissionStatus::Canceled) => {
                 transaction.commit()?; return self.get(mission_id);
             }
@@ -276,6 +479,121 @@ impl MissionStore {
         append_event_tx(&transaction, mission_id, &format!("mission_{action}"), "",
             match action { "pause" => "用户暂停后续派发，当前步骤可收尾", "resume" => "用户恢复任务", _ => "用户取消任务" },
             serde_json::json!({"action": action}), &now)?;
+        transaction.commit()?;
+        self.get(mission_id)
+    }
+
+    pub(crate) fn increase_budget(
+        &self,
+        mission_id: &str,
+        input: &MissionBudgetIncrease,
+        increased_by: &str,
+    ) -> Result<MissionView, Box<dyn Error>> {
+        require_id("mission_id", mission_id)?;
+        require_text("budget request_id", &input.request_id, 200)?;
+        require_sha256(&input.expected_plan_sha256)?;
+        require_text("increased_by", increased_by, 160)?;
+        if input.additional_minutes > 525_600
+            || input.additional_tokens.is_some_and(|value| value == 0 || value > 9_000_000_000_000_000)
+            || input.additional_cost.is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err("budget increase values are outside the supported range".into());
+        }
+        if input.additional_tokens.is_some() && input.unlimited_tokens {
+            return Err("choose either additional_tokens or unlimited_tokens".into());
+        }
+
+        let request_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(input)?));
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+
+        let prior_payloads = {
+            let mut statement = transaction.prepare(
+                "SELECT payload_json FROM mission_events WHERE mission_id = ?1 AND event_type = 'budget_extended'",
+            )?;
+            let payloads = statement.query_map(params![mission_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            payloads
+        };
+        for raw in prior_payloads {
+            let payload: serde_json::Value = serde_json::from_str(&raw)?;
+            if payload.get("request_id").and_then(serde_json::Value::as_str) == Some(input.request_id.as_str()) {
+                if payload.get("request_sha256").and_then(serde_json::Value::as_str) != Some(request_digest.as_str()) {
+                    return Err("budget request_id was already used with different values".into());
+                }
+                transaction.commit()?;
+                return self.get(mission_id);
+            }
+        }
+
+        if mission.status != MissionStatus::Waiting {
+            return Err("budget can only be increased while the mission is waiting".into());
+        }
+        if mission.plan_sha256 != input.expected_plan_sha256
+            || mission.confirmation.as_ref().is_none_or(|confirmation| confirmation.plan_sha256 != input.expected_plan_sha256)
+        {
+            return Err("mission plan changed; reload before increasing its budget".into());
+        }
+        if mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::AwaitingVerification)) {
+            return Err("mission still has a running task or pending verification; wait for it to stop before continuing".into());
+        }
+        let reason = budget_exhaustion_reason_on(&transaction, &mission)?
+            .or_else(|| mission.budget.as_ref().and_then(|budget| repair_exhaustion_reason(&mission, budget)))
+            .unwrap_or_else(|| "用户主动增加后续执行预算".to_string());
+        let mut budget = mission.budget.clone().ok_or("mission has no declared budget")?;
+        let previous_budget = budget.clone();
+        budget.max_rounds = budget.max_rounds.checked_add(input.additional_rounds)
+            .ok_or("max_rounds exceeds the supported range")?;
+        budget.max_minutes = budget.max_minutes.checked_add(input.additional_minutes)
+            .ok_or("max_minutes exceeds the supported range")?;
+        budget.max_repair_attempts = budget.max_repair_attempts.checked_add(input.additional_repair_attempts)
+            .ok_or("max_repair_attempts exceeds the supported range")?;
+        if input.unlimited_tokens {
+            if budget.max_total_tokens.is_none() {
+                return Err("token budget is already unlimited".into());
+            }
+            budget.max_total_tokens = None;
+        } else if let Some(additional) = input.additional_tokens {
+            let current = budget.max_total_tokens.ok_or("token budget is already unlimited")?;
+            budget.max_total_tokens = Some(current.checked_add(additional).ok_or("max_total_tokens exceeds the supported range")?);
+        }
+        if let Some(additional) = input.additional_cost {
+            let current = budget.max_cost.ok_or("cost budget is already unlimited")?;
+            let increased = current + additional;
+            if !increased.is_finite() {
+                return Err("max_cost exceeds the supported range".into());
+            }
+            budget.max_cost = Some(increased);
+        }
+        if budget == previous_budget {
+            return Err("provide at least one budget increase".into());
+        }
+        if let Some(remaining_reason) = budget_exhaustion_reason_with_budget(&transaction, &mission, &budget)?
+            .or_else(|| repair_exhaustion_reason(&mission, &budget)) {
+            return Err(format!("the increased budget still does not allow continuation: {remaining_reason}").into());
+        }
+
+        let now = now_stamp();
+        transaction.execute(
+            "UPDATE mission_runs SET budget_json = ?2, status = ?3, updated_at = ?4 WHERE mission_id = ?1",
+            params![mission_id, serde_json::to_string(&budget)?,
+                if runtime_blocked_on(&transaction, &mission)? { "waiting" } else { "active" }, now],
+        )?;
+        append_event_tx(
+            &transaction, mission_id, "budget_extended", "",
+            format!("预算已增加，任务从“{reason}”恢复执行"),
+            serde_json::json!({
+                "request_id": input.request_id,
+                "request_sha256": request_digest,
+                "plan_sha256": input.expected_plan_sha256,
+                "increased_by": increased_by.trim(),
+                "previous_budget": previous_budget,
+                "budget": budget,
+                "increase": input,
+            }),
+            &now,
+        )?;
         transaction.commit()?;
         self.get(mission_id)
     }
@@ -330,7 +648,7 @@ impl MissionStore {
         }
         let plan_sha256 = plan_hash(
             &mission.mission_id,
-            &mission.workspace.root,
+            &mission.workspace,
             &mission.acceptance_criteria,
             proposal,
         )?;
@@ -393,6 +711,9 @@ impl MissionStore {
             return Err("mission plan changed after review; show the latest revision before confirming".into());
         }
         let selected = selected_task_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if mission.workspace.permission_mode == "full_access" && proposal.tasks.iter().any(|task| selected.contains(&task.id) && !crate::workflow::supports_full_access(&task.execution.executor)) {
+            return Err("完全访问模式需要选择 HiMind AI 或 ACP 执行器，请调整专家指派或改用工作区访问".into());
+        }
         validate_selection_with_scopes(
             &proposal,
             &selected,
@@ -493,13 +814,24 @@ impl MissionStore {
             .iter_mut()
             .find(|task| task.id == task_id)
             .ok_or_else(|| format!("task is not in the proposed plan: {task_id}"))?;
+        if let Some(assignment) = mission.assignment.as_ref() {
+            let role = assignment.roles.iter().find(|role| role.role_id == execution.role_id)
+                .ok_or("task must select an assigned expert role")?;
+            let expected = crate::mission::ExecutionBinding {
+                executor: role.executor.clone(), model: role.model.clone(), role_id: role.role_id.clone(),
+                service_id: role.service_id.clone(), expert: role.expert.clone(),
+            };
+            if expected != *execution {
+                return Err("change the expert assignment to edit its execution binding".into());
+            }
+        }
         task.execution = execution.clone();
         crate::mission::validate_execution_binding(task)?;
         validate_proposal(&proposal)?;
         validate_task_paths(&proposal.tasks, &mission.workspace.root)?;
         let plan_sha256 = plan_hash(
             &mission.mission_id,
-            &mission.workspace.root,
+            &mission.workspace,
             &mission.acceptance_criteria,
             &proposal,
         )?;
@@ -558,6 +890,20 @@ impl MissionStore {
         if !matches!(mission.status, MissionStatus::Active | MissionStatus::Waiting | MissionStatus::Planned) {
             return Err("mission is not active for follow-up work".into());
         }
+        let mut bound_tasks = tasks.to_vec();
+        if let Some(assignment) = mission.assignment.as_ref() {
+            for task in &mut bound_tasks {
+                let parent = mission.tasks.iter().find(|parent| parent.spec.id == task.repair_of)
+                    .ok_or("follow-up must reference a failed repair target")?;
+                let role = assignment.roles.iter().find(|role| role.role_id == parent.spec.execution.role_id)
+                    .ok_or("follow-up target has no assigned expert role")?;
+                task.execution = crate::mission::ExecutionBinding {
+                    role_id: role.role_id.clone(), executor: role.executor.clone(),
+                    model: role.model.clone(), service_id: role.service_id.clone(), expert: role.expert.clone(),
+                };
+            }
+        }
+        let tasks = bound_tasks.as_slice();
         let mut all = mission.tasks.iter().map(|task| task.spec.clone()).collect::<Vec<_>>();
         all.extend_from_slice(tasks);
         validate_task_graph(&all)?;
@@ -566,7 +912,10 @@ impl MissionStore {
         if tasks.iter().any(|task| existing.contains(task.id.as_str())) {
             return Err("follow-up task id already exists in mission".into());
         }
+        let reopened = review_rework_targets(&mission, tasks)?;
         for task in tasks {
+            let parent = mission.tasks.iter().find(|parent| parent.spec.id == task.repair_of)
+                .ok_or("follow-up must reference a repair target")?;
             for path in &task.read_paths {
                 if is_absolute_path(path)
                     && !absolute_path_approved(path, &confirmation.approved_absolute_read_paths)
@@ -597,10 +946,13 @@ impl MissionStore {
                         task.id
                     ).into());
                 }
+                // A read authorization is not a write grant. Each revision
+                // retains its original specialist's exact output boundary.
+                if !path_allowed(path, &parent.spec.write_paths) {
+                    return Err(format!("follow-up task {} writes outside its repair target scope: {path}", task.id).into());
+                }
             }
-            let parent = mission.tasks.iter().find(|parent| parent.spec.id == task.repair_of)
-                .ok_or("follow-up must reference a failed repair target")?;
-            if parent.status != TaskStatus::Failed {
+            if parent.status != TaskStatus::Failed && !reopened.contains(&parent.spec.id) {
                 return Err("follow-up repair target must be a failed selected task".into());
             }
             if parent.spec.required_checks.iter().any(|check| !task.required_checks.contains(check))
@@ -615,6 +967,19 @@ impl MissionStore {
         }
         if let Some(reason) = budget_exhaustion_reason_on(&transaction, &mission)? {
             return Err(reason.into());
+        }
+        for id in &reopened {
+            let parent = mission.tasks.iter().find(|task| &task.spec.id == id).ok_or("revision target missing")?;
+            transaction.execute("UPDATE mission_tasks SET status='failed', verification_passed=0, updated_at=?3 WHERE mission_id=?1 AND task_id=?2",
+                params![mission_id, id, now])?;
+            append_event_tx(&transaction, mission_id, "task_reopened_for_review", id,
+                "后续独立复核要求修改，原交付退回原专家；原验收证据保留",
+                serde_json::json!({"plan_sha256": mission.plan_sha256,
+                    "previous_implementation_run_id":parent.attempt_run_id,
+                    "previous_verification_run_id":parent.verification_run_id,
+                    "previous_evidence_refs":parent.evidence_refs,
+                    "revision_task_ids":tasks.iter().filter(|task| &task.repair_of == id).map(|task| &task.id).collect::<Vec<_>>(),
+                    "reason":reason}), &now)?;
         }
         for (index, task) in tasks.iter().enumerate() {
             transaction.execute(
@@ -716,39 +1081,21 @@ impl MissionStore {
         if mission.status == MissionStatus::Canceled {
             return Err("canceled mission cannot accept usage".into());
         }
-        let already: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'run_usage_recorded' AND payload_json LIKE ?2",
-            params![mission_id, format!("%\"run_id\":\"{}\"%", run_id)],
-            |row| row.get(0),
-        )?;
-        if already == 0 {
-            append_event_tx(
-                &transaction,
-                mission_id,
-                "run_usage_recorded",
-                task_id,
-                "记录执行器用量",
-                serde_json::json!({
-                    "run_id": run_id,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "estimated_cost": usage.estimated_cost,
-                    "currency": usage.currency,
-                    "billing_owner": usage.billing_owner,
-                }),
-                &now,
-            )?;
+        let previous = effective_usage_payloads(&transaction, mission_id)?.into_iter()
+            .find(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()
+                .and_then(|value| value.get("run_id").and_then(serde_json::Value::as_str).map(str::to_string))
+                .as_deref() == Some(run_id));
+        let reconciles = previous.as_ref().is_some_and(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()
+            .is_some_and(|value| value["billing_owner"] == "unreported")) && usage.billing_owner != "unreported";
+        if previous.is_none() || reconciles {
+            append_event_tx(&transaction, mission_id,
+                if reconciles { "run_usage_reconciled" } else { "run_usage_recorded" }, task_id,
+                if reconciles { "依据运行时计量补记用量，保留原始未知记录" } else { "记录执行器用量" },
+                serde_json::json!({"run_id":run_id,"input_tokens":usage.input_tokens,
+                    "output_tokens":usage.output_tokens,"estimated_cost":usage.estimated_cost,
+                    "currency":usage.currency,"billing_owner":usage.billing_owner}), &now)?;
         }
-        let rows = {
-            let mut statement = transaction.prepare(
-                "SELECT payload_json FROM mission_events
-                 WHERE mission_id = ?1 AND event_type = 'run_usage_recorded'",
-            )?;
-            let rows = statement
-                .query_map(params![mission_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
+        let rows = effective_usage_payloads(&transaction, mission_id)?;
         let mut total = crate::agent_core_contracts::LocalRunUsage {
             input_tokens: 0,
             output_tokens: 0,
@@ -996,6 +1343,86 @@ impl MissionStore {
         self.get(mission_id)
     }
 
+    /// Recheck an existing implementation without rewriting files or granting
+    /// another repair. Prior failures remain in the append-only event history.
+    pub(crate) fn retry_verification(
+        &self, mission_id: &str, task_id: &str, input: &MissionVerificationRetry,
+    ) -> Result<MissionView, Box<dyn Error>> {
+        require_id("task_id", task_id)?;
+        require_text("request_id", &input.request_id, 200)?;
+        require_sha256(&input.expected_plan_sha256)?;
+        require_id("expected_verification_run_id", &input.expected_verification_run_id)?;
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(input)?));
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission not found")?;
+        let events = list_events(&tx, mission_id, 0)?;
+        for event in &events {
+            if event.event_type == "verification_retry_requested" && event.payload["request_id"] == input.request_id {
+                if event.task_id != task_id || event.payload["request_sha256"] != digest {
+                    return Err("verification request_id already used with different values".into());
+                }
+                tx.commit()?;
+                return self.get(mission_id);
+            }
+        }
+        if mission.status != MissionStatus::Active || mission.confirmation.as_ref()
+            .is_none_or(|value| value.plan_sha256 != input.expected_plan_sha256)
+            || mission.plan_sha256 != input.expected_plan_sha256
+        { return Err("recheck requires the active confirmed plan".into()); }
+        if let Some(reason) = budget_exhaustion_reason_on(&tx, &mission)? {
+            return Err(format!("increase the exhausted budget before rechecking: {reason}").into());
+        }
+        if mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Ready | TaskStatus::AwaitingVerification)) {
+            return Err("wait for current work to finish before rechecking".into());
+        }
+        let task = mission.tasks.iter().find(|task| task.spec.id == task_id).ok_or("task not found")?;
+        if task.status != TaskStatus::Failed || task.verification_passed != Some(false)
+            || task.verification_run_id != input.expected_verification_run_id || task.attempt_run_id.is_empty()
+        { return Err("recheck requires the latest failed independent verification".into()); }
+        if mission.tasks.iter().any(|child| child.spec.repair_of == task_id && child.status != TaskStatus::Canceled) {
+            return Err("recheck the latest repair task instead of its ancestor".into());
+        }
+        let prior_baseline = events.iter().rev().find(|event| event.task_id == task_id
+            && matches!(event.event_type.as_str(), "task_baseline_captured" | "verification_retry_requested"))
+            .and_then(|event| event.payload.get("protected_baseline")).cloned();
+        let baseline = if let Some(baseline) = prior_baseline {
+            if input.source_baseline.is_some() { return Err("an existing baseline cannot be replaced".into()); }
+            baseline
+        } else {
+            let source = input.source_baseline.as_ref().ok_or("no execution baseline; provide a sourced pre-run baseline")?;
+            require_text("source_reference", &source.source_reference, 1024)?;
+            require_sha256(&source.artifact_sha256)?;
+            let captured = chrono::DateTime::parse_from_rfc3339(&source.captured_at)?;
+            let started = events.iter().find(|event| event.event_type == "task_dispatched")
+                .ok_or("initial dispatch timestamp missing")?;
+            if captured > chrono::DateTime::parse_from_rfc3339(&started.occurred_at)? {
+                return Err("source baseline must predate the first implementation dispatch".into());
+            }
+            if source.files.is_empty() || source.files.len() > 10_000 { return Err("invalid baseline file count".into()); }
+            for hash in source.files.values() { require_sha256(hash)?; }
+            serde_json::json!({"provenance": "source_client_pre_run_attestation", "source": source,
+                "files": source.files, "imported_at": now_stamp()})
+        };
+        let current = super::protected_files(std::path::Path::new(&mission.workspace.root), &task.spec)?;
+        if baseline["files"] != current {
+            return Err("protected files differ from the baseline or the baseline does not cover the read-only scope".into());
+        }
+        let now = now_stamp();
+        tx.execute("INSERT INTO mission_workspace_claims (workspace_key, mission_id, task_id, run_id, acquired_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)", params![workspace_claim_key(&mission.workspace.root), mission_id, task_id, task.attempt_run_id, now])?;
+        tx.execute("UPDATE mission_tasks SET status = 'awaiting_verification', verification_run_id = '',
+            verification_passed = NULL, updated_at = ?3 WHERE mission_id = ?1 AND task_id = ?2", params![mission_id, task_id, now])?;
+        tx.execute("UPDATE mission_runs SET updated_at = ?2 WHERE mission_id = ?1", params![mission_id, now])?;
+        append_event_tx(&tx, mission_id, "verification_retry_requested", task_id,
+            "已补充核验证据，重新检查同一实现；不增加代码返工次数",
+            serde_json::json!({"request_id": input.request_id, "request_sha256": digest,
+                "previous_verification_run_id": input.expected_verification_run_id,
+                "plan_sha256": input.expected_plan_sha256, "protected_baseline": baseline}), &now)?;
+        tx.commit()?;
+        self.get(mission_id)
+    }
+
     pub(crate) fn begin_verification_attempt(
         &self,
         mission_id: &str,
@@ -1131,7 +1558,7 @@ impl MissionStore {
             &transaction, mission_id,
             if passed { "task_completed" } else { "verification_failed" },
             task_id,
-            if passed { "独立验证通过".to_string() } else { format!("独立验证失败：{}", reason.trim()) },
+            if passed { "独立验证通过".to_string() } else { format!("独立验证失败：{}", reason.trim()).chars().take(1900).collect() },
             serde_json::json!({
                 "implementation_run_id": implementation_run_id,
                 "verification_run_id": verification_run_id,
@@ -1182,6 +1609,11 @@ impl MissionStore {
     }
 
     fn get_with_plan(&self, mission_id: &str) -> Result<(MissionView, MissionPlanProposal), Box<dyn Error>> {
+        let (mission, proposal) = self.get_with_optional_plan(mission_id)?;
+        Ok((mission, proposal.ok_or("mission has no proposed plan")?))
+    }
+
+    fn get_with_optional_plan(&self, mission_id: &str) -> Result<(MissionView, Option<MissionPlanProposal>), Box<dyn Error>> {
         let connection = self.connection()?;
         let mission = load_mission(&connection, mission_id)?
             .ok_or_else(|| format!("mission not found: {mission_id}"))?;
@@ -1190,7 +1622,9 @@ impl MissionStore {
             params![mission_id],
             |row| row.get(0),
         )?;
-        let proposal = serde_json::from_str(&plan_json)?;
+        let proposal = if mission.plan_sha256.is_empty() && plan_json.trim() == "{}" {
+            None
+        } else { serde_json::from_str(&plan_json)? };
         Ok((mission, proposal))
     }
 
@@ -1210,23 +1644,38 @@ impl MissionStore {
         budget_exhaustion_reason_on(&self.connection()?, mission)
     }
 
-    fn record_budget_exhausted(&self, mission_id: &str, reason: &str) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn follow_up_budget_exhaustion_reason(&self, mission: &MissionView) -> Result<Option<String>, Box<dyn Error>> {
+        Ok(self.budget_exhaustion_reason(mission)?.or_else(||
+            mission.budget.as_ref().and_then(|budget| repair_exhaustion_reason(mission, budget))))
+    }
+
+    pub(crate) fn record_budget_exhausted(&self, mission_id: &str, reason: &str) -> Result<(), Box<dyn Error>> {
         let now = now_stamp();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let already: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'budget_exhausted'",
-            params![mission_id],
-            |row| row.get(0),
-        )?;
         transaction.execute(
             "UPDATE mission_runs SET status = ?2, updated_at = ?3 WHERE mission_id = ?1",
             params![mission_id, MissionStatus::Waiting.as_str(), now],
         )?;
-        if already == 0 {
-            append_event_tx(&transaction, mission_id, "budget_exhausted", "", reason,
-                serde_json::json!({"reason": reason}), &now)?;
+        append_event_tx(&transaction, mission_id, "budget_exhausted", "", reason,
+            serde_json::json!({"reason": reason}), &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_follow_up(&self, mission_id: &str, message: &str, fingerprint: &str) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+        if mission.status != MissionStatus::Active || mission.tasks.iter().any(|task|
+            matches!(task.status, TaskStatus::Ready | TaskStatus::Running | TaskStatus::AwaitingVerification)) {
+            return Ok(());
         }
+        let now = now_stamp();
+        transaction.execute("UPDATE mission_runs SET status = 'waiting', updated_at = ?2 WHERE mission_id = ?1", params![mission_id, now])?;
+        append_event_tx(&transaction, mission_id, "mission_follow_up_waiting", "",
+            "返工计划生成失败，任务已暂停；修复原因后恢复可重新生成",
+            serde_json::json!({"error":message,"fingerprint":fingerprint,"recovery_action":"resume"}), &now)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1365,8 +1814,24 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn repair_exhaustion_reason(mission: &MissionView, budget: &crate::mission::MissionBudget) -> Option<String> {
+    let repairs = mission.tasks.iter().filter(|task| !task.spec.repair_of.is_empty()).count();
+    (repairs >= budget.max_repair_attempts as usize
+        && mission.tasks.iter().any(|task| task.status == TaskStatus::Failed)
+        && !mission.tasks.iter().any(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Running | TaskStatus::AwaitingVerification)))
+        .then(|| format!("达到返工上限：已创建 {repairs}/{} 次返工", budget.max_repair_attempts))
+}
+
 fn budget_exhaustion_reason_on(connection: &Connection, mission: &MissionView) -> Result<Option<String>, Box<dyn Error>> {
         let Some(budget) = mission.budget.as_ref() else { return Ok(None); };
+        budget_exhaustion_reason_with_budget(connection, mission, budget)
+}
+
+fn budget_exhaustion_reason_with_budget(
+    connection: &Connection,
+    mission: &MissionView,
+    budget: &crate::mission::MissionBudget,
+) -> Result<Option<String>, Box<dyn Error>> {
         let Some(confirmation) = mission.confirmation.as_ref() else { return Ok(None); };
         let rounds: i64 = connection.query_row(
             "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type = 'task_dispatched'",
@@ -1385,15 +1850,7 @@ fn budget_exhaustion_reason_on(connection: &Connection, mission: &MissionView) -
         if elapsed_minutes >= budget.max_minutes as u64 {
             return Ok(Some(format!("达到时限上限：已运行 {elapsed_minutes}/{} 分钟", budget.max_minutes)));
         }
-        let usage_json: Vec<String> = {
-            let mut statement = connection.prepare(
-                "SELECT payload_json FROM mission_events WHERE mission_id = ?1 AND event_type = 'run_usage_recorded'",
-            )?;
-            let rows = statement
-                .query_map(params![mission.mission_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
+        let usage_json = effective_usage_payloads(connection, &mission.mission_id)?;
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut estimated_cost = 0.0f64;
@@ -1571,18 +2028,28 @@ fn list_events(connection: &Connection, mission_id: &str, after_sequence: u64) -
     }).collect()
 }
 
+/// Corrections are append-only. Budget checks and UI totals use the newest
+/// measurement per run, so a reconciliation is never counted twice.
+fn effective_usage_payloads(connection: &Connection, mission_id: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut statement = connection.prepare("SELECT sequence,payload_json FROM mission_events
+        WHERE mission_id=?1 AND event_type IN ('run_usage_recorded','run_usage_reconciled') ORDER BY sequence ASC")?;
+    let rows = statement.query_map(params![mission_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?
+        .collect::<Result<Vec<_>,_>>()?;
+    let mut latest = std::collections::BTreeMap::new();
+    for (sequence, raw) in rows {
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let id = value.get("run_id").and_then(serde_json::Value::as_str).map(str::to_string)
+            .unwrap_or_else(|| format!("legacy-event-{sequence}"));
+        latest.insert(id, raw);
+    }
+    Ok(latest.into_values().collect())
+}
+
 fn usage_from_events(
     connection: &Connection,
     mission_id: &str,
 ) -> Result<Option<crate::agent_core_contracts::LocalRunUsage>, Box<dyn Error>> {
-    let mut statement = connection.prepare(
-        "SELECT payload_json FROM mission_events
-         WHERE mission_id = ?1 AND event_type = 'run_usage_recorded'
-         ORDER BY sequence ASC",
-    )?;
-    let rows = statement
-        .query_map(params![mission_id], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = effective_usage_payloads(connection, mission_id)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -1618,6 +2085,19 @@ fn usage_from_events(
 fn new_mission_id() -> String { format!("mission_{}_{:08x}", Utc::now().timestamp_millis(), rand::random::<u32>()) }
 fn now_stamp() -> String { Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true) }
 
+fn runtime_blocked_on(connection: &rusqlite::Connection, mission: &MissionView) -> Result<bool, Box<dyn Error>> {
+    let latest: Option<(String, String)> = connection.query_row(
+        "SELECT event_type,payload_json FROM mission_events WHERE mission_id=?1 AND event_type IN ('runtime_workspace_blocked','runtime_workspace_resolved') ORDER BY sequence DESC LIMIT 1",
+        params![mission.mission_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+    match latest {
+        Some((event, payload)) if event == "runtime_workspace_blocked" => {
+            let payload: serde_json::Value = serde_json::from_str(&payload)?;
+            Ok(payload["plan_sha256"] == mission.plan_sha256)
+        },
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1651,7 +2131,7 @@ mod tests {
             title: "Handoff mission".to_string(),
             objective: "Implement reviewed plan".to_string(),
             workspace: MissionWorkspace {
-                root: "F:/repo".to_string(),
+                permission_mode: String::new(), root: "F:/repo".to_string(),
                 read_scope: vec!["frontend".to_string()],
                 write_scope: vec!["frontend/src".to_string()],
             },
@@ -1721,40 +2201,103 @@ mod tests {
         assert!(store.create_handoff_with_store(&wrong_pin, &workflow_store).unwrap_err().to_string().contains("differs from the Mission pin"));
     }
 
-    #[test]
-    fn assigned_roles_are_required_before_planning_and_override_imported_bindings() {
-        let store = store("assignment");
+    struct ExpertTestHome(Option<std::ffi::OsString>);
+    impl ExpertTestHome {
+        fn new(root: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HIMIND_AGENT_HOME");
+            std::env::set_var("HIMIND_AGENT_HOME", root);
+            Self(previous)
+        }
+    }
+    impl Drop for ExpertTestHome {
+        fn drop(&mut self) {
+            match self.0.as_ref() {
+                Some(previous) => std::env::set_var("HIMIND_AGENT_HOME", previous),
+                None => std::env::remove_var("HIMIND_AGENT_HOME"),
+            }
+        }
+    }
+
+    fn assignment_fixture(name: &str) -> (MissionStore, crate::workflow::WorkflowStore, crate::mission::MissionWorkflowPin, crate::mission::MissionAssignmentInput, ExpertTestHome) {
+        let store = store(name);
+        let home = ExpertTestHome::new(store.path.parent().unwrap());
+        let expert = crate::expert::save(serde_json::from_value(serde_json::json!({
+            "id":"com.himind.expert.assignment-test", "name":"测试专家", "version":"1.0.0",
+            "instructions":"ASSIGNMENT_METHOD: inspect real evidence before modifying files"
+        })).unwrap()).unwrap();
+        let expert_pin = crate::mission::MissionExpertPin {
+            expert_id:expert.id, expert_version:expert.version, expert_digest:expert.digest,
+        };
         let workflow_store = crate::workflow::WorkflowStore::new(store.path.parent().unwrap().join("workflows"));
         let (id, version, digest) = handoff_package(&workflow_store);
         let pin = crate::mission::MissionWorkflowPin {
-            workflow_id: id, workflow_version: version, workflow_sha256: digest, entrypoint: String::new(),
+            workflow_id:id, workflow_version:version, workflow_sha256:digest, entrypoint:String::new(),
         };
-        let input = imported_handoff(&pin);
-        let mission = store.create_handoff_with_store(&input, &workflow_store).unwrap();
-        let assignment = crate::mission::MissionAssignmentInput {
-            roles: vec![crate::mission::MissionRoleAssignment {
-                role_id: "ui.implementer.shared".to_string(),
-                label: "Implementer".to_string(),
-                executor: "himind.builtin".to_string(),
-                service_id: "service".to_string(),
-                model: "himind:service:model".to_string(),
-            }],
-            task_roles: vec![
-                crate::mission::MissionTaskRoleMapping {
-                    task_id: "fix".to_string(), role_id: "ui.implementer.shared".to_string(),
-                },
-                crate::mission::MissionTaskRoleMapping {
-                    task_id: "verify".to_string(), role_id: "ui.implementer.shared".to_string(),
-                },
-            ],
-            applied_by: "local-user".to_string(),
-            recommended: true,
+        let (package, _) = workflow_store.load_pinned_version(&pin.workflow_id, &pin.workflow_version, &pin.workflow_sha256).unwrap();
+        let input = crate::mission::MissionAssignmentInput {
+            roles: package.roles.keys().map(|role_id| crate::mission::MissionRoleAssignment {
+                expert:Some(expert_pin.clone()), role_id:role_id.clone(), label:role_id.clone(),
+                executor:"himind.builtin".into(), service_id:"service".into(), model:"himind:service:model".into(),
+            }).collect(),
+            task_roles: ["fix", "verify"].iter().map(|task_id| crate::mission::MissionTaskRoleMapping {
+                task_id:task_id.to_string(), role_id:"ui.implementer.shared".into(),
+            }).collect(),
+            applied_by:"local-user".into(), recommended:true,
         };
+        (store, workflow_store, pin, input, home)
+    }
+
+    #[test]
+    fn assigned_roles_are_required_before_planning_and_override_imported_bindings() {
+        let _lock = crate::store::paths::test_env_lock();
+        let (store, workflows, pin, assignment, _home) = assignment_fixture("assignment");
+        let mission = store.create_handoff_with_store(&imported_handoff(&pin), &workflows).unwrap();
         assert!(store.propose_plan(&mission.mission_id, &proposal()).is_err());
-        let assigned = store.assign_roles_with_store(&mission.mission_id, &assignment, &workflow_store).unwrap();
+        let mut missing_expert = assignment.clone(); missing_expert.roles[0].expert = None;
+        assert!(store.assign_roles_with_store(&mission.mission_id, &missing_expert, &workflows).is_err());
+        let mut missing_slot = assignment.clone(); missing_slot.roles.pop();
+        assert!(store.assign_roles_with_store(&mission.mission_id, &missing_slot, &workflows).is_err());
+        let assigned = store.assign_roles_with_store(&mission.mission_id, &assignment, &workflows).unwrap();
         assert_eq!(assigned.status, MissionStatus::AwaitingConfirmation);
-        assert_eq!(assigned.assignment.as_ref().unwrap().roles[0].role_id, "ui.implementer.shared");
         assert_eq!(assigned.proposed_tasks[0].execution.service_id, "service");
+        let expert = assigned.proposed_tasks[0].execution.expert.as_ref().unwrap();
+        assert!(crate::mission::expert_instructions(expert).unwrap().contains("ASSIGNMENT_METHOD"));
+        let reopened = MissionStore::new(store.path.clone()).get(&mission.mission_id).unwrap();
+        assert_eq!(reopened.proposed_tasks[0].execution.expert.as_ref(), Some(expert));
+    }
+
+    #[test]
+    fn generated_plan_reassignment_rehashes_and_follow_up_keeps_selected_expert() {
+        let _lock = crate::store::paths::test_env_lock();
+        let (store, workflows, pin, mut assignment, _home) = assignment_fixture("generated-assignment");
+        let mut input = imported_handoff(&pin);
+        input.plan_mode = MissionPlanMode::Generated; input.imported_plan = None;
+        let mission = store.create_handoff_with_store(&input, &workflows).unwrap();
+        assignment.task_roles.clear();
+        store.assign_roles_with_store(&mission.mission_id, &assignment, &workflows).unwrap();
+        let mut plan = proposal();
+        for task in &mut plan.tasks { task.execution.role_id = "ui.implementer.shared".into(); }
+        let original = store.propose_plan(&mission.mission_id, &plan).unwrap();
+        for role in &mut assignment.roles { role.model = "himind:service:changed-model".into(); }
+        assignment.task_roles = plan.tasks.iter().map(|task| crate::mission::MissionTaskRoleMapping {
+            task_id:task.id.clone(), role_id:task.execution.role_id.clone(),
+        }).collect();
+        let reassigned = store.assign_roles_with_store(&mission.mission_id, &assignment, &workflows).unwrap();
+        assert_eq!(reassigned.status, MissionStatus::AwaitingConfirmation);
+        assert!(reassigned.confirmation.is_none());
+        assert_ne!(original.plan_sha256, reassigned.plan_sha256);
+        assert!(reassigned.plan_revision > original.plan_revision);
+        assert_eq!(reassigned.proposed_tasks[0].execution.model, "himind:service:changed-model");
+        let expected = reassigned.proposed_tasks[0].execution.clone();
+        store.confirm_plan(&mission.mission_id, &reassigned.plan_sha256, &["fix".into()], &["frontend/src".into()], &[], &[], "test").unwrap();
+        store.begin_task_attempt(&mission.mission_id, "fix", "failed-attempt").unwrap();
+        store.complete_task_attempt(&mission.mission_id, "fix", "failed-attempt", false, &[], "failed").unwrap();
+        let mut repair = plan.tasks[0].clone();
+        repair.id = "repair".into(); repair.repair_of = "fix".into();
+        repair.execution.role_id = "invented-role".into(); repair.execution.expert = None;
+        repair.execution.model.clear(); repair.execution.service_id.clear();
+        let repaired = store.add_follow_up_tasks(&mission.mission_id, &[repair], "repair").unwrap();
+        assert_eq!(repaired.tasks.iter().find(|task| task.spec.id == "repair").unwrap().spec.execution, expected);
     }
 
     fn create_input() -> MissionCreateInput {
@@ -1762,7 +2305,7 @@ mod tests {
             title: "修复登录页焦点".to_string(),
             objective: "完成可验证的 UI 修复".to_string(),
             workspace: MissionWorkspace {
-                root: "F:/repo".to_string(),
+                permission_mode: String::new(), root: "F:/repo".to_string(),
                 read_scope: vec!["frontend".to_string()],
                 write_scope: vec!["frontend".to_string()],
             },
@@ -1777,7 +2320,7 @@ mod tests {
             write_paths: vec!["frontend/src".to_string()],
             acceptance_criteria: vec!["检查通过".to_string()],
             required_checks: vec!["npm test".to_string()],
-            execution: ExecutionBinding {
+            execution: ExecutionBinding { expert: None,
                 executor: "himind.builtin".to_string(), model: String::new(),
                 role_id: "ui.implementer".to_string(), service_id: String::new(),
             },
@@ -1937,6 +2480,7 @@ mod tests {
         store.confirm_plan(&created.mission_id, &planned.plan_sha256,
             &["fix".to_string(), "verify".to_string()], &["frontend/src".to_string()], &[], &[], "test-user").unwrap();
         let mut follow_up = task("repair");
+        follow_up.repair_of = "fix".to_string();
         follow_up.write_paths = vec!["backend".to_string()];
         assert!(store.add_follow_up_tasks(&created.mission_id, &[follow_up], "修复失败")
             .unwrap_err().to_string().contains("outside confirmed scope"));
@@ -1961,6 +2505,7 @@ mod tests {
         store.begin_task_attempt(&created.mission_id, "fix", "run-failed").unwrap();
         store.complete_task_attempt(&created.mission_id, "fix", "run-failed", false, &[], "failed").unwrap();
         let mut follow_up = task("repair-absolute");
+        follow_up.repair_of = "fix".to_string();
         follow_up.read_paths = vec!["F:/repo/external/other.json".to_string()];
         assert!(store.add_follow_up_tasks(&created.mission_id, &[follow_up], "修复失败")
             .unwrap_err().to_string().contains("outside confirmed absolute scope"));
@@ -2004,6 +2549,75 @@ mod tests {
             &["fix".to_string()], &["frontend/src".to_string()], &[], &[], "test-user").unwrap();
         let _ = name;
         created
+    }
+
+    #[test]
+    fn runtime_full_access_requires_plan_confirmation_and_persists_recovery_choice() {
+        let store = store("runtime-full-access");
+        let created = store.create(&create_input()).unwrap();
+        let planned = store.propose_plan(&created.mission_id, &proposal()).unwrap();
+        let full = store.set_permission_mode(&created.mission_id,&planned.plan_sha256,"full_access").unwrap();
+        assert_ne!(full.plan_sha256,planned.plan_sha256);
+        assert!(store.confirm_plan(&created.mission_id,&planned.plan_sha256,&["fix".into()],&["frontend/src".into()],&[],&[],"user").is_err());
+        assert_eq!(full.status,MissionStatus::AwaitingConfirmation);
+        let active = store.confirm_plan(&created.mission_id,&full.plan_sha256,&["fix".into()],&["frontend/src".into()],&[],&[],"user").unwrap();
+        assert_eq!(store.runtime_mode(&created.mission_id,&full.plan_sha256).unwrap(),"full_access");
+        assert!(store.set_permission_mode(&created.mission_id,&full.plan_sha256,"workspace_write").is_err());
+        assert_eq!(active.workspace.permission_mode,"full_access");
+        store.suspend_runtime(&created.mission_id,"fix",&serde_json::json!({})).unwrap();
+        store.resolve_runtime_block(&created.mission_id,&full.plan_sha256,"full_access",&serde_json::json!({"user_choice":true})).unwrap();
+        let reopened=MissionStore::new(store.path.clone());
+        assert_eq!(reopened.runtime_mode(&created.mission_id,&full.plan_sha256).unwrap(),"full_access");
+        assert_ne!(reopened.runtime_mode(&created.mission_id,"stale-plan").unwrap(),"full_access");
+    }
+
+    #[test]
+    fn runtime_recovery_preserves_ready_task_and_is_bound_to_current_plan() {
+        let store = store("runtime-recovery");
+        let created = confirmed_single_task(&store, "runtime");
+        let before = store.get(&created.mission_id).unwrap();
+        let blocked = store.suspend_runtime(&created.mission_id, "fix", &serde_json::json!({"code":"runtime_workspace_blocked"})).unwrap();
+        assert_eq!(blocked.status, MissionStatus::Waiting);
+        assert_eq!(blocked.tasks, before.tasks);
+        assert_eq!(blocked.usage, before.usage);
+        assert!(blocked.tasks[0].attempt_run_id.is_empty());
+        assert!(store.control(&created.mission_id, "resume").is_err());
+        assert!(store.resolve_runtime_block(&created.mission_id, "stale", "files_only", &serde_json::json!({})).is_err());
+        let resumed = store.resolve_runtime_block(&created.mission_id, &before.plan_sha256, "files_only", &serde_json::json!({})).unwrap();
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert_eq!(resumed.tasks, before.tasks);
+        assert_eq!(resumed.confirmation, before.confirmation);
+        assert!(!store.runtime_blocked(&created.mission_id).unwrap());
+        let reopened = MissionStore::new(store.path.clone());
+        assert!(reopened.runtime_files_only(&created.mission_id, &before.plan_sha256).unwrap());
+        assert!(!reopened.runtime_files_only(&created.mission_id, "another-plan").unwrap());
+        assert!(reopened.resolve_runtime_block(&created.mission_id, &before.plan_sha256, "default", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn runtime_recovery_respects_cancellation_and_expired_budget() {
+        let store = store("runtime-recovery-budget");
+        let created = confirmed_single_task(&store, "runtime");
+        let before = store.get(&created.mission_id).unwrap();
+        store.suspend_runtime(&created.mission_id, "fix", &serde_json::json!({})).unwrap();
+        let mut expired = before.confirmation.clone().unwrap();
+        expired.confirmed_at = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        store.connection().unwrap().execute("UPDATE mission_runs SET confirmation_json=?2 WHERE mission_id=?1",
+            params![created.mission_id, serde_json::to_string(&expired).unwrap()]).unwrap();
+        let recovered = store.resolve_runtime_block(&created.mission_id, &before.plan_sha256, "files_only", &serde_json::json!({})).unwrap();
+        assert_eq!(recovered.status, MissionStatus::Waiting);
+        assert!(!store.runtime_blocked(&created.mission_id).unwrap());
+        assert!(store.control(&created.mission_id, "resume").is_err());
+        let resumed = store.increase_budget(&created.mission_id, &MissionBudgetIncrease {
+            additional_repair_attempts: 0,
+            request_id:"runtime-extra-time".into(), expected_plan_sha256:before.plan_sha256.clone(),
+            additional_minutes: 4320, additional_rounds:0, additional_tokens:None, unlimited_tokens:false, additional_cost:None,
+        }, "test-user").unwrap();
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert!(store.runtime_files_only(&created.mission_id, &before.plan_sha256).unwrap());
+        store.suspend_runtime(&created.mission_id, "fix", &serde_json::json!({})).unwrap();
+        store.control(&created.mission_id, "cancel").unwrap();
+        assert!(store.resolve_runtime_block(&created.mission_id, &before.plan_sha256, "default", &serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -2064,7 +2678,7 @@ mod tests {
         let store = store("execution-binding");
         let created = store.create(&create_input()).unwrap();
         let planned = store.propose_plan(&created.mission_id, &proposal()).unwrap();
-        let execution = crate::mission::ExecutionBinding {
+        let execution = crate::mission::ExecutionBinding { expert: None,
             executor: "himind.builtin".to_string(),
             model: "himind:service:model".to_string(),
             role_id: "ui.reviewer".to_string(),
@@ -2165,6 +2779,70 @@ mod tests {
     }
 
     #[test]
+    fn recheck_preserves_failures_requires_baseline_and_is_idempotent() {
+        let store = store("recheck-baseline");
+        let root = std::env::temp_dir().join(format!("mission-recheck-{}", rand::random::<u64>()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("readonly.txt"), "protected").unwrap();
+        let created = store.create(&MissionCreateInput {
+            title: "recheck".into(), objective: String::new(),
+            workspace: MissionWorkspace { permission_mode: String::new(), root: root.to_string_lossy().into(), read_scope: vec![".".into()], write_scope: vec!["src".into()] },
+            acceptance_criteria: vec!["protected files unchanged".into()],
+        }).unwrap();
+        let mut plan = proposal();
+        plan.tasks = vec![task("fix")];
+        plan.tasks[0].read_paths = vec!["readonly.txt".into(), "src".into()];
+        plan.tasks[0].write_paths = vec!["src".into()];
+        plan.budget.max_repair_attempts = 0;
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        store.confirm_plan(&created.mission_id, &planned.plan_sha256, &["fix".into()], &["src".into()], &[], &[], "user").unwrap();
+        store.begin_task_attempt(&created.mission_id, "fix", "impl").unwrap();
+        store.await_task_verification(&created.mission_id, "fix", "impl", "ready").unwrap();
+        store.begin_verification_attempt(&created.mission_id, "fix", "verify1").unwrap();
+        store.record_verification_result(&created.mission_id, "fix", "impl", "verify1", false, &["local-run:verify1".into()], "missing baseline").unwrap();
+        let mut input = MissionVerificationRetry { request_id: "retry1".into(), expected_plan_sha256: planned.plan_sha256.clone(),
+            expected_verification_run_id: "verify1".into(), source_baseline: None };
+        assert!(store.retry_verification(&created.mission_id, "fix", &input).unwrap_err().to_string().contains("baseline"));
+        let files = super::super::protected_files(&root, &plan.tasks[0]).unwrap();
+        let mut source = super::super::MissionSourceBaseline {
+            source_reference: "codex:pre-run-evidence".into(),
+            captured_at: (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(), artifact_sha256: "a".repeat(64),
+            files: serde_json::from_value(files).unwrap(),
+        };
+        input.source_baseline = Some(source.clone());
+        assert!(store.retry_verification(&created.mission_id, "fix", &input).unwrap_err().to_string().contains("predate"));
+        source.captured_at = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        input.source_baseline = Some(source);
+        let mut stale = input.clone(); stale.expected_plan_sha256 = "f".repeat(64);
+        assert!(store.retry_verification(&created.mission_id, "fix", &stale).is_err());
+        let mut wrong = input.clone(); wrong.source_baseline.as_mut().unwrap().files.insert("readonly.txt".into(), "0".repeat(64));
+        assert!(store.retry_verification(&created.mission_id, "fix", &wrong).unwrap_err().to_string().contains("differ"));
+        let retried = store.retry_verification(&created.mission_id, "fix", &input).unwrap();
+        assert_eq!(retried.tasks[0].status, TaskStatus::AwaitingVerification);
+        assert_eq!(retried.tasks[0].attempt_run_id, "impl");
+        assert_eq!(retried.plan_sha256, planned.plan_sha256);
+        assert_eq!(retried.budget.unwrap().max_repair_attempts, 0);
+        assert!(store.workspace_claim(&created.workspace.root).unwrap().is_some());
+        store.retry_verification(&created.mission_id, "fix", &input).unwrap();
+        let events = store.snapshot(&created.mission_id, 0).unwrap().events;
+        assert_eq!(events.iter().filter(|event| event.event_type == "verification_retry_requested").count(), 1);
+        assert!(events.iter().any(|event| event.event_type == "verification_failed" && event.payload["verification_run_id"] == "verify1"));
+        wrong.request_id = input.request_id.clone();
+        assert!(store.retry_verification(&created.mission_id, "fix", &wrong).unwrap_err().to_string().contains("different values"));
+        store.begin_verification_attempt(&created.mission_id, "fix", "verify2").unwrap();
+        assert!(store.record_verification_result(&created.mission_id, "fix", "impl", "verify1", true, &["old".into()], "").is_err());
+        store.record_verification_result(&created.mission_id, "fix", "impl", "verify2", false, &["local-run:verify2".into()], "review issue").unwrap();
+        input.request_id = "retry2".into(); input.expected_verification_run_id = "verify2".into();
+        assert!(store.retry_verification(&created.mission_id, "fix", &input).unwrap_err().to_string().contains("replaced"));
+        input.source_baseline = None;
+        fs::write(root.join("readonly.txt"), "tampered").unwrap();
+        assert!(store.retry_verification(&created.mission_id, "fix", &input).unwrap_err().to_string().contains("differ"));
+        fs::write(root.join("readonly.txt"), "protected").unwrap();
+        store.retry_verification(&created.mission_id, "fix", &input).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verification_rejects_unadmitted_run() {
         let store = store("unadmitted-verification");
         let created = confirmed_single_task(&store, "unadmitted");
@@ -2260,6 +2938,182 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_token_budget_can_be_extended_and_resumed_idempotently() {
+        let store = store("token-budget-extension");
+        let created = store.create(&create_input()).unwrap();
+        let mut plan = proposal();
+        plan.tasks.truncate(1);
+        plan.budget.max_total_tokens = Some(100);
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        let confirmed = store.confirm_plan(
+            &created.mission_id, &planned.plan_sha256, &["fix".into()],
+            &["frontend/src".into()], &[], &[], "test-user",
+        ).unwrap();
+        store.begin_task_attempt(&created.mission_id, "fix", "run-over-budget").unwrap();
+        store.record_run_usage(&created.mission_id, "fix", "run-over-budget",
+            &crate::agent_core_contracts::LocalRunUsage {
+                input_tokens: 90, output_tokens: 20, estimated_cost: 0.0,
+                currency: String::new(), billing_owner: "local".into(),
+            }).unwrap();
+        store.complete_task_attempt(&created.mission_id, "fix", "run-over-budget", false, &[], "budget test").unwrap();
+        assert!(store.next_ready_task(&created.mission_id).unwrap().is_none());
+        let waiting = store.get(&created.mission_id).unwrap();
+        assert_eq!(waiting.status, MissionStatus::Waiting);
+        let input = MissionBudgetIncrease {
+            additional_repair_attempts: 0,
+            request_id: "budget-extension-once".into(),
+            expected_plan_sha256: planned.plan_sha256.clone(),
+            additional_rounds: 2,
+            additional_minutes: 30,
+            additional_tokens: None,
+            unlimited_tokens: true,
+            additional_cost: None,
+        };
+
+        // Progress and diagnostic events do not replace the effective budget state.
+        store.append_event(&created.mission_id, "task_progress", "fix", "late progress", serde_json::json!({})).unwrap();
+        let resumed = store.increase_budget(&created.mission_id, &input, "test-user").unwrap();
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert_eq!(resumed.plan_sha256, confirmed.plan_sha256);
+        assert_eq!(resumed.confirmation, confirmed.confirmation);
+        assert_eq!(resumed.budget.as_ref().unwrap().max_total_tokens, None);
+        assert_eq!(resumed.budget.as_ref().unwrap().max_rounds, plan.budget.max_rounds + 2);
+        assert_eq!(resumed.budget.as_ref().unwrap().max_minutes, plan.budget.max_minutes + 30);
+
+        let repeated = store.increase_budget(&created.mission_id, &input, "test-user").unwrap();
+        assert_eq!(repeated.budget, resumed.budget);
+        assert_eq!(store.snapshot(&created.mission_id, 0).unwrap().events
+            .iter().filter(|event| event.event_type == "budget_extended").count(), 1);
+        let mut conflicting_replay = input.clone();
+        conflicting_replay.additional_minutes += 1;
+        assert!(store.increase_budget(&created.mission_id, &conflicting_replay, "test-user")
+            .unwrap_err().to_string().contains("different values"));
+    }
+
+    #[test]
+    fn budget_extension_allows_explicit_proactive_increase_but_rejects_stale_plan() {
+        let store = store("budget-extension-guards");
+        let created = confirmed_single_task(&store, "budget-extension-guards");
+        let confirmed = store.get(&created.mission_id).unwrap();
+        let paused = store.control(&created.mission_id, "pause").unwrap();
+        let input = MissionBudgetIncrease {
+            additional_repair_attempts: 0,
+            request_id: "manual-pause-extension".into(),
+            expected_plan_sha256: confirmed.plan_sha256.clone(),
+            additional_rounds: 1,
+            additional_minutes: 0,
+            additional_tokens: None,
+            unlimited_tokens: false,
+            additional_cost: None,
+        };
+        assert_eq!(paused.status, MissionStatus::Waiting);
+        let increased = store.increase_budget(&created.mission_id, &input, "test-user").unwrap();
+        assert_eq!(increased.status, MissionStatus::Active);
+        assert_eq!(increased.budget.as_ref().unwrap().max_rounds, confirmed.budget.as_ref().unwrap().max_rounds + 1);
+        assert_eq!(increased.confirmation, confirmed.confirmation);
+        assert_eq!(store.increase_budget(&created.mission_id, &input, "test-user").unwrap().budget, increased.budget);
+        let exhausted = store.create(&create_input()).unwrap();
+        let mut plan = proposal(); plan.tasks.truncate(1); plan.budget.max_total_tokens = Some(1);
+        let planned = store.propose_plan(&exhausted.mission_id, &plan).unwrap();
+        store.confirm_plan(&exhausted.mission_id, &planned.plan_sha256, &["fix".into()],
+            &["frontend/src".into()], &[], &[], "test-user").unwrap();
+        store.begin_task_attempt(&exhausted.mission_id, "fix", "run-stale-plan").unwrap();
+        store.record_run_usage(&exhausted.mission_id, "fix", "run-stale-plan",
+            &crate::agent_core_contracts::LocalRunUsage {
+                input_tokens: 2, output_tokens: 0, estimated_cost: 0.0,
+                currency: String::new(), billing_owner: "local".into(),
+            }).unwrap();
+        store.complete_task_attempt(&exhausted.mission_id, "fix", "run-stale-plan", false, &[], "budget test").unwrap();
+        store.next_ready_task(&exhausted.mission_id).unwrap();
+        let stale = MissionBudgetIncrease {
+            additional_repair_attempts: 0,
+            request_id: "stale-plan-extension".into(),
+            expected_plan_sha256: "0".repeat(64),
+            additional_rounds: 1, additional_minutes: 0,
+            additional_tokens: Some(1), unlimited_tokens: false, additional_cost: None,
+        };
+        assert!(store.increase_budget(&exhausted.mission_id, &stale, "test-user")
+            .unwrap_err().to_string().contains("plan changed"));
+    }
+
+    #[test]
+    fn proactive_budget_extension_preserves_runtime_blocks_and_rejects_inflight_work() {
+        let store = store("proactive-budget-guards");
+        let created = confirmed_single_task(&store, "proactive-budget-guards");
+        let confirmed = store.get(&created.mission_id).unwrap();
+        let input = MissionBudgetIncrease {
+            request_id: "proactive-guards".into(), expected_plan_sha256: confirmed.plan_sha256.clone(),
+            additional_rounds: 1, additional_minutes: 0, additional_repair_attempts: 0,
+            additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+        };
+        store.begin_task_attempt(&created.mission_id, "fix", "run-inflight").unwrap();
+        store.control(&created.mission_id, "pause").unwrap();
+        assert!(store.increase_budget(&created.mission_id, &input, "test-user").unwrap_err().to_string().contains("running task"));
+        store.await_task_verification(&created.mission_id, "fix", "run-inflight", "ready").unwrap();
+        assert!(store.increase_budget(&created.mission_id, &input, "test-user").unwrap_err().to_string().contains("pending verification"));
+
+        let blocked = confirmed_single_task(&store, "proactive-blocked");
+        let blocked = store.get(&blocked.mission_id).unwrap();
+        let mut blocked_input = input;
+        blocked_input.expected_plan_sha256 = blocked.plan_sha256.clone();
+        store.suspend_runtime(&blocked.mission_id, "fix", &serde_json::json!({"code":"runtime_workspace_blocked"})).unwrap();
+        store.append_event(&blocked.mission_id, "task_progress", "fix", "diagnostic", serde_json::json!({})).unwrap();
+        let mut unchanged = blocked_input.clone(); unchanged.additional_rounds = 0;
+        assert!(store.increase_budget(&blocked.mission_id, &unchanged, "test-user").unwrap_err().to_string().contains("at least one"));
+        let increased = store.increase_budget(&blocked.mission_id, &blocked_input, "test-user").unwrap();
+        assert_eq!(increased.status, MissionStatus::Waiting);
+        assert_eq!(increased.budget.unwrap().max_rounds, blocked.budget.unwrap().max_rounds + 1);
+        assert!(store.control(&blocked.mission_id, "resume").is_err());
+    }
+
+    #[test]
+    fn resuming_manually_paused_over_budget_mission_records_exhaustion_and_allows_extension() {
+        let store = store("paused-over-budget-extension");
+        let created = store.create(&create_input()).unwrap();
+        let mut plan = proposal();
+        plan.tasks.truncate(1);
+        plan.budget.max_total_tokens = Some(100);
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        store.confirm_plan(
+            &created.mission_id, &planned.plan_sha256, &["fix".into()],
+            &["frontend/src".into()], &[], &[], "test-user",
+        ).unwrap();
+        store.begin_task_attempt(&created.mission_id, "fix", "run-paused-over-budget").unwrap();
+        assert_eq!(store.control(&created.mission_id, "pause").unwrap().status, MissionStatus::Waiting);
+        store.record_run_usage(&created.mission_id, "fix", "run-paused-over-budget",
+            &crate::agent_core_contracts::LocalRunUsage {
+                input_tokens: 90, output_tokens: 20, estimated_cost: 0.0,
+                currency: String::new(), billing_owner: "local".into(),
+            }).unwrap();
+        store.complete_task_attempt(
+            &created.mission_id, "fix", "run-paused-over-budget", false, &[], "paused run completed",
+        ).unwrap();
+
+        let reason = store.control(&created.mission_id, "resume").unwrap_err().to_string();
+        assert!(reason.contains("Token"), "{reason}");
+        assert_eq!(store.get(&created.mission_id).unwrap().status, MissionStatus::Waiting);
+        let snapshot = store.snapshot(&created.mission_id, 0).unwrap();
+        assert_eq!(snapshot.events.last().unwrap().event_type, "budget_exhausted");
+        assert_eq!(snapshot.events.iter().filter(|event| event.event_type == "budget_exhausted").count(), 1);
+
+        assert!(store.control(&created.mission_id, "resume").is_err());
+        assert_eq!(store.snapshot(&created.mission_id, 0).unwrap().events
+            .iter().filter(|event| event.event_type == "budget_exhausted").count(), 1);
+        let resumed = store.increase_budget(&created.mission_id, &MissionBudgetIncrease {
+            additional_repair_attempts: 0,
+            request_id: "resume-paused-over-budget".into(),
+            expected_plan_sha256: planned.plan_sha256,
+            additional_rounds: 1,
+            additional_minutes: 30,
+            additional_tokens: None,
+            unlimited_tokens: true,
+            additional_cost: None,
+        }, "test-user").unwrap();
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert_eq!(resumed.budget.unwrap().max_total_tokens, None);
+    }
+
+    #[test]
     fn token_budget_fails_closed_without_usage_evidence() {
         let store = store("token-unreported");
         let created = store.create(&create_input()).unwrap();
@@ -2311,6 +3165,25 @@ mod tests {
         assert_eq!(store.get(&created.mission_id).unwrap().usage.unwrap().input_tokens, 7);
         assert_eq!(store.snapshot(&created.mission_id, 0).unwrap().events
             .iter().filter(|event| event.event_type == "run_usage_recorded").count(), 1);
+    }
+
+    #[test]
+    fn unknown_usage_can_be_reconciled_without_losing_history_or_double_counting() {
+        let store = store("usage-reconciliation");
+        let created = confirmed_single_task(&store, "usage-reconciliation");
+        store.begin_task_attempt(&created.mission_id, "fix", "failed-run").unwrap();
+        let unknown = crate::agent_core_contracts::LocalRunUsage { input_tokens:0, output_tokens:0,
+            estimated_cost:0.0, currency:String::new(), billing_owner:"unreported".into() };
+        store.record_run_usage(&created.mission_id,"fix","failed-run",&unknown).unwrap();
+        let measured = crate::agent_core_contracts::LocalRunUsage { input_tokens:1200, output_tokens:80,
+            billing_owner:"local".into(), ..unknown };
+        for _ in 0..2 { store.record_run_usage(&created.mission_id,"fix","failed-run",&measured).unwrap(); }
+        let actual = store.get(&created.mission_id).unwrap().usage.unwrap();
+        assert_eq!(actual.input_tokens,1200);
+        assert_eq!(actual.output_tokens,80);
+        let events = store.snapshot(&created.mission_id,0).unwrap().events;
+        assert_eq!(events.iter().filter(|event|event.event_type=="run_usage_recorded").count(),1);
+        assert_eq!(events.iter().filter(|event|event.event_type=="run_usage_reconciled").count(),1);
     }
 
     #[test]
@@ -2425,6 +3298,97 @@ mod tests {
             &["local-run:run-repair-verify".to_string()], "").unwrap();
         assert_eq!(updated.tasks.iter().find(|task| task.spec.id == "fix").unwrap().status, TaskStatus::Completed);
         assert_eq!(store.next_ready_task(&created.mission_id).unwrap().unwrap().id, "verify");
+    }
+
+    #[test]
+    fn review_rework_covers_historical_repairs_but_requires_downstream_revision_order() {
+        let store = store("review-history-order");
+        let mut mission = store.create(&create_input()).unwrap();
+        let mut ia = task("ia"); ia.depends_on.clear();
+        let mut synthesis = task("synthesis"); synthesis.depends_on = vec!["ia".into()];
+        let mut historical_synthesis = synthesis.clone();
+        historical_synthesis.id = "previous-synthesis-repair".into(); historical_synthesis.repair_of = "synthesis".into();
+        let mut review = task("review"); review.depends_on = vec!["synthesis".into()];
+        let mut failed_review = review.clone(); failed_review.id = "failed-review-retry".into();
+        failed_review.repair_of = "review".into(); failed_review.depends_on.clear();
+        mission.tasks = [ia.clone(), synthesis.clone(), historical_synthesis, review, failed_review.clone()].into_iter().map(|spec| {
+            let status = if spec.id.contains("review") { TaskStatus::Failed } else { TaskStatus::Completed };
+            MissionTaskView {spec,status,attempt_run_id:String::new(),verification_run_id:String::new(),verification_passed:None,evidence_refs:vec![]}
+        }).collect();
+        ia.id = "ia-revision".into(); ia.repair_of = "ia".into();
+        synthesis.id = "synthesis-revision".into(); synthesis.repair_of = "synthesis".into();
+        synthesis.depends_on = vec![ia.id.clone()];
+        failed_review.id = "review-revision".into(); failed_review.repair_of = "failed-review-retry".into();
+        failed_review.depends_on = vec![synthesis.id.clone(),ia.id.clone()];
+        assert_eq!(review_rework_targets(&mission, &[ia.clone(),synthesis.clone(),failed_review.clone()]).unwrap(),
+            BTreeSet::from(["ia".to_string(),"synthesis".to_string()]));
+        let mut unordered = synthesis.clone(); unordered.depends_on.clear();
+        assert!(review_rework_targets(&mission, &[ia.clone(),unordered,failed_review.clone()])
+            .unwrap_err().to_string().contains("must depend on its upstream revision"));
+        failed_review.depends_on = vec![ia.id.clone()];
+        assert!(review_rework_targets(&mission, &[ia,failed_review])
+            .unwrap_err().to_string().contains("revalidate completed downstream"));
+    }
+
+    #[test]
+    fn downstream_review_reopens_producer_then_requires_separate_reverification() {
+        let store = store("review-feedback");
+        let created = store.create(&create_input()).unwrap();
+        let mut plan = proposal();
+        plan.budget.max_rounds = 40;
+        plan.budget.max_repair_attempts = 2;
+        plan.tasks[0].write_paths = vec!["frontend/src/design.md".into()];
+        plan.tasks[1].write_paths = vec!["frontend/src/acceptance.json".into()];
+        plan.tasks[1].execution.role_id = "independent-reviewer".into();
+        let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+        store.confirm_plan(&created.mission_id, &planned.plan_sha256, &["fix".into(),"verify".into()],
+            &["frontend/src".into()], &[], &[], "test-user").unwrap();
+        let verify = |id: &str, run: &str| {
+            let review = format!("{run}-review");
+            store.begin_task_attempt(&created.mission_id, id, run).unwrap();
+            store.await_task_verification(&created.mission_id, id, run, "review").unwrap();
+            store.begin_verification_attempt(&created.mission_id, id, &review).unwrap();
+            store.append_event(&created.mission_id, "host_verification_checked", id, "test host evidence", serde_json::json!({
+                "passed":true,"plan_sha256":planned.plan_sha256,"implementation_run_id":run,"verification_run_id":review,
+            })).unwrap();
+            store.record_verification_result(&created.mission_id,id,run,&review,true,&[format!("local-run:{review}")],"").unwrap()
+        };
+        verify("fix", "producer-v1");
+        store.begin_task_attempt(&created.mission_id,"verify","review-v1").unwrap();
+        store.complete_task_attempt(&created.mission_id,"verify","review-v1",false,&[],"upstream design conflict").unwrap();
+        let mut first_retry = plan.tasks[1].clone();
+        first_retry.id = "review-retry".into(); first_retry.repair_of = "verify".into(); first_retry.depends_on.clear();
+        store.add_follow_up_tasks(&created.mission_id,&[first_retry.clone()],"review retry").unwrap();
+        store.begin_task_attempt(&created.mission_id,"review-retry","review-v2").unwrap();
+        store.complete_task_attempt(&created.mission_id,"review-retry","review-v2",false,&[],"confirmed upstream issue").unwrap();
+        store.control(&created.mission_id, "pause").unwrap();
+        store.increase_budget(&created.mission_id, &MissionBudgetIncrease {
+            request_id: "review-feedback-budget".into(), expected_plan_sha256: planned.plan_sha256.clone(),
+            additional_rounds: 0, additional_minutes: 0, additional_repair_attempts: 6,
+            additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+        }, "test-user").unwrap();
+        let mut correction = plan.tasks[0].clone();
+        correction.id = "producer-revision".into(); correction.repair_of = "fix".into();
+        let mut final_review = first_retry;
+        final_review.id = "review-revision".into(); final_review.repair_of = "review-retry".into();
+        final_review.depends_on = vec![correction.id.clone()];
+        assert!(store.add_follow_up_tasks(&created.mission_id,&[correction.clone()],"unreviewed revision").is_err());
+        let mut unordered = final_review.clone(); unordered.depends_on.clear();
+        assert!(store.add_follow_up_tasks(&created.mission_id,&[correction.clone(),unordered],"unordered review").is_err());
+        let mut widened = correction.clone(); widened.write_paths.push("frontend/src/acceptance.json".into());
+        assert!(store.add_follow_up_tasks(&created.mission_id,&[widened,final_review.clone()],"widened writer").unwrap_err().to_string().contains("repair target scope"));
+        let revised = store.add_follow_up_tasks(&created.mission_id,&[correction,final_review],"review found real defect").unwrap();
+        assert_eq!(revised.tasks.iter().find(|t| t.spec.id=="fix").unwrap().status,TaskStatus::Failed);
+        assert_eq!(revised.tasks.iter().find(|t| t.spec.id=="review-revision").unwrap().status,TaskStatus::Blocked);
+        assert_eq!(store.next_ready_task(&created.mission_id).unwrap().unwrap().id,"producer-revision");
+        let reopened = MissionStore::new(store.path.clone());
+        assert!(reopened.snapshot(&created.mission_id,0).unwrap().events.iter().any(|e|
+            e.event_type=="task_reopened_for_review" && e.payload["previous_implementation_run_id"]=="producer-v1"));
+        verify("producer-revision","producer-v2");
+        assert_eq!(store.next_ready_task(&created.mission_id).unwrap().unwrap().id,"review-revision");
+        let completed = verify("review-revision","review-v3");
+        assert_eq!(completed.status,MissionStatus::Completed);
+        assert!(completed.tasks.iter().all(|t| t.status==TaskStatus::Completed));
     }
 
     #[test]

@@ -1,0 +1,49 @@
+{
+  "passed": 12,
+  "results": [
+    "中文别名导航、单行层级与详情目录计数",
+    "技术名搜索保留祖先、进入中文子项目与返回父级",
+    "刷新保留手动收起状态，中文别名和物理路径均可检索",
+    "后代汇总、统一分页与仅此项目切换",
+    "从父级读取子会话并复制或继续时传真实owner",
+    "正文搜索继承后代范围和所属中文名",
+    "多个中文别名明确选择、原技术名保留",
+    "批量整理预览、保存及版本保护恢复入口",
+    "窄窗层级名称、布局与滚动区域",
+    "滚轮和键盘只移动当前列表，返回预览保留位置",
+    "200%等效视口重排保留项目切换、历史与键盘操作",
+    "键盘进入子项目弹窗与Esc回还"
+  ],
+  "measurements": [
+    {
+      "width": 1280,
+      "overflow": false,
+      "list": 198,
+      "bodyScroll": false
+    },
+    {
+      "width": 1024,
+      "overflow": false,
+      "list": 198,
+      "bodyScroll": false
+    },
+    {
+      "width": 768,
+      "overflow": false,
+      "list": 159,
+      "bodyScroll": false
+    },
+    {
+      "width": 320,
+      "overflow": false,
+      "list": 148,
+      "bodyScroll": false
+    },
+    {
+      "equivalentZoom": 200,
+      "overflow": false,
+      "list": 148
+    }
+  ],
+  "errors": []
+}

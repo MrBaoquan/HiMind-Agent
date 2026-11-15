@@ -123,6 +123,9 @@ pub(crate) struct SkillRecord {
     pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     pub current: bool,
     pub previous_version: Option<String>,
+    /// 记录来自开发直挂注册表，而不是 builtin/managed/user 安装目录。
+    #[serde(default)]
+    pub development: bool,
 }
 
 #[cfg(test)]

@@ -1,0 +1,70 @@
+{
+  "evidence_type": "Chrome component regression with synthetic in-memory data",
+  "files": [
+    {
+      "sha256": "89952e480723081870aa5e469483c55fe73161c9069b6413751d9d43933ac28a",
+      "path": "frontend/src/components/ModalSurface.tsx"
+    },
+    {
+      "sha256": "b7a3fcea873befeb7cd8ff8d82197ab4b3fcc8096eb307986ef158a0a291200b",
+      "path": "frontend/src/components/ModalSurface.css"
+    },
+    {
+      "sha256": "b9f5f656244ce21f0d15a78b5569a7ca0b4c3f483a0adfe799efd2869c3ee6b2",
+      "path": "frontend/src/components/ConfirmDialog.tsx"
+    },
+    {
+      "sha256": "e6a8e5a8ffdb1e3c025a4a23090d458abb3c65d6c9bb25114c67c91c311264cf",
+      "path": "frontend/src/components/useModalFocus.ts"
+    },
+    {
+      "sha256": "21882166b9411ba6dbde6e432868b3a429411a0f27cbea9e994f3b869840d134",
+      "path": "frontend/src/pages/WorkspaceRegistryPage.tsx"
+    },
+    {
+      "sha256": "7031afb131f57f3e042672c836f478c886b40de2f36670bd7cb41caca72938bf",
+      "path": "frontend/src/pages/WorkspaceRegistryPage.css"
+    },
+    {
+      "sha256": "a71a27bf2a6370cc9602d4682a040ee33b00399423706c76edb03d4974f26a04",
+      "path": "frontend/src/pages/WorkspaceSessionHistoryPanel.tsx"
+    },
+    {
+      "sha256": "748f624cb697045336df653d7ffb1adbb49cc72e1bb27780d09bacd99254e53a",
+      "path": "frontend/src/pages/WorkspaceSessionHistoryPanel.css"
+    },
+    {
+      "sha256": "4883ae1a9e9bfcc3b514053bcbc88bb0fe125cb127f7f41fc4c23d58ba14ea94",
+      "path": "frontend/src/pages/WorkspaceFeedback.tsx"
+    },
+    {
+      "sha256": "c964e4619de46fbba58e58039ddee25f604aa511d85dcec3d8332627ed0827fc",
+      "path": "frontend/src/pages/WorkspaceFeedback.css"
+    },
+    {
+      "sha256": "c002332bc572c680e60c9a4cec496935238ffa371a66e3b7f5f642bb0e52c64d",
+      "path": "frontend/styles.css"
+    },
+    {
+      "sha256": "be7ed86d7e3496848758c8387968d92a48557cd33faeef43f77a28d0e02d493e",
+      "path": "src/session_history.rs"
+    },
+    {
+      "sha256": "92b9e23842e275adee1f348524284588f798e7ce7ac2a6a229514e43843eca67",
+      "path": "frontend/scripts/check-workspace-ui.browser.mjs"
+    },
+    {
+      "sha256": "f3637f2447550fc0c2d5f5a2082912b5177e28823e90f29f0b20ac1f6d48f681",
+      "path": "frontend/scripts/fixtures/workspace-ui-review.tsx"
+    },
+    {
+      "sha256": "88e0c91f63d3b84d3d3061a4d7bacf908d7233d3fbca8b7e73652c4d2c07bb99",
+      "path": "frontend/scripts/check-session-history.browser.mjs"
+    },
+    {
+      "sha256": "46bdde06af14e46bc79ad16039b212727037e56a94634735796e6ddb234fac20",
+      "path": "frontend/package.json"
+    }
+  ],
+  "captured_at": "2026-11-12T07:03:20.2800557+08:00"
+}

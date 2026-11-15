@@ -207,11 +207,7 @@ fn run_check(
 }
 
 fn command_words(text: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    if text.len() > 4096
-        || text
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '|' | '&' | ';' | '<' | '>' | '`' | '$'))
-    {
+    if text.len() > 4096 || text.chars().any(char::is_control) {
         return Err("required checks must be direct commands without shell operators".into());
     }
     let mut words = Vec::new();
@@ -222,6 +218,11 @@ fn command_words(text: &str) -> Result<Vec<String>, Box<dyn Error>> {
         match (quote, c) {
             (Some(q), c) if q == c => quote = None,
             (Some(_), c) => word.push(c),
+            // We execute argv directly, without a shell. Operators inside a
+            // quoted argument are literal program input (e.g. python -c).
+            (None, '|' | '&' | ';' | '<' | '>' | '`' | '$') => {
+                return Err("required checks must be direct commands without shell operators".into());
+            }
             (None, '\'' | '"') => {
                 quote = Some(c);
                 in_word = true;
@@ -256,6 +257,8 @@ mod tests {
             command_words(r#"cargo test "two words""#).unwrap(),
             vec!["cargo", "test", "two words"]
         );
+        assert_eq!(command_words(r#"python -c "import json;json.load(open('reports/visual.json',encoding='utf-8'))""#).unwrap(),
+            vec!["python", "-c", "import json;json.load(open('reports/visual.json',encoding='utf-8'))"]);
         for text in [
             "cargo test && echo ok",
             "cargo test | cat",
@@ -278,6 +281,10 @@ mod tests {
         );
         assert_eq!(results[0].exit_code, 7);
         assert_eq!(results[0].output_sha256.len(), 64);
+        let checks = run_required_checks(Path::new("."),
+            &[r#"node -e "const a=1;process.exit(a > 0 ? 0 : 9)""#.to_string()],
+            Duration::from_secs(10), &|| Ok(false));
+        assert_eq!(checks[0].exit_code, 0, "{:?}", checks[0]);
     }
     #[test]
     fn projection_usage_reads_only_aggregate_token_totals() {

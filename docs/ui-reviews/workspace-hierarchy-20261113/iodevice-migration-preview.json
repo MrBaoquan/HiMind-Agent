@@ -1,0 +1,104 @@
+{
+  "mode": "proposal_only_not_applied",
+  "captured_at": "2026-11-13T14:30:01.528075+08:00",
+  "source_updated_at": "2026-11-13T03:43:53Z",
+  "parent": {
+    "id": "prj-1794361979643-f7877ca5",
+    "current_name": "IODevice",
+    "suggested_name": "IO 设备平台",
+    "aliases": [
+      "IODevice",
+      "MrBaoquan/IOToolkit"
+    ],
+    "preserve_links": true
+  },
+  "changes": [
+    {
+      "workspace_id": "wsp-1794536585830-a0aa651b",
+      "path": "O:/DevModules/IODevice/CinemaControl",
+      "previous_project_id": "prj-1794361979643-f7877ca5",
+      "suggested_name": "动感影院播控",
+      "technical_name": "CinemaControl",
+      "aliases": [
+        "CinemaControl"
+      ],
+      "kind": "product",
+      "parent_id": "prj-1794361979643-f7877ca5",
+      "preserve_workspace_id": true
+    },
+    {
+      "workspace_id": "wsp-1794541336753-9a9548cf",
+      "path": "O:/DevModules/IODevice/IODevice",
+      "previous_project_id": "prj-1794361979643-f7877ca5",
+      "suggested_name": "核心驱动与 SDK",
+      "technical_name": "IODevice SDK",
+      "aliases": [
+        "IODevice SDK"
+      ],
+      "kind": "library",
+      "parent_id": "prj-1794361979643-f7877ca5",
+      "preserve_workspace_id": true
+    },
+    {
+      "workspace_id": "wsp-1794541350920-32144e37",
+      "path": "O:/DevModules/IODevice/IODevice/IOStudio",
+      "previous_project_id": "prj-1794361979643-f7877ca5",
+      "suggested_name": "设备配置与编排",
+      "technical_name": "IOStudio",
+      "aliases": [
+        "IOStudio"
+      ],
+      "kind": "product",
+      "parent_id": "prj-1794361979643-f7877ca5",
+      "preserve_workspace_id": true
+    },
+    {
+      "workspace_id": "wsp-1794541374127-59329d96",
+      "path": "O:/DevModules/IODevice/IOUI",
+      "previous_project_id": "prj-1794361979643-f7877ca5",
+      "suggested_name": "设备插件",
+      "technical_name": "IOUI",
+      "aliases": [
+        "IOUI"
+      ],
+      "kind": "library",
+      "parent_id": "prj-1794361979643-f7877ca5",
+      "preserve_workspace_id": true
+    },
+    {
+      "workspace_id": "wsp-1794541389731-62db2073",
+      "path": "F:/U3DProjects/Premium Projects/UNIPlayer",
+      "previous_project_id": "prj-1794361979643-f7877ca5",
+      "suggested_name": "交互播放器",
+      "technical_name": "UNIPlayer",
+      "aliases": [
+        "UNIPlayer"
+      ],
+      "kind": "product",
+      "parent_id": "prj-1794361979643-f7877ca5",
+      "preserve_workspace_id": true
+    }
+  ],
+  "keep_parent_bindings": [
+    {
+      "id": "wsp-1794361979643-24a44bd8",
+      "project_id": "prj-1794361979643-f7877ca5",
+      "path": "O:/DevModules/IODevice",
+      "role": "root",
+      "source": "import",
+      "confidence": "exact",
+      "created_at": "2026-11-11T01:52:59Z"
+    }
+  ],
+  "expected_counts": {
+    "root_projects": 1,
+    "subprojects": 5,
+    "directory_bindings": 6
+  },
+  "notes": [
+    "中文名称为可编辑建议，非用户已登记名称。",
+    "实施代码未写入本机真实登记。",
+    "应用前必须从最新登记刷新revision并调用整理预览，不能把此提案作为可直接执行输入。",
+    "UNIPlayer保留F盘入口；O盘符号链接可另行显式登记到同一子项目。"
+  ]
+}

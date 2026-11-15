@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::app::reasoning_tags::{sanitize_reasoning_tags, ReasoningTagSanitizer};
+use crate::store::ai_services::{upstream_endpoint_url, AIServiceProtocol, UpstreamEndpoint};
 use crate::store::local_usage::{self, LocalUsageRecord};
 
 const HEADER_LIMIT: usize = 64 * 1024;
@@ -826,20 +827,18 @@ fn binding_has_model(binding: &GatewayBinding, model: &str) -> bool {
             .iter()
             .any(|candidate| candidate.trim() == model)
 }
-/// 上游地址拼接：base 通常已含 `/v1`，避免拼成 `/v1/v1/...`。
-fn join_upstream(base_url: &str, path: &str) -> String {
-    let base = base_url.trim().trim_end_matches('/');
-    let path = if path.starts_with("/v1/") && base.ends_with("/v1") {
-        // 两边都带 `/v1`：去掉路径里的那份，避免拼成 `/v1/v1/...`。
-        &path[3..]
-    } else {
-        path
-    };
-    if !path.starts_with("/v1/") && !base.ends_with("/v1") {
-        // 两边都没有 `/v1`：上游是 OpenAI 兼容服务，补上标准前缀。
-        return format!("{base}/v1{path}");
+/// 绑定里的上游协议字符串来自持久化数据；解析失败按 OpenAI Chat 兜底。
+fn upstream_protocol(protocol: &str) -> AIServiceProtocol {
+    AIServiceProtocol::parse(protocol).unwrap_or(AIServiceProtocol::OpenaiChat)
+}
+
+/// 直通转发时按上游协议选择端点；互译路径各自显式指定协议。
+fn protocol_endpoint(protocol: &AIServiceProtocol) -> UpstreamEndpoint {
+    match protocol {
+        AIServiceProtocol::Anthropic => UpstreamEndpoint::Messages,
+        AIServiceProtocol::OpenaiChat => UpstreamEndpoint::ChatCompletions,
+        AIServiceProtocol::OpenaiResponses => UpstreamEndpoint::Responses,
     }
-    format!("{base}{path}")
 }
 
 /// 将 Responses 工具结果里的图片/文件附件降级成文本说明。
@@ -2068,7 +2067,9 @@ fn forward(
     let active_index = std::cell::Cell::new(0usize);
     let mut send_upstream = |payload: &[u8]| {
         let mut route_send = |candidate: &GatewayBinding| {
-            let upstream_url = join_upstream(&candidate.base_url, &head.path);
+            let protocol = upstream_protocol(&candidate.protocol);
+            let upstream_url =
+                upstream_endpoint_url(&candidate.base_url, &protocol, protocol_endpoint(&protocol));
             let client = upstream_client(&upstream_url)?;
             let mut request = client
                 .request(method.clone(), &upstream_url)
@@ -2156,20 +2157,40 @@ fn forward(
     if !status.is_success() {
         let upstream_headers = response.headers().clone();
         let raw = read_error_body(response);
-        let header_names = head.headers.keys().cloned().collect::<Vec<_>>().join(",");
-        crate::approval::manager::append_event_log(
-            "warn",
-            &format!(
-                "本机网关上游返回失败：request_id={} status={} path={} bytes={} headers={} request={} structure={}",
-                current_request_id(),
-                status.as_u16(),
-                head.path,
-                raw.len(),
-                header_names,
-                request_summary,
-                anthropic_request_profile,
-            ),
+        let upstream_protocol = upstream_protocol(&response_binding.protocol);
+        let upstream_url = upstream_endpoint_url(
+            &response_binding.base_url,
+            &upstream_protocol,
+            protocol_endpoint(&upstream_protocol),
         );
+        log_upstream_failure(
+            response_binding,
+            &upstream_url,
+            status.as_u16(),
+            &raw,
+            &request_summary,
+            &anthropic_request_profile,
+        );
+        if status.as_u16() == 404 {
+            write_upstream_not_found_diagnostic(
+                stream,
+                kind,
+                response_binding,
+                &upstream_url,
+                status.as_u16(),
+                &raw,
+            )?;
+            record_usage(
+                response_binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         if matches!(status.as_u16(), 400 | 422) {
             let request = serde_json::from_slice::<Value>(
                 final_request_body.as_deref().unwrap_or(&outgoing_body),
@@ -2377,7 +2398,11 @@ fn forward_translated(
     let mut send = |candidate: &GatewayBinding| {
         let client = upstream_client(&candidate.base_url)?;
         let request = client
-            .post(join_upstream(&candidate.base_url, "/v1/chat/completions"))
+            .post(upstream_endpoint_url(
+                &candidate.base_url,
+                &AIServiceProtocol::OpenaiChat,
+                UpstreamEndpoint::ChatCompletions,
+            ))
             .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
@@ -2397,6 +2422,32 @@ fn forward_translated(
         let upstream_headers = response.headers().clone();
         let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
+        let upstream_url = upstream_endpoint_url(
+            &binding.base_url,
+            &AIServiceProtocol::OpenaiChat,
+            UpstreamEndpoint::ChatCompletions,
+        );
+        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
+        if status.as_u16() == 404 {
+            write_upstream_not_found_diagnostic(
+                stream,
+                kind,
+                binding,
+                &upstream_url,
+                status.as_u16(),
+                &raw_error,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         if matches!(status.as_u16(), 400 | 422) {
             let request = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
             write_upstream_compatibility_diagnostic(
@@ -2590,7 +2641,11 @@ fn forward_anthropic_responses_translated(
     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
         let client = upstream_client(&candidate.base_url)?;
         let request_builder = client
-            .post(join_upstream(&candidate.base_url, "/responses"))
+            .post(upstream_endpoint_url(
+                &candidate.base_url,
+                &AIServiceProtocol::OpenaiResponses,
+                UpstreamEndpoint::Responses,
+            ))
             .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
@@ -2612,6 +2667,32 @@ fn forward_anthropic_responses_translated(
         let upstream_headers = response.headers().clone();
         let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
+        let upstream_url = upstream_endpoint_url(
+            &binding.base_url,
+            &AIServiceProtocol::OpenaiResponses,
+            UpstreamEndpoint::Responses,
+        );
+        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
+        if status.as_u16() == 404 {
+            write_upstream_not_found_diagnostic(
+                stream,
+                kind,
+                binding,
+                &upstream_url,
+                status.as_u16(),
+                &raw_error,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         if matches!(status.as_u16(), 400 | 422) {
             let request =
                 serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
@@ -2820,7 +2901,11 @@ fn forward_responses_translated(
         let client = upstream_client(&candidate.base_url)?;
         let opencode_session = opencode_session_for_value(candidate, client_session, request);
         let mut upstream_request = client
-            .post(join_upstream(&candidate.base_url, "/chat/completions"))
+            .post(upstream_endpoint_url(
+                &candidate.base_url,
+                &AIServiceProtocol::OpenaiChat,
+                UpstreamEndpoint::ChatCompletions,
+            ))
             .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
@@ -2840,6 +2925,32 @@ fn forward_responses_translated(
         let upstream_headers = response.headers().clone();
         let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
+        let upstream_url = upstream_endpoint_url(
+            &binding.base_url,
+            &AIServiceProtocol::OpenaiChat,
+            UpstreamEndpoint::ChatCompletions,
+        );
+        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
+        if status.as_u16() == 404 {
+            write_upstream_not_found_diagnostic(
+                stream,
+                kind,
+                binding,
+                &upstream_url,
+                status.as_u16(),
+                &raw_error,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         if matches!(status.as_u16(), 400 | 422) {
             let request = request.clone();
             write_upstream_compatibility_diagnostic(
@@ -2865,18 +2976,6 @@ fn forward_responses_translated(
             );
             return Ok(());
         }
-        // 翻译路径的失败要留痕：只看上游报错无法判断是哪条消息结构不合法。
-        crate::approval::manager::append_event_log(
-            "warn",
-            &format!(
-                "本机网关上游返回失败：request_id={} status={} path=/chat/completions binding={} model={} detail={}",
-                current_request_id(),
-                status.as_u16(),
-                binding.id,
-                binding.exposed_model,
-                detail.replace('\n', " "),
-            ),
-        );
         let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
         let head = format!(
             "{}content-length: {}\r\n\r\n",
@@ -3037,7 +3136,11 @@ fn forward_chat_responses_translated(
     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
         let client = upstream_client(&candidate.base_url)?;
         let upstream_request = client
-            .post(join_upstream(&candidate.base_url, "/responses"))
+            .post(upstream_endpoint_url(
+                &candidate.base_url,
+                &AIServiceProtocol::OpenaiResponses,
+                UpstreamEndpoint::Responses,
+            ))
             .header("authorization", format!("Bearer {}", candidate.api_key))
             .header("content-type", "application/json")
             .header("accept-encoding", "identity");
@@ -3059,6 +3162,32 @@ fn forward_chat_responses_translated(
         let upstream_headers = response.headers().clone();
         let raw_error = read_error_body(response);
         let detail = String::from_utf8_lossy(&raw_error).to_string();
+        let upstream_url = upstream_endpoint_url(
+            &binding.base_url,
+            &AIServiceProtocol::OpenaiResponses,
+            UpstreamEndpoint::Responses,
+        );
+        log_upstream_failure(binding, &upstream_url, status.as_u16(), &raw_error, "", "");
+        if status.as_u16() == 404 {
+            write_upstream_not_found_diagnostic(
+                stream,
+                kind,
+                binding,
+                &upstream_url,
+                status.as_u16(),
+                &raw_error,
+            )?;
+            record_usage(
+                binding,
+                &display_model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(());
+        }
         if matches!(status.as_u16(), 400 | 422) {
             let request =
                 serde_json::from_slice::<Value>(final_request_body.as_deref().unwrap_or(body))
@@ -4172,6 +4301,115 @@ fn write_upstream_failure(stream: &mut TcpStream, detail: &str) -> GatewayError 
     GatewayError::Answered
 }
 
+/// 上游失败日志行：必须带上实际上游 URL，否则 404 只能看到客户端路径。
+fn upstream_failure_log_line(
+    binding: &GatewayBinding,
+    upstream_url: &str,
+    status: u16,
+    raw: &[u8],
+    request_summary: &str,
+    request_profile: &str,
+) -> String {
+    let detail = summarize_upstream_error(&String::from_utf8_lossy(raw));
+    format!(
+        "本机网关上游返回失败：request_id={} client={} service={} binding={} status={} upstream={} bytes={} request={} structure={} upstream_detail=[{detail}]",
+        current_request_id(),
+        binding.client,
+        binding.service,
+        binding.id,
+        status,
+        upstream_url,
+        raw.len(),
+        request_summary,
+        request_profile,
+    )
+}
+
+fn log_upstream_failure(
+    binding: &GatewayBinding,
+    upstream_url: &str,
+    status: u16,
+    raw: &[u8],
+    request_summary: &str,
+    request_profile: &str,
+) {
+    crate::approval::manager::append_event_log(
+        "warn",
+        &upstream_failure_log_line(
+            binding,
+            upstream_url,
+            status,
+            raw,
+            request_summary,
+            request_profile,
+        ),
+    );
+}
+
+/// 上游 404 的可读错误体。不能把上游原文直接丢给客户端：
+/// Claude Desktop 会把 404 统一解释成“模型不可用”，真实原因被吞掉。
+fn upstream_not_found_payload(
+    client_protocol: &str,
+    upstream_url: &str,
+    upstream_status: u16,
+    raw: &[u8],
+) -> String {
+    let detail = summarize_upstream_error(&String::from_utf8_lossy(raw));
+    let message = format!(
+        "上游返回 {upstream_status}（端点或模型未找到）：{upstream_url}。请检查服务 Base URL、接口类型与上游模型名是否匹配；Anthropic 地址不要包含 /v1/messages，OpenAI 兼容地址应保留 /v1 或厂商版本前缀。上游响应：{detail}"
+    );
+    if client_protocol == "anthropic" {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "code": "himind_gateway_upstream_not_found",
+                "message": message,
+                "upstream_url": upstream_url,
+                "upstream_status": upstream_status,
+            }
+        })
+    } else {
+        json!({
+            "error": {
+                "type": "api_error",
+                "code": "himind_gateway_upstream_not_found",
+                "message": message,
+                "upstream_url": upstream_url,
+                "upstream_status": upstream_status,
+            }
+        })
+    }
+    .to_string()
+}
+
+fn write_upstream_not_found_diagnostic(
+    stream: &mut TcpStream,
+    client_protocol: &str,
+    binding: &GatewayBinding,
+    upstream_url: &str,
+    upstream_status: u16,
+    raw: &[u8],
+) -> Result<(), GatewayError> {
+    let payload = upstream_not_found_payload(
+        client_protocol,
+        upstream_url,
+        upstream_status,
+        raw,
+    );
+    write_buffered_head(
+        stream,
+        502,
+        "application/json; charset=utf-8",
+        &binding.id,
+        payload.len(),
+    )
+    .map_err(|_| GatewayError::Answered)?;
+    let _ = stream.write_all(payload.as_bytes());
+    let _ = stream.flush();
+    Ok(())
+}
+
 /// SSE 行扫描：只在行边界解析，避免把半个 JSON 当成用量。
 struct StreamScanner {
     protocol: String,
@@ -4784,25 +5022,83 @@ mod tests {
     #[test]
     fn upstream_url_does_not_duplicate_v1() {
         assert_eq!(
-            join_upstream("https://api.example.com/v1", "/v1/chat/completions"),
+            upstream_endpoint_url(
+                "https://api.example.com/v1",
+                &AIServiceProtocol::OpenaiChat,
+                UpstreamEndpoint::ChatCompletions,
+            ),
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(
-            join_upstream("https://api.example.com", "/v1/chat/completions"),
+            upstream_endpoint_url(
+                "https://api.example.com",
+                &AIServiceProtocol::OpenaiChat,
+                UpstreamEndpoint::ChatCompletions,
+            ),
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(
-            join_upstream("https://api.example.com/v1/", "/v1/models"),
+            upstream_endpoint_url(
+                "https://api.example.com/v1/",
+                &AIServiceProtocol::OpenaiResponses,
+                UpstreamEndpoint::Models,
+            ),
             "https://api.example.com/v1/models"
         );
-        // 客户端不带 `/v1`（OpenCode 的 openai-compatible provider 就是这样）。
+    }
+
+    #[test]
+    fn upstream_url_handles_versioned_and_full_endpoint_bases() {
+        // Anthropic 上游：Base URL 误填完整端点时不能重复拼 `/v1/messages`。
         assert_eq!(
-            join_upstream("https://api.example.com/v1", "/chat/completions"),
-            "https://api.example.com/v1/chat/completions"
+            upstream_endpoint_url(
+                "https://vectide.cn/v1/messages",
+                &AIServiceProtocol::Anthropic,
+                UpstreamEndpoint::Messages,
+            ),
+            "https://vectide.cn/v1/messages"
         );
         assert_eq!(
-            join_upstream("https://api.example.com", "/chat/completions"),
-            "https://api.example.com/v1/chat/completions"
+            upstream_endpoint_url(
+                "https://vectide.cn/v1/messages",
+                &AIServiceProtocol::Anthropic,
+                UpstreamEndpoint::Models,
+            ),
+            "https://vectide.cn/v1/models"
+        );
+        assert_eq!(
+            upstream_endpoint_url(
+                "https://api.moonshot.cn/anthropic/v1",
+                &AIServiceProtocol::Anthropic,
+                UpstreamEndpoint::Messages,
+            ),
+            "https://api.moonshot.cn/anthropic/v1/messages"
+        );
+        // OpenAI 兼容上游：保留 `/api/v3` 这类厂商版本前缀，不再额外补 `/v1`。
+        assert_eq!(
+            upstream_endpoint_url(
+                "https://ark.cn-beijing.volces.com/api/v3",
+                &AIServiceProtocol::OpenaiResponses,
+                UpstreamEndpoint::Responses,
+            ),
+            "https://ark.cn-beijing.volces.com/api/v3/responses"
+        );
+        assert_eq!(
+            upstream_endpoint_url(
+                "https://ark.cn-beijing.volces.com/api/plan/v3",
+                &AIServiceProtocol::OpenaiChat,
+                UpstreamEndpoint::ChatCompletions,
+            ),
+            "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions"
+        );
+        // query/fragment 必须被清掉，否则拼接出的地址非法。
+        assert_eq!(
+            upstream_endpoint_url(
+                "https://api.example.com/v1?x=1#y",
+                &AIServiceProtocol::OpenaiResponses,
+                UpstreamEndpoint::Responses,
+            ),
+            "https://api.example.com/v1/responses"
         );
     }
 
@@ -5148,6 +5444,80 @@ mod tests {
             "response={response}"
         );
     }
+    #[test]
+    fn upstream_404_returns_gateway_diagnostic_with_upstream_url() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let head = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, _) => head,
+                _ => panic!("expected request"),
+            };
+            assert_eq!(head.path, "/v1/messages");
+            let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"接口路径不存在或不受支持。请检查基础地址与接口路径是否重复拼接","code":"VectorTide_invalid_api_endpoint"}}"#.as_bytes();
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "k2-404-token".to_string();
+        let resolver_token = token.clone();
+        let upstream_base = format!("http://{upstream_address}/v1/messages");
+        let resolver_base = upstream_base.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "claude-desktop:profile:vector-tide-k2".to_string(),
+                client: "claude-desktop".to_string(),
+                service: "custom:vector-tide-copy-copy".to_string(),
+                profile_id: "himind-proxy".to_string(),
+                entry_protocol: "anthropic".to_string(),
+                exposed_model: "vector-tide-k2/deepseek-v4.1-flash-1017".to_string(),
+                models: vec!["vector-tide-k2/deepseek-v4.1-flash-1017".to_string()],
+                default_model: "deepseek-v4.1-flash-1017".to_string(),
+                upstream_model: "deepseek-v4.1-flash-1017".to_string(),
+                is_default: true,
+                protocol: "anthropic".to_string(),
+                base_url: resolver_base.clone(),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = br#"{"model":"vector-tide-k2/deepseek-v4.1-flash-1017","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway"),
+            "response={response}"
+        );
+        assert!(
+            response.contains("himind_gateway_upstream_not_found"),
+            "response={response}"
+        );
+        assert!(
+            response.contains(&format!("\"upstream_url\":\"{upstream_base}\"")),
+            "response={response}"
+        );
+        assert!(response.contains("Base URL"), "response={response}");
+    }
+
     #[test]
     fn responses_gateway_pre_normalizes_limited_tool_history() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5843,6 +6213,65 @@ mod tests {
         assert!(summarised.contains("cache_control"), "{summarised}");
         assert!(summarised.contains("excerpt="), "{summarised}");
         assert!(!summarised.contains("sk-secret-value"), "{summarised}");
+    }
+
+    #[test]
+    fn upstream_not_found_payload_is_actionable_for_both_client_shapes() {
+        let raw = r#"{"type":"error","error":{"type":"invalid_request_error","message":"接口路径不存在或不受支持","code":"VectorTide_invalid_api_endpoint"}}"#.as_bytes();
+        let anthropic = upstream_not_found_payload(
+            "anthropic",
+            "https://vectide.cn/v1/messages",
+            404,
+            raw,
+        );
+        let value: Value = serde_json::from_str(&anthropic).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(
+            value["error"]["code"],
+            "himind_gateway_upstream_not_found"
+        );
+        assert_eq!(
+            value["error"]["upstream_url"],
+            "https://vectide.cn/v1/messages"
+        );
+        assert_eq!(value["error"]["upstream_status"], 404);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Base URL"), "{message}");
+        assert!(message.contains("VectorTide_invalid_api_endpoint"), "{message}");
+
+        let openai = upstream_not_found_payload(
+            "openai-chat",
+            "https://api.example.com/v1/chat/completions",
+            404,
+            b"{}",
+        );
+        let value: Value = serde_json::from_str(&openai).unwrap();
+        assert!(value.get("type").is_none());
+        assert_eq!(
+            value["error"]["code"],
+            "himind_gateway_upstream_not_found"
+        );
+    }
+
+    #[test]
+    fn upstream_failure_log_line_includes_url_and_redacts_credentials() {
+        let binding = binding("claude-desktop", "anthropic", "local-token");
+        let line = upstream_failure_log_line(
+            &binding,
+            "https://vectide.cn/v1/messages",
+            404,
+            br#"{"error":{"message":"bad","code":"X","authorization":"Bearer sk-secret"}}"#,
+            "",
+            "",
+        );
+        assert!(line.contains("status=404"), "{line}");
+        assert!(
+            line.contains("upstream=https://vectide.cn/v1/messages"),
+            "{line}"
+        );
+        assert!(!line.contains("real-secret"), "{line}");
+        assert!(!line.contains("local-token"), "{line}");
+        assert!(!line.contains("sk-secret"), "{line}");
     }
 
     #[test]

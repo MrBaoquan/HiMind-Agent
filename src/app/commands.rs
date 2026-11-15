@@ -3421,7 +3421,17 @@ pub(crate) fn save_ai_service(
     // 可选端点：同一服务可以同时提供 OpenAI 兼容与 Anthropic 两个地址。
     // 留空时由 `protocol` + `base_url` 合成单端点，旧前端无需改动。
     endpoints: Option<Vec<EndpointInput>>,
+    // 新增时目标 ID 已存在：必须显式确认覆盖。编辑已有服务由前端传 true。
+    allow_overwrite: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let requested_id = id.trim().to_string();
+    if !allow_overwrite.unwrap_or(false)
+        && crate::store::ai_services::exists(&requested_id).map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "服务 ID「{requested_id}」已存在；如要覆盖，请显式确认后重试。"
+        ));
+    }
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
     let endpoints_from_form = endpoints
         .unwrap_or_default()
@@ -3862,6 +3872,43 @@ pub(crate) async fn get_skill_catalog(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// 读取技能库里某个技能的 SKILL.md 原文，供「我的能力 → 技能」预览。
+///
+/// 只读技能包根部的 SKILL.md，不接受任意路径；开发直挂记录同样可读。
+#[tauri::command]
+pub(crate) fn read_skill_document(skill_id: String) -> Result<serde_json::Value, String> {
+    crate::skill::manifest::validate_skill_id(&skill_id).map_err(|error| error.to_string())?;
+    let store = crate::skill::store::SkillStore::new();
+    store
+        .bootstrap_builtin_skills()
+        .map_err(|error| error.to_string())?;
+    let record = store
+        .get_record(&skill_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("技能不存在：{skill_id}"))?;
+    let path = record.version_root.join("SKILL.md");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| format!("技能包中没有 SKILL.md：{skill_id}"))?;
+    if !metadata.is_file() {
+        return Err(format!("技能包中没有 SKILL.md：{skill_id}"));
+    }
+    // 技能包本身有校验和与体积约束；这里再加一道上限，避免异常包把单次预览拖成整页卡死。
+    const MAX_DOCUMENT_BYTES: u64 = 1_000_000;
+    if metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err("SKILL.md 超过 1 MB，暂不支持在应用内预览".to_string());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读取 SKILL.md 失败：{error}"))?;
+    Ok(json!({
+        "skill_id": record.manifest.id,
+        "name": record.manifest.name,
+        "version": record.manifest.version,
+        "path": crate::skill::target::display_path(&path),
+        "size": metadata.len(),
+        "content": content,
+    }))
 }
 
 #[tauri::command]

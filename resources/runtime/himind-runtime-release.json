@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "product_id": "com.himind.runtime.deepseek-harness",
-  "version": "0.2.2-rc.1",
+  "version": "0.2.2-rc.1.himind.1",
   "channel": "stable",
   "platform": "windows",
   "architecture": "x64",
   "package_type": "directory-zip",
-  "file_name": "deepseek-harness-runtime-0.2.2-rc.1-windows-x64.zip",
-  "size": 195316745,
-  "sha256": "f781b3f4018acb9a4ecf01060d5c2d007c9c36eeaaab39c52624b401eab1352c",
-  "signature": "n4bGanadEo6i0GUs/KOIAYyYvQmzLTWKdeKhoIhoo5wucjEt8bI2kgxtflMyzuHjXa8BNjnzOY9aiWfTa+Q1DiLzBmV5+5BugzXrS2ofzO5S5b7CDDX7OirxIQncCCkDSGGjxFD3KtUj6w/ra+ntr23pC4iVNPmDQuldqU0tHr2vED22I0BFm21hGPy0XVzkgj74Ox1Dq+xlDcAre0r8Cd4bHnBXkU3Wj/aQ6HFPy9lFd9te69iyaq+ceW7akzf9tQVfRgEtxitdasIN6Eg2+pjFrff2fn6VmmzuKo1ptZmJsolSefmC7lUFd5kAkLIWyamy6fvhHEQWAkxgE/rPYqdOntuSQ+qJWiKhgrViSzgD6aUbhMpCJOK88dMxopmpnGBbD0m3Dfl91EhAi0CcJinHMD27iAgTVxvZw5WaQ3ovkCCtXQ0RgB6qrkgMiGoCnInet+Bu0oOdTXgPPiYmGf2A7vSMLlaFSy9XwVOVWHcmF8Jfld+5sO5CYQS0jahe",
+  "file_name": "deepseek-harness-runtime-0.2.2-rc.1.himind.1-windows-x64.zip",
+  "size": 195273999,
+  "sha256": "255a00a18a013e10c03e1e9152492a00a808e18fe97bf34cf172c7faee4fbe97",
+  "signature": "p1CbI6Zt5dtvyj/4zA9g5fRAaixpB1n4+bYjnIReW/8u9DNymd4w7K1BSIdHzSW42FZgc9Kupq/NR15n8+jjGES/RJgl5WggUnxTdYEBe+kA3Oytw50oCty3AXljqdsup6DHrP3DPSWxEkX5QEcDoVWt5nD9GYxqALOmcH3BS8i4sqqOkunoVx2fMikj1VxJrvm7H+tLGKhlcoo/9z3SsM4hyrkz9TlE66vn3bOjXoTsA44UvdQMHnxfpfHmnXZ6hN0KFGhbYDWdx4zqwj/sB+lTyEdbkzI0ko/xi1oSYMDJP092DXq2t7d7ahtugRxqdafTQwjNOc1hM3URdfydsQmD5oBcYeOe1y9knBQ6q0uy3fyeHOR0ElBCP8ekbM2DCcaA73bdROOVxS95qcm5/2QtWYVvHoJJP2GJZnTZwt0BNkq0hKN3f4Uz5l5zg8teocGLsEoL33/zIvqpuQIOOc4CBDIStDOZrbm2yhjsAfPvV/d+mUtpGbdcs7vVxtRP",
   "signature_key_id": "himind-production-2026",
   "signature_algorithm": "rsa-pss-sha256",
   "min_agent_version": "0.3.92",
@@ -22,5 +22,5 @@
     "office"
   ],
   "mandatory": false,
-  "release_notes": "DSH 0.2.2-rc.1: Node 24.x engine floor, official-bundles and liveshare bundles; bundled with HiMind Agent 0.3.92."
+  "release_notes": "HiMind Runtime revision: Node restricted-token pipe DACL compatibility; default node --test, piped children and IPC supported without weakening file confinement."
 }

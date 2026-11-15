@@ -88,6 +88,9 @@ struct RegistryCache {
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    RuntimeWorkspaceCheck,
+    MissionPermissionSet,
+    RuntimeWorkspaceResolve,
     EngineeringProjectResolve,
     EngineeringCheckpointCreate,
     EngineeringWorkspaceLeaseAcquire,
@@ -99,6 +102,9 @@ enum CapabilityHandler {
     MissionEventsList,
     MissionAssignmentOptions,
     MissionAssignmentApply,
+    MissionPlanConfirm,
+    MissionBudgetExtend,
+    MissionVerificationRetry,
     MissionControl,
     MissionWorkflowExport,
     WorkflowCatalogList,
@@ -268,6 +274,7 @@ enum CapabilityHandler {
     MediaAudioSpeechLocal,
     MediaAudioTranscribeLocal,
     MediaAIDescribe,
+    MediaImageRead,
     MediaAITagBatchStart,
     MediaAITagBatchStatus,
     MediaAITagBatchCancel,
@@ -305,6 +312,7 @@ enum CapabilityHandler {
     WorkspaceRegistryCandidateAccept,
     WorkspaceRegistryCandidateDismiss,
     WorkspaceRegistryValidate,
+    WorkspaceRegistryImport,
 }
 
 #[derive(Clone)]
@@ -1918,6 +1926,7 @@ impl CapabilityGateway {
                             "type":"object",
                             "properties": {
                                 "root":{"type":"string","minLength":1},
+                                "permission_mode":{"enum":["workspace_write","full_access"]},
                                 "read_scope":{"type":"array","items":{"type":"string"}},
                                 "write_scope":{"type":"array","items":{"type":"string"}}
                             },
@@ -1954,6 +1963,30 @@ impl CapabilityGateway {
                     "required":["mission_id"],"additionalProperties":false
                 }),
                 CapabilityHandler::MissionGet,
+            ),
+            registration(
+                "runtime.workspace.check", "检查工作区命令环境",
+                "只读检查 Windows 沙箱所需权限，返回目录、实际缺失权限、授权指纹及恢复选项；不修改权限。",
+                "read_only",
+                json!({"type":"object","properties":{"workspace":{"type":"string","minLength":1}},"required":["workspace"],"additionalProperties":false}),
+                CapabilityHandler::RuntimeWorkspaceCheck,
+            ),
+            registration(
+                "mission.permission.set", "设置协作任务执行权限",
+                "在计划确认前选择 workspace_write 或 full_access；更新计划摘要，须经用户确认计划后才执行。完全访问由 HiMind AI 按当前系统用户权限执行，不修改 ACL、不自动提权。",
+                "local_write",
+                json!({"type":"object","properties":{"mission_id":{"type":"string","minLength":1},"expected_plan_sha256":{"type":"string"},"permission_mode":{"enum":["workspace_write","full_access"]}},"required":["mission_id","expected_plan_sha256","permission_mode"],"additionalProperties":false}),
+                CapabilityHandler::MissionPermissionSet,
+            ),
+            registration(
+                "runtime.workspace.resolve", "恢复工作区命令环境",
+                "用户确认后选择本任务完全访问、工作区最小授权、重新检查或仅文件工具继续。full_access 使用当前系统用户权限，不修改 ACL、不要求权限指纹；始终绑定当前任务与计划。其他操作按新权限指纹校验，修复保留备份。",
+                "R3",
+                json!({"type":"object","properties":{
+                    "workspace":{"type":"string","minLength":1},"expected_fingerprint":{"type":"string"},
+                    "action":{"enum":["full_access","repair","retry","files_only"]},"mission_id":{"type":"string"},"expected_plan_sha256":{"type":"string"}
+                },"required":["workspace","action"],"additionalProperties":false}),
+                CapabilityHandler::RuntimeWorkspaceResolve,
             ),
             registration(
                 "mission.events.list",
@@ -1993,6 +2026,79 @@ impl CapabilityGateway {
                     "required":["mission_id","input"],"additionalProperties":false
                 }),
                 CapabilityHandler::MissionAssignmentApply,
+            ),
+            registration(
+                "mission.plan.confirm",
+                "确认协作任务计划与访问范围",
+                "确认当前计划摘要、任务选集和精确读写范围；宿主随后独立调度。此操作需要高风险审批。",
+                "local_write",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mission_id":{"type":"string","minLength":1},
+                        "plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                        "selected_task_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":160},"minItems":1,"maxItems":128,"uniqueItems":true},
+                        "approved_paths":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1024},"maxItems":128,"uniqueItems":true},
+                        "approved_absolute_read_paths":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1024},"maxItems":128,"uniqueItems":true},
+                        "approved_absolute_write_paths":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1024},"maxItems":128,"uniqueItems":true},
+                        "confirmed_by":{"type":"string","minLength":1,"maxLength":160}
+                    },
+                    "required":["mission_id","plan_sha256","selected_task_ids","approved_paths","approved_absolute_read_paths","approved_absolute_write_paths","confirmed_by"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::MissionPlanConfirm,
+            ),
+            registration(
+                "mission.verification.retry",
+                "重新核验协作任务",
+                "对核验失败的同一实现重新运行只读核验，保留原失败记录和计划权限；不会重写实现或增加返工次数。旧任务可补充有来源的执行前文件基线。",
+                "local_write",
+                json!({"type":"object", "properties": {
+                    "mission_id":{"type":"string","minLength":1},
+                    "task_id":{"type":"string","minLength":1},
+                    "input":{"type":"object", "properties": {
+                        "request_id":{"type":"string","minLength":1,"maxLength":200},
+                        "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                        "expected_verification_run_id":{"type":"string","minLength":1},
+                        "source_baseline":{"type":"object","properties": {
+                            "source_reference":{"type":"string","minLength":1,"maxLength":1024},
+                            "captured_at":{"type":"string","minLength":1},
+                            "artifact_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                            "files":{"type":"object","minProperties":1,"maxProperties":10000,
+                                "additionalProperties":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"}}
+                        }, "required":["source_reference","captured_at","artifact_sha256","files"], "additionalProperties":false}
+                    }, "required":["request_id","expected_plan_sha256","expected_verification_run_id"],"additionalProperties":false}
+                }, "required":["mission_id","task_id","input"],"additionalProperties":false}),
+                CapabilityHandler::MissionVerificationRetry,
+            ),
+            registration(
+                "mission.budget.extend",
+                "增加协作任务预算并继续",
+                "对已停止执行和核验、正在等待的已确认任务增加额度并继续调度，支持预算耗尽后续跑或主动增额；保留计划版本、已批准访问范围及未解除的环境阻断，需要高风险审批。",
+                "local_write",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "mission_id":{"type":"string","minLength":1},
+                        "input":{
+                            "type":"object",
+                            "properties":{
+                                "request_id":{"type":"string","minLength":1,"maxLength":200},
+                                "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                                "additional_rounds":{"type":"integer","minimum":0,"maximum":4294967295u64},
+                                "additional_minutes":{"type":"integer","minimum":0,"maximum":525600},
+                                "additional_repair_attempts":{"type":"integer","minimum":0,"maximum":4294967295u64},
+                                "additional_tokens":{"type":"integer","minimum":1,"maximum":9000000000000000u64},
+                                "unlimited_tokens":{"type":"boolean"},
+                                "additional_cost":{"type":"number","exclusiveMinimum":0}
+                            },
+                            "required":["request_id","expected_plan_sha256","additional_rounds","additional_minutes","unlimited_tokens"],
+                            "additionalProperties":false
+                        }
+                    },
+                    "required":["mission_id","input"],"additionalProperties":false
+                }),
+                CapabilityHandler::MissionBudgetExtend,
             ),
             registration(
                 "mission.workflow.export",
@@ -3401,6 +3507,11 @@ impl CapabilityGateway {
             local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", media_audio_speech_local_schema(), CapabilityHandler::MediaAudioSpeechLocal),
             local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", media_audio_transcribe_local_schema(), CapabilityHandler::MediaAudioTranscribeLocal),
             local_media_registration("media.ai.describe", "描述图片内容", "使用已接入的多模态模型分析一张本地图片，返回标签、描述与画面质量；用于素材打标、精选评分与 OCR 兜底。", "local_action", media_ai_describe_schema(), CapabilityHandler::MediaAIDescribe),
+            local_media_registration("media.image.read", "读取本地图片", "仅读取工作区内图片，将像素作为 MCP image 内容返回当前模型；按文件内容识别格式，不改原始证据，不调用其他模型或网络服务。", "read_only", json!({
+                "type":"object","properties":{"workspace_root":{"type":"string","minLength":1},
+                    "path":{"type":"string","minLength":1},"max_edge":{"type":"integer","minimum":128,"maximum":2048}},
+                "required":["workspace_root","path"],"additionalProperties":false
+            }), CapabilityHandler::MediaImageRead),
             local_media_registration("media.ai.tag.batch.start", "后台批量打标", "提交多条素材，Agent 在后台并发调用多模态模型；返回 job_id，可轮询状态、取消或关闭视图后继续。", "local_action", media_ai_tag_batch_start_schema(), CapabilityHandler::MediaAITagBatchStart),
             local_media_registration("media.ai.tag.batch.status", "查看批量打标进度", "按 job_id 返回批量打标进度、每条结果、tokens 与错误。", "read_only", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchStatus),
             local_media_registration("media.ai.tag.batch.cancel", "取消批量打标", "取消正在运行的批量视觉打标作业。", "local_write", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchCancel),
@@ -3618,6 +3729,23 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::WorkspaceRegistryValidate,
+            ),
+            registration_versioned(
+                "workspace.registry.import",
+                crate::workspace_registry::CAPABILITY_VERSION,
+                "导入工作日志登记",
+                "把工作日志的项目与路径绑定迁进内核登记表；默认 dry_run，先看计划再落盘。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "source_path": { "type": "string", "minLength": 1, "description": "工作日志 projects.json 的绝对路径" },
+                        "dry_run": { "type": "boolean", "description": "默认 true，只返回计划不写盘" }
+                    },
+                    "required": ["source_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceRegistryImport,
             ),
         ];
 
@@ -3885,6 +4013,12 @@ impl CapabilityGateway {
             return Err(control_plane_provider::unavailable_error(&self.options).into());
         }
         validate_capability_input_schema(&registration.descriptor.input_schema, &input)?;
+        if capability_id == "mission.plan.confirm" {
+            policy::mission_plan_confirmation_target(&input)?;
+        }
+        if capability_id == "mission.budget.extend" {
+            policy::mission_budget_extension_target(&input)?;
+        }
         // The pid/display-number rule belongs to Dashboard business
         // capabilities only. A local plugin is allowed to define its own
         // `exhibit_id` argument with unrelated semantics.
@@ -4064,6 +4198,18 @@ impl CapabilityGateway {
                 value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
                 Ok(value)
             }
+            CapabilityHandler::RuntimeWorkspaceCheck => {
+                crate::app::runtime_workspace::check(input.get("workspace").and_then(Value::as_str).ok_or("workspace is required")?)
+            }
+            CapabilityHandler::MissionPermissionSet => {
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.set_permission_mode(
+                    input["mission_id"].as_str().ok_or("mission_id is required")?,
+                    input["expected_plan_sha256"].as_str().ok_or("expected_plan_sha256 is required")?,
+                    input["permission_mode"].as_str().ok_or("permission_mode is required")?)?)?)
+            }
+            CapabilityHandler::RuntimeWorkspaceResolve => {
+                crate::app::runtime_workspace::resolve(&serde_json::from_value(input)?)
+            }
             CapabilityHandler::MissionEventsList => {
                 let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
                     .filter(|value| !value.is_empty()).ok_or("mission.events.list requires mission_id")?;
@@ -4082,6 +4228,45 @@ impl CapabilityGateway {
                     input.get("input").cloned().ok_or("mission.assignment.apply requires input")?
                 )?;
                 Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.assign_roles(mission_id, &request)?)?)
+            }
+            CapabilityHandler::MissionPlanConfirm => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.plan.confirm requires mission_id")?;
+                let plan_sha256 = input.get("plan_sha256").and_then(Value::as_str)
+                    .ok_or("mission.plan.confirm requires plan_sha256")?;
+                let string_array = |field: &str| -> Result<Vec<String>, std::io::Error> {
+                    input.get(field).and_then(Value::as_array)
+                        .ok_or_else(|| std::io::Error::other(format!("mission.plan.confirm requires {field}")))?
+                        .iter().map(|value| value.as_str().map(str::to_string)
+                            .ok_or_else(|| std::io::Error::other(format!("mission.plan.confirm {field} must contain strings"))))
+                        .collect()
+                };
+                let selected_task_ids = string_array("selected_task_ids")?;
+                let approved_paths = string_array("approved_paths")?;
+                let approved_absolute_read_paths = string_array("approved_absolute_read_paths")?;
+                let approved_absolute_write_paths = string_array("approved_absolute_write_paths")?;
+                let confirmed_by = input.get("confirmed_by").and_then(Value::as_str)
+                    .ok_or("mission.plan.confirm requires confirmed_by")?;
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.confirm_plan(
+                    mission_id, plan_sha256, &selected_task_ids, &approved_paths,
+                    &approved_absolute_read_paths, &approved_absolute_write_paths, confirmed_by,
+                )?)?)
+            }
+            CapabilityHandler::MissionVerificationRetry => {
+                let mission_id = input["mission_id"].as_str().ok_or("mission_id missing")?;
+                let task_id = input["task_id"].as_str().ok_or("task_id missing")?;
+                let request = serde_json::from_value(input["input"].clone())?;
+                Ok(serde_json::to_value(crate::app::mission_dispatch::retry_verification(mission_id, task_id, &request)?)?)
+            }
+            CapabilityHandler::MissionBudgetExtend => {
+                let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
+                    .filter(|value| !value.is_empty()).ok_or("mission.budget.extend requires mission_id")?;
+                let request: crate::mission::MissionBudgetIncrease = serde_json::from_value(
+                    input.get("input").cloned().ok_or("mission.budget.extend requires input")?
+                )?;
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.increase_budget(
+                    mission_id, &request, "MCP client",
+                )?)?)
             }
             CapabilityHandler::MissionControl => {
                 let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
@@ -4542,6 +4727,9 @@ impl CapabilityGateway {
                 Ok(serde_json::to_value(
                     crate::workspace_registry::validate_registry(&registry),
                 )?)
+            }
+            CapabilityHandler::WorkspaceRegistryImport => {
+                crate::workspace_registry::capability_import(&input)
             }
             CapabilityHandler::AIClientList => Ok(serde_json::to_value(
                 crate::app::ai_provider_import::status(&self.options),
@@ -5384,6 +5572,7 @@ impl CapabilityGateway {
                 )
             }
             CapabilityHandler::MediaAIDescribe => crate::app::vision_describe::describe(&input),
+            CapabilityHandler::MediaImageRead => crate::app::vision_describe::read_image(&input),
             CapabilityHandler::MediaAITagBatchStart => crate::app::vision_batch::start(&input),
             CapabilityHandler::MediaAITagBatchStatus => crate::app::vision_batch::status(&input),
             CapabilityHandler::MediaAITagBatchCancel => crate::app::vision_batch::cancel(&input),

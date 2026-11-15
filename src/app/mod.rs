@@ -61,6 +61,7 @@ pub(crate) mod remote_execution;
 pub(crate) mod responses_chat;
 pub(crate) mod responses_media;
 pub(crate) mod runtime_mode;
+pub(crate) mod runtime_workspace;
 pub(crate) mod sandbox_warmup;
 pub(crate) mod security;
 pub mod service;

@@ -219,6 +219,44 @@ fn normalize_endpoints(
     normalized
 }
 
+/// 保存时的端点归一：先按协议把 Base URL 规范成 API 根，再按协议族去重。
+/// 与读取时的 `normalize_endpoints` 不同，这里会剥掉误填的完整端点后缀。
+fn normalize_endpoints_for_save(
+    base_url: &str,
+    protocol: &AIServiceProtocol,
+    endpoints: Vec<AIServiceEndpoint>,
+) -> Result<Vec<AIServiceEndpoint>, Box<dyn Error>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    let candidates = if endpoints.is_empty() {
+        vec![AIServiceEndpoint::new(protocol.clone(), base_url.to_string())]
+    } else {
+        endpoints
+    };
+    for endpoint in candidates {
+        validate_base_url_for_save(&endpoint.base_url, &endpoint.protocol)?;
+        let protocol = endpoint
+            .protocol
+            .family()
+            .normalize_protocol(&endpoint.protocol);
+        let base_url = normalize_api_base_url(&endpoint.base_url, &protocol);
+        if base_url.is_empty() {
+            continue;
+        }
+        if seen.insert(protocol.family()) {
+            normalized.push(AIServiceEndpoint { protocol, base_url });
+        }
+    }
+    if normalized.is_empty() {
+        validate_base_url_for_save(base_url, protocol)?;
+        normalized.push(AIServiceEndpoint::new(
+            protocol.clone(),
+            normalize_api_base_url(base_url, protocol),
+        ));
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CustomAIService {
     pub id: String,
@@ -543,6 +581,65 @@ fn validate_base_url(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 保存时的 Base URL 校验：在通用校验之上拒绝 query/fragment，
+/// 并拦住“协议与完整端点路径明显不匹配”的写法。
+fn validate_base_url_for_save(
+    value: &str,
+    protocol: &AIServiceProtocol,
+) -> Result<(), Box<dyn Error>> {
+    validate_base_url(value)?;
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| "base_url 必须是合法的 http/https URL".to_string())?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "base_url 不应包含 query 或 fragment；请填写 API 根地址，例如 https://api.example.com/v1"
+                .into(),
+        );
+    }
+    if let Some(family) = endpoint_family_for_path(url.path()) {
+        if family != protocol.family() {
+            let expected = match family {
+                AIServiceProtocolFamily::Anthropic => "Anthropic Messages",
+                AIServiceProtocolFamily::OpenAi => "OpenAI 兼容",
+            };
+            return Err(format!(
+                "base_url 看起来是 {expected} 端点，但接口类型是 {}；请填写 API 根地址，或切换接口类型",
+                protocol.as_str()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// 路径是否以某个已知的完整推理端点结尾；用于保存时识别误填。
+fn endpoint_family_for_path(path: &str) -> Option<AIServiceProtocolFamily> {
+    let path = path.trim_end_matches('/');
+    if path.ends_with("/v1/messages") || path.ends_with("/messages") {
+        return Some(AIServiceProtocolFamily::Anthropic);
+    }
+    if path.ends_with("/v1/chat/completions")
+        || path.ends_with("/chat/completions")
+        || path.ends_with("/v1/responses")
+        || path.ends_with("/responses")
+    {
+        return Some(AIServiceProtocolFamily::OpenAi);
+    }
+    None
+}
+
+/// 远端明文 HTTP 会让 API Key 在局域网/公网上裸奔；只允许回环地址。
+fn is_remote_http_base_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 fn normalize_id(id: &str) -> Result<String, Box<dyn Error>> {
     let id = id.trim().to_string();
     if id.is_empty() || id.len() > 64 {
@@ -555,6 +652,15 @@ fn normalize_id(id: &str) -> Result<String, Box<dyn Error>> {
         return Err("服务 ID 只允许字母、数字、下划线和连字符".into());
     }
     Ok(id)
+}
+
+/// 判断服务 ID 是否已存在；保存命令用它阻止新增静默覆盖。
+pub(crate) fn exists(id: &str) -> Result<bool, Box<dyn Error>> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Ok(false);
+    }
+    Ok(load_all()?.contains_key(id))
 }
 
 pub(crate) fn list() -> Result<Vec<CustomAIService>, Box<dyn Error>> {
@@ -841,19 +947,32 @@ fn upsert_internal(
     balance_user_id: Option<String>,
 ) -> Result<CustomAIService, Box<dyn Error>> {
     let id = normalize_id(&input.id)?;
-    validate_base_url(&input.base_url)?;
+    validate_base_url_for_save(&input.base_url, &input.protocol)?;
     if input.display_name.trim().is_empty() {
         return Err("display_name 不能为空".into());
     }
     // 端点列表是事实源，标量只是它的第一条投影：先归一，再看标量该写什么。
-    let endpoints = normalize_endpoints(&input.base_url, &input.protocol, input.endpoints);
-    for endpoint in &endpoints {
-        validate_base_url(&endpoint.base_url)?;
-    }
+    let endpoints =
+        normalize_endpoints_for_save(&input.base_url, &input.protocol, input.endpoints)?;
     let primary_endpoint = endpoints
         .first()
         .cloned()
-        .expect("normalize_endpoints always returns at least one endpoint");
+        .expect("normalize_endpoints_for_save always returns at least one endpoint");
+    // 远端明文 HTTP 不阻止保存（局域网自建服务仍可能需要），但必须在日志里留下告警。
+    let mut warned_http = std::collections::BTreeSet::new();
+    for endpoint in &endpoints {
+        if is_remote_http_base_url(&endpoint.base_url)
+            && warned_http.insert(endpoint.base_url.clone())
+        {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!(
+                    "AI 服务 {} 使用远端 HTTP Base URL，API Key 将以明文传输：{}",
+                    id, endpoint.base_url
+                ),
+            );
+        }
+    }
     let has_media_model = !input.image_model.trim().is_empty()
         || input
             .media
@@ -1999,32 +2118,98 @@ fn selection_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(dir.join(SELECTION_FILE))
 }
 
-/// Anthropic 协议里的 API 根地址：去掉末尾斜杠，并剥掉可选的末尾 `/v1`。
+/// 上游端点类型。URL 拼接只认这一组稳定后缀，避免各调用方各写一套 `/v1` 规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamEndpoint {
+    Models,
+    ChatCompletions,
+    Responses,
+    Messages,
+}
+
+impl UpstreamEndpoint {
+    fn path(self, protocol: &AIServiceProtocol) -> &'static str {
+        match (protocol, self) {
+            (AIServiceProtocol::Anthropic, Self::Messages) => "/v1/messages",
+            (AIServiceProtocol::Anthropic, Self::Models) => "/v1/models",
+            // 非 Anthropic 上游不会走 Messages；保留兜底，避免拼出空路径。
+            (AIServiceProtocol::Anthropic, _) => "/v1/messages",
+            (_, Self::ChatCompletions) => "/chat/completions",
+            (_, Self::Responses) => "/responses",
+            (_, Self::Models) => "/models",
+            (_, Self::Messages) => "/v1/messages",
+        }
+    }
+}
+
+/// 把用户填写的 Base URL 规范成“API 根”：
+/// - 去掉 query/fragment 和末尾斜杠；
+/// - 剥掉误填的完整端点后缀（`/v1/messages`、`/responses` 等）；
+/// - Anthropic 再剥掉末尾 `/v1`（网关/探测会自行补 `/v1/...`）；
+/// - OpenAI 兼容地址如果是裸主机，则补 `/v1`，已有版本前缀（`/v1`、`/api/v3`）保持原样。
+pub(crate) fn normalize_api_base_url(base_url: &str, protocol: &AIServiceProtocol) -> String {
+    let trimmed = base_url.trim();
+    let Ok(mut url) = url::Url::parse(trimmed) else {
+        return trimmed.trim_end_matches('/').to_string();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut path = url.path().trim_end_matches('/').to_string();
+    let suffixes: &[&str] = if protocol.is_anthropic() {
+        &["/v1/messages", "/messages", "/v1/models", "/models", "/v1"]
+    } else {
+        &[
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/responses",
+            "/responses",
+            "/v1/models",
+            "/models",
+        ]
+    };
+    for suffix in suffixes {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    if !protocol.is_anthropic() && (path.is_empty() || path == "/") {
+        path = "/v1".to_string();
+    }
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+/// 按协议和端点类型生成最终上游地址。所有转发/探测/模型列表必须走这里。
+pub(crate) fn upstream_endpoint_url(
+    base_url: &str,
+    protocol: &AIServiceProtocol,
+    endpoint: UpstreamEndpoint,
+) -> String {
+    let base = normalize_api_base_url(base_url, protocol);
+    format!("{base}{}", endpoint.path(protocol))
+}
+
+/// Anthropic 协议里的 API 根地址：去掉末尾斜杠，并剥掉可选的 `/v1` 或完整端点。
 ///
 /// GCMP Anthropic 类模板给出的是 API 根地址（如 `https://api.moonshot.cn/anthropic`），
 /// 手工填写时用户常按 OpenAI 习惯带上 `/v1`，两种写法指向同一根。Anthropic SDK
 /// 系客户端（Claude Code、DSH）会在根地址后自行追加 `/v1/messages`，因此写入这些
 /// 客户端前必须回到根地址；只有需要显式带 `/v1` 的客户端（OpenCode/AI SDK）才补回去。
 pub(crate) fn anthropic_api_root(base_url: &str) -> String {
-    let base = base_url.trim().trim_end_matches('/');
-    base.strip_suffix("/v1").unwrap_or(base).to_string()
-}
-
-/// Anthropic 原生模型列表地址 `{api_root}/v1/models`。
-fn anthropic_models_url(base_url: &str) -> String {
-    format!("{}/v1/models", anthropic_api_root(base_url))
+    normalize_api_base_url(base_url, &AIServiceProtocol::Anthropic)
 }
 
 /// 火山方舟 Agent Plan 是套餐推理入口，只提供 Messages 推理，不提供 `/models`
 /// 发现接口。用 `x-api-key` 访问不存在的模型列表会先被鉴权层拒绝成 401，极易被
 /// 误判为 Key 无效；因此这里单独识别，连接检查改走最小 Messages 探测。
 pub(crate) fn is_volcengine_agent_plan(base_url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(base_url.trim()) else {
+    let normalized = normalize_api_base_url(base_url, &AIServiceProtocol::Anthropic);
+    let Ok(parsed) = url::Url::parse(&normalized) else {
         return false;
     };
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = parsed.path().trim_end_matches('/');
-    let path = path.strip_suffix("/v1").unwrap_or(path);
     host.ends_with(".volces.com") && path == "/api/plan"
 }
 
@@ -2045,7 +2230,8 @@ pub(crate) fn fetch_models(
     protocol: AIServiceProtocol,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     validate_base_url(base_url)?;
-    if is_volcengine_agent_plan(base_url) {
+    let base_url = normalize_api_base_url(base_url, &protocol);
+    if is_volcengine_agent_plan(&base_url) {
         return Err(
             "火山方舟 Agent Plan 不提供 /models 模型列表接口；请使用目录预设模型，连接检查会改为发起 1 Token 的 Messages 探测"
                 .into(),
@@ -2061,16 +2247,14 @@ pub(crate) fn fetch_models(
         client_builder = client_builder.no_proxy();
     }
     let client = client_builder.build()?;
+    let models_url = upstream_endpoint_url(&base_url, &protocol, UpstreamEndpoint::Models);
     let request = match protocol {
         AIServiceProtocol::Anthropic => client
-            .get(anthropic_models_url(base_url))
+            .get(models_url.as_str())
             .header("x-api-key", api_key.trim())
             .header("anthropic-version", ANTHROPIC_API_VERSION),
         AIServiceProtocol::OpenaiChat | AIServiceProtocol::OpenaiResponses => {
-            let base = base_url.trim().trim_end_matches('/');
-            client
-                .get(format!("{base}/models"))
-                .bearer_auth(api_key.trim())
+            client.get(models_url.as_str()).bearer_auth(api_key.trim())
         }
     };
     let response = request
@@ -2112,6 +2296,7 @@ pub(crate) fn probe_chat_connection(
     model: &str,
 ) -> Result<(), Box<dyn Error>> {
     validate_base_url(base_url)?;
+    let base_url = normalize_api_base_url(base_url, &protocol);
     let model = model.trim();
     if model.is_empty() {
         return Err("连接探测需要先配置默认模型".into());
@@ -2126,9 +2311,15 @@ pub(crate) fn probe_chat_connection(
         client_builder = client_builder.no_proxy();
     }
     let client = client_builder.build()?;
+    let endpoint = match protocol {
+        AIServiceProtocol::Anthropic => UpstreamEndpoint::Messages,
+        AIServiceProtocol::OpenaiChat => UpstreamEndpoint::ChatCompletions,
+        AIServiceProtocol::OpenaiResponses => UpstreamEndpoint::Responses,
+    };
+    let url = upstream_endpoint_url(&base_url, &protocol, endpoint);
     let request = match protocol {
         AIServiceProtocol::Anthropic => client
-            .post(format!("{}/v1/messages", anthropic_api_root(base_url)))
+            .post(url.as_str())
             .header("x-api-key", api_key.trim())
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .json(&serde_json::json!({
@@ -2137,10 +2328,7 @@ pub(crate) fn probe_chat_connection(
                 "messages": [{ "role": "user", "content": "ping" }],
             })),
         AIServiceProtocol::OpenaiChat => client
-            .post(format!(
-                "{}/chat/completions",
-                base_url.trim().trim_end_matches('/')
-            ))
+            .post(url.as_str())
             .bearer_auth(api_key.trim())
             .json(&serde_json::json!({
                 "model": model,
@@ -2148,10 +2336,7 @@ pub(crate) fn probe_chat_connection(
                 "messages": [{ "role": "user", "content": "ping" }],
             })),
         AIServiceProtocol::OpenaiResponses => client
-            .post(format!(
-                "{}/responses",
-                base_url.trim().trim_end_matches('/')
-            ))
+            .post(url.as_str())
             .bearer_auth(api_key.trim())
             .json(&serde_json::json!({
                 "model": model,
@@ -3323,6 +3508,17 @@ mod tests {
     }
 
     #[test]
+    fn service_exists_detects_saved_ids() {
+        with_isolated_home(|| {
+            assert!(!super::exists("deepseek-account").unwrap());
+            super::upsert(balance_test_service("sk-exists")).expect("save service");
+            assert!(super::exists("deepseek-account").unwrap());
+            assert!(super::exists(" deepseek-account ").unwrap());
+            assert!(!super::exists("").unwrap());
+        });
+    }
+
+    #[test]
     fn fetch_models_parses_openai_models_payload() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -3396,6 +3592,44 @@ mod tests {
     }
 
     #[test]
+    fn fetch_models_does_not_duplicate_full_messages_base_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"data":[{"id":"deepseek-v4.1-flash-1017"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        // 用户误把完整 Messages 端点填进 Base URL：模型列表必须回到 `/v1/models`。
+        let models = super::fetch_models(
+            &format!("http://{addr}/v1/messages"),
+            "sk-test",
+            AIServiceProtocol::Anthropic,
+        )
+        .expect("fetch models");
+        assert_eq!(models, vec!["deepseek-v4.1-flash-1017".to_string()]);
+        let request = received.lock().unwrap().clone();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.contains("/v1/messages/v1/models"),
+            "duplicated endpoint: {request}"
+        );
+    }
+
+    #[test]
     fn identifies_volcengine_agent_plan_as_catalog_only() {
         assert!(super::is_volcengine_agent_plan(
             "https://ark.cn-beijing.volces.com/api/plan"
@@ -3450,6 +3684,43 @@ mod tests {
         assert!(normalized.contains("anthropic-version: 2023-06-01"));
         assert!(normalized.contains("\"max_tokens\":1"));
         assert!(normalized.contains("\"content\":\"ping\""));
+    }
+
+    #[test]
+    fn probe_chat_connection_does_not_duplicate_full_messages_base_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 8192];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"type":"message","content":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        super::probe_chat_connection(
+            &format!("http://{addr}/v1/messages"),
+            "sk-test",
+            AIServiceProtocol::Anthropic,
+            "deepseek-v4.1-flash-1017",
+        )
+        .expect("probe succeeds");
+        let request = received.lock().unwrap().clone();
+        assert!(
+            request.starts_with("POST /v1/messages "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            !request.contains("/v1/messages/v1/messages"),
+            "duplicated endpoint: {request}"
+        );
     }
 
     #[test]
@@ -3580,6 +3851,144 @@ mod tests {
     }
 
     /// 旧配置文件没有 `endpoints`：读时必须补出单端点，且标量仍是投影。
+    #[test]
+    fn save_normalizes_full_endpoint_base_urls() {
+        with_isolated_home(|| {
+            let anthropic = super::upsert(CustomAIServiceInput {
+                id: "anthropic-full".to_string(),
+                display_name: "Anthropic Full".to_string(),
+                base_url: "https://vectide.cn/v1/messages".to_string(),
+                protocol: AIServiceProtocol::Anthropic,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save anthropic");
+            assert_eq!(anthropic.base_url, "https://vectide.cn");
+            assert_eq!(anthropic.protocol, AIServiceProtocol::Anthropic);
+            assert_eq!(anthropic.endpoints[0].base_url, "https://vectide.cn");
+
+            let openai = super::upsert(CustomAIServiceInput {
+                id: "openai-full".to_string(),
+                display_name: "OpenAI Full".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save openai");
+            assert_eq!(openai.base_url, "https://api.example.com/v1");
+            assert_eq!(openai.protocol, AIServiceProtocol::OpenaiResponses);
+        });
+    }
+
+    #[test]
+    fn save_rejects_query_and_fragment_in_base_url() {
+        with_isolated_home(|| {
+            for (index, base_url) in [
+                "https://api.example.com/v1?x=1",
+                "https://api.example.com/v1#frag",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let error = super::upsert(CustomAIServiceInput {
+                    id: format!("bad-url-{index}"),
+                    display_name: "Bad URL".to_string(),
+                    base_url: base_url.to_string(),
+                    protocol: AIServiceProtocol::OpenaiResponses,
+                    model: "m".to_string(),
+                    models: vec!["m".to_string()],
+                    endpoints: Vec::new(),
+                    image_model: String::new(),
+                    image_adapter: String::new(),
+                    media: Default::default(),
+                    api_key: "sk-test".to_string(),
+                })
+                .expect_err("query/fragment must be rejected");
+                let message = error.to_string();
+                assert!(
+                    message.contains("query") && message.contains("fragment"),
+                    "{message}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn save_rejects_protocol_endpoint_family_mismatch() {
+        with_isolated_home(|| {
+            let error = super::upsert(CustomAIServiceInput {
+                id: "mismatch".to_string(),
+                display_name: "Mismatch".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::Anthropic,
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                endpoints: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect_err("protocol/endpoint mismatch must be rejected");
+            assert!(error.to_string().contains("接口类型"), "{error}");
+        });
+    }
+
+    #[test]
+    fn remote_http_warning_only_for_non_loopback() {
+        assert!(super::is_remote_http_base_url(
+            "http://192.168.1.10:8080/v1"
+        ));
+        assert!(super::is_remote_http_base_url("http://example.com/v1"));
+        assert!(!super::is_remote_http_base_url("http://localhost:8080/v1"));
+        assert!(!super::is_remote_http_base_url("http://127.0.0.1:8080/v1"));
+        assert!(!super::is_remote_http_base_url("http://[::1]:8080/v1"));
+        assert!(!super::is_remote_http_base_url("https://example.com/v1"));
+    }
+
+    #[test]
+    fn save_normalizes_secondary_endpoints_before_dedupe() {
+        with_isolated_home(|| {
+            let saved = super::upsert(CustomAIServiceInput {
+                id: "multi-full".to_string(),
+                display_name: "Multi Full".to_string(),
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                endpoints: vec![
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::OpenaiResponses,
+                        "https://api.example.com/v1/responses",
+                    ),
+                    AIServiceEndpoint::new(
+                        AIServiceProtocol::Anthropic,
+                        "https://api.example.com/v1/messages",
+                    ),
+                ],
+                model: "m".to_string(),
+                models: vec!["m".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: "sk-test".to_string(),
+            })
+            .expect("save multi endpoint");
+            assert_eq!(saved.endpoints.len(), 2);
+            assert_eq!(saved.endpoints[0].base_url, "https://api.example.com/v1");
+            assert_eq!(saved.endpoints[1].base_url, "https://api.example.com");
+        });
+    }
+
     #[test]
     fn legacy_service_without_endpoints_upgrades_to_single_endpoint() {
         let legacy = serde_json::json!({

@@ -137,6 +137,8 @@ type AiProvidersPanelProps = {
     balance_access_token: string;
     balance_user_id: string;
     api_key: string;
+    /** 新增时目标 ID 已存在：只有显式确认后才允许覆盖。 */
+    allow_overwrite?: boolean;
   }) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onCloneAIService: (id: string) => Promise<CustomAIService>;
@@ -222,6 +224,7 @@ export function AiProvidersPanel({
   const [presetCategory, setPresetCategory] = useState<string>('');
   const modalRef = useRef<HTMLElement | null>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const confirm = useConfirm();
 
   const customServices = aiServices?.custom?.services ?? [];
   // 每个能力的默认服务即该能力路由表的第一项（ADR 0023）。
@@ -336,8 +339,10 @@ export function AiProvidersPanel({
     setFormError('');
     setFormNotice('');
     setDraft({
-      id: preset.id,
-      display_name: preset.name,
+      // 预设只是模板：不能把模板 ID 当成服务 ID，否则新增会覆盖同 ID 服务，
+      // 编辑态还会把保存目标切到模板对应的服务上。
+      id: editingServiceId ?? draft.id,
+      display_name: draft.display_name.trim() ? draft.display_name : preset.name,
       base_url: preset.base_url,
       protocol: preset.protocol,
       secondary_protocol: '',
@@ -364,7 +369,8 @@ export function AiProvidersPanel({
       balance_profile_id: balanceProfileForPreset(preset.base_url),
       balance_access_token: '',
       balance_user_id: '',
-      api_key: '',
+      // 用户已经输入的 Key 不能被模板清空；编辑态留空仍表示保留已保存 Key。
+      api_key: draft.api_key,
     });
   }
 
@@ -490,12 +496,35 @@ export function AiProvidersPanel({
       return;
     }
     const enabled = new Set(enabledCapabilities);
-    const id = draft.id.trim() || suggestedServiceId(draft.display_name);
+    // 编辑态永远保存回当前服务；新增态才按用户填写/自动生成的 ID 落库。
+    const targetId = editingServiceId ?? (draft.id.trim() || suggestedServiceId(draft.display_name));
+    const existingById = !editingServiceId && customServices.some(service => service.id === targetId);
+    const normalizedName = draft.display_name.trim().toLowerCase();
+    const nameCollision = normalizedName.length > 0 && customServices.some(service =>
+      service.id !== targetId && service.display_name.trim().toLowerCase() === normalizedName
+    );
+    let allowOverwrite = Boolean(editingServiceId);
+    if (existingById || nameCollision) {
+      const conflicts = [
+        existingById ? `服务 ID「${targetId}」已存在` : '',
+        nameCollision ? `服务名称「${draft.display_name.trim()}」已被其他服务使用` : '',
+      ].filter(Boolean).join('；');
+      const accepted = await confirm({
+        title: '保存前确认冲突',
+        description: existingById
+          ? `${conflicts}。继续会用当前表单覆盖该服务的连接信息、模型和能力；已分发客户端的绑定不会自动迁移。`
+          : `${conflicts}。继续会创建同名服务，列表和聚合入口里可能难以区分。`,
+        confirmText: existingById ? '覆盖保存' : '仍然保存',
+        danger: existingById,
+      });
+      if (!accepted) return;
+      allowOverwrite = allowOverwrite || existingById;
+    }
     setFormError('');
     setSaving(true);
     try {
       await onSaveAIService({
-        id,
+        id: targetId,
         display_name: draft.display_name.trim(),
         base_url: draft.base_url.trim(),
         protocol: draft.protocol,
@@ -525,6 +554,7 @@ export function AiProvidersPanel({
         balance_access_token: draft.balance_access_token.trim(),
         balance_user_id: draft.balance_user_id.trim(),
         api_key: draft.api_key.trim(),
+        allow_overwrite: allowOverwrite,
       });
       setDraft(emptyDraft);
       setEnabledCapabilities(['chat']);

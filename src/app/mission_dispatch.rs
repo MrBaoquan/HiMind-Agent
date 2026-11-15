@@ -28,14 +28,54 @@ impl WorkflowStepExecutor for RuntimeStepExecutor<'_> {
         step: &WorkflowStep,
         input: &Value,
     ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+        // Persist full host evidence in the LocalRun, but do not copy hundreds
+        // of file hashes (and the duplicate workflow_context.input) into a CLI
+        // argument. This also projects inputs saved by older Agent versions.
+        let prompt_input = if package.id.starts_with("com.himind.mission.verify.") && step.id == "VERIFY" {
+            verification_prompt_input(input)
+        } else { input.clone() };
         execute_runtime_step(
             package,
             step,
-            input,
+            &prompt_input,
             Some(self.options),
             &|| Ok((self.canceled)()),
         )
     }
+}
+
+fn verification_prompt_input(input: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+    fn manifest_summary(files: &Value) -> Value {
+        json!({"file_count": files.as_object().map_or(0, |files| files.len()),
+            "manifest_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(files).unwrap_or_default())),
+            "source": "full manifest retained in host verification input"})
+    }
+    let mut projected = input.clone();
+    if let Some(check) = projected.get_mut("protected_file_check").and_then(Value::as_object_mut) {
+        if let Some(baseline) = check.get_mut("baseline").and_then(Value::as_object_mut) {
+            if let Some(files) = baseline.remove("files") { baseline.insert("manifest".into(), manifest_summary(&files)); }
+            if let Some(source) = baseline.get_mut("source").and_then(Value::as_object_mut) {
+                if let Some(files) = source.remove("files") { source.insert("manifest".into(), manifest_summary(&files)); }
+            }
+        }
+        if let Some(files) = check.remove("current_files") { check.insert("current_manifest".into(), manifest_summary(&files)); }
+    }
+    for field in ["implementation_output", "implementation_evidence"] {
+        if let Some(value) = projected.get_mut(field) {
+            let serialized = serde_json::to_string(value).unwrap_or_default();
+            if serialized.len() > 4000 {
+                *value = json!({"source": "implementation self-report; full payload retained in host LocalRun",
+                    "sha256": format!("{:x}", Sha256::digest(serialized.as_bytes())),
+                    "preview": serialized.chars().take(1200).collect::<String>(),
+                    "truncated": true});
+            }
+        }
+    }
+    if let Some(context) = projected.get_mut("workflow_context").and_then(Value::as_object_mut) {
+        context.remove("input");
+    }
+    projected
 }
 
 #[tauri::command]
@@ -63,6 +103,18 @@ pub(crate) async fn dispatch_next_mission_task(
 
 pub(crate) fn control_mission(mission_id: &str, action: &str) -> Result<crate::mission::MissionView, Box<dyn Error>> {
     let store = MissionStore::open_default()?;
+    if action == "resume" {
+        let current = store.get(mission_id)?;
+        for task in current.tasks.iter().filter(|task| task.status == crate::mission::TaskStatus::Failed) {
+            for id in [&task.attempt_run_id, &task.verification_run_id] {
+                if !id.is_empty() && task.spec.execution.executor == "himind.builtin" {
+                    if let Some(usage) = crate::runtime::deepseek_harness::recorded_workflow_usage(id)? {
+                        store.record_run_usage(mission_id, &task.spec.id, id, &usage)?;
+                    }
+                }
+            }
+        }
+    }
     let mission = store.control(mission_id, action)?;
     if action == "cancel" {
         let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
@@ -127,7 +179,8 @@ pub(crate) fn dispatch_next(
         }));
     }
     validate_execution_binding(&task)?;
-    let package = task_package(&mission.mission_id, &mission.title, &task, &mission.workspace.root)?;
+    if let Some(blocked) = prepare_task_environment(&store, &mission, &task)? { return Ok(blocked); }
+    let package = mission_task_package(&store, &mission, &task)?;
     let runner = WorkflowRunner::open_default()?;
     let request_id = format!("mission_{}_{}", mission.mission_id, task.id);
     let expected_run_id = format!("workflow_run_{request_id}");
@@ -135,6 +188,17 @@ pub(crate) fn dispatch_next(
     if let Err(error) = store.begin_task_attempt(mission_id, &task.id, &expected_run_id) {
         return defer_dispatch(&store, mission_id, &task.id, &error.to_string(), json!({}));
     }
+    let baseline = match crate::mission::protected_files(Path::new(&mission.workspace.root), &task) {
+        Ok(files) => files,
+        Err(error) => {
+            store.complete_task_attempt(mission_id, &task.id, &expected_run_id, false,
+                &[], &format!("无法记录执行前文件基线：{error}"))?;
+            return Err(error);
+        }
+    };
+    store.append_event(mission_id, "task_baseline_captured", &task.id, "系统已记录执行前只读文件基线",
+        json!({"protected_baseline": {"provenance": "host_before_execution", "files": baseline},
+            "implementation_run_id": expected_run_id, "plan_sha256": mission.plan_sha256}))?;
     let run = match runner.start("local-agent", &package, &request_id, &input) {
         Ok(run) => run,
         Err(error) => {
@@ -150,6 +214,21 @@ pub(crate) fn dispatch_next(
         return defer_dispatch(&store, mission_id, &task.id, &reason, json!({"run_id": run.run_id}));
     }
     execute_implementation_attempt(&store, options, &mission, &task, &package, &input, &runner, run)
+}
+
+fn prepare_task_environment(store: &MissionStore, mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<Option<Value>, Box<dyn Error>> {
+    let runtime_mode = store.runtime_mode(&mission.mission_id, &mission.plan_sha256)?;
+    if runtime_mode == "full_access" && !crate::workflow::supports_full_access(&task.execution.executor) {
+        return Err("完全访问模式需要选择 HiMind AI 或 ACP 执行器".into());
+    }
+    if task.execution.executor == "himind.builtin" && !task.write_paths.is_empty() && runtime_mode == "default" {
+        if let Err(error) = super::runtime_workspace::prepare(&mission.workspace.root) {
+            let environment = serde_json::from_str::<Value>(&error.to_string()).unwrap_or_else(|_| json!({"message":error.to_string()}));
+            store.suspend_runtime(&mission.mission_id, &task.id, &environment)?;
+            return Ok(Some(json!({"dispatched":false,"reason":"runtime_workspace_blocked","environment":environment})));
+        }
+    }
+    Ok(None)
 }
 
 fn defer_dispatch(
@@ -177,9 +256,9 @@ fn mission_time_remaining(mission: &crate::mission::MissionView) -> std::time::D
     std::time::Duration::from_secs((u64::from(budget.max_minutes) * 60).saturating_sub(elapsed))
 }
 
-fn mission_should_stop(id: &str, original: &crate::mission::MissionView) -> bool {
-    mission_time_remaining(original).is_zero() || MissionStore::open_default().and_then(|store| store.get(id))
-        .map(|mission| matches!(mission.status, crate::mission::MissionStatus::Canceled | crate::mission::MissionStatus::Failed | crate::mission::MissionStatus::Completed)).unwrap_or(true)
+fn mission_should_stop(id: &str, _original: &crate::mission::MissionView) -> bool {
+    MissionStore::open_default().and_then(|store| store.get(id))
+        .map(|mission| mission_time_remaining(&mission).is_zero() || matches!(mission.status, crate::mission::MissionStatus::Canceled | crate::mission::MissionStatus::Failed | crate::mission::MissionStatus::Completed)).unwrap_or(true)
 }
 
 fn mission_executor<'a>(options: &'a Options, mission: &crate::mission::MissionView) -> RuntimeStepExecutor<'a> {
@@ -303,7 +382,8 @@ fn resume_or_reconcile_attempt(
     match run.status {
         crate::agent_core_contracts::LocalRunStatus::Queued => {
             validate_execution_binding(task)?;
-            let package = task_package(&mission.mission_id, &mission.title, task, &mission.workspace.root)?;
+            if let Some(blocked) = prepare_task_environment(store, mission, task)? { return Ok(blocked); }
+            let package = mission_task_package(store, mission, task)?;
             let input = implementation_input(mission, task);
             let runner = WorkflowRunner::open_default()?;
             execute_implementation_attempt(store, options, mission, task, &package, &input, &runner, run)
@@ -337,46 +417,31 @@ fn resume_or_reconcile_attempt(
 }
 
 fn candidate_identity(mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<Value, Box<dyn Error>> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut identity = crate::workflow::current_candidate_identity(&json!({
-        "workspace_root": mission.workspace.root, "allow_dirty": true,
-    }))?;
-    let repository = identity["candidate"]["repository_root"].as_str().ok_or("repository root missing")?;
-    let path_key = |path: &str| path.replace('\\', "/").trim_start_matches("//?/").trim_end_matches('/').to_ascii_lowercase();
-    let repository = path_key(repository);
-    let mut paths = task.read_paths.iter().chain(&task.write_paths)
-        .filter(|path| Path::new(path).is_absolute())
-        .filter(|path| {
-            let key = path_key(path);
-            key != repository && !key.starts_with(&format!("{repository}/"))
-        }).cloned().collect::<Vec<_>>();
-    paths.sort(); paths.dedup();
-    let mut hash = Sha256::new();
-    for raw in paths {
-        hash.update(raw.as_bytes()); hash.update([0]);
-        if !Path::new(&raw).exists() { hash.update(b"missing"); continue; }
-        let mut entries = walkdir::WalkDir::new(&raw).follow_links(false).into_iter()
-            .take(10_001).collect::<Result<Vec<_>, _>>()?;
-        if entries.len() > 10_000 { return Err("external candidate exceeds 10000 entries".into()); }
-        entries.sort_by(|a, b| a.path().cmp(b.path()));
-        let mut total_bytes = 0u64;
-        for entry in entries {
-            if entry.file_type().is_symlink() { return Err("external candidate symlinks require a resolved explicit path".into()); }
-            hash.update(entry.path().to_string_lossy().as_bytes()); hash.update([0]);
-            if entry.file_type().is_file() {
-                let size = entry.metadata()?.len();
-                total_bytes = total_bytes.saturating_add(size);
-                if total_bytes > 256 * 1024 * 1024 { return Err("external candidate exceeds 256 MiB".into()); }
-                hash.update(size.to_le_bytes());
-                let mut file = std::fs::File::open(entry.path())?;
-                let mut buffer = [0u8; 65536];
-                loop { let count = file.read(&mut buffer)?; if count == 0 { break; } hash.update(&buffer[..count]); }
-            }
-        }
+    crate::mission::scoped_candidate_identity(
+        Path::new(&mission.workspace.root), task.read_paths.iter().chain(&task.write_paths),
+    )
+}
+
+pub(crate) fn retry_verification(
+    mission_id: &str, task_id: &str, input: &crate::mission::MissionVerificationRetry,
+) -> Result<crate::mission::MissionView, Box<dyn Error>> {
+    let store = MissionStore::open_default()?;
+    let mission = store.get(mission_id)?;
+    let task = mission.tasks.iter().find(|task| task.spec.id == task_id).ok_or("task not found")?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger.get_run(&task.attempt_run_id)?.ok_or("implementation run missing")?;
+    if run.status != crate::agent_core_contracts::LocalRunStatus::Succeeded {
+        return Err("implementation did not succeed; a recheck cannot replace an implementation repair".into());
     }
-    identity["candidate"]["external_paths_sha256"] = json!(format!("{:x}", hash.finalize()));
-    Ok(identity)
+    store.retry_verification(mission_id, task_id, input)
+}
+
+#[tauri::command]
+pub(crate) async fn retry_mission_verification(
+    mission_id: String, task_id: String, input: crate::mission::MissionVerificationRetry,
+) -> Result<crate::mission::MissionView, String> {
+    tauri::async_runtime::spawn_blocking(move || retry_verification(&mission_id, &task_id, &input)
+        .map_err(|error| error.to_string())).await.map_err(|error| error.to_string())?
 }
 
 fn run_verification(
@@ -399,7 +464,16 @@ fn run_verification(
         .find(|event| matches!(event.event_type, crate::agent_core_contracts::RuntimeEventType::ToolCompleted))
         .map(|event| event.payload.clone())
         .unwrap_or(Value::Null);
-    let expected_verification_id = format!("workflow_run_mission_{}_{}_verify", mission.mission_id, task.id);
+    let events = store.snapshot(&mission.mission_id, 0)?.events;
+    let retry = events.iter().rev().find(|event| event.task_id == task.id && event.event_type == "verification_retry_requested");
+    let suffix = retry.and_then(|event| event.payload["request_sha256"].as_str())
+        .map(|digest| format!("_{}", &digest[..16])).unwrap_or_default();
+    let protected_baseline = events.iter().rev().find(|event| event.task_id == task.id
+        && matches!(event.event_type.as_str(), "task_baseline_captured" | "verification_retry_requested"))
+        .and_then(|event| event.payload.get("protected_baseline")).cloned().unwrap_or(Value::Null);
+    let protected_current = crate::mission::protected_files(Path::new(&mission.workspace.root), task)?;
+    let protected_files_match = !protected_baseline.is_null() && protected_baseline["files"] == protected_current;
+    let expected_verification_id = format!("workflow_run_mission_{}_{}_verify{suffix}", mission.mission_id, task.id);
     if let Some(current) = ledger.get_run(&expected_verification_id)? {
         if matches!(current.status, crate::agent_core_contracts::LocalRunStatus::Running | crate::agent_core_contracts::LocalRunStatus::Waiting) {
             return defer_dispatch(store, &mission.mission_id, &task.id, "Independent verification is active or waiting", json!({"run_id": current.run_id}));
@@ -408,15 +482,20 @@ fn run_verification(
     if store.get(&mission.mission_id)?.status != crate::mission::MissionStatus::Active {
         return Ok(json!({"dispatched": false, "reason": "Mission paused or canceled before host checks"}));
     }
+    store.append_event(&mission.mission_id, "verification_preparing", &task.id,
+        "系统正在冻结任务文件并运行必需检查，随后交给另一位专家核验", json!({"implementation_run_id": pending.attempt_run_id}))?;
+    let candidate_before = candidate_identity(mission, task)?;
     let host_checks = crate::mission::run_required_checks(
         Path::new(&mission.workspace.root), &task.required_checks,
         mission_time_remaining(mission).min(std::time::Duration::from_secs(300)),
         &|| Ok(mission_should_stop(&mission.mission_id, mission)),
     );
-    let candidate_before = candidate_identity(mission, task)?;
+    if candidate_identity(mission, task)? != candidate_before {
+        return Err("任务文件在必需检查期间发生变化，将重新准备核验".into());
+    }
     let package = verification_package(mission, task)?;
     let runner = WorkflowRunner::open_default()?;
-    let request_id = format!("mission_{}_{}_verify", mission.mission_id, task.id);
+    let request_id = format!("mission_{}_{}_verify{suffix}", mission.mission_id, task.id);
     let proposed_input = json!({
         "workspace_root": mission.workspace.root,
         "mission_id": mission.mission_id,
@@ -434,6 +513,8 @@ fn run_verification(
         "expected_plan_sha256": mission.plan_sha256,
         "candidate_before": candidate_before.get("candidate").cloned().unwrap_or(Value::Null),
         "host_checks": host_checks,
+        "protected_file_check": {"baseline": protected_baseline, "current_files": protected_current,
+            "matches": protected_files_match, "source": "host_comparison"},
     });
     let expected_run_id = format!("workflow_run_{request_id}");
     let (run, input) = if let Some(run) = ledger.get_run(&expected_run_id)? {
@@ -443,6 +524,17 @@ fn run_verification(
     } else {
         (runner.start("local-verifier", &package, &request_id, &proposed_input)?, proposed_input)
     };
+    // A recovered LocalRun keeps its original input. Test output hashes may
+    // change between identical successful executions (for example TAP timing),
+    // so validate the reviewer against the host evidence it actually received.
+    // The fresh checks above still have to pass, and the files must be unchanged.
+    let fresh_checks_passed = !host_checks.is_empty() && host_checks.iter().all(|check| check.exit_code == 0);
+    let host_checks: Vec<crate::mission::HostCheck> = serde_json::from_value(
+        input.get("host_checks").cloned().ok_or("saved verification has no host checks")?,
+    )?;
+    if candidate_identity(mission, task)?.get("candidate") != input.get("candidate_before") {
+        return Err("saved verification candidate no longer matches the task files".into());
+    }
     let candidate_before = json!({"candidate": input.get("candidate_before")});
     if input.get("expected_plan_sha256").and_then(Value::as_str) != Some(mission.plan_sha256.as_str()) {
         return Err("saved verification input is bound to an obsolete plan".into());
@@ -499,6 +591,9 @@ fn run_verification(
     let run_succeeded = outcome.run.status == crate::agent_core_contracts::LocalRunStatus::Succeeded;
     let verification_output = verification_events_output(&outcome.run.run_id)?;
     let candidate_after = candidate_identity(mission, task);
+    let negative_review = verification_output.as_ref().is_some_and(|output|
+        is_bound_negative_review(output, &task.id, &mission.plan_sha256,
+            candidate_before.get("candidate").unwrap_or(&Value::Null)));
     let validation = verification_output.as_ref().map(|value| {
         let current_candidate = candidate_after.as_ref()
             .ok()
@@ -514,12 +609,18 @@ fn run_verification(
         )
     });
     let passed = run_succeeded
+        && fresh_checks_passed
+        && protected_files_match
         && candidate_after.is_ok()
         && validation.as_ref().is_some_and(|result| result.is_ok());
     let mut final_evidence = evidence_refs;
     final_evidence.push(format!("local-run:{}", outcome.run.run_id));
     let reason = if passed {
         String::new()
+    } else if !fresh_checks_passed {
+        "系统必需检查存在失败或超时".to_string()
+    } else if !protected_files_match {
+        "缺少执行前文件基线，或只读文件已变化；请查看文件范围证据".to_string()
     } else if let Err(error) = candidate_after {
         format!("无法在独立验收后冻结 candidate identity: {error}")
     } else if let Some(Err(error)) = validation {
@@ -540,6 +641,9 @@ fn run_verification(
             "checks": host_checks,
             "candidate_before": candidate_before.get("candidate"),
             "reason": reason,
+            "reviewer_output": verification_output,
+            "protected_file_check": {"baseline": protected_baseline, "current_files": protected_current,
+                "matches": protected_files_match},
         }),
     )?;
     final_evidence.push(format!("mission-event:{}", host_event.event_id));
@@ -547,6 +651,16 @@ fn run_verification(
         &mission.mission_id, &task.id, &pending.attempt_run_id,
         &outcome.run.run_id, passed, &final_evidence, &reason,
     )?;
+    let updated = if !run_succeeded && !negative_review {
+        // A verifier that never ran is a runtime failure, not a request for the
+        // implementation expert to rewrite an already valid delivery.
+        let paused = store.control(&mission.mission_id, "pause")?;
+        store.append_event(&mission.mission_id, "verification_runtime_failed", &task.id,
+            "核验执行器未完成，任务已暂停；修复运行环境后可重试同一交付的核验",
+            json!({"error":reason,"verification_run_id":outcome.run.run_id,
+                "recovery_action":"mission.verification.retry"}))?;
+        paused
+    } else { updated };
     Ok(json!({
         "dispatched": true,
         "verification": true,
@@ -574,10 +688,22 @@ fn verification_events_output(run_id: &str) -> Result<Option<Value>, Box<dyn Err
                 }
                 output
             })
-        } else {
-            None
-        }
+        } else if matches!(event.event_type, crate::agent_core_contracts::RuntimeEventType::Error) {
+            event.payload.get("runtime_report").filter(|value| value.get("passed").is_some()).cloned()
+        } else { None }
     }))
+}
+
+fn is_bound_negative_review(output: &Value, task_id: &str, plan: &str, candidate: &Value) -> bool {
+    output.get("passed").and_then(Value::as_bool) == Some(false)
+        && output.get("plan_sha256").and_then(Value::as_str) == Some(plan)
+        && output.get("verified_task_ids").and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(task_id)))
+        && output.get("reasons").and_then(Value::as_array)
+            .is_some_and(|reasons| reasons.iter().any(|reason| reason.as_str().is_some_and(|text| !text.trim().is_empty())))
+        && ["candidate_id", "commit_sha", "tree_digest", "status_digest"].iter().all(|field|
+            candidate.get(field).and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                && output.get("candidate").and_then(|value| value.get(field)) == candidate.get(field))
 }
 
 fn validate_verification_output(
@@ -589,7 +715,11 @@ fn validate_verification_output(
     host_checks: &[crate::mission::HostCheck],
 ) -> Result<(), String> {
     if output.get("passed").and_then(Value::as_bool) != Some(true) {
-        return Err("验证 Agent 未返回 passed=true".to_string());
+        let reasons = output.get("reasons").and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).filter(|value| !value.trim().is_empty())
+                .take(10).collect::<Vec<_>>().join("；")).unwrap_or_default();
+        return Err(if reasons.is_empty() { "核验专家未给出通过结论，请查看核验记录".to_string() }
+            else { format!("核验未通过：{reasons}") });
     }
     if output.get("plan_sha256").and_then(Value::as_str) != Some(expected_plan_sha256) {
         return Err("验证证据未绑定当前 plan_sha256".to_string());
@@ -703,14 +833,38 @@ fn record_or_require_usage(
     )?)
 }
 
-fn role_entry(task: &MissionTaskSpec) -> Value {
+fn role_entry(task: &MissionTaskSpec) -> Result<Value, Box<dyn Error>> {
+    let instructions = task.execution.expert.as_ref()
+        .map(crate::mission::expert_instructions).transpose()?.unwrap_or_default();
+    Ok(
     json!({
         "label": task.execution.role_id,
-        "brief": format!("你是专家团队中的 {}。只负责当前任务，不扩大范围，不自行宣布最终通过。", task.execution.role_id),
+        "brief": format!("你是专家团队中的 {}。只负责当前任务，不扩大范围，不自行宣布最终通过。", task.execution.role_id) + "\n" + &instructions
+            + "\n本次任务契约与授权范围优先于专家方法。使用已固定的专家指令，不加载宿主中未固定的外部技能；方法要求与任务约束冲突时遵守任务约束，如实记录能力限制。",
         "runtime_provider": task.execution.executor,
         "model": task.execution.model,
         "tool_policy": "default",
-    })
+    }))
+}
+
+fn mission_task_package(store: &MissionStore, mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<WorkflowPackage, Box<dyn Error>> {
+    let mut package = task_package(&mission.mission_id, &mission.title, task, &mission.workspace.root)?;
+    for step in &mut package.steps {
+        if let Some(runtime) = &mut step.runtime {
+            runtime.timeout_seconds = mission_time_remaining(mission).as_secs().max(1);
+        }
+    }
+    if crate::workflow::supports_full_access(&task.execution.executor) {
+        let mode = store.runtime_mode(&mission.mission_id, &mission.plan_sha256)?;
+        if mode == "files_only" && task.execution.executor == "himind.builtin" {
+            if let Some(role) = package.roles.get_mut(&task.execution.role_id) { role.tool_policy = "files_only".to_string(); }
+        } else if mode == "full_access" {
+            for step in &mut package.steps {
+                if let Some(runtime) = &mut step.runtime { runtime.permission_mode = "full_access".into(); }
+            }
+        }
+    }
+    Ok(package)
 }
 
 fn task_package(
@@ -720,7 +874,7 @@ fn task_package(
     workspace_root: &str,
 ) -> Result<WorkflowPackage, Box<dyn Error>> {
     let prompt = format!(
-        "你是专家团队的{}。只执行下面这一项任务，不扩大范围。\n任务：{}\n目标：{}\n允许读取：{}\n允许写入：{}\n验收：{}\n必须检查：{}\n绝对路径必须严格限于宿主确认记录中的授权范围；Mission 授权是业务策略，不代表操作系统沙箱。\n完成后输出 JSON：{{\"passed\":true|false,\"summary\":\"...\",\"evidence\":[\"...\"]}}。自报 passed 只是送验建议，最终由宿主检查。",
+        "你是专家团队的{}。只执行下面这一项任务，不扩大范围。\n任务：{}\n目标：{}\n允许读取：{}\n允许写入：{}\n验收：{}\n必须检查：{}\n绝对路径必须严格限于宿主确认记录中的授权范围；Mission 授权是业务策略，不代表操作系统沙箱。\n完成后输出 JSON：{{\"passed\":true|false,\"summary\":\"...\",\"evidence\":[\"...\"]}}。本阶段 passed 只表示当前任务交付是否就绪、必需检查是否真实通过，是送验建议，不代表 Mission 或独立验收已通过。宿主将在本阶段成功结束后另行启动正式 VERIFY；不要因正式 VERIFY 尚未运行而把已就绪的本阶段交付判为失败，也不得自行调用或冒充宿主 VERIFY。交付未完成、必需检查失败或证据不足时必须如实返回 false。",
         task.execution.role_id,
         task.title,
         task.objective,
@@ -737,7 +891,7 @@ fn task_package(
         "description": "Mission task attempt",
         "min_agent_version": "0.3.90",
         "supported_runtimes": [task.execution.executor.clone()],
-        "roles": { task.execution.role_id.clone(): role_entry(task) },
+        "roles": { task.execution.role_id.clone(): role_entry(task)? },
         "steps": [{
             "id": task.id,
             "title": task.title,
@@ -768,6 +922,7 @@ fn verification_package(
         "你是独立验证 Agent，不得修改代码，不得相信开发 Agent 自报通过。检查任务 {} 的实际改动、验收标准和必需检查。只读审查。输入 host_checks 是宿主在当前候选上实际执行的独立检查记录，含退出码、输出哈希和经脱敏的测试摘要；它是宿主证据，不是 worker 自报。你必须在输出 checks 中逐条引用这些宿主记录：command 与 exit_code 原样复制，detail 注明 source=host 并引用对应输出哈希。若客户端沙箱能实际执行检查，也可以额外提供执行结果；若不能，不得伪造 worker 执行，也不得因此拒绝宿主已核验且与当前 candidate 绑定的全绿检查。仍须独立检查代码、授权范围和完成标准；宿主检查全绿不自动代表全部标准满足。只输出 JSON：{{\"passed\":true|false,\"verified_task_ids\":[\"{}\"],\"plan_sha256\":\"复制输入中的 expected_plan_sha256\",\"candidate\":{{\"candidate_id\":\"复制输入 candidate_before.candidate_id\",\"commit_sha\":\"复制输入 candidate_before.commit_sha\",\"tree_digest\":\"复制输入 candidate_before.tree_digest\",\"status_digest\":\"复制输入 candidate_before.status_digest\"}},\"checks\":[{{\"command\":\"宿主检查命令原样\",\"exit_code\":0,\"detail\":\"source=host; output_sha256=...\"}}],\"reasons\":[]}}。每一条 checks 必须能追溯到宿主记录或真实执行结果且 exit_code 为 0；没有任务覆盖、当前计划 hash 或 candidate identity 时 passed 必须为 false。",
         task.id, task.id
     );
+    let prompt = format!("核验工具边界：用 read/glob/grep 等文件工具读取授权范围内的代码和测试，不加载技能，不调用Shell/Git，不请求提权、不重试权限失败。必需检查已由宿主执行，请引用输入的 host_checks 与 candidate_before。输入 protected_file_check 对照执行前基线检查只读文件；provenance=host_before_execution 是宿主执行前记录，source_client_pre_run_attestation 是来源客户端启动前记录的明确署名声明，宿主仅验证本次对照一致，不得称其为宿主历史观测。matches=true 可作为该来源范围内的文件未改证据，仍需独立检查实现和标准。matches=false 或基线缺失必须不通过。本阶段仅检查当前任务 required_checks，不将尚未执行的后续任务交付物当成本阶段失败项。完成文件审阅后直接返回核验JSON。\n{prompt}");
     let value = json!({
         "schema_version": "workflow_package.v1",
         "id": format!("com.himind.mission.verify.{}", mission.mission_id),
@@ -776,6 +931,13 @@ fn verification_package(
         "description": "Independent verification attempt",
         "min_agent_version": "0.3.90",
         "supported_runtimes": [task.execution.executor.clone()],
+        "roles": { "verifier": {
+            "label": "独立验证",
+            "brief": "你是独立验证 Agent，只读核验实现结果，不继承实现职责的方法约束，不得相信开发 Agent 自报通过。",
+            "runtime_provider": task.execution.executor,
+            "model": task.execution.model,
+            "tool_policy": "default"
+        } },
         "steps": [{
             "id": "VERIFY",
             "title": "独立验证",
@@ -789,7 +951,7 @@ fn verification_package(
                 "workspace_path": mission.workspace.root,
                 "model": task.execution.model,
                 "tool_policy": "default",
-                "timeout_seconds": 900
+                "timeout_seconds": mission_time_remaining(mission).as_secs().max(1)
             }
         }],
         "artifacts": [],
@@ -803,6 +965,80 @@ mod tests {
     use super::validate_verification_output;
     use serde_json::json;
 
+    #[test]
+    fn verification_prompt_compacts_manifests_without_changing_host_evidence() {
+        let files = (0..600).map(|i| (format!("source/path-{i:04}.rs"), json!("a".repeat(64))))
+            .collect::<serde_json::Map<_, _>>();
+        let input = json!({"protected_file_check": {"baseline":{"provenance":"host_before_execution","files":files},
+            "current_files":files,"matches":false}, "host_checks":[{"command":"python contracts/check.py visual","exit_code":0,"output_sha256":"b".repeat(64)}],
+            "expected_plan_sha256":"c".repeat(64),"candidate_before":{"tree_digest":"d".repeat(64)},
+            "implementation_output":{"summary":"x".repeat(64000)},
+            "workflow_context":{"input":{"protected_file_check":{"files":files}},"run":{"run_id":"verify-run"}}});
+        let projected = super::verification_prompt_input(&input);
+        assert!(serde_json::to_vec(&projected).unwrap().len() < 6000);
+        assert_eq!(projected["host_checks"], input["host_checks"]);
+        assert_eq!(projected["candidate_before"], input["candidate_before"]);
+        assert_eq!(projected["expected_plan_sha256"], input["expected_plan_sha256"]);
+        assert_eq!(projected["protected_file_check"]["matches"], false);
+        assert_eq!(projected["protected_file_check"]["baseline"]["manifest"]["file_count"], 600);
+        assert_eq!(projected["workflow_context"]["run"]["run_id"], "verify-run");
+        assert_eq!(input["protected_file_check"]["baseline"]["files"].as_object().unwrap().len(), 600);
+        assert_eq!(super::verification_prompt_input(&projected), projected);
+    }
+
+    #[test]
+    fn confirmed_full_access_reaches_acp_task_runtime() {
+        let root = std::env::temp_dir().join(format!("acp-mission-permission-{}", rand::random::<u64>()));
+        let store = crate::mission::MissionStore::new(root.join("missions.sqlite3"));
+        for provider in ["acp.claude", "acp.opencode"] {
+            let input = serde_json::from_value(json!({"title":"ACP permission test", "workspace":{"root":"F:/isolated", "permission_mode":"full_access", "write_scope":["sum.mjs"]}})).unwrap();
+            let created = store.create(&input).unwrap();
+            let task: crate::mission::MissionTaskSpec = serde_json::from_value(json!({"id":"work", "title":"Work", "write_paths":["sum.mjs"], "acceptance_criteria":["correct sum"], "required_checks":["node test.mjs"], "execution":{"executor":provider,"role_id":"implementer"}})).unwrap();
+            let plan: crate::mission::MissionPlanProposal = serde_json::from_value(json!({"summary":"permission propagation", "tasks":[task], "required_acceptance":["correct sum"], "budget":{"max_rounds":2,"max_minutes":10,"max_repair_attempts":0}})).unwrap();
+            let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
+            let active = store.confirm_plan(&created.mission_id, &planned.plan_sha256, &["work".into()], &["sum.mjs".into()], &[], &[], "test-user").unwrap();
+            let package = super::mission_task_package(&store, &active, &task).unwrap();
+            assert_eq!(package.steps[0].runtime.as_ref().unwrap().permission_mode, "full_access");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_package_uses_selected_expert_and_rejects_installed_digest_drift() {
+        let _lock = crate::store::paths::test_env_lock();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match self.0.as_ref() {
+                    Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+                    None => std::env::remove_var("HIMIND_AGENT_HOME"),
+                }
+            }
+        }
+        let home = std::env::temp_dir().join(format!("mission-expert-package-{}", rand::random::<u64>()));
+        let _restore = RestoreHome(std::env::var_os("HIMIND_AGENT_HOME"));
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
+        let expert = crate::expert::save(serde_json::from_value(json!({
+            "id":"com.himind.expert.package-test", "name":"测试专家", "version":"1.0.0",
+            "instructions":"PACKAGE_EXPERT_METHOD: inspect concrete evidence"
+        })).unwrap()).unwrap();
+        let task: crate::mission::MissionTaskSpec = serde_json::from_value(json!({
+            "id":"work", "title":"Work", "execution":{
+                "executor":"himind.builtin", "role_id":"reviewer", "service_id":"svc", "model":"himind:svc:model",
+                "expert":{"expert_id":expert.id,"expert_version":expert.version,"expert_digest":expert.digest}
+            }
+        })).unwrap();
+        let package = super::task_package("mission_test", "Test", &task, "F:/fixture").unwrap();
+        assert!(package.roles["reviewer"].brief.contains("PACKAGE_EXPERT_METHOD"));
+        assert_eq!(package.steps[0].runtime.as_ref().unwrap().model, task.execution.model);
+        let path = home.join("experts").join(&expert.id).join("versions").join(&expert.version).join("expert.json");
+        let mut definition: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        definition["instructions"] = json!("CHANGED_METHOD");
+        std::fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+        assert!(super::task_package("mission_test", "Test", &task, "F:/fixture").is_err());
+        // The test writes only its own randomly named temporary expert store.
+    }
+
     fn candidate() -> serde_json::Value {
         json!({
             "candidate_id": "candidate-1",
@@ -810,6 +1046,20 @@ mod tests {
             "tree_digest": "tree-1",
             "status_digest": "status-1"
         })
+    }
+
+    #[test]
+    fn negative_review_must_bind_the_task_plan_and_candidate() {
+        let mut review = output();
+        review["passed"] = json!(false);
+        review["reasons"] = json!(["实际交付缺少错误状态"]);
+        assert!(super::is_bound_negative_review(&review, "fix", "plan-1", &candidate()));
+        assert!(!super::is_bound_negative_review(&review, "other", "plan-1", &candidate()));
+        assert!(!super::is_bound_negative_review(&review, "fix", "stale-plan", &candidate()));
+        review["candidate"]["tree_digest"] = json!("stale-tree");
+        assert!(!super::is_bound_negative_review(&review, "fix", "plan-1", &candidate()));
+        assert!(!super::is_bound_negative_review(&output(), "fix", "plan-1", &candidate()));
+        assert!(!super::is_bound_negative_review(&json!({"passed":false}), "fix", "plan-1", &candidate()));
     }
 
     fn output() -> serde_json::Value {
@@ -829,6 +1079,9 @@ mod tests {
     #[test]
     fn verification_evidence_requires_host_bound_identity_and_successful_checks() {
         let candidate = candidate();
+        let reason = validate_verification_output(&json!({"passed":false,"reasons":["README 缺少执行前基线"]}),
+            "fix", "plan-1", &candidate, &candidate, &[]).unwrap_err();
+        assert!(reason.contains("README 缺少执行前基线"));
         let host_checks = vec![crate::mission::HostCheck {
             command: "cargo test".to_string(),
             exit_code: 0,

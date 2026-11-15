@@ -1,0 +1,67 @@
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const base = process.cwd();
+const out = resolve(base,'target/workspace-ui-audit-20261111');
+mkdirSync(out,{recursive:true});
+const {createServer} = await import(pathToFileURL(resolve(base,'frontend/node_modules/vite/dist/node/index.js')));
+const {default:react} = await import(pathToFileURL(resolve(base,'frontend/node_modules/@vitejs/plugin-react/dist/index.js')));
+const {chromium} = await import(pathToFileURL(resolve(base,'target/session-history-playwright/node_modules/playwright/index.mjs')));
+const fixtureUrl = '/@fs/' + encodeURI(resolve(out,'fixture.tsx').replaceAll('\\','/'));
+const server = await createServer({root:resolve(base,'frontend'),configFile:false,plugins:[react(),{name:'workspace-review-fixture',configureServer(vite){vite.middlewares.use('/__workspace-review',async(req,res,next)=>{if(new URL(req.url||'/','http://local').pathname!=='/')return next();res.setHeader('Content-Type','text/html; charset=utf-8');res.end(await vite.transformIndexHtml('/__workspace-review','<!doctype html><html lang="zh-CN"><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"></head><body><div id="root"></div><script type="module" src="'+fixtureUrl+'"></script></body></html>'));});}}],server:{host:'127.0.0.1',port:5195,fs:{allow:[base]}}});
+await server.listen();
+const browser = await chromium.launch({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+const page = await browser.newPage({viewport:{width:1280,height:900}});
+const origin='http://127.0.0.1:'+server.httpServer.address().port;
+const report={scope:'Current source rendered with real components and synthetic data; no persistent mutations',errors:[],layouts:[],modal:{},states:{}};
+page.on('pageerror',e=>{report.errors.push(e.message);console.error('PAGE',e.message);});
+page.on('console',e=>{if(e.type()==='error')console.error('BROWSER',e.text());});
+page.on('requestfailed',r=>console.error('REQUEST',r.url(),r.failure()));
+async function open(scenario='normal'){const wrapper=page.viewportSize().width>=1024?'shell':'isolated';await page.goto(origin+'/__workspace-review?scenario='+scenario+'&wrapper='+wrapper);await page.locator('.workspace-registry-head').waitFor();if(scenario!=='registry-error')await page.locator('.workspace-registry-project-layout').waitFor();}
+async function layout(label){return await page.evaluate(label=>{const metrics=s=>{const e=document.querySelector(s);if(!e)return null;const r=e.getBoundingClientRect(),c=getComputedStyle(e);return {x:r.x,y:r.y,width:r.width,height:r.height,scrollWidth:e.scrollWidth,clientWidth:e.clientWidth,fontSize:c.fontSize,color:c.color,background:c.backgroundColor,overflow:c.overflow};};return {label,viewport:innerWidth,documentWidth:document.documentElement.scrollWidth,bodyWidth:document.body.scrollWidth,detail:metrics('.workspace-registry-project-detail'),history:metrics('.workspace-session-history'),tools:metrics('.workspace-session-history-tools'),overflow:[...document.querySelectorAll('.workspace-registry *')].map(e=>({e,r:e.getBoundingClientRect()})).filter(x=>x.r.right>innerWidth+1&&x.r.width>0).slice(0,12).map(x=>({selector:x.e.className,tag:x.e.tagName,right:x.r.right,width:x.r.width})),smallText:[...document.querySelectorAll('.workspace-registry strong,.workspace-registry small,.workspace-registry code,.workspace-registry span')].filter(e=>e.getBoundingClientRect().height>0&&parseFloat(getComputedStyle(e).fontSize)<12).slice(0,15).map(e=>({selector:e.className||e.parentElement.className,size:getComputedStyle(e).fontSize,text:e.textContent.slice(0,35)}))};},label);}
+try{
+  for(const width of [1280,1024,768,560,400,320]){await page.setViewportSize({width,height:900});await open();await page.locator('.workspace-session-history-row').first().waitFor();report.layouts.push(await layout('projects-'+width));await page.screenshot({path:resolve(out,'projects-'+width+'.png'),fullPage:width>=1024});}
+  await page.setViewportSize({width:1024,height:900});await open();
+  await page.getByRole('button',{name:'预览会话：Synthetic session 001',exact:true}).click();
+  await page.locator('.workspace-session-history-message').first().waitFor();
+  report.states.preview=await page.evaluate(()=>{const e=document.querySelector('.workspace-session-history-preview'),r=e.getBoundingClientRect();return {top:r.top,bottom:r.bottom,viewportHeight:innerHeight,visible:r.top<innerHeight&&r.bottom>0,active:document.activeElement.getAttribute('aria-label'),mainScroll:document.querySelector('.main-content').scrollTop,bodyScroll:scrollY};});
+  await page.screenshot({path:resolve(out,'preview-after-click.png')});
+  await page.getByRole('button',{name:'关闭预览',exact:true}).click();
+  report.states.previewAfterClose=await page.evaluate(()=>({tag:document.activeElement.tagName,label:document.activeElement.getAttribute('aria-label')}));
+  await open();
+  await page.getByRole('button',{name:'新建项目',exact:true}).click();
+  report.modal.afterOpen = await page.evaluate(()=>({activeTag:document.activeElement.tagName,activeText:document.activeElement.textContent.slice(0,40),inside:!!document.activeElement.closest('[role=dialog]')}));
+  await page.keyboard.press('Escape');report.modal.escapeClosed=await page.getByRole('dialog').count()===0;
+  await page.screenshot({path:resolve(out,'editor-1024.png')});
+  const inputs=page.getByRole('dialog').locator('input,select,textarea,button');await inputs.last().focus();await page.keyboard.press('Tab');report.modal.tabAfterLast=await page.evaluate(()=>({inside:!!document.activeElement.closest('[role=dialog]'),tag:document.activeElement.tagName,text:document.activeElement.textContent.slice(0,45)}));
+  await page.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();
+  report.modal.afterClose=await page.evaluate(()=>({tag:document.activeElement.tagName,text:document.activeElement.textContent.slice(0,40)}));
+  await page.getByRole('button',{name:'新建项目',exact:true}).click();
+  await page.getByRole('dialog').getByLabel('显示名称',{exact:true}).fill('合成项目');
+  await page.getByRole('dialog').getByRole('button',{name:'新建项目',exact:true}).click();
+  await page.locator('.workspace-registry-alert.error').waitFor();
+  report.modal.saveError=await page.evaluate(()=>{const e=document.querySelector('.workspace-registry-alert.error'),r=e.getBoundingClientRect();return {text:e.textContent,inside:!!e.closest('[role=dialog]'),role:e.getAttribute('role'),x:r.x,y:r.y,right:r.right,dialogLeft:document.querySelector('[role=dialog]').getBoundingClientRect().left};});
+  await page.screenshot({path:resolve(out,'editor-error.png')});
+  await page.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();
+  await page.getByRole('tab',{name:/目录清单/}).click();report.states.directory1024=await layout('directories-1024');
+  report.states.smallTargets=await page.locator('.workspace-registry button').evaluateAll(es=>es.map(e=>({text:e.textContent,rect:e.getBoundingClientRect()})).filter(x=>x.rect.height>0&&(x.rect.width<24||x.rect.height<24)).map(x=>({text:x.text,width:x.rect.width,height:x.rect.height})));
+  await page.setViewportSize({width:320,height:900});await open();await page.getByRole('tab',{name:/目录清单/}).click();report.states.directory320=await layout('directories-320');await page.screenshot({path:resolve(out,'directories-320.png')});
+  await open();
+  await page.getByRole('tab',{name:/待确认目录/}).click();report.states.pending320=await layout('pending-320');await page.screenshot({path:resolve(out,'pending-320.png')});
+  await page.setViewportSize({width:1024,height:900});await open();
+  await page.getByRole('tab',{name:/待确认目录/}).focus();await page.keyboard.press('ArrowLeft');report.states.keyboardTab=await page.evaluate(()=>({active:document.activeElement.textContent,selected:document.activeElement.getAttribute('aria-selected')}));
+  await page.getByRole('tab').nth(0).focus();await page.keyboard.press('Tab');report.states.keyboardAfterProjectTab=await page.evaluate(()=>({tag:document.activeElement.tagName,label:document.activeElement.getAttribute('aria-label')}));
+  await page.getByRole('tab').nth(0).click();await page.getByRole('searchbox',{name:'搜索项目、别名或目录'}).fill('不存在的合成项目');report.states.noProjectMatch=await page.locator('.workspace-registry-tree-empty').textContent();
+  await page.getByRole('searchbox',{name:'搜索项目、别名或目录'}).fill('');await page.getByRole('searchbox',{name:'搜索会话标题或目录',exact:true}).fill('nonexisting-synthetic-session');await page.locator('.workspace-session-history-empty').waitFor();report.states.noSessionMatch=await page.locator('.workspace-session-history-empty').textContent();
+  await page.setViewportSize({width:1024,height:900});await open('history-error');await page.getByRole('alert').waitFor();report.states.historyError=await page.getByRole('alert').textContent();await page.screenshot({path:resolve(out,'history-error.png')});
+  await open('wire-source');await page.locator('.workspace-session-history-source-state').first().waitFor();report.states.wireSources=await page.locator('.workspace-session-history-source-state').allTextContents();await page.screenshot({path:resolve(out,'wire-source.png')});
+  await open('slow-refresh');const t=Date.now();await page.getByRole('button',{name:'刷新工作区'}).click();await page.waitForTimeout(200);report.states.refresh={afterMs:Date.now()-t,disabled:await page.getByRole('button',{name:'刷新工作区'}).isDisabled(),ariaBusy:await page.locator('.workspace-registry').getAttribute('aria-busy'),loadingVisible:await page.getByText('读取工作区',{exact:true}).count()};await page.waitForTimeout(2200);
+  await open('empty');report.states.emptyText=await page.locator('.workspace-registry-no-projects').textContent();await page.screenshot({path:resolve(out,'empty.png')});
+  await open('registry-error');report.states.registryError=await page.locator('.workspace-registry-alert.error').textContent();report.states.registryErrorRole=await page.locator('.workspace-registry-alert.error').getAttribute('role');
+  await open();await page.emulateMedia({colorScheme:'dark'});report.states.darkMode=await page.evaluate(()=>({colorScheme:getComputedStyle(document.documentElement).colorScheme,bg:getComputedStyle(document.body).backgroundColor}));
+  await page.emulateMedia({colorScheme:'light'});
+  await page.evaluate(()=>{const s=document.createElement('style');s.textContent='* { line-height:1.5!important;letter-spacing:.12em!important;word-spacing:.16em!important } p {margin-block-end:2em!important}';document.head.append(s);});report.states.textSpacing=await layout('text-spacing-1024');await page.screenshot({path:resolve(out,'text-spacing.png')});
+  await open();await page.evaluate(()=>{document.documentElement.style.zoom='2';});report.states.zoom200=await layout('css-zoom-200-percent');await page.screenshot({path:resolve(out,'zoom200.png')});
+  report.generatedAt=new Date().toISOString();
+  writeFileSync(resolve(out,'result.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({layouts:report.layouts.map(x=>({label:x.label,viewport:x.viewport,doc:x.documentWidth,detail:x.detail?.width,tools:x.tools?.width,overflow:x.overflow.length})),modal:report.modal,states:{preview:report.states.preview,smallTargets:report.states.smallTargets,historyError:report.states.historyError,wireSources:report.states.wireSources,refresh:report.states.refresh,darkMode:report.states.darkMode},errors:report.errors},null,2));
+}catch(error){console.error('AUDIT',error.message);writeFileSync(resolve(out,'partial-result.json'),JSON.stringify(report,null,2));console.error((await page.locator('body').innerText()).slice(0,5000));await page.screenshot({path:resolve(out,'harness-failure.png')});throw error;}finally{await browser.close();await server.close();}

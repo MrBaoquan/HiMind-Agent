@@ -619,3 +619,172 @@ fn registry_file_lives_under_data_for_backup_coverage() {
     );
     assert!(path.ends_with("workspace-registry.json"));
 }
+
+// ---------------------------------------------------------------------------
+// 从工作日志导入
+// ---------------------------------------------------------------------------
+
+fn work_log_fixture() -> WorkLogFile {
+    WorkLogFile {
+        schema_version: "work-log-projects.v2".to_string(),
+        projects: vec![
+            WorkLogProject {
+                id: "pj-1".to_string(),
+                name: "扩展仓库".to_string(),
+                aliases: vec!["himind-extensions".to_string()],
+                kind: "平台产品".to_string(),
+                status: "active".to_string(),
+                external_id: "prj_abc".to_string(),
+                paths: vec![WorkLogPath {
+                    path: "F:/WebProjects/himind-extensions".to_string(),
+                    kind: "repo".to_string(),
+                }],
+            },
+            WorkLogProject {
+                id: "pj-2".to_string(),
+                name: "没有路径的项目".to_string(),
+                kind: "交付项目".to_string(),
+                status: "active".to_string(),
+                ..Default::default()
+            },
+            WorkLogProject {
+                id: "pj-3".to_string(),
+                name: "路径被抢的项目".to_string(),
+                kind: "未知分类".to_string(),
+                paths: vec![
+                    WorkLogPath {
+                        path: "F:/WebProjects/himind-extensions".to_string(),
+                        kind: "repo".to_string(),
+                    },
+                    WorkLogPath {
+                        path: "relative/not/absolute".to_string(),
+                        kind: "repo".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+    }
+}
+
+#[test]
+fn import_plan_flags_conflicts_and_maps_kinds_without_writing() {
+    let (_dir, path) = temp_registry();
+    let registry = Registry::default();
+    let mut plan = plan_work_log_import(&registry, &work_log_fixture());
+
+    assert_eq!(plan.total_projects, 3);
+    assert_eq!(plan.create_count, 3, "登记表为空时三条都是新建");
+    assert_eq!(plan.bind_count, 1, "只有第一条路径可绑定");
+    // 被抢的路径 + 相对路径各跳过一条。
+    assert_eq!(plan.skipped_paths.len(), 2);
+    assert!(
+        plan.skipped_paths
+            .iter()
+            .any(|item| item.note.contains("本批次的项目")),
+        "冲突说明要指出撞的是谁：{:?}",
+        plan.skipped_paths
+    );
+    assert!(plan
+        .skipped_paths
+        .iter()
+        .any(|item| item.note.contains("不是绝对路径")));
+
+    // 类型映射：认不出的落 other 并留一条说明。
+    let unknown = plan
+        .entries
+        .iter()
+        .find(|item| item.work_log_id == "pj-3")
+        .unwrap();
+    assert_eq!(unknown.kind, KIND_OTHER);
+    assert!(unknown.notes.iter().any(|note| note.contains("没有对应项")));
+
+    // 没有路径的项目也要留一条说明，而不是静默变成空项目。
+    let empty = plan
+        .entries
+        .iter()
+        .find(|item| item.work_log_id == "pj-2")
+        .unwrap();
+    assert!(empty.notes.iter().any(|note| note.contains("没有路径")));
+
+    // dry-run 不写盘：计划生成过，登记表文件仍不存在。
+    assert!(!path.exists(), "dry-run 不应写盘");
+    plan.dry_run = true;
+}
+
+#[test]
+fn import_applies_identity_bindings_and_links() {
+    let (_dir, path) = temp_registry();
+    let source = work_log_fixture();
+    let mut plan = None;
+    Registry::update_at(&path, |registry| {
+        let computed = plan_work_log_import(registry, &source);
+        apply_work_log_import(registry, &source, &computed)?;
+        plan = Some(computed);
+        Ok(())
+    })
+    .unwrap();
+    assert!(plan.is_some());
+
+    let registry = Registry::load_from(&path).unwrap();
+    assert_eq!(registry.projects.len(), 3);
+
+    let imported = registry.find_project("扩展仓库").expect("项目应已导入");
+    assert_eq!(imported.kind, KIND_PRODUCT);
+    assert_eq!(imported.links.work_log_project_id, "pj-1");
+    assert_eq!(imported.links.work_log_project_name, "扩展仓库");
+    assert_eq!(imported.links.workbench_project_id, "prj_abc");
+    assert!(imported.description.contains("平台产品"));
+
+    let bindings = registry.workspaces_of(&imported.id);
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source, SOURCE_IMPORT);
+    assert_eq!(bindings[0].confidence, CONFIDENCE_EXACT);
+
+    // 导入后能按路径解析出项目——这是这次迁移真正的目的。
+    let hit = resolve_path(&registry, "F:/WebProjects/himind-extensions/plugins/x")
+        .unwrap()
+        .expect("导入的绑定应能解析");
+    assert_eq!(hit.project.id, imported.id);
+}
+
+#[test]
+fn import_merges_into_existing_project_without_renaming_it() {
+    let (_dir, path) = temp_registry();
+    // 先在登记表里放一个同名项目，名字与工作日志不同（用户后来改过）。
+    Registry::update_at(&path, |registry| {
+        upsert_project(
+            registry,
+            ProjectInput {
+                name: "扩展仓库".to_string(),
+                aliases: vec!["旧别名".to_string()],
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+
+    let source = work_log_fixture();
+    Registry::update_at(&path, |registry| {
+        let plan = plan_work_log_import(registry, &source);
+        assert_eq!(plan.merge_count, 1);
+        apply_work_log_import(registry, &source, &plan)
+    })
+    .unwrap();
+
+    let registry = Registry::load_from(&path).unwrap();
+    let merged = registry.find_project("扩展仓库").unwrap();
+    // 名字不被覆盖，别名是并集，链接补上。
+    assert_eq!(merged.aliases.iter().any(|item| item == "旧别名"), true);
+    assert_eq!(
+        merged
+            .aliases
+            .iter()
+            .any(|item| item == "himind-extensions"),
+        true
+    );
+    assert_eq!(merged.links.work_log_project_id, "pj-1");
+    // 项目总数 = 原有 1 + 另外两条新建。
+    assert_eq!(registry.projects.len(), 3);
+}

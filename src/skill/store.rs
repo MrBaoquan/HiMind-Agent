@@ -568,6 +568,7 @@ impl SkillStore {
             icon,
             current: current_pointer.is_some(),
             previous_version,
+            development: false,
         }))
     }
 }

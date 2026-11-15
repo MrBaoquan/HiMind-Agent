@@ -154,7 +154,7 @@ fn handle_service_connection(
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let hello: ServiceFrame = read_frame(&mut reader)?.ok_or("MCP bridge closed before hello")?;
-    let _client = match hello {
+    let client = match hello {
         ServiceFrame::Hello {
             protocol_version,
             token: client_token,
@@ -209,6 +209,7 @@ fn handle_service_connection(
         String::new(),
         Some(registry_updates),
     );
+    server.inherit_runtime_lease(&client)?;
     loop {
         let Some(frame) = read_frame(&mut reader)? else {
             break;

@@ -48,7 +48,8 @@ pub(crate) fn execute_runtime_step(
         });
     // auto 的含义是「挑一个能干这活的本机 Runtime」——干不了的就不该成为候选。
     // 传 tool_policy 进去，让 none 约束参与候选筛选，而不是先挑中再报错。
-    let provider = resolve_provider(provider_name, tool_policy)?;
+    let provider = resolve_provider(if runtime.permission_mode == "full_access" && provider_name == "auto" { "himind.builtin" } else { provider_name }, tool_policy)?;
+    super::validate_runtime_permission_mode(&provider, &runtime.permission_mode)?;
     enforce_runtime_network_policy(&provider, runtime.allow_network)?;
     let disable_tools = enforce_runtime_tool_policy(&provider, tool_policy)?;
     enforce_model_namespace(&provider, model_alias)?;
@@ -141,7 +142,7 @@ pub(crate) fn execute_runtime_step(
                 run_id,
                 step.id.as_str(),
                 model_alias,
-                workflow_access_for_risk(&step.risk_level),
+                workflow_access_with_permission(&step.risk_level, tool_policy, &runtime.permission_mode),
                 is_canceled,
             )?;
             // 把“实际用了哪个模型/哪类服务”写进步骤输出，随运行事实一起留痕。
@@ -164,6 +165,7 @@ pub(crate) fn execute_runtime_step(
                 timeout_seconds,
                 run_id,
                 acp_model,
+                &runtime.permission_mode,
                 options,
                 is_canceled,
             )?;
@@ -187,6 +189,7 @@ pub(crate) fn execute_runtime_step(
                 "denied_client_methods": execution.denied_client_methods,
                 "log_path": execution.log_path,
             }));
+            usage = execution.usage;
             execution.final_text
         }
         value => return Err(format!("unsupported workflow runtime provider: {value}").into()),
@@ -297,7 +300,10 @@ fn resolve_provider(provider: &str, tool_policy: &str) -> Result<String, Box<dyn
     // 否则会出现「auto 挑中 codex，运行到一半报 cannot enforce tool_policy=none」——
     // 那是最难排查的一类失败：预检说能动、真跑才炸。
     let require_no_tools = tool_policy.trim() == "none";
-    let candidate_ok = |name: &str| !require_no_tools || super::runtime_supports_tool_none(name);
+    let candidate_ok = |name: &str| {
+        if tool_policy.trim() == "files_only" { name == "himind.builtin" }
+        else { !require_no_tools || super::runtime_supports_tool_none(name) }
+    };
 
     if std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1")
         && candidate_ok("himind.fixture")
@@ -406,6 +412,22 @@ fn workflow_access_for_risk(risk_level: &str) -> crate::runtime::deepseek_harnes
     }
 }
 
+fn workflow_access_for_policy(risk_level: &str, tool_policy: &str) -> crate::runtime::deepseek_harness::WorkflowAccess {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match (workflow_access_for_risk(risk_level), tool_policy.trim()) {
+        (WorkflowAccess::Write, "files_only") => WorkflowAccess::FilesOnly,
+        (access, _) => access,
+    }
+}
+
+fn workflow_access_with_permission(risk_level: &str, tool_policy: &str, permission_mode: &str) -> crate::runtime::deepseek_harness::WorkflowAccess {
+    use crate::runtime::deepseek_harness::WorkflowAccess;
+    match workflow_access_for_policy(risk_level, tool_policy) {
+        WorkflowAccess::Write if permission_mode == "full_access" => WorkflowAccess::Full,
+        access => access,
+    }
+}
+
 fn enforce_runtime_network_policy(
     provider: &str,
     allow_network: Option<bool>,
@@ -428,6 +450,7 @@ fn enforce_runtime_network_policy(
 fn enforce_runtime_tool_policy(provider: &str, tool_policy: &str) -> Result<bool, Box<dyn Error>> {
     match tool_policy.trim() {
         "" | "default" => Ok(false),
+        "files_only" if provider == "himind.builtin" => Ok(false),
         "none" => {
             // 与预检共用同一份判据：预检说能跑、运行期才拒绝，是最难排查的一类失败。
             if super::runtime_supports_tool_none(provider) {
@@ -932,6 +955,18 @@ mod tests {
     }
 
     #[test]
+    fn files_only_policy_cannot_escalate_read_or_use_external_providers() {
+        use crate::runtime::deepseek_harness::WorkflowAccess;
+        assert_eq!(workflow_access_for_policy("R2", "files_only"), WorkflowAccess::FilesOnly);
+        assert_eq!(workflow_access_for_policy("R1", "files_only"), WorkflowAccess::Read);
+        assert_eq!(workflow_access_for_policy("R2", "default"), WorkflowAccess::Write);
+        assert!(!enforce_runtime_tool_policy("himind.builtin", "files_only").unwrap());
+        for provider in ["personal.codex", "personal.github-copilot", "acp.claude"] {
+            assert!(enforce_runtime_tool_policy(provider, "files_only").is_err());
+        }
+    }
+
+    #[test]
     fn tool_policy_none_requires_a_provider_that_can_honor_it() {
         assert_eq!(
             enforce_runtime_tool_policy("himind.builtin", "none").unwrap(),
@@ -1147,6 +1182,18 @@ mod tests {
             enforce_model_namespace("acp.claude", Some("himind:svc:x")).unwrap_err();
         assert!(acp_with_himind.to_string().contains("himind:"), "{acp_with_himind}");
         assert!(enforce_model_namespace("himind.builtin", Some("bare-model")).is_err());
+    }
+
+    #[test]
+    fn full_access_requires_explicit_mode_and_preserves_read_and_files_only_limits() {
+        use crate::runtime::deepseek_harness::WorkflowAccess;
+        assert_eq!(workflow_access_with_permission("R2","default","full_access"),WorkflowAccess::Full);
+        assert_eq!(workflow_access_with_permission("R2","default",""),WorkflowAccess::Write);
+        assert_eq!(workflow_access_with_permission("R1","default","full_access"),WorkflowAccess::Read);
+        assert_eq!(workflow_access_with_permission("R2","files_only","full_access"),WorkflowAccess::FilesOnly);
+        assert!(super::super::validate_runtime_permission_mode("personal.codex","full_access").is_err());
+        assert!(super::super::validate_runtime_permission_mode("acp.claude","full_access").is_ok());
+        assert!(super::super::validate_runtime_permission_mode("acp.opencode","full_access").is_ok());
     }
 
     #[test]

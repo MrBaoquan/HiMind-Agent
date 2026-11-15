@@ -168,11 +168,15 @@ fn release(key: &str) {
 /// left WebView2 and SQLite sidecar files unusable for a normal launch. Keep
 /// this guard in the warmup layer as a final defence even when callers already
 /// filter their workspace lists.
-fn protected_workspace_reason(executable: &Path, workspace: &Path) -> Option<String> {
+pub(crate) fn protected_workspace_reason(executable: &Path, workspace: &Path) -> Option<String> {
+    if workspace.parent().is_none() {
+        return Some("磁盘或共享根目录禁止递归沙箱授权，请选择工作区子目录".into());
+    }
     let candidate = path_key(workspace);
     protected_roots(executable).into_iter().find_map(|root| {
         let root = path_key(&root);
-        if candidate == root || candidate.starts_with(&(root.clone() + "\\")) {
+        if candidate == root || candidate.starts_with(&(root.clone() + "\\"))
+            || root.starts_with(&(candidate.clone() + "\\")) {
             Some(format!("Agent 管理目录（{}）禁止 ACL 预热", root))
         } else {
             None
@@ -305,6 +309,7 @@ const { pathToFileURL } = require("node:url");
             return WarmupOutcome::Skipped("工作区目录不可用".to_string());
         }
         let mut command = crate::runtime::process::hidden_command(&node);
+        crate::runtime::deepseek_harness::configure_runtime_environment(&mut command, executable);
         command
             .arg("-e")
             .arg(WARMUP_SCRIPT)
@@ -314,13 +319,18 @@ const { pathToFileURL } = require("node:url");
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::runtime::process::remove_himind_secret_environment(&mut command);
-        let output = match command.output() {
-            Ok(output) => output,
+        let mut child = match command.spawn() {
+            Ok(child) => child,
             Err(error) => return WarmupOutcome::Failed(format!("无法执行 node：{error}")),
         };
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if output.status.success() {
+        let stdout = child.stdout.take().map(crate::runtime::process::capture_output);
+        let stderr = child.stderr.take().map(crate::runtime::process::capture_output);
+        let status = crate::runtime::process::wait_for_child_with_timeout_and_cancel(&mut child,
+            "HIMIND_SANDBOX_WARMUP_TIMEOUT_SECONDS", 300, "工作区沙箱准备", || Ok(false));
+        let stdout = crate::runtime::process::join_output(stdout).trim().to_string();
+        let stderr = crate::runtime::process::join_output(stderr).trim().to_string();
+        let status = match status { Ok(status) => status, Err(error) => return WarmupOutcome::Failed(error.to_string()) };
+        if status.success() {
             WarmupOutcome::Ready(if stdout.is_empty() {
                 "ready".to_string()
             } else {
@@ -445,7 +455,8 @@ mod tests {
         let root = temp_root("user-workspace");
         let executable = root.join("runtime").join("bin").join("dsh.cmd");
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        assert!(protected_workspace_reason(&executable, &root).is_none());
+        assert!(protected_workspace_reason(&executable, &root.join("project")).is_none());
+        assert!(protected_workspace_reason(&executable, &root).is_some());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -149,6 +149,7 @@ pub(crate) fn record_at(root: &Path) -> Option<SkillRecord> {
         icon,
         current: true,
         previous_version: None,
+        development: true,
     })
 }
 
@@ -210,6 +211,7 @@ mod tests {
 
         let id = register_skill_at(&source, &registry).unwrap();
         assert_eq!(id, "com.himind.skill.demo");
+        assert!(record_at(&source).expect("开发直挂记录").development);
         assert_eq!(entries_at(&registry).len(), 1);
 
         // 同名重复登记必须覆盖而不是追加，否则列表会出现重复项。

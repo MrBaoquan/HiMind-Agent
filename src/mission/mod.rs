@@ -3,15 +3,19 @@
 //! Mission 管业务目标、计划确认、任务依赖与用户可见事件；Task Attempt
 //! 将引用 LocalRun，而不在这里复制步骤执行状态。
 
+mod assignment;
 mod checks;
+mod candidate;
+pub(crate) use candidate::{protected_files, scoped_candidate_identity};
+pub(crate) use assignment::{expert_instructions, validate_expert_pin, validate_catalog_assignment, validate_execution_catalog};
 mod contract;
 pub(crate) mod export;
 pub(crate) use checks::{read_projection_usage, run_required_checks, HostCheck};
 mod store;
 
 pub(crate) use contract::{
-    ExecutionBinding, MissionAssignment, MissionAssignmentInput, MissionAssignmentOptions,
-    MissionBudget, MissionConfirmation, MissionCreateInput, MissionEvent, MissionHandoff,
+    ExecutionBinding, MissionExpertPin, MissionAssignment, MissionAssignmentInput, MissionAssignmentOptions,
+    MissionBudget, MissionBudgetIncrease, MissionVerificationRetry, MissionSourceBaseline, MissionConfirmation, MissionCreateInput, MissionEvent, MissionHandoff,
     MissionHandoffInput, MissionPlanMode, MissionPlanProposal, MissionRoleAssignment,
     MissionRoleOption, MissionStatus, MissionTaskRoleMapping, MissionTaskSpec, MissionTaskView,
     MissionView, MissionWorkflowPin, MissionWorkspace, TaskStatus, validate_execution_binding,
@@ -38,6 +42,9 @@ pub(crate) fn validate_task_against_workflow(
             task.id, task.execution.role_id
         ).into());
     }
+    if let Some(pin) = task.execution.expert.as_ref() {
+        validate_expert_pin(pin)?;
+    }
     if !package.accepts_provider(task.execution.executor.trim()) {
         return Err(format!(
             "task {} executor {} is not accepted by pinned workflow",
@@ -55,9 +62,28 @@ pub(crate) fn validate_mission_workflow_binding(
     let (package, _) = workflows.load_pinned_version(
         &pin.workflow_id, &pin.workflow_version, &pin.workflow_sha256,
     )?;
+    // Historical assignments without pins remain readable and retain their legacy path.
+    let pinned_assignment = mission.assignment.as_ref()
+        .filter(|assignment| assignment.roles.iter().any(|role| role.expert.is_some()));
+    let catalog = if pinned_assignment.is_some() {
+        Some(crate::app::mission_commands::mission_assignment_options_sync(&mission.mission_id)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?)
+    } else { None };
     for task in &mission.tasks {
         if task.status != crate::mission::TaskStatus::Canceled {
             validate_task_against_workflow(&task.spec, &package)?;
+            if let (Some(assignment), Some(catalog)) = (pinned_assignment, catalog.as_ref()) {
+                let role = assignment.roles.iter().find(|role| role.role_id == task.spec.execution.role_id)
+                    .ok_or("task must use an assigned expert role")?;
+                let expected = ExecutionBinding {
+                    role_id: role.role_id.clone(), executor: role.executor.clone(),
+                    service_id: role.service_id.clone(), model: role.model.clone(), expert: role.expert.clone(),
+                };
+                if expected.expert.is_none() || expected != task.spec.execution {
+                    return Err("task binding differs from the selected expert assignment".into());
+                }
+                validate_execution_catalog(&expected, &catalog.executors)?;
+            }
         }
     }
     Ok(())
@@ -130,7 +156,7 @@ mod parser_tests {
             objective: String::new(),
             status: crate::mission::MissionStatus::Planned,
             workspace: crate::mission::MissionWorkspace {
-                root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![],
+                permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![],
             },
             acceptance_criteria: vec![], plan_revision: 0, plan_sha256: String::new(),
             plan_summary: String::new(), required_acceptance: vec![], proposed_tasks: vec![],
@@ -145,7 +171,7 @@ mod parser_tests {
     #[test]
     fn assigned_role_contract_limits_generated_plan_roles() {
         let assignment = crate::mission::MissionAssignment {
-            roles: vec![crate::mission::MissionRoleAssignment {
+            roles: vec![crate::mission::MissionRoleAssignment { expert: None,
                 role_id: "ui.implementer.ia".to_string(),
                 label: "IA".to_string(),
                 executor: "himind.builtin".to_string(),

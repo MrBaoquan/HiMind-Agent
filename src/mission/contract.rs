@@ -97,9 +97,22 @@ impl TaskStatus {
     }
 }
 
+/// A Mission resolves an exact expert asset; changing the library cannot change
+/// an already reviewed plan. The digest is part of each task's plan hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionExpertPin {
+    pub expert_id: String,
+    pub expert_version: String,
+    pub expert_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionBinding {
+    /// Absent only in historical plans created before expert assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert: Option<MissionExpertPin>,
     pub executor: String,
     #[serde(default)]
     pub model: String,
@@ -148,6 +161,44 @@ pub(crate) struct MissionBudget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MissionBudgetIncrease {
+    pub request_id: String,
+    pub expected_plan_sha256: String,
+    #[serde(default)]
+    pub additional_rounds: u32,
+    #[serde(default)]
+    pub additional_minutes: u32,
+    #[serde(default)]
+    pub additional_repair_attempts: u32,
+    #[serde(default)]
+    pub additional_tokens: Option<u64>,
+    #[serde(default)]
+    pub unlimited_tokens: bool,
+    #[serde(default)]
+    pub additional_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionSourceBaseline {
+    pub source_reference: String,
+    pub captured_at: String,
+    pub artifact_sha256: String,
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionVerificationRetry {
+    pub request_id: String,
+    pub expected_plan_sha256: String,
+    pub expected_verification_run_id: String,
+    #[serde(default)]
+    pub source_baseline: Option<MissionSourceBaseline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MissionPlanProposal {
     pub summary: String,
     pub tasks: Vec<MissionTaskSpec>,
@@ -188,6 +239,8 @@ pub(crate) struct MissionWorkflowPin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionRoleAssignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert: Option<MissionExpertPin>,
     pub role_id: String,
     #[serde(default)]
     pub label: String,
@@ -268,6 +321,10 @@ pub(crate) struct MissionAssignmentInput {
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionWorkspace {
     pub root: String,
+    /// Empty historical values retain workspace confinement. Full access is a
+    /// user choice confirmed with the plan, never inferred from a tool error.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permission_mode: String,
     #[serde(default)]
     pub read_scope: Vec<String>,
     #[serde(default)]
@@ -407,6 +464,8 @@ pub(crate) struct MissionAssignmentOptions {
     pub workflow_version: String,
     pub workflow_sha256: String,
     pub roles: Vec<MissionRoleOption>,
+    pub experts: Vec<crate::expert::ExpertSummary>,
+    pub executors: Vec<crate::app::mission_commands::MissionExecutionOption>,
     pub source: String,
 }
 
@@ -507,12 +566,16 @@ pub(crate) fn apply_assignment_to_plan(
         task.execution.executor = role.executor.trim().to_string();
         task.execution.service_id = role.service_id.trim().to_string();
         task.execution.model = role.model.trim().to_string();
+        task.execution.expert = role.expert.clone();
     }
     validate_proposal(&next)?;
     Ok(next)
 }
 
 pub(crate) fn validate_create(input: &MissionCreateInput) -> Result<(), Box<dyn Error>> {
+    if !matches!(input.workspace.permission_mode.as_str(), "" | "workspace_write" | "full_access") {
+        return Err("permission_mode must be workspace_write or full_access".into());
+    }
     require_text("title", &input.title, MAX_TITLE_CHARS)?;
     if input.objective.chars().count() > MAX_SUMMARY_CHARS {
         return Err(format!("objective exceeds {MAX_SUMMARY_CHARS} characters").into());
@@ -782,6 +845,16 @@ pub(crate) fn plan_hash(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&canonical)?)
     ))
+}
+
+pub(crate) fn plan_hash_for_workspace(
+    mission_id: &str, workspace: &MissionWorkspace, mission_acceptance: &[String], proposal: &MissionPlanProposal,
+) -> Result<String, Box<dyn Error>> {
+    let original = plan_hash(mission_id, &workspace.root, mission_acceptance, proposal)?;
+    if workspace.permission_mode != "full_access" { return Ok(original); }
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&serde_json::json!({
+        "schema_version":"mission_plan_hash.v2", "plan_sha256":original, "permission_mode":"full_access"
+    }))?)))
 }
 
 pub(crate) fn normalized_paths(paths: &[String]) -> Vec<String> {

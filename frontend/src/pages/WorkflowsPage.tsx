@@ -61,6 +61,7 @@ type WorkflowsPageProps = {
   onOpenCapabilities?: () => void;
   /** 从待处理中心或定时计划跳入时，直接打开指定 Run。 */
   initialRunId?: string;
+  onBackToTasks?: () => void;
   loading: boolean;
   error: string;
   onRefresh: () => void;
@@ -546,7 +547,7 @@ function withExecutionOverrides(
   return Object.keys(overrides).length ? { execution_overrides: overrides } : {};
 }
 
-export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', onBackToTasks, loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
   // 工作流页把「有哪些能力」和「跑成什么样」拆成两个页签：进来先看到能跑的工作流，
   // 而不是一张运行记录表；有活动运行时才在列表上方补一条运行态。
   const [pageTab, setPageTab] = useState<'library' | 'runs'>(() => (mode === 'library' ? 'library' : initialRunId ? 'runs' : 'library'));
@@ -1541,7 +1542,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
           而且它启动的是当前选中的工作流，与正在看的这条运行记录无关。
           运行记录是只读历史；没有记录时的空态已经给出「去看工作流」这一步。 */}
       {mode === 'runs' ? <>
-      <PageHeader title="工作流" />
+      <PageHeader title="工作流" actions={onBackToTasks ? <button className="btn" onClick={onBackToTasks}><ArrowLeft size={14}/>返回我的任务</button> : undefined} />
       <div className="workflow-mode-tabs segmented-control" role="tablist" aria-label="工作流视图">
         <button type="button" role="tab" aria-selected={pageTab === 'library'} className={pageTab === 'library' ? 'active' : ''} onClick={() => setPageTab('library')}>工作流<span>{workflows.length}</span></button>
         <button type="button" role="tab" aria-selected={pageTab === 'runs'} className={pageTab === 'runs' ? 'active' : ''} onClick={() => setPageTab('runs')}>运行记录<span>{runs.length}</span></button>

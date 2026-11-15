@@ -1,6 +1,7 @@
 import { ArrowRight, CheckCircle2, CircleAlert, ClipboardCheck, Clock3, MessageCircle, ShieldCheck, Workflow, XCircle } from 'lucide-react';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import type { ApprovalItem, WorkflowCenterSnapshot } from '../services/agentApi';
+import { executionTodoId, workflowNeedsUser, type MissionTodo } from './taskCenterModel';
 import { formatStamp } from '../timeFormat';
 
 type WaitingRun = WorkflowCenterSnapshot['runs'][number];
@@ -32,35 +33,47 @@ function waitingIcon(item: WaitingRun) {
   return <CircleAlert size={18} />;
 }
 
-export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpenWorkflowRun, onOpenApprovalHistory }: {
+export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTodos = [], missionError, onOpenMission, onRefresh, onRespond, onOpenWorkflowRun, onOpenApprovalHistory }: {
   approvals: ApprovalItem[];
+  missionTodos?: MissionTodo[];
+  missionError?: string;
+  onOpenMission?: (missionId: string) => void;
   workflowRuns: WaitingRun[];
   onRefresh: () => void;
   onRespond: (id: string, approved: boolean) => void;
   onOpenWorkflowRun: (runId: string) => void;
   onOpenApprovalHistory: () => void;
 }) {
-  const total = approvals.length + workflowRuns.length;
+  const workflowRuns = allWorkflowRuns.filter(workflowNeedsUser);
+  const total = approvals.length + workflowRuns.length + missionTodos.length;
 
   return (
     <>
       <PageHeader
         title="需要我处理"
-        actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button></div>}
+        actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button><button className="btn" onClick={onRefresh}>刷新</button></div>}
       />
       {/* 全为 0 时这排统计只是三个零：空态文案已经说清这里会出现什么，
           数字没有信息量还占掉首屏。有内容时才给出分项计数。 */}
       {total > 0 ? <div className="inbox-summary" aria-label="需要我处理摘要">
         <div><strong>{total}</strong><span>全部事项</span></div>
         <div><strong>{approvals.length}</strong><span>操作审批</span></div>
-        <div><strong>{workflowRuns.length}</strong><span>工作流等待</span></div>
+        <div><strong>{workflowRuns.length}</strong><span>工作流交互</span></div>
+        <div><strong>{missionTodos.length}</strong><span>协作任务待办</span></div>
       </div> : null}
+      {missionError ? <p className="error" role="alert">{missionError}，协作待办暂不完整。</p> : null}
       {total === 0 ? (
         <div className="card inbox-empty-card">
           <EmptyState icon={CheckCircle2} title="当前没有待处理事项" text="新的审批、反馈和人工交互会集中显示在这里。" />
         </div>
       ) : (
         <div className="inbox-grid">
+          {missionTodos.length ? <section className="card inbox-section">
+            <div className="inbox-section-header"><div><strong>协作任务待办</strong><span>需要处理的协作任务</span></div><Pill kind="warn">{missionTodos.length}</Pill></div>
+            <div className="inbox-item-list">{missionTodos.map(todo => <button type="button" className="inbox-item inbox-item-button" data-todo-id={todo.id} key={todo.id} onClick={() => onOpenMission?.(todo.missionId)}>
+              <div className="inbox-item-icon workflow"><ShieldCheck size={18}/></div><div className="inbox-item-main"><strong>{todo.title}</strong><span>{todo.action}</span></div><ArrowRight size={17}/>
+            </button>)}</div>
+          </section>:null}
           <section className="card inbox-section">
             <div className="inbox-section-header">
               <div><strong>操作审批</strong><span>需要确认的敏感操作</span></div>
@@ -88,13 +101,13 @@ export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpe
 
           <section className="card inbox-section">
             <div className="inbox-section-header">
-              <div><strong>工作流等待</strong><span>等待反馈、审批或外部操作</span></div>
+              <div><strong>工作流等待</strong><span>等待反馈、审批或填写信息</span></div>
               <Pill kind={workflowRuns.length ? 'warn' : 'neutral'}>{workflowRuns.length}</Pill>
             </div>
             {workflowRuns.length ? (
               <div className="inbox-item-list">
                 {workflowRuns.map(item => (
-                  <button type="button" className="inbox-item inbox-item-button" key={item.run.run_id} onClick={() => onOpenWorkflowRun(item.run.run_id)}>
+                  <button type="button" className="inbox-item inbox-item-button" key={item.run.run_id} data-todo-id={executionTodoId(item.run.run_id, item.run.current_step_id, item.interaction_request?.kind || item.waiting_kind)} onClick={() => onOpenWorkflowRun(item.run.run_id)}>
                     <div className="inbox-item-icon workflow">{waitingIcon(item)}</div>
                     <div className="inbox-item-main">
                       <strong>{item.interaction_request?.title || item.workflow_name || item.workflow_id || '工作流运行'}</strong>

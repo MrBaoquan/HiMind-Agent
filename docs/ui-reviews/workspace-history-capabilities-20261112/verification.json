@@ -1,0 +1,51 @@
+{
+  "date": "2026-11-12",
+  "platform": "Windows + real Chrome, synthetic stores and launch/clipboard doubles",
+  "rust": {
+    "passed": 48,
+    "failed": 0,
+    "command": "cargo test --locked --bin himind-agent session_history -- --test-threads=1",
+    "log": "rust.log"
+  },
+  "history_browser": {
+    "passed": 37,
+    "result": "history-browser/result.json",
+    "command": "node frontend/scripts/check-session-history.browser.mjs"
+  },
+  "workspace_browser": {
+    "passed": 24,
+    "result": "workspace-browser/result.json",
+    "command": "node frontend/scripts/check-workspace-ui.browser.mjs"
+  },
+  "frontend_build": {
+    "passed": true,
+    "command": "npm --prefix frontend run build",
+    "existing_warning": "main bundle >500 KiB"
+  },
+  "design_tokens": {
+    "passed": true,
+    "command": "npm --prefix frontend run check:design-tokens"
+  },
+  "text_layout": {
+    "passed": true,
+    "command": "npm --prefix frontend run check:text-layout"
+  },
+  "copy": {
+    "passed": false,
+    "known_existing_count": 6,
+    "files": {
+      "MissionTeamPanel.tsx": 2,
+      "missionView.ts": 1,
+      "RuntimeWorkspaceDialog.tsx": 3
+    },
+    "log": "copy-known-failure.log"
+  },
+  "not_performed": [
+    "real private transcript reads",
+    "real native client resume",
+    "native WebView/high DPI/manual acceptance",
+    "deployment/restart/commit/push"
+  ],
+  "zoom_note": "CSS zoom 200% with physical fixture height compensated; no native WebView zoom claim",
+  "sources": "source-hashes.json"
+}

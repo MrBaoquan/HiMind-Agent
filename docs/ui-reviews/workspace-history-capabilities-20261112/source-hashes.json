@@ -1,0 +1,90 @@
+{
+  "src/main.rs": {
+    "sha256": "89487298351f2f0d5bb16e57cb9d0e98272cbd1f64780527443c5600e885a118",
+    "before_sha256": "f1f70e9407c31e41975b15ad9e5537aaf58d193eff089a6418eca3c23e470d2e"
+  },
+  "src/app/ui.rs": {
+    "sha256": "717aad2d86ae12ee8b38b1548908c57e8dae7dfec3e52b90b7ea293c701c7e92",
+    "before_sha256": "ddf7f5786740b1040b1aeff7651ebc0d700b8c10bfa4d81668179c2a70943bd7"
+  },
+  "src/app/commands.rs": {
+    "sha256": "cca9bfd9225f59bc57aa425055b4b069b4f2a3f1e21e4e76ec92bba5d3991110",
+    "before_sha256": "f61f293a1b203848f7f1994c3dfc6281044e73575d62d5dc8609961b8059a23c"
+  },
+  "src/session_history.rs": {
+    "sha256": "d6b3ecad4394a494430eb969bf70d6bdb7dc76e43983fb6e6c591cde8872a333",
+    "before_sha256": "be7ed86d7e3496848758c8387968d92a48557cd33faeef43f77a28d0e02d493e"
+  },
+  "src/session_history_actions.rs": {
+    "sha256": "6f4f8a2765c6bf6d2e46904957cde24d9d0f50e8f0e8eaa4a72f28cb427857d4",
+    "before_sha256": null
+  },
+  "src/session_history_inspect.rs": {
+    "sha256": "4219d0a7ca223cc31f50e105547903a78ec3882a623f2b351daab0b19addb416",
+    "before_sha256": null
+  },
+  "src/session_history_tools.rs": {
+    "sha256": "9011a61d2b8ac68122944a471e09e7e06b5c1f0c2e604b91267e1349cec5bf19",
+    "before_sha256": null
+  },
+  "src/session_history_sources.rs": {
+    "sha256": "78e5bfc2a37e122c553cf6a2ef61d00926525185df21c48588d3518de76d1543",
+    "before_sha256": "2b0e3e67e7cf70c1fabd87bf4d9acaceab3c5efe60bdc57d65e8f7566038184f"
+  },
+  "src/session_history_sources/codex.rs": {
+    "sha256": "0658eeaba4de77b4aa7b7173db5fd99fe46005a44c5726195064ea01d1029fc2",
+    "before_sha256": "4afc1bf24bcd3113e68f559acca6633fd20b32d5befa9fd10cba8de208551d7e"
+  },
+  "src/session_history_sources/opencode.rs": {
+    "sha256": "0044fb1c9e6944112ab36676148873af20fd4d5915b03354925150f643e93396",
+    "before_sha256": "d1a51bcfd8e9a5b87e08560a18a77d131719554ba775dfdcae1375d1c66b857a"
+  },
+  "src/session_history_sources/path_cache.rs": {
+    "sha256": "ee826c2fa417cd6a0dfcd02e8d406fe413ac5bf698e2f14ff78502cc75a35ba4",
+    "before_sha256": null
+  },
+  "frontend/src/services/agentApi.ts": {
+    "sha256": "c34a7d719c9f31d03274bb9c0a32a006260b2ab1bb3613ba2f473f8fea9a6039",
+    "before_sha256": "cd9ba914562415ef61d47e99895dc0bef9769d01c618d9dcc5623d26ff7246fa"
+  },
+  "frontend/src/pages/WorkspaceSessionHistoryPanel.tsx": {
+    "sha256": "4188f07fcaf4b975e2fc8eda61b019b5bb4df40b384f5137752ae4fbe27e0f55",
+    "before_sha256": "fa0a80502878c9c2a141ce5ccaeea20c44bf8e39881ccf1abce7d2768ee91a56"
+  },
+  "frontend/src/pages/WorkspaceSessionHistoryPanel.css": {
+    "sha256": "9e8535049cd7247e2bbf2720b67953d4af155d06a1f101148826440ab2356d1f",
+    "before_sha256": "2297d6b9836fbb3f01903f8c7e9fa3c4d6c0c81b3f2177dae6b8450968a33a01"
+  },
+  "frontend/src/pages/WorkspaceHistoryActions.tsx": {
+    "sha256": "a62c8a7a11b3bf5de5e991742a951b2c80127dab1c68d6bc784d28a43a461112",
+    "before_sha256": null
+  },
+  "frontend/src/pages/WorkspaceHistoryInspector.tsx": {
+    "sha256": "e7e3ef20cd6ff1356bb6be4fe65dbab4045abda4511b4d256fbfcc808992ddf2",
+    "before_sha256": null
+  },
+  "frontend/scripts/fixtures/workspace-session-history.tsx": {
+    "sha256": "da0cb9ce18fa0ed18c181726fdf2acbed0f10c2dc08a26f23cd3b0161a477165",
+    "before_sha256": "221d3ffe311864a95422ffc113ef8b7d91fa8a97f9f906e9c5e4487eb3702107"
+  },
+  "frontend/scripts/check-session-history.browser.mjs": {
+    "sha256": "75f35f84cd0d352d901125c758f419cf001dacbfe38bccf159e25b1ad1b08c8b",
+    "before_sha256": "e75cbde8d0ee653694178feaabd45155501e253782cbe16f0a474b5a9c0e60bf"
+  },
+  "frontend/scripts/check-workspace-ui.browser.mjs": {
+    "sha256": "760d8fd60abec962d72eec5191c5fe06634d9754f355c3c9d3022132e6caba0e",
+    "before_sha256": "760d8fd60abec962d72eec5191c5fe06634d9754f355c3c9d3022132e6caba0e"
+  },
+  "frontend/scripts/fixtures/workspace-ui-review.tsx": {
+    "sha256": "a742d7af65d9f3a8311baf71dec67eb4389d3848359ea1448899a716708bd6d3",
+    "before_sha256": "a742d7af65d9f3a8311baf71dec67eb4389d3848359ea1448899a716708bd6d3"
+  },
+  "docs/workspace-session-history.md": {
+    "sha256": "4186d5377f24de1cbc9ce5c0437eef5c1b8b4e781346ce87d8c893e4d2d2bee8",
+    "before_sha256": "45e432444d7aa7096a60f904b5695a906b112d4f4ca94d7f1e10e307d0de8fdc"
+  },
+  "docs/ui-reviews/workspace-history-capabilities-20261112/README.md": {
+    "sha256": "0b05c5415a1dee940364d0952647eb0a7d5278bacb0a1ced2f766e06df1d8e86",
+    "before_sha256": null
+  }
+}

@@ -168,12 +168,16 @@ pub(crate) fn apply_execution_overrides(
                 .into());
             }
             for runtime in step_runtime_steps_mut(step, step_id)? {
+                validate_runtime_permission_mode(provider, &runtime.permission_mode)?;
                 // 换 provider 不能把「强制隔离」换成「做不到隔离」。
                 if runtime.tool_policy.trim() == "none" && !runtime_supports_tool_none(provider) {
                     return Err(format!(
                         "execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=none"
                     )
                     .into());
+                }
+                if runtime.tool_policy.trim() == "files_only" && provider != "himind.builtin" && provider != "auto" {
+                    return Err(format!("execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=files_only").into());
                 }
                 runtime.provider = provider.to_string();
             }
@@ -711,6 +715,10 @@ pub(crate) struct WorkflowStep {
 pub(crate) struct WorkflowRuntimeStep {
     pub provider: String,
     pub prompt: String,
+    /// Explicit machine access under the current OS user. Independent of tool
+    /// selection and model risk; supported by the built-in and ACP runtimes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permission_mode: String,
     #[serde(default)]
     pub workspace_path: String,
     #[serde(default)]
@@ -1078,12 +1086,16 @@ impl WorkflowPackage {
         for (role_id, role) in &self.roles {
             validate_workflow_id(role_id)
                 .map_err(|error| format!("workflow role {role_id}: {error}"))?;
-            if !matches!(role.tool_policy.trim(), "" | "default" | "none") {
+            if !matches!(role.tool_policy.trim(), "" | "default" | "none" | "files_only") {
                 return Err(format!(
-                    "workflow role {role_id} tool_policy must be default or none"
+                    "workflow role {role_id} tool_policy must be default, none or files_only"
                 ));
             }
             let provider = role.runtime_provider.trim();
+            if role.tool_policy.trim() == "files_only" && !matches!(provider, "" | "auto" | "himind.builtin") {
+                return Err(format!("workflow role {role_id}: provider {provider} cannot enforce tool_policy=files_only"));
+            }
+
             if !provider.is_empty() && !self.accepts_provider(provider) {
                 return Err(format!(
                     "workflow role {role_id} runtime_provider is not declared in supported_runtimes or optional_providers: {provider}"
@@ -1880,11 +1892,25 @@ fn normalized_step_kind(step: &WorkflowStep) -> Result<&'static str, String> {
     Ok("manual")
 }
 
+pub(crate) fn validate_runtime_permission_mode(provider: &str, mode: &str) -> Result<(), String> {
+    match mode {
+        "" | "workspace_write" => Ok(()),
+        "full_access" if provider == "auto" || supports_full_access(provider) => Ok(()),
+        "full_access" => Err(format!("provider {provider} cannot enforce permission_mode=full_access; select HiMind AI or an ACP executor")),
+        _ => Err(format!("unsupported runtime permission_mode: {mode}")),
+    }
+}
+
+pub(crate) fn supports_full_access(provider: &str) -> bool {
+    provider == "himind.builtin" || crate::runtime::acp::is_provider(provider)
+}
+
 fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
     let runtime = step
         .runtime
         .as_ref()
         .ok_or_else(|| format!("workflow runtime step {} requires runtime", step.id))?;
+    validate_runtime_permission_mode(&runtime.provider, &runtime.permission_mode)?;
     if runtime.provider.trim().is_empty() {
         return Err(format!(
             "workflow runtime step {} provider is required",
@@ -1900,11 +1926,14 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
     if !runtime.result_schema.trim().is_empty() {
         validate_relative_asset_path(&runtime.result_schema)?;
     }
-    if !matches!(runtime.tool_policy.as_str(), "" | "default" | "none") {
+    if !matches!(runtime.tool_policy.as_str(), "" | "default" | "none" | "files_only") {
         return Err(format!(
-            "workflow runtime step {} tool_policy must be default or none",
+            "workflow runtime step {} tool_policy must be default, none or files_only",
             step.id
         ));
+    }
+    if runtime.tool_policy.trim() == "files_only" && !matches!(runtime.provider.trim(), "auto" | "himind.builtin") {
+        return Err(format!("workflow runtime step {} cannot enforce tool_policy=files_only with {}", step.id, runtime.provider));
     }
     let mut seen_artifacts = HashSet::new();
     for artifact_id in &runtime.input_artifacts {
@@ -2130,6 +2159,7 @@ fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), Strin
                 branch.id
             )
         })?;
+        validate_runtime_permission_mode(&runtime.provider, &runtime.permission_mode)?;
         if runtime.provider.trim().is_empty() {
             return Err(format!(
                 "workflow delegate branch {} runtime provider is required",
@@ -2142,11 +2172,14 @@ fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), Strin
                 branch.id
             ));
         }
-        if !matches!(runtime.tool_policy.trim(), "" | "default" | "none") {
+        if !matches!(runtime.tool_policy.trim(), "" | "default" | "none" | "files_only") {
             return Err(format!(
-                "workflow delegate branch {} tool_policy must be default or none",
+                "workflow delegate branch {} tool_policy must be default, none or files_only",
                 branch.id
             ));
+        }
+        if runtime.tool_policy.trim() == "files_only" && !matches!(runtime.provider.trim(), "auto" | "himind.builtin") {
+            return Err(format!("workflow delegate branch {} cannot enforce tool_policy=files_only with {}", branch.id, runtime.provider));
         }
         validate_model_alias(&runtime.model).map_err(|error| {
             format!("workflow delegate branch {} model: {error}", branch.id)
@@ -2790,7 +2823,7 @@ mod tests {
             .supported_runtimes
             .push("personal.codex".to_string());
         step.runtime = Some(WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Implement the next change from the current feedback.".to_string(),
             workspace_path: "input.project_root".to_string(),
             result_schema: String::new(),
@@ -2828,7 +2861,7 @@ mod tests {
             .supported_runtimes
             .push("personal.codex".to_string());
         step.runtime = Some(WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Run one bounded iteration.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
@@ -2878,7 +2911,7 @@ mod tests {
             .supported_runtimes
             .extend(["personal.codex".to_string(), "himind.builtin".to_string()]);
         step.runtime = Some(WorkflowRuntimeStep {
-            provider: "personal.codex".to_string(),
+            permission_mode: String::new(), provider: "personal.codex".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
@@ -2922,7 +2955,7 @@ mod tests {
         // 主模型与 provider 匹配，只有降级序列跨了命名空间：
         // provider 用内置，这样失败点唯一落在「降级序列与主模型不同源」上。
         step.runtime = Some(WorkflowRuntimeStep {
-            provider: "himind.builtin".to_string(),
+            permission_mode: String::new(), provider: "himind.builtin".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
