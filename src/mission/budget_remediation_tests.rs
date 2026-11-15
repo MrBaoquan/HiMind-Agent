@@ -210,7 +210,9 @@ fn f05_stale_missing_mismatched_confirmation_and_active_reject_but_manual_pause_
     assert_eq!(paused.effective_wait.as_ref().unwrap().reason, "manual_pause");
     assert!(paused.effective_wait.as_ref().unwrap().can_increase_budget);
     let after = store.increase_budget(&mission.mission_id, &increase(&mission), "budget-test-user").unwrap();
-    assert_eq!(after.status, MissionStatus::Active);
+    assert_eq!(after.status, MissionStatus::Waiting);
+    assert_eq!(after.effective_wait.as_ref().unwrap().reason, "manual_pause");
+    assert!(store.next_ready_task(&mission.mission_id).unwrap().is_none());
     assert_eq!(after.confirmation, mission.confirmation);
     assert_eq!(after.budget.as_ref().unwrap().max_total_tokens, Some(150));
     assert_eq!(events_of(&store, &mission.mission_id, "task_dispatched"), 0);
@@ -224,7 +226,9 @@ fn f06_running_present_rejects_then_explicit_retry_rechecks_all_gates() {
     reject_unchanged(&store, &mission.mission_id, &increase(&mission));
     store.record_run_usage(&mission.mission_id, "fix", "run-live", &usage(100, 1.0, "USD")).unwrap();
     store.complete_task_attempt(&mission.mission_id, "fix", "run-live", false, &[], "finished").unwrap();
-    assert_eq!(store.increase_budget(&mission.mission_id, &increase(&mission), "budget-test-user").unwrap().status, MissionStatus::Active);
+    assert_eq!(store.increase_budget(&mission.mission_id, &increase(&mission), "budget-test-user").unwrap().status, MissionStatus::Waiting);
+    assert!(store.next_ready_task(&mission.mission_id).unwrap().is_none());
+    assert_eq!(store.control(&mission.mission_id, "resume").unwrap().status, MissionStatus::Active);
 }
 
 #[test]

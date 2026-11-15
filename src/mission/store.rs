@@ -720,15 +720,18 @@ impl MissionStore {
             return Err(format!("the increased budget still does not allow continuation: {remaining_reason}").into());
         }
 
+        let remains_waiting = runtime_blocked_on(&transaction, &mission)?
+            || manually_paused_on(&transaction, &mission)?;
         let now = now_stamp();
         transaction.execute(
             "UPDATE mission_runs SET budget_json = ?2, status = ?3, updated_at = ?4 WHERE mission_id = ?1",
             params![mission_id, serde_json::to_string(&budget)?,
-                if runtime_blocked_on(&transaction, &mission)? { "waiting" } else { "active" }, now],
+                if remains_waiting { "waiting" } else { "active" }, now],
         )?;
         append_event_tx(
             &transaction, mission_id, "budget_extended", "",
-            format!("预算已增加，任务从“{reason}”恢复执行"),
+            if remains_waiting { format!("预算已增加，任务保持等待（{reason}）") }
+            else { format!("预算已增加，任务从“{reason}”恢复执行") },
             serde_json::json!({
                 "request_id": input.request_id,
                 "request_sha256": request_digest,
@@ -2866,9 +2869,8 @@ fn effective_wait_on(connection: &Connection, mission: &MissionView) -> Result<s
         } else if !associated { "unknown" }
         else if budget_reason.is_some() && !admitted_verification { "budget_exhausted" } else if environment { "environment_blocked" }
         else if running { "system_verification" } else {
-            let action: Option<String> = connection.query_row("SELECT event_type FROM mission_events WHERE mission_id=?1 AND event_type IN ('mission_pause','mission_resume','budget_extended') ORDER BY sequence DESC LIMIT 1", params![mission.mission_id], |r| r.get(0)).optional()?;
             if verifying && !admitted_verification { "unknown" }
-            else if action.as_deref() == Some("mission_pause") { "manual_pause" }
+            else if manually_paused_on(connection, mission)? { "manual_pause" }
             // Waiting is not dispatched by the supervisor. An owned submitted
             // implementation needs an explicit user resume; the active state
             // above belongs to the system. Do not infer liveness from a saved
@@ -2883,6 +2885,17 @@ fn effective_wait_on(connection: &Connection, mission: &MissionView) -> Result<s
         can_resume: waiting && associated && !running && !environment
             && (admitted_verification || (!verifying && budget_reason.is_none())),
     })
+}
+
+fn manually_paused_on(connection: &Connection, mission: &MissionView) -> Result<bool, Box<dyn Error>> {
+    // Follow-ups, progress and budget increases do not express resume intent.
+    // An explicit resume blocked by budget records budget_exhausted instead of
+    // mission_resume; its later authorized extension must still resume work.
+    let action: Option<String> = connection.query_row(
+        "SELECT event_type FROM mission_events WHERE mission_id=?1
+         AND event_type IN ('mission_pause','mission_resume','budget_exhausted') ORDER BY sequence DESC LIMIT 1",
+        params![mission.mission_id], |row| row.get(0)).optional()?;
+    Ok(action.as_deref() == Some("mission_pause"))
 }
 
 fn runtime_blocked_on(connection: &rusqlite::Connection, mission: &MissionView) -> Result<bool, Box<dyn Error>> {
@@ -3015,6 +3028,51 @@ mod tests {
             }).collect(),
         };
         (store, request)
+    }
+
+    #[test]
+    fn budget_extension_preserves_manual_pause_after_native_follow_up() {
+        let (store, mut follow) = native_follow_up_fixture("pause-follow-up-budget");
+        follow.tasks.truncate(1);
+        let id = &follow.mission_id;
+        let paused = store.control(id, "pause").unwrap();
+        assert_eq!(paused.status, MissionStatus::Waiting);
+        let added = store.add_follow_up_tasks_for_mcp(&follow).unwrap();
+        assert_eq!(added.status, MissionStatus::Waiting);
+        assert_eq!(added.tasks.iter().find(|task| task.spec.id == "repair-fix").unwrap().status, TaskStatus::Ready);
+        assert_eq!(store.snapshot(id, 0).unwrap().events.last().unwrap().event_type, "follow_up_tasks_added");
+        let request = MissionBudgetIncrease {
+            request_id: "paused-follow-up-budget".into(), expected_plan_sha256: added.plan_sha256.clone(),
+            additional_rounds: 1, additional_minutes: 120, additional_repair_attempts: 1,
+            additional_tokens: None, unlimited_tokens: false, additional_cost: None,
+        };
+        let increased = store.increase_budget(id, &request, "test-user").unwrap();
+        assert_eq!(increased.status, MissionStatus::Waiting, "a budget increase must not resume a user-paused Mission");
+        assert_eq!(increased.effective_wait.as_ref().unwrap().reason, "manual_pause");
+        assert!(store.next_ready_task(id).unwrap().is_none(), "the ready follow-up must not be dispatchable while paused");
+        assert_eq!(increased.plan_sha256, added.plan_sha256);
+        assert_eq!(increased.confirmation, added.confirmation);
+        assert_eq!(increased.tasks, added.tasks);
+        assert_eq!(increased.budget.as_ref().unwrap().max_minutes, added.budget.as_ref().unwrap().max_minutes + 120);
+        let before_replay = store.snapshot(id, 0).unwrap();
+        assert_eq!(store.increase_budget(id, &request, "test-user").unwrap(), before_replay.mission);
+        assert_eq!(store.snapshot(id, 0).unwrap(), before_replay, "same-key replay must not write or resume");
+
+        let reopened = MissionStore::new(store.path.clone());
+        let mut second = request.clone(); second.request_id = "paused-follow-up-budget-2".into();
+        let increased_again = reopened.increase_budget(id, &second, "test-user").unwrap();
+        assert_eq!(increased_again.status, MissionStatus::Waiting, "a prior budget_extended event must not erase pause intent");
+        assert_eq!(increased_again.effective_wait.as_ref().unwrap().reason, "manual_pause");
+        assert!(reopened.next_ready_task(id).unwrap().is_none());
+        let snapshot = reopened.snapshot(id, 0).unwrap();
+        assert!(!snapshot.events.iter().any(|event| event.event_type == "mission_resume"));
+        assert_eq!(snapshot.events.iter().filter(|event| event.event_type == "task_dispatched").count(), 2, "only the two original failed attempts were dispatched");
+        let resumed = reopened.control(id, "resume").unwrap();
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert_eq!(reopened.next_ready_task(id).unwrap().unwrap().id, "repair-fix");
+        let before_replay = reopened.snapshot(id, 0).unwrap();
+        assert_eq!(reopened.increase_budget(id, &request, "test-user").unwrap(), before_replay.mission);
+        assert_eq!(reopened.snapshot(id, 0).unwrap(), before_replay, "old request replay cannot change a later resume");
     }
 
     fn pending_cancel_fixture(name: &str) -> (MissionStore, PendingRepairCancellation) {
@@ -4854,7 +4912,9 @@ mod tests {
         };
         assert_eq!(paused.status, MissionStatus::Waiting);
         let increased = store.increase_budget(&created.mission_id, &input, "test-user").unwrap();
-        assert_eq!(increased.status, MissionStatus::Active);
+        assert_eq!(increased.status, MissionStatus::Waiting);
+        assert_eq!(increased.effective_wait.as_ref().unwrap().reason, "manual_pause");
+        assert!(store.next_ready_task(&created.mission_id).unwrap().is_none());
         assert_eq!(increased.budget.as_ref().unwrap().max_rounds, confirmed.budget.as_ref().unwrap().max_rounds + 1);
         assert_eq!(increased.confirmation, confirmed.confirmation);
         assert_eq!(store.increase_budget(&created.mission_id, &input, "test-user").unwrap().budget, increased.budget);
@@ -5396,6 +5456,8 @@ mod tests {
             additional_rounds: 0, additional_minutes: 0, additional_repair_attempts: 6,
             additional_tokens: None, unlimited_tokens: false, additional_cost: None,
         }, "test-user").unwrap();
+        assert_eq!(store.get(&created.mission_id).unwrap().status, MissionStatus::Waiting);
+        store.control(&created.mission_id, "resume").unwrap();
         let mut correction = plan.tasks[0].clone();
         correction.id = "producer-revision".into(); correction.repair_of = "fix".into();
         let mut final_review = first_retry;
