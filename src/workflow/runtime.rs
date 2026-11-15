@@ -571,14 +571,21 @@ fn fixture_runtime_output(
         "applied_at": crate::approval::manager::unix_now(),
     });
     std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "summary": "fixture runtime applied the requested development change",
         "changes": [format!("updated {}", relative_state_path.to_string_lossy())],
         "verification": [{"name": "fixture", "status": "passed"}],
         "fixture_iteration": iteration,
         "fixture_state_path": relative_state_path.to_string_lossy(),
-    })
-    .to_string())
+    });
+    // The explicit fixture still has to satisfy Mission's strict final report
+    // contract after its actual write succeeds. Ordinary workflow output keeps
+    // its original shape; independent VERIFY remains host-bound above.
+    if ["mission_id", "task_id"].iter().all(|key|
+        input.get(*key).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())) {
+        report["passed"] = json!(true);
+    }
+    Ok(report.to_string())
 }
 
 fn resolve_workspace(template: &str, input: &Value) -> Result<String, Box<dyn Error>> {
