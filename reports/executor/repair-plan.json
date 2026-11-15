@@ -1,0 +1,40 @@
+{
+  "task": "repair-executor-lifecycle-runtime-7",
+  "phase": "execute",
+  "problem_model": {
+    "entry": "An aggregate passing TAP summary does not establish full-entry success. Preparation, current-resource identity and live handoff gates are separate. Latest host baseline is event777, not748.",
+    "budget": "Current supervisor can change Active/AwaitingVerification to Waiting after actual over-limit implementation usage; dispatcher then cannot select independent verification.",
+    "history": "Feedback773 supplies historical diagnostic text; no inaccessible historical raw reread is a runtime7 readiness prerequisite. Current source reproduction and preserved history are required."
+  },
+  "boundaries": [
+    "Only current task write_paths; no src/store writes, configuration mutation, install/update, host modification, commit/push/deploy or formal VERIFY.",
+    "personal.codex with empty model/service and unchanged pinned expert.",
+    "Generated evidence/builds/cache use current host_runtime_resources. Native operational locks/cache/accounting/logs differ from model file permissions."
+  ],
+  "options_compared": [
+    {
+      "option": "Allow independent verification of an already admitted task, enforce budget before subsequent task/repair",
+      "decision": "selected; retain claim, independent run, host evidence, pause/cancel/environment and plan checks"
+    },
+    {
+      "option": "Mark task complete, bypass claim or relax inflight budget-extension guards",
+      "decision": "rejected; violates independent acceptance and ownership"
+    },
+    {
+      "option": "Repeat paid inference in required checks",
+      "decision": "rejected; compile and live preparation precede identity freeze, checks revalidate only"
+    }
+  ],
+  "risks": [
+    "Historical event777 raw output not available within current root: exact historical cause must remain unknown; do not infer from305 passes.",
+    "Current native config/runtime or installed provider may fail; no invented credentials or fallback binding.",
+    "No helper proof substitutes final installed pipeline, downstream QA or deployment."
+  ],
+  "verification_path": [
+    "Compile deterministic current-store/supervisor repro and preserve failing log.",
+    "Implement atomic task-boundary policy and execute full retained regressions plus budget controls.",
+    "Perform trusted opt-in current-source HiMind/Codex artifact handoff and launch/resume in this task root.",
+    "Freeze compile inputs including runtime-profiles, binaries, config/runtime and toolchain; run three original commands unchanged.",
+    "Write truthful readiness report with current counts, failures, provenance and follow-up responsibilities."
+  ]
+}

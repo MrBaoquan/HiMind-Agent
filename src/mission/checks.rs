@@ -1,4 +1,5 @@
 //! Execute only the checks in the confirmed task, collecting host-owned exit codes.
+use super::runtime_resources::CheckRuntimeResources;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -23,6 +24,26 @@ pub(crate) fn run_required_checks(
     timeout: Duration,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Vec<HostCheck> {
+    run_required_checks_inner(workspace, checks, timeout, is_canceled, None)
+}
+
+pub(crate) fn run_required_checks_with_resources(
+    workspace: &Path,
+    checks: &[String],
+    timeout: Duration,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    resources: &CheckRuntimeResources,
+) -> Vec<HostCheck> {
+    run_required_checks_inner(workspace, checks, timeout, is_canceled, Some(resources))
+}
+
+fn run_required_checks_inner(
+    workspace: &Path,
+    checks: &[String],
+    timeout: Duration,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    resources: Option<&CheckRuntimeResources>,
+) -> Vec<HostCheck> {
     let started = Instant::now();
     checks
         .iter()
@@ -37,6 +58,7 @@ pub(crate) fn run_required_checks(
                         text,
                         remaining.min(Duration::from_secs(300)),
                         is_canceled,
+                        resources,
                     )
                 });
             let (exit_code, output_sha256, test_summary, error) = match result {
@@ -137,6 +159,7 @@ fn run_check(
     text: &str,
     timeout: Duration,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    resources: Option<&CheckRuntimeResources>,
 ) -> Result<(i32, String, String), Box<dyn Error>> {
     use crate::runtime::process;
     if is_canceled()? || timeout.is_zero() {
@@ -164,12 +187,15 @@ fn run_check(
     };
     command
         .args(&words[1..])
-        .current_dir(workspace)
+        .current_dir(process::canonical_workspace(workspace.to_str().ok_or("check workspace must be Unicode")?)?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     process::remove_himind_secret_environment(&mut command);
-    let mut child = command.spawn()?;
+    if let Some(resources) = resources {
+        resources.apply_for_workspace(workspace, &mut command)?;
+    }
+    let (mut child,tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
     let stdout = child.stdout.take().map(process::capture_output);
     let stderr = child.stderr.take().map(process::capture_output);
     let status = process::wait_for_child_until_with_cancel(
@@ -181,29 +207,40 @@ fn run_check(
     if status.is_err() {
         process::terminate_process_tree(&mut child);
     }
+    drop(tree);
     let out = process::join_output(stdout);
     let err = process::join_output(stderr);
     let status = status?;
     let digest = format!("{:x}", Sha256::digest(format!("{out}\n{err}").as_bytes()));
-    // Only standard numeric TAP totals are exposed to agents. Raw process
-    // output may contain secrets or private content; it is represented by hash.
+    // Numeric TAP and fixed, nonsecret remediation diagnostics only. Never
+    // expose arbitrary stdout/stderr, exception messages or absolute paths.
     let summary = out
         .lines()
         .chain(err.lines())
         .filter(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            fields.len() == 3
+            (fields.len() == 3
                 && fields[0] == "#"
                 && matches!(
                     fields[1],
                     "tests" | "suites" | "pass" | "fail" | "cancelled" | "skipped" | "todo"
                 )
-                && fields[2].parse::<u64>().is_ok()
+                && fields[2].parse::<u64>().is_ok()) || safe_remediation_diagnostic(line)
         })
         .take(16)
         .collect::<Vec<_>>()
         .join("\n");
     Ok((status.code().unwrap_or(-1), digest, summary))
+}
+
+fn safe_remediation_diagnostic(line:&str)->bool {
+    let fields=line.split_whitespace().collect::<Vec<_>>();
+    fields.len()==4 && fields[0]=="#" && fields[1]=="remediation"
+        && matches!(fields[2],"missing_preparation"|"candidate_mismatch"|"product_regression_failed"|
+            "live_evidence_missing"|"check_deadline"|"prepare_failed"|"unexpected_failure")
+        && fields[3].len()<=180 && fields[3].starts_with("executor-lifecycle-repair/")
+        && fields[3].split('/').all(|p|!p.is_empty() && p!="." && p!="..")
+        && fields[3].bytes().all(|b|b.is_ascii_alphanumeric() || b"/._-".contains(&b))
 }
 
 fn command_words(text: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -251,6 +288,128 @@ fn command_words(text: &str) -> Result<Vec<String>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::runtime_resources::test_support::Fixture;
+
+    #[test]
+    fn remediation_diagnostics_are_bounded_allowlisted_and_relative() {
+        assert!(safe_remediation_diagnostic("# remediation missing_preparation executor-lifecycle-repair/checks-123.json"));
+        for line in ["# remediation secret executor-lifecycle-repair/checks.json",
+            "# remediation candidate_mismatch C:/private/file", "# remediation candidate_mismatch executor-lifecycle-repair/../secret",
+            "# remediation candidate_mismatch executor-lifecycle-repair/a?token=secret",
+            "# remediation candidate_mismatch executor-lifecycle-repair/a extra"] {assert!(!safe_remediation_diagnostic(line));}
+        assert!(!safe_remediation_diagnostic(&format!("# remediation candidate_mismatch executor-lifecycle-repair/{}","a".repeat(180))));
+    }
+
+    #[test]
+    fn resources_reach_real_node_before_script_and_preserve_candidate() {
+        assert!(crate::runtime::process::resolve_executable("node").is_some(), "Node is required for this test");
+        let fixture = Fixture::new();
+        let keys = [
+            "HIMIND_MISSION_CHECK_ROOT", "SERVICE_UI_RUNTIME_ROOT", "TEMP", "TMP", "TMPDIR",
+            "npm_config_cache", "npm_config_update_notifier", "PYTHONDONTWRITEBYTECODE",
+        ];
+        let parent_env = keys.map(std::env::var_os);
+        let resources = fixture.prepare();
+        let candidate = super::super::scoped_candidate_identity(&fixture.workspace, ["."]).unwrap();
+        let script = r#"
+            const assert=require('node:assert/strict'),fs=require('node:fs'),p=require('node:path');
+            const root=process.env.HIMIND_MISSION_CHECK_ROOT;
+            assert.ok(root);
+            assert.ok(p.isAbsolute(root));
+            assert.ok(!root.startsWith(String.fromCharCode(92,92,63,92)));
+            assert.equal(process.env.SERVICE_UI_RUNTIME_ROOT,root);
+            assert.equal(process.env.TEMP,p.join(root,'tmp'));
+            assert.equal(process.env.TMP,process.env.TEMP);
+            assert.equal(process.env.TMPDIR,process.env.TEMP);
+            assert.equal(process.env.npm_config_cache,p.join(root,'npm-cache'));
+            assert.equal(process.env.npm_config_update_notifier,'false');
+            assert.equal(process.env.PYTHONDONTWRITEBYTECODE,'1');
+            assert.ok(fs.statSync(process.env.TEMP).isDirectory());
+            assert.ok(fs.statSync(process.env.npm_config_cache).isDirectory());
+            assert.ok(p.relative(process.cwd(),root).startsWith('..'));
+            for(const [dir,name] of [[root,'screenshot.png'],[root,'build.js'],[process.env.TEMP,'temp.txt'],[process.env.npm_config_cache,'cache.txt']]){
+                fs.writeFileSync(p.join(dir,name),'generated');
+            }
+            fs.writeFileSync(p.join(root,'env-evidence.json'),JSON.stringify({root,cwd:process.cwd()}));
+            console.log('# tests 1');console.log('# pass 1');
+        "#;
+        let command = format!("node -e \"{}\"", script.lines().map(str::trim).collect::<Vec<_>>().join(" "));
+        let results = run_required_checks_with_resources(
+            &fixture.workspace, &[command.clone()], Duration::from_secs(10), &|| Ok(false), &resources,
+        );
+        assert_eq!(results[0].exit_code, 0, "{:?}", results[0]);
+        assert_eq!(results[0].command, command);
+        assert_eq!(results[0].test_summary, "# tests 1\n# pass 1");
+        assert_eq!(results[0].output_sha256.len(), 64);
+        assert_eq!(candidate, super::super::scoped_candidate_identity(&fixture.workspace, ["."]).unwrap());
+        assert_eq!(parent_env, keys.map(std::env::var_os));
+        let input = resources.input();
+        let root = Path::new(input["root"].as_str().unwrap());
+        for relative in ["screenshot.png", "build.js", "tmp/temp.txt", "npm-cache/cache.txt", "env-evidence.json"] {
+            assert!(root.join(relative).is_file(), "{relative}");
+        }
+        let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("env-evidence.json")).unwrap()).unwrap();
+        assert_eq!(evidence["root"], input["root"]);
+        assert_eq!(std::fs::canonicalize(evidence["cwd"].as_str().unwrap()).unwrap(), std::fs::canonicalize(&fixture.workspace).unwrap());
+    }
+
+    #[test]
+    fn resources_preserve_real_node_failure_exit_code() {
+        assert!(crate::runtime::process::resolve_executable("node").is_some(), "Node is required for this test");
+        let fixture = Fixture::new();
+        let resources = fixture.prepare();
+        let results = run_required_checks_with_resources(
+            &fixture.workspace,
+            &[r#"node -e "require('node:fs').writeFileSync(require('node:path').join(process.env.HIMIND_MISSION_CHECK_ROOT,'failure.txt'),'evidence');process.exit(7)""#.to_owned()],
+            Duration::from_secs(10), &|| Ok(false), &resources,
+        );
+        assert_eq!(results[0].exit_code, 7, "{:?}", results[0]);
+        assert!(results[0].error.is_empty());
+        assert_eq!(results[0].output_sha256.len(), 64);
+        assert!(Path::new(resources.input()["root"].as_str().unwrap()).join("failure.txt").is_file());
+    }
+
+    #[test]
+    fn legacy_checks_keep_inherited_environment_without_enabling_resources() {
+        assert!(crate::runtime::process::resolve_executable("node").is_some(), "Node is required for this test");
+        let fixture = Fixture::new();
+        let keys = ["HIMIND_MISSION_CHECK_ROOT", "SERVICE_UI_RUNTIME_ROOT", "TEMP", "TMP", "TMPDIR",
+            "npm_config_cache", "npm_config_update_notifier", "PYTHONDONTWRITEBYTECODE"];
+        let expected = keys.iter().filter_map(|key| std::env::var(key).ok().map(|value| (*key, value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = serde_json::to_string(&expected).unwrap();
+        let script = format!(
+            "const assert=require('node:assert/strict');const expected=JSON.parse(String.fromCharCode({}));for(const key of String.fromCharCode({}).split(',')){{assert.equal(process.env[key],expected[key]);}}",
+            expected.bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
+            keys.join(",").bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
+        );
+        // Long task resource paths can make encoded env fixtures exceed the
+        // real 4096-byte command boundary. Keep the boundary and run a script
+        // from this generated fixture workspace instead.
+        std::fs::write(fixture.workspace.join("legacy-env.js"),script).unwrap();
+        let results = run_required_checks(
+            &fixture.workspace, &["node legacy-env.js".into()], Duration::from_secs(10), &|| Ok(false),
+        );
+        assert_eq!(results[0].exit_code, 0, "{:?}", results[0]);
+        assert!(!fixture.cache.exists());
+    }
+
+    #[test]
+    fn resources_for_another_workspace_fail_before_node_spawn() {
+        assert!(crate::runtime::process::resolve_executable("node").is_some(), "Node is required for this test");
+        let fixture = Fixture::new();
+        let resources = fixture.prepare();
+        let other = fixture.root.join("other-workspace");
+        std::fs::create_dir(&other).unwrap();
+        let results = run_required_checks_with_resources(
+            &other, &[r#"node -e "require('node:fs').writeFileSync('must-not-run','bad')""#.to_owned()],
+            Duration::from_secs(10), &|| Ok(false), &resources,
+        );
+        assert_eq!(results[0].exit_code, -1);
+        assert!(results[0].error.contains("different workspace"));
+        assert!(!other.join("must-not-run").exists());
+    }
+
     #[test]
     fn command_parser_preserves_arguments_and_rejects_shells() {
         assert_eq!(

@@ -367,6 +367,7 @@ struct AcpSessionOutcome {
 
 struct AcpProcess {
     child: Option<Child>,
+    tree: Option<crate::runtime::owned_tree::OwnedTree>,
     /// stdin 由写线程持有，但句柄留在共享槽位：会话收尾时取走它，agent 立刻看到
     /// EOF 自行退出，而不是只能靠杀进程。
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -888,7 +889,7 @@ impl AcpProcess {
             command.env("npm_config_offline", "true");
         }
         process::configure_hidden_process(&mut command);
-        let mut child = command.spawn()?;
+        let (mut child, tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
         let stdin = child.stdin.take().ok_or("ACP agent stdin is unavailable")?;
         let stdout = child
             .stdout
@@ -1108,6 +1109,7 @@ impl AcpProcess {
         };
         Ok(Self {
             child: Some(child),
+            tree: Some(tree),
             stdin,
             outgoing: Some(outgoing),
             shared,
@@ -1225,6 +1227,9 @@ impl AcpProcess {
         if let Some(mut child) = self.child.take() {
             process::terminate_process_tree(&mut child);
         }
+        // Release inherited writers before joining SDK/output readers, even
+        // when the root has already exited and cannot be found by PID.
+        self.tree.take();
     }
 }
 

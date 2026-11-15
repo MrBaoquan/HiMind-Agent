@@ -1,0 +1,345 @@
+{
+  "area": "ia",
+  "summary": "保留六项覆盖、IA-001—IA-005 和原证据链。本轮依据 ACC-001 修正 IA-003、IA-004：budget_exhausted→task_progress 不仅遮掉前端入口，也使后端新预算扩展被最后任意事件门控拒绝；优先由 Mission 后端负责人统一有效预算等待判定，保留全部预算授权与保护，并给出暂不支持时的受控诊断恢复路径。仅审查建议，后端变更尚未实施，未执行真实接口、生产恢复或正式 VERIFY。原缺文件修复与安装版观察记录保留为历史证据，不冒充本轮实测。",
+  "coverage": [
+    {
+      "topic": "service_discovery",
+      "status": "finding",
+      "evidence": "IA-001、IA-002：AiConnectionsPage.tsx:168-231、AiProvidersPanel.tsx:750-769、main.tsx:2260；services.png 与 services.ax.txt:38-63 说明五页签已可发现，但保存反馈换称模型来源；ai-connections.png 与 AX:48-78 的就绪摘要和待更新事实冲突。"
+    },
+    {
+      "topic": "client_service_executor_terms",
+      "status": "finding",
+      "evidence": "IA-001：aiConnectionsTabs.ts:12-21 固定五个入口；SettingsPage.tsx:792-795 将远程任务执行方称执行工具；MissionTeamPanel.tsx:658-660 区分执行器、服务、模型。runtime.png 与 runtime.ax.txt:49-95 证明安装实例也区分引擎、CLI 和 ACP 接入，但没有证明三种默认互相继承。"
+    },
+    {
+      "topic": "default_and_override",
+      "status": "reviewed",
+      "evidence": "AiProvidersPanel.tsx:229-234 对话默认取能力路由首项；agentApi.ts:3585-3604 允许空模型跟随服务默认，返回 resolved/ambiguous/missing 与 selected/fallbacks；routes.ax.txt:47-69 展示默认与备用顺序及自检；MissionTeamPanel.tsx:658-660 显式选执行器/服务/模型。报告定义各作用域，不推断任务覆盖与全局路由的后端优先级，实际请求和回退未验证。"
+    },
+    {
+      "topic": "task_status_and_next_action",
+      "status": "finding",
+      "evidence": "IA-003、IA-004：TaskCenterPage.tsx:303-305 未传事件；taskCenterModel.ts:6-13、68-71 未把 Mission 等待环境/预算纳入待我处理；missionView.ts:101-107、208-211 与 MissionTeamPanel.tsx:331-356 对最后事件敏感。tasks.png 仅证明安装列表有状态与重试，不证明预算或环境等待已复现；没有 tasks AX 文件。 ACC-001 复核补充 store.rs:464-470：保留入口不等于扩展可执行，须后端统一判定。"
+    },
+    {
+      "topic": "progress_and_evidence",
+      "status": "finding",
+      "evidence": "IA-005：MissionTeamPanel.tsx:337-348 展示验收计数、阶段和最近事件，:368-370 仅总体完成时在概览显示证据，:424-435 未在已完成子任务行展示证据入口，:472 仅展示事件摘要而非完整 payload。missionView.ts:170-174 正确声明无细粒度事件不推断操作。tasks.png 是运行列表静态依据；Mission 详情无安装截图/AX，缺陷限于源码条件可见性。"
+    },
+    {
+      "topic": "failure_and_recovery",
+      "status": "finding",
+      "evidence": "IA-003、IA-004、IA-005：TaskCenterPage.tsx:231-245 失败保留上次结果；:355-376 区分用户暂停、审批与失败重试；MissionTeamPanel.tsx:431-452 区分重新核验、跟进和继续原运行。tasks.png 可见 workspace unavailable 错误与重试；未点击，无法证实恢复效果、幂等性或后端拒绝行为。 本轮静态明确普通 resume 的耗尽 Err 可能伴随诊断事件提交（store.rs:367-386），不等于恢复成功；未进行真实接口测试。"
+    }
+  ],
+  "findings": [
+    {
+      "id": "IA-001",
+      "title": "服务保存反馈与入口名称不同，执行方术语缺少作用域",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "AI 服务保存后提示模型来源，远程任务设置称执行工具、专家配置称执行器。高频维护者需自行判断自己改的是连接定义、默认路由还是任务执行方，增加误导航和误改配置风险；未证明造成请求错路由。",
+      "recommendation": "main.tsx 保存、删除、克隆反馈统一使用 AI 服务；保留五个稳定页签 id，不改接口。SettingsPage 将执行工具标为远程任务执行器，说明只影响远程任务。运行环境页说明负责安装与可用性，不是默认模型；专家表单增加本任务显式选择/由执行器自身配置的来源摘要。AI 服务列表增加进入能力路由和工具接入的上下文链接，不新增平行一级入口。验收：新增/编辑/删除及错误提示都称 AI 服务；三种配置的作用域可在对应控件旁读到，配置行为保持原样。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/main.tsx",
+          "line_start": 2260,
+          "line_end": 2260,
+          "quote": "notify('success', '模型来源已保存')"
+        },
+        {
+          "path": "source/frontend/src/pages/SettingsPage.tsx",
+          "line_start": 792,
+          "line_end": 795,
+          "quote": "title=\"执行工具\""
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 658,
+          "line_end": 660,
+          "quote": "请选择宿主执行器"
+        },
+        {
+          "path": "source/frontend/src/pages/aiConnectionsTabs.ts",
+          "line_start": 12,
+          "line_end": 18,
+          "quote": "services: 'AI 服务'"
+        },
+        {
+          "path": "evidence/ui/services.png",
+          "observation": "安装实例的 AI 服务页有新增服务、工作台服务、本机服务三个层级；本机服务说明把路由与分发指向各自页面。没有观察保存后的反馈。"
+        },
+        {
+          "path": "evidence/ui/services.ax.txt",
+          "observation": "38-63 行记录 AI 连接、AI 服务页签、默认路由在能力路由查看和新增服务；不能据此声称源码中的保存反馈已在安装版复现。"
+        },
+        {
+          "path": "evidence/ui/runtime.ax.txt",
+          "observation": "49-95 行记录运行环境、工作流 AI 步骤执行方、内置执行引擎、CLI 执行后端及 ACP 接入说明。远程任务设置与专家指派页无对应安装证据，术语差异限源码。"
+        }
+      ]
+    },
+    {
+      "id": "IA-002",
+      "title": "工具页总览宣告全部接好，却另有待更新和未接入",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "维护者先扫总览会认为无需行动，忽略服务变更后的更新通知。已就绪不等于全部工具接入，也不等于已注册工具配置最新。安装实例真实出现该信息矛盾，未证明连接调用失败。",
+      "recommendation": "AiToolsPanel 将模型同步 needs_update/failed/conflict 的工具并入待处理集合并按工具 id 去重；总览显示已就绪 N / 已检测 M、待更新 K，未接入另计。没有阻塞但仍有可选未接入时改为已接入工具可用，不再说接入、模型、执行都已接好。待更新时主操作更新配置，冲突时改为逐项检查并提示不会自动覆盖。验收：安装证据同类夹具中 K=1 时待处理至少 1 且筛选可定位该工具；所有统计以同一快照和同一工具集合为口径。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiToolsPanel.tsx",
+          "line_start": 140,
+          "line_end": 140,
+          "quote": "const pendingClientSync = clients.filter((entry) => entry.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(entry.sync_state ?? ''));"
+        },
+        {
+          "path": "source/frontend/src/pages/AiToolsPanel.tsx",
+          "line_start": 149,
+          "line_end": 161,
+          "quote": "const headline = attention.length ? `${attention.length} 个工具待处理` : '工具已就绪';"
+        },
+        {
+          "path": "source/frontend/src/pages/AiToolsPanel.tsx",
+          "line_start": 158,
+          "line_end": 161,
+          "quote": ": '接入、模型、执行都已接好。';"
+        },
+        {
+          "path": "evidence/ui/ai-connections.png",
+          "observation": "安装界面同一首屏顶部为工具已就绪、接入模型执行都已接好，筛选显示未接入 4、待处理 0，下一条通知却是 1 个已注册工具待更新，原因 claude-code：AI 服务已变化。"
+        },
+        {
+          "path": "evidence/ui/ai-connections.ax.txt",
+          "observation": "48-78 行同时记录就绪文案、未接入 4、待处理 0、1 个已注册工具待更新与更新全部按钮；这是安装版已观察事实，当前源码有独立 pendingClientSync 与 attention 两套计算。"
+        }
+      ]
+    },
+    {
+      "id": "IA-003",
+      "title": "任务列表丢失事件上下文，环境和预算等待不进入待我处理",
+      "priority": "P1",
+      "confidence": "confirmed",
+      "impact": "需要用户处理的环境/预算阻塞可能只显示暂停/等待和查看等待原因，并且不进入待我处理筛选。用户依赖该筛选时会漏掉使任务继续的必要动作。源码投影缺口确定；未用真实等待任务复现，不能断言所有任务都会漏列。",
+      "recommendation": "TaskCenterPage、taskCenterModel 和详情共用同一状态展示投影，包含可获得的等待原因、行动者、动作与新鲜度。列表取得事件上下文或使用宿主已有摘要；若 API 无该信息则移交接口负责人，不在本任务改数据契约。环境阻塞/预算用尽映射为需要你处理，但原因可见不等于动作可执行；预算扩展须以 Mission 后端有效预算等待判定为准，不能只补事件投影。当前 budget_exhausted→task_progress 使 store.rs:464-470 拒绝新扩展请求；按 budget_recovery_decision 先完成后端决策，再深链到可执行对话框；暂不支持时深链只读诊断与受控恢复。用户主动暂停与系统核验排队不要混入强制待办。未知原因显示等待原因尚未同步，查看详情，不猜具体原因。验收：环境阻塞、预算用尽、主动暂停、系统核验四种夹具的列表与详情状态一致，前两种可从待我处理直接定位动作。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/TaskCenterPage.tsx",
+          "line_start": 303,
+          "line_end": 305,
+          "quote": "{missionStatusLabel(mission)}"
+        },
+        {
+          "path": "source/frontend/src/pages/TaskCenterPage.tsx",
+          "line_start": 305,
+          "line_end": 305,
+          "quote": "{missionNextAction(mission)}"
+        },
+        {
+          "path": "source/frontend/src/pages/taskCenterModel.ts",
+          "line_start": 6,
+          "line_end": 13,
+          "quote": ": mission.status === 'awaiting_confirmation' ? 'confirmation' : null;"
+        },
+        {
+          "path": "source/frontend/src/pages/taskCenterModel.ts",
+          "line_start": 68,
+          "line_end": 71,
+          "quote": "needsUser: !ENDED_STATUSES.has(m.status) && (missionStalled(m) || Boolean(missionTodo(m)) || (related.get('mission:'+m.mission_id) || []).some(activityNeedsUser))"
+        },
+        {
+          "path": "source/frontend/src/pages/missionView.ts",
+          "line_start": 208,
+          "line_end": 211,
+          "quote": "if (missionRuntimeBlocked(mission, events)) return '选择工作区授权或仅用文件工具继续';"
+        },
+        {
+          "path": "source/frontend/src/services/agentApi.ts",
+          "line_start": 365,
+          "line_end": 388,
+          "quote": "status: MissionStatus;"
+        },
+        {
+          "path": "evidence/ui/tasks.png",
+          "observation": "安装列表可见待我处理、进行中、已结束与具体运行失败重试；不包含预算用尽或命令环境阻塞的 Mission 详情，故未复现此缺陷。未提供 tasks.ax.txt，无法证明这些状态的辅助技术表现。"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 464,
+          "line_end": 470,
+          "quote": "if latest_event.as_deref() != Some(\"budget_exhausted\") {"
+        }
+      ]
+    },
+    {
+      "id": "IA-004",
+      "title": "预算等待依赖最后事件，后续诊断可能遮掉正确恢复入口",
+      "priority": "P1",
+      "confidence": "confirmed",
+      "impact": "Mission 仍 waiting 且 budget_exhausted 后追加非状态事件时，预算标识和增加预算入口会退回一般恢复任务。用户无法从同一位置知道为何停、谁处理和怎样继续。代码条件可确定，事件顺序在生产是否出现仍未验证，静态核查进一步确认：store.rs:464-470 的预算扩展也读取最后任意事件，因此仅恢复预算按钮后该新请求仍被拒绝；一般 resume 在实际预算仍耗尽时追加 budget_exhausted、提交后返回错误，不恢复派发（:367-386）。这是静态条件冲突，不是已发生的生产故障或真实接口测试结论。",
+      "recommendation": "missionView 和 MissionTeamPanel 使用最近有效状态转换而非任意最后事件判断预算等待；参考 missionRuntimeBlocked 已有的 blocked/resolved 配对与 plan_sha256 边界。将预算、用户暂停、命令环境、外部等待分别显示原因/行动者/下一步；仅在已解决或新状态转换后清除原因。目标支持方案验收：budget_exhausted→task_progress 后仍显示原因，并在后端资格确认后提供增加预算并继续；暂不支持时提供诊断与受控恢复，不承诺直接扩展成功；增加预算并恢复后消失；旧计划阻塞事件不污染新计划。原仅展示层建议不足以满足 ACC-001：store.rs:464-470 同样要求任意最后事件为 budget_exhausted。须优先由 Mission 后端负责人统一有效预算等待判定，前端消费同一判定；详见本报告 budget_recovery_decision。后端变更尚未实施，不能以保留按钮认定可恢复，不绕过审批或预算策略。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 331,
+          "line_end": 332,
+          "quote": "const budgetExhausted = mission.status === 'waiting' && events[events.length - 1]?.event_type === 'budget_exhausted';"
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 354,
+          "line_end": 356,
+          "quote": ": mission.status==='waiting' ? <button className=\"btn\" disabled={controlling} onClick={()=>void controlMission('resume')}>恢复任务</button>"
+        },
+        {
+          "path": "source/frontend/src/pages/missionView.ts",
+          "line_start": 101,
+          "line_end": 107,
+          "quote": "if (transition?.event_type === 'budget_exhausted') return '预算已用尽';"
+        },
+        {
+          "path": "source/frontend/src/pages/missionView.ts",
+          "line_start": 85,
+          "line_end": 89,
+          "quote": "const last = [...events].reverse().find(event => ['runtime_workspace_blocked', 'runtime_workspace_resolved'].includes(event.event_type));"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 464,
+          "line_end": 470,
+          "quote": "if latest_event.as_deref() != Some(\"budget_exhausted\") {"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 437,
+          "line_end": 453,
+          "quote": "return Err(\"budget request_id was already used with different values\".into());"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 456,
+          "line_end": 476,
+          "quote": "return Err(\"mission still has a running task; wait for it to stop before continuing\".into());"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 503,
+          "line_end": 528,
+          "quote": "if runtime_blocked_on(&transaction, &mission)? { \"waiting\" } else { \"active\" }"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 367,
+          "line_end": 386,
+          "quote": "return Err(reason.into());"
+        },
+        {
+          "path": "source/src/mission/store.rs",
+          "line_start": 1794,
+          "line_end": 1803,
+          "quote": "声明了成本上限，但执行器未上报可信成本，已停止继续派发"
+        },
+        {
+          "path": "source/src/app/mission_commands.rs",
+          "line_start": 679,
+          "line_end": 688,
+          "quote": ") -> Result<MissionView, String> {"
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 512,
+          "line_end": 523,
+          "quote": "request_id: `agent-ui:${crypto.randomUUID()}`,"
+        }
+      ],
+      "unverified": "无对应预算等待安装截图或 AX；这是源码分支审查，未实测事件序列、恢复点击或后端预算保护。"
+    },
+    {
+      "id": "IA-005",
+      "title": "总体未完成时概览不展示已记录子任务证据",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "部分完成或核验失败时，用户最需要核对已交付文件和验收依据；概览的交付证据区却由总体 completed 控制。计划行虽有失败摘要和重核入口，但没有同位证据链接，用户被迫到活动或执行详情追索。没有断言证据丢失或所有页面都无法访问。",
+      "recommendation": "MissionTeamPanel 概览按 evidenceTasks 是否存在展示已提交结果与核验，不以总体完成为前提；每个子任务行提供查看证据，区分实现提交、必需检查、独立核验三类结论，附实际可得的执行 id、文件引用和时间。无证据时明确未记录，不填造测试计数；可复制路径，若支持打开仅用既有安全动作。验收：部分完成、核验失败、全部完成三个夹具均能从概览找到已有证据；没有记录的测试结果显示未提供而不是 0 次通过。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 330,
+          "line_end": 330,
+          "quote": "const evidenceTasks = mission.tasks.filter(task => task.evidence_refs.length || task.verification_passed !== null);"
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 368,
+          "line_end": 370,
+          "quote": "{mission.status==='completed'?<section className=\"mission-detail-panel mission-delivery\"><h3>交付结果与验收</h3>"
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 369,
+          "line_end": 369,
+          "quote": "未记录证据路径。"
+        },
+        {
+          "path": "source/frontend/src/pages/MissionTeamPanel.tsx",
+          "line_start": 425,
+          "line_end": 435,
+          "quote": "执行或核验未通过，请查看活动记录。"
+        },
+        {
+          "path": "source/frontend/src/pages/missionView.ts",
+          "line_start": 170,
+          "line_end": 174,
+          "quote": "当前执行器暂未上报细粒度事件；显示运行状态，不推断具体操作"
+        }
+      ],
+      "unverified": "Mission 部分完成/失败详情未提供截图与 AX；只确认源码概览渲染门槛，未复现路径打开、复制或读屏交互。"
+    }
+  ],
+  "budget_recovery_decision": {
+    "basis": "ACC-001；移交 B08。仅审查建议，后端、接口、前端变更均尚未实施；不更改 acceptance 结论。",
+    "current_facts": [
+      "waiting + budget_exhausted→task_progress：当前前端按最后任意事件丢失预算入口；即使前端保留入口，新预算请求仍在 store.rs:464-470 被拒绝。该断言以新 request_id、waiting、计划及确认匹配为前提；已成功请求的同值重放在 :437-453 提前返回当前 Mission。",
+      "store.rs:367-386：普通 resume 在预算仍耗尽且无环境阻塞时追加 budget_exhausted 并 commit 后返回 Err，不能视作恢复成功；存在环境阻塞时 :364-365 提前拒绝。:472-505 还检查无 Running、当前耗尽及扩展后不再耗尽。",
+      "store.rs:507-528：扩展成功提交 budget_extended；环境仍阻塞则保持 waiting，否则 active。成功不等于任务已派发、已完成或独立验收通过。mission_commands.rs:679-688 当前返回 Result<MissionView,String>，不是已实现的结构化错误码或 HTTP 状态契约。"
+    ],
+    "preferred_owner": "Mission 后端负责人牵头统一判定、事务和恢复门控；宿主接口负责人提供原因/计划/事件游标/动作资格与拒绝原因；Mission 前端负责人实现同快照列表、待办、详情及幂等提交；Runtime负责人负责可信用量与运行收尾；综合方案专家更新 B08，独立验收者执行后续夹具与真实接口验证。",
+    "target_rule": "后端在事务内以当前 waiting、当前已确认 plan_sha256、当前预算及可信用量重新计算有效预算等待，不以任意最后事件授权。按 sequence 在当前计划及确认边界内归约预算与显式暂停/恢复/计划替换等状态转换；task_progress 等非状态事件不清除原因。budget_extended 关闭旧耗尽区间，但之后重新达到限额仍需重新判定；手动暂停且未耗尽不能扩展。历史 budget_exhausted payload 无 plan_sha256（:380-382），不得虚构关联，需以计划/确认边界结合当前预算复算；关联不明标未知并拒绝自动恢复。环境与预算原因可并存，前端不凭旧事件自行判定可执行。此规则是待实施设计，不是当前事实。",
+    "guards": "保留 :418-430 参数范围与互斥校验、:432-454 事务内 request_id+完整输入摘要幂等、:456-462 waiting 与任务/确认计划哈希双校验、:472-505 无运行任务和扩展后全部限额复算。只追加用户明确批准的预算，不默认 unlimited_tokens、不自动追加成本。:1794-1803 无成本记录、空币种/不可信成本继续 fail closed；增加额度不修复缺失成本，不以0补齐、不暗换币、不移除上限。保持审批、确认范围和 OS 权限边界。",
+    "interface_semantics": {
+      "success": "新请求仅在全部门控通过后原子写预算和唯一 budget_extended，返回最新 Mission：active 表示可由既有调度器再检查后派发；若环境阻塞仍 waiting，显示预算已增加、命令环境待处理。响应丢失时以原 request_id 和原完整输入重试；前端须为一次逻辑提交持久保留该键，不能每次重试生成新键（当前 MissionTeamPanel.tsx:513 每次 submit 新建 UUID，需后续实现）。",
+      "replay": "同 request_id 同摘要成功重放返回当前 Mission，不再次增加或强制激活，即使当前状态/计划已变化也不能把该返回解读为新预算授权；同键异参拒绝。事件重放按 sequence/cursor 去重并重新投影，重复 budget_extended 不可重复累计。",
+      "reject": "建议接口提供可判别的拒绝原因（待设计，不冒充现有码）：计划变化→刷新后重新确认；运行未收尾→等待并查询既有运行；非预算/关联不明→只读诊断；额度不足→显示仍触发的限额，由用户重新授权新输入/新键；可信成本缺失→移交Runtime补真实计量后复查；同键异参→不得自动换键重发。预算扩展拒绝不得改预算、状态、确认或派发；普通 resume 的提交诊断后 Err 是现存例外，须刷新读取，不能当成功。"
+    },
+    "temporary_unsupported_path": "若负责人暂不支持 budget_exhausted→task_progress：明确标记该序列不可直接扩展，保留预算原因与待我处理入口，主操作改为查看诊断，不放一个保证可成功的增加预算按钮。记录 mission_id、当前/确认计划哈希、事件 sequence/type、预算/可信用量和运行状态，不收集密钥；刷新快照。确认无运行任务、无环境阻塞且当前仍真实耗尽后，可由操作者明确选择一次既有 resume 作受控重新检查：:367-386 会追加 budget_exhausted、仍 waiting 并返回耗尽错误；必须刷新证实这条新事件和未激活后，才用用户明确批准的额度调用扩展。不能自动循环 resume，遇并发新事件则停止、保留 waiting 并交 Mission 后端负责人；有环境阻塞先走既有环境诊断/授权路径并复查预算；运行未停先等待或走既有取消/收尾流程。成本不可信则交 Runtime，额度增加不能解锁；无法满足前提保留安全暂停并提供诊断移交，不编辑数据库、不伪造/删除事件、不清空成本或确认、不重建任务绕过授权。此为静态推导的临时操作方案，未经真实接口验证。",
+    "b08_acceptance": [
+      "T1 当前计划 waiting、确实耗尽、无运行任务：budget_exhausted→task_progress 后列表/待办/详情同原因；后端新扩展在足额且显式授权后成功，仅1条 budget_extended，active且计划/确认不变；后续派发仍再检查。",
+      "T2 同序列叠加 runtime_workspace_blocked：扩展足额成功但仍 waiting；预算原因清除、环境原因保留；环境解决后才具备继续条件。",
+      "T3 旧计划事件、手动暂停未耗尽、确认哈希不匹配或关联不明：拒绝且预算不变，不以保留按钮替代门控；刷新显示可操作诊断。",
+      "T4 同键同参并发/丢响应重试只扩展一次；同键异参拒绝；重启重放及增量重复 task_progress/budget_extended 不重计预算、不重派发，返回当前状态不强制恢复。",
+      "T5 Running 存在拒绝；运行收尾后刷新才重试；事务竞态下不能在运行中扩展。",
+      "T6 新额度仍不足、轮次/时长/Token/成本任一仍超限拒绝；成本无记录/空币种/不可信继续停止，不能靠提高额度或自动不限额解除。",
+      "T7 若暂不支持，明确拒绝语义并验证上述只读诊断→受控重检 Err+waiting→刷新→显式扩展路径；并发事件再次遮挡时停止并移交，不自动重试/自动加预算。以上为待实施及待验收夹具，本次未执行。"
+    ],
+    "unverified": "仅静态读源码及既有验收意见，未启动产品、未执行 Rust 测试或真实接口/事件注入。store.rs:2840-2968 的幂等、暂停、旧计划及 resume 测试仅阅读，不算本次运行通过；没有预算等待渲染证据。"
+  },
+  "limitations": [
+    "原检查首次实际执行 python contracts/check.py ia 返回 exit 1，AssertionError: Missing deliverable: reports/ia.json；reports/ia.md 也不存在。本次不是对历史失败断言的猜测。宿主事件 mission_1794443924791_2d612a63:278 的 exit_code=1、285ms、output_sha256=b00c63f1bafac8eb54ec9fa38b5b479cc628e2d4e759f7f70cf980dd39e3b75f 仅为历史记录，test_summary/error 为空且无数字 TAP 统计。",
+    "source 是含未提交修改的当前快照；安装截图来自 v0.3.92（e630a08）。文案相同不证明构建相同，未建立逐文件版本对应关系。",
+    "本次读取七张原始截图像素及六份现有 AX，不新增或修改 UI 证据；tasks 无 AX。仅复查已有桌面首屏，非本次启动或交互实测。设置截图预览为 982x752，任务截图预览为 1282x822，不等同于已确认 CSS viewport。",
+    "未运行生产应用、未保存服务配置、未发模型请求、未点自检/重试/预算续跑；未验证真实默认优先级、回退、费用、任务幂等性、键盘焦点、读屏实听、200% 放大、320px 重排、长文本、深色主题、减少动效。",
+    "保守场景假设：同一台 Windows 设备上反复接入 AI 工具、维护服务并跟踪多项协作任务的操作者；用户研究和角色频率未提供。仅修复 IA 报告，不改产品、API、检查器或其他交付；正式 VERIFY 与最终验收由宿主执行。",
+    "取值为沿用本地令牌与建议验收阈值，不是实际像素或对比度测量；设计规范优先级为本地约束、平台规范、通用规范。",
+    "本轮 repair-ia-budget-recovery-2 仅静态复核 ACC-001 关联源码并修订 IA 两份报告；七张截图/六份 AX 与原缺文件检查记录均为上一轮保留记录，本轮未重新读取图像或运行 UI。全部后端目标规则、拒绝原因分类及 B08 夹具尚未实施/执行；不得视为接口契约已变更。未加载宿主未固定外部技能。"
+  ],
+  "checks": [
+    {
+      "phase": "repair-ia-budget-recovery-2_after_revision",
+      "command": "python contracts/check.py ia",
+      "exit_code": 0,
+      "output_summary": "{\"passed\": true, \"stage\": \"ia\", \"source_files_unchanged\": true, \"meaning\": \"Structural and evidence checks only; independent semantic review still required.\"}",
+      "scope": "真实执行的结构与源码证据检查，不是接口/渲染/Rust测试或宿主正式VERIFY。"
+    }
+  ]
+}

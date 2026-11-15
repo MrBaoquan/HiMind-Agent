@@ -1,0 +1,644 @@
+{
+  "summary": "18项发现全部采纳；合并重复后13项整改待办，均为未来实施而非生产完成。UI-006仅采纳验证与条件修复，不将假设当事实。",
+  "dispositions": [
+    {
+      "finding_id": "AI-001",
+      "decision": "accept",
+      "reason": "源码直接覆盖目录，纳入B01原子读改写及恢复；不以数据库重构替代最小修复。"
+    },
+    {
+      "finding_id": "AI-002",
+      "decision": "accept",
+      "reason": "删除两文件存在中断窗口，B02幂等修复依赖B01；换序不是事务。"
+    },
+    {
+      "finding_id": "AI-003",
+      "decision": "accept",
+      "reason": "客户端错误边界确实透传原文，B03阻断条件性泄漏；不是已泄漏事件。"
+    },
+    {
+      "finding_id": "AI-004",
+      "decision": "accept",
+      "reason": "I/O结果被忽略，B04区分传输失败和成功，不承诺断流无缝续跑。"
+    },
+    {
+      "finding_id": "AI-005",
+      "decision": "accept",
+      "reason": "B05明确预算币种与未知成本，保留保守阻断及请求幂等。"
+    },
+    {
+      "finding_id": "IA-001",
+      "decision": "accept",
+      "reason": "B06统一术语并展示作用域，不改变默认解析策略。"
+    },
+    {
+      "finding_id": "IA-002",
+      "decision": "accept",
+      "reason": "与UI-007同根因，统一合入B07，按工具去重而非重复计算。"
+    },
+    {
+      "finding_id": "IA-003",
+      "decision": "accept",
+      "reason": "B08采纳后端统一有效预算等待与前端同快照资格，追溯ACC-001；仅保留预算入口不能解决当前后端拒绝。"
+    },
+    {
+      "finding_id": "IA-004",
+      "decision": "accept",
+      "reason": "B08采纳后端统一有效预算等待与前端同快照资格，追溯ACC-001；仅保留预算入口不能解决当前后端拒绝。"
+    },
+    {
+      "finding_id": "IA-005",
+      "decision": "accept",
+      "reason": "B09按实际证据存在展示，不等总体完成，不捏造测试计数。"
+    },
+    {
+      "finding_id": "UI-001",
+      "decision": "accept",
+      "reason": "B10统一模态责任并测试嵌套焦点；confirmed限实现分叉，实际跳焦未复现。"
+    },
+    {
+      "finding_id": "UI-002",
+      "decision": "accept",
+      "reason": "B11使用原生选择语义及步骤状态。"
+    },
+    {
+      "finding_id": "UI-003",
+      "decision": "accept",
+      "reason": "B11与选择语义同表单交付，但保留独立字段定位验收。"
+    },
+    {
+      "finding_id": "UI-004",
+      "decision": "accept",
+      "reason": "B12由父页唯一持有tabpanel，源码与安装AX均支持。"
+    },
+    {
+      "finding_id": "UI-005",
+      "decision": "accept",
+      "reason": "B13沿用本地12/13/14px令牌，优先于IA通用字号建议；不声称当前对比度失败。"
+    },
+    {
+      "finding_id": "UI-006",
+      "decision": "accept",
+      "reason": "B13先测内容容器与长文本，复现后做条件回落；保留hypothesis，不断言当前溢出。"
+    },
+    {
+      "finding_id": "UI-007",
+      "decision": "accept",
+      "reason": "与IA-002合并B07，一个事实集合驱动摘要/筛选/行动。"
+    },
+    {
+      "finding_id": "UI-008",
+      "decision": "accept",
+      "reason": "B13区分健康未知与配置存在，保留旧数据与时间，不静默伪成功。"
+    }
+  ],
+  "items": [
+    {
+      "id": "B01",
+      "title": "目录锁内原子读改写与上一版本恢复",
+      "priority": "P1",
+      "phase": "M1",
+      "owner": "配置后端负责人：实现锁、原子替换及恢复诊断；QA负责中断注入",
+      "source_findings": [
+        "AI-001"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "在临时写、刷新、替换前后逐点终止，重启至少旧/新一份可解析；恢复记录配置版本且不含凭据",
+        "并发修改两个不同服务无丢失更新；损坏快照不被自动恢复为有效版本"
+      ],
+      "rollback": "暂停配置写入口，校验并恢复上一版加密目录；保留失败文件供诊断，不退回无保护覆盖写。"
+    },
+    {
+      "id": "B02",
+      "title": "删除幂等清引用及启动一致性诊断",
+      "priority": "P1",
+      "phase": "M1",
+      "owner": "配置后端负责人：跨目录/路由恢复；前端负责人：呈现悬空引用诊断",
+      "source_findings": [
+        "AI-002"
+      ],
+      "depends_on": [
+        "B01"
+      ],
+      "acceptance": [
+        "目录提交后、路由提交前终止，重启并重试删除相同id，全部悬空引用消失",
+        "清理不存在id可重复执行，其他默认/备用相对顺序不变；启动检测不擅自选择新服务"
+      ],
+      "rollback": "停止编辑并成对恢复同版本目录和路由快照；单文件回退禁止；长程事务存储另立决策。"
+    },
+    {
+      "id": "B03",
+      "title": "统一公开错误DTO与脱敏边界",
+      "priority": "P1",
+      "phase": "M1",
+      "owner": "网关负责人：直通/互译统一安全错误；安全复核人：检查响应及日志",
+      "source_findings": [
+        "AI-003"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "虚构Bearer和x-api-key回显的401/403/500在所有错误分支响应与日志均无原值",
+        "客户端仍得到安全code与request_id，限长异常HTML不透传，凭request_id可关联安全诊断"
+      ],
+      "rollback": "保留脱敏边界；适配异常时禁用受影响互译分支并返回安全错误，不恢复原文透传。"
+    },
+    {
+      "id": "B04",
+      "title": "区分完整响应、读取失败与流式中断",
+      "priority": "P2",
+      "phase": "M2",
+      "owner": "网关负责人：读取结果类型及transport_outcome；计量负责人：完整性标记",
+      "source_findings": [
+        "AI-004"
+      ],
+      "depends_on": [
+        "B03"
+      ],
+      "acceptance": [
+        "伪上游200后截断/超时：写出前返回结构化502，不记为静默成功，记录request_id与usage不完整",
+        "超限与I/O错误不同码；已写出流只标中断，不自动重放工具调用或承诺无缝续流"
+      ],
+      "rollback": "关闭有问题适配路径，保留失败/未知标记；不得以HTTP200重新认定完整成功。"
+    },
+    {
+      "id": "B05",
+      "title": "预算币种与可信用量契约",
+      "priority": "P2",
+      "phase": "M2",
+      "owner": "Mission负责人：预算门控；Runtime负责人：币种和完整性上报",
+      "source_findings": [
+        "AI-005"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "USD+CNY分桶且不可作为单币限额比较，空币种/未上报成本仍停止成本预算派发",
+        "同run用量和同request_id预算扩展重放不重复；旧plan_sha256扩展被拒，重启后结论一致"
+      ],
+      "rollback": "旧事件保留原值并标不可比较，成本预算维持暂停；不补零、不隐式换汇、不删除历史事件。"
+    },
+    {
+      "id": "B06",
+      "title": "统一服务术语与默认来源说明",
+      "priority": "P2",
+      "phase": "M1",
+      "owner": "产品IA负责人：术语及作用域；前端负责人：反馈与上下文深链",
+      "source_findings": [
+        "IA-001"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "服务新增/编辑/删除/复制及失败反馈均称AI服务；保留五页签id和深链",
+        "远程任务默认、运行环境可用性、任务显式选择分别就近说明；空模型标跟随服务默认，无解析结果标未解析，不宣称覆盖已有任务"
+      ],
+      "rollback": "仅撤回新增解释/链接，保持数据与绑定不变；保留旧深链兼容映射。"
+    },
+    {
+      "id": "B07",
+      "title": "工具可用与需行动同快照摘要",
+      "priority": "P2",
+      "phase": "M1",
+      "owner": "工具接入前端负责人：同集合摘要与筛选；产品负责人：行动优先级",
+      "source_findings": [
+        "IA-002",
+        "UI-007"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "ready+needs_update/failed/conflict分别测试，按工具id去重；K=1时待处理至少1且筛选定位相同行",
+        "可运行数量与需更新数量并列、未接入另列；冲突主操作查看差异，不自动覆盖；统计携带同一快照时间"
+      ],
+      "rollback": "隐藏不可信总数，保留逐行状态和更新通知；不回退为全部接好。"
+    },
+    {
+      "id": "B08",
+      "title": "跨层有效预算等待、事务门控与安全恢复",
+      "priority": "P1",
+      "phase": "M1",
+      "owner": "Mission后端负责人牵头事务归约/门控；宿主接口负责人同快照资格/兼容；Mission前端负责人共享投影/稳定幂等键；Runtime负责人可信用量/收尾；独立测试负责人执行夹具，均待实名指派",
+      "source_findings": [
+        "IA-003",
+        "IA-004"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "IA-003/IA-004/ACC-001：budget_exhausted→task_progress在新契约下经事务复核足额扩展成功；当前实现新请求拒绝，前端入口不代表修复",
+        "列表/待办/详情同快照原因、行动者、资格及游标；环境/预算需要处理，主动暂停/系统核验另分组；缺关联显示未知",
+        "保留waiting、双计划哈希、无Running、参数及全部限额/可信成本复算；仅明确批准额度，不默认不限额、不扩大权限",
+        "同键同摘要只一次扩展，同键异参拒绝；丢响应原键重试返回当前Mission，不强制激活；重放不重复用量/派发",
+        "逐例运行fixture_spec，记录目标与当前差异；模拟与源码静态检查不能替代真实接口输出"
+      ],
+      "rollback": "关闭新直接扩展，保留诊断与历史事件；未知保持waiting，不改数据库、不伪造事件、不清成本、不重建任务绕过批准。",
+      "review_refs": [
+        "ACC-001"
+      ],
+      "implementation_status": "target_not_implemented",
+      "implementation_order": [
+        "M0冻结当前计划边界、资格及夹具",
+        "M1a后端事务规则与测试，再发布可协商接口能力",
+        "M1b前端只读比对后启用新契约扩展与稳定幂等提交",
+        "M1c独立真实接口/重启/竞态验证；非本轮执行"
+      ],
+      "compatibility": "旧请求字段及Result兼容入口保留；结构化资格/拒绝需能力协商。旧后端最后事件门控未解决，未知/旧能力仅诊断；一次明确resume重检需Err+waiting刷新证实，禁止循环或自动加额。",
+      "fixture_spec": {
+        "version": "B08-target-v1",
+        "status": "specification_only_not_executed",
+        "trace": [
+          "IA-003",
+          "IA-004",
+          "ACC-001"
+        ],
+        "base_initial": {
+          "mission_id": "demo-b08",
+          "status": "waiting",
+          "plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confirmation_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "budget": {
+            "max_rounds": 10,
+            "max_minutes": 60,
+            "max_total_tokens": 100,
+            "max_cost": 10,
+            "currency": "USD"
+          },
+          "usage": {
+            "rounds": 1,
+            "minutes": 1,
+            "total_tokens": 100,
+            "cost": 1,
+            "currency": "USD",
+            "trusted": true
+          },
+          "running_tasks": 0,
+          "environment_blocked": false,
+          "events": [
+            {
+              "sequence": 1,
+              "type": "plan_confirmed",
+              "plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "sequence": 2,
+              "type": "budget_exhausted"
+            },
+            {
+              "sequence": 3,
+              "type": "task_progress"
+            }
+          ],
+          "dispatch_count": 0
+        },
+        "base_request": {
+          "request_id": "K",
+          "expected_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "additional_rounds": 0,
+          "additional_minutes": 0,
+          "additional_tokens": 50,
+          "additional_cost": null,
+          "unlimited_tokens": false
+        },
+        "adapter_contract": {
+          "operations": [
+            "reset",
+            "append_events",
+            "increase",
+            "resume",
+            "reload",
+            "restart",
+            "replay",
+            "transaction_barrier",
+            "read_dispatch_count"
+          ],
+          "rules": [
+            "isolated temporary data and fixed clock; no real model requests",
+            "map logical events to real host API; unsupported operation means unexecuted, never simulated pass",
+            "each variant is separate reset; unspecified initial fields inherit base_initial",
+            "reject snapshots compare full budget/status/confirmation and dispatch count; only explicit resume diagnostic may append event",
+            "replay ordered by sequence, deduplicate, do not add budget from event again"
+          ],
+          "required_evidence": [
+            "request_and_response_redacted",
+            "before_after_snapshots",
+            "event_sequence_and_extended_count",
+            "dispatch_count",
+            "restart_replay_result",
+            "current_vs_target_diff"
+          ]
+        },
+        "cases": [
+          {
+            "id": "F01",
+            "initial_overrides": {},
+            "operations": [
+              "increase(K)",
+              "reload"
+            ],
+            "expected": [
+              "tokens_limit=150",
+              "budget_extended_count=1",
+              "status=active",
+              "budget_reason=false",
+              "plan_and_confirmation_unchanged",
+              "dispatch_count=0"
+            ],
+            "current_vs_target": "当前新K被最后事件门控拒绝；目标需后端改造"
+          },
+          {
+            "id": "F02",
+            "initial_overrides": {
+              "environment_blocked": true,
+              "append_events": [
+                "runtime_workspace_blocked"
+              ]
+            },
+            "operations": [
+              "increase(K)",
+              "reload",
+              "resolve_environment_via_existing_authorized_path",
+              "recheck_and_resume",
+              "reload"
+            ],
+            "expected": [
+              "after_increase:waiting,environment_reason=true,budget_reason=false",
+              "after_resolve:active_only_if_all_gates_pass",
+              "no_permission_expansion"
+            ],
+            "current_vs_target": "当前最后事件门控拒绝"
+          },
+          {
+            "id": "F03",
+            "initial_overrides": {},
+            "operations": [
+              "increase(K)_drop_response",
+              "concurrent_retry_same_K_same_input",
+              "restart",
+              "retry_same_K",
+              "pause",
+              "retry_same_K",
+              "increase(K,additional_tokens=60)"
+            ],
+            "expected": [
+              "total_increase=50",
+              "budget_extended_count=1",
+              "replay_returns_current_waiting",
+              "different_input_rejected",
+              "no_duplicate_dispatch"
+            ],
+            "current_vs_target": "当前已有成功请求同摘要重放；前端稳定键待改"
+          },
+          {
+            "id": "F04",
+            "initial_overrides": {},
+            "operations": [
+              "increase(K)",
+              "restart",
+              "replay_full_log",
+              "replay_duplicate_and_out_of_order_sequences_3_4",
+              "reload"
+            ],
+            "expected": [
+              "budget_limit=150",
+              "budget_reason=false",
+              "cursor_monotonic",
+              "no_duplicate_budget_or_dispatch",
+              "sequence_gap_requires_snapshot"
+            ],
+            "current_vs_target": "目标投影/事件去重夹具，未执行"
+          },
+          {
+            "id": "F05",
+            "initial_overrides": {
+              "variants": [
+                "plan_H2_with_old_H_events",
+                "confirmation_hash_mismatch",
+                "legacy_plan_association_unknown",
+                "manual_pause_not_exhausted",
+                "status_active"
+              ]
+            },
+            "operations": [
+              "reset_each_variant",
+              "increase_new_K",
+              "reload"
+            ],
+            "expected": [
+              "reject",
+              "budget_status_confirmation_unchanged",
+              "no_dispatch",
+              "old_plan_not_projected",
+              "unknown_diagnostic_only"
+            ],
+            "current_vs_target": "当前部分保护已有；关联归约待实现"
+          },
+          {
+            "id": "F06",
+            "initial_overrides": {
+              "variants": [
+                "Running_present",
+                "Running_created_at_transaction_barrier"
+              ]
+            },
+            "operations": [
+              "reset_each_variant",
+              "increase(K)",
+              "reload",
+              "finish_running",
+              "refresh_and_explicit_retry"
+            ],
+            "expected": [
+              "reject_while_running",
+              "no_mutation_on_reject",
+              "success_only_after_all_gates_rechecked"
+            ],
+            "current_vs_target": "需测试事务锁/屏障，不用sleep"
+          },
+          {
+            "id": "F07",
+            "initial_overrides": {
+              "variants": [
+                "rounds_still_exhausted",
+                "minutes_still_exhausted",
+                "tokens_still_exhausted",
+                "cost_still_exhausted",
+                "cost_missing",
+                "currency_empty",
+                "cost_untrusted"
+              ]
+            },
+            "operations": [
+              "reset_each_variant",
+              "increase_insufficient_or_untrusted",
+              "reload"
+            ],
+            "expected": [
+              "reject",
+              "budget_status_confirmation_unchanged",
+              "no_dispatch",
+              "no_zero_fill_fx_or_auto_unlimited"
+            ],
+            "current_vs_target": "现有fail-closed须保留；目标含可信计量"
+          },
+          {
+            "id": "F08",
+            "initial_overrides": {
+              "variants": [
+                "invalid_zero_tokens",
+                "out_of_range",
+                "overflow",
+                "tokens_and_unlimited",
+                "empty_request_id",
+                "old_plan_hash",
+                "no_budget_change"
+              ]
+            },
+            "operations": [
+              "reset_each_variant",
+              "increase_variant",
+              "reload"
+            ],
+            "expected": [
+              "reject",
+              "budget_status_confirmation_unchanged",
+              "no_dispatch",
+              "no_budget_permission_expansion"
+            ],
+            "current_vs_target": "保留现有参数门控"
+          },
+          {
+            "id": "F09",
+            "initial_overrides": {
+              "contract": "legacy",
+              "variants": [
+                "safe_preconditions",
+                "progress_after_recheck",
+                "environment_blocked",
+                "Running_present",
+                "cost_untrusted"
+              ]
+            },
+            "operations": [
+              "diagnose_and_reload",
+              "user_explicit_once_resume_if_safe",
+              "reload",
+              "user_explicit_increase_if_new_exhausted_event_confirmed",
+              "reload"
+            ],
+            "expected": [
+              "safe:resume_Err_and_waiting_then_explicit_extension",
+              "progress_race:reject_stop_and_handoff",
+              "unsafe:no_auto_resume_or_extension",
+              "no_loop_or_event_forgery"
+            ],
+            "current_vs_target": "静态推导兼容路径，未做真实接口验证"
+          },
+          {
+            "id": "F10",
+            "initial_overrides": {},
+            "operations": [
+              "increase(K)",
+              "consume_tokens_to_150",
+              "append_new_budget_exhausted",
+              "reload",
+              "replay_old_plan_events"
+            ],
+            "expected": [
+              "new_exhaustion_enters_budget_todo",
+              "old_plan_not_reactivated",
+              "success_not_completion_or_verification"
+            ],
+            "current_vs_target": "目标恢复后再耗尽覆盖"
+          }
+        ]
+      }
+    },
+    {
+      "id": "B09",
+      "title": "部分完成证据与三类核验结论同位展示",
+      "priority": "P2",
+      "phase": "M2",
+      "owner": "任务前端负责人：证据入口；宿主证据负责人：实际执行引用",
+      "source_findings": [
+        "IA-005"
+      ],
+      "depends_on": [
+        "B08"
+      ],
+      "acceptance": [
+        "部分完成、核验失败、全部完成均从概览和子任务行看到已有证据",
+        "实现提交、必需检查、独立核验分列实际run/id/时间；缺测试正文写未提供，不写0次通过",
+        "复制路径保留全值，打开仅用已有安全动作；重核、重做、续跑解释重复范围"
+      ],
+      "rollback": "撤回新打开动作但保留只读引用及复制；不删除历史证据或改写验收结论。"
+    },
+    {
+      "id": "B10",
+      "title": "服务表单复用统一原生模态",
+      "priority": "P1",
+      "phase": "M1",
+      "owner": "前端基础组件负责人：ModalSurface责任；无障碍QA：焦点与读屏复核",
+      "source_findings": [
+        "UI-001"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "删除表单document级Tab循环，复用ModalSurface；新增→Tab/Shift+Tab→内层冲突→取消→Esc仅最上层可交互",
+        "关闭回触发器，切步聚焦标题；讲述人/NVDA不能浏览背景；保存忙态不重复提交"
+      ],
+      "rollback": "禁用冲突嵌套流程，保留单层安全模态及取消出口；不得重装全局焦点循环。"
+    },
+    {
+      "id": "B11",
+      "title": "预设选择语义与跨步字段错误定位",
+      "priority": "P2",
+      "phase": "M2",
+      "owner": "服务表单前端负责人：radio、步骤及错误映射；无障碍QA：选择/错误播报",
+      "source_findings": [
+        "UI-002",
+        "UI-003"
+      ],
+      "depends_on": [
+        "B10"
+      ],
+      "acceptance": [
+        "分类aria-pressed、预设原生radio、步骤aria-current，AX读出实际所选；键盘可改变选择",
+        "逐个必填缺失：摘要链接定位字段、aria-invalid/describedby读出要求；末步早期错误回正确步骤并保留非密钥输入"
+      ],
+      "rollback": "保留原生输入和字段错误，只撤复杂跨步增强，改为单页可定位表单；不清空用户非秘密输入。"
+    },
+    {
+      "id": "B12",
+      "title": "运行环境唯一tabpanel所有权",
+      "priority": "P2",
+      "phase": "M1",
+      "owner": "AI连接前端负责人：父子语义边界；无障碍QA：AX检查",
+      "source_findings": [
+        "UI-004"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "ai-panel-acp数量恰为1，父页持有tabpanel，子页普通容器",
+        "五页签aria-controls均唯一有效，方向键/Home/End焦点与选择一致，AX仅一个运行环境面板"
+      ],
+      "rollback": "撤回其它页签调整但保留唯一id及父页所有权，不恢复重复面板。"
+    },
+    {
+      "id": "B13",
+      "title": "本地令牌、窄容器验证与目录降级六态",
+      "priority": "P2",
+      "phase": "M2",
+      "owner": "UI负责人：令牌/容器回落；服务前端负责人：健康状态；QA：渲染及故障矩阵",
+      "source_findings": [
+        "UI-005",
+        "UI-006",
+        "UI-008"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "事实行/备用模型使用12px meta、名称13px、局部标题14px，不留9.5/10/11px裸字号；实测正文4.5:1、非文本/焦点3:1并记录合成色",
+        "内容宽320/390/480/620/880、200%、120字符URL及50%文案膨胀测边界遮挡；若复现挤压，服务<480动作换行、表单<440单列；未复现则附记录不宣称缺陷",
+        "仅健康目录失败不清配置列表，显示未知及旧快照时间，可局部重试；加载aria-busy、初始空/筛选空、错误、部分可用、成功、无权限均有文字与下一步",
+        "键盘/读屏检查status与alert，减少动效不位移缩放；命中区建议32px且核查24px最低及例外"
+      ],
+      "rollback": "撤回布局增强仍保留完整文字/滚动及明确未知；健康查询故障隔离不恢复以模型数推断健康。"
+    }
+  ]
+}

@@ -1,6 +1,24 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type { CatalogView } from '../pages/mcpCatalogView';
 
+// Only the host approval wrapper's target JSON may select a review.
+// Paths and nested/caller-supplied review references are never used.
+export function missionFollowUpReviewDigest(description: string): string | null {
+    const targets = description.split(/\r?\n/).filter(line => line.startsWith('目标：'));
+    if (targets.length !== 1) return null;
+    try {
+        const target: unknown = JSON.parse(targets[0].slice('目标：'.length));
+        if (!target || typeof target !== 'object' || Array.isArray(target)) return null;
+        const review = target as Record<string, unknown>;
+        return review.review_mode === 'full_review_required'
+            && typeof review.payload_sha256 === 'string'
+            && /^[0-9a-f]{64}$/.test(review.payload_sha256)
+            ? review.payload_sha256 : null;
+    } catch {
+        return null;
+    }
+}
+
 export type ExtensionIconInfo = {
   url: string;
   sha256: string;
@@ -217,6 +235,21 @@ export type MissionBudget = {
     max_repair_attempts: number;
     max_total_tokens: number | null;
     max_cost: number | null;
+    currency?: string | null;
+};
+
+export type MissionEffectiveWait = {
+    contract_version: string;
+    plan_sha256: string;
+    cursor: number;
+    // verification_resume_required is the downstream producer contract; legacy
+    // v1 system_verification+can_resume is normalized by missionResumeAction.
+    reason: 'budget_exhausted' | 'environment_blocked' | 'manual_pause' | 'system_verification' | 'verification_resume_required' | 'unknown' | 'not_waiting' | string;
+    actor: 'user' | 'system' | 'unknown' | 'none' | string;
+    budget_reason: string | null;
+    environment_blocked: boolean;
+    can_increase_budget: boolean;
+    can_resume: boolean;
 };
 
 export type MissionBudgetIncrease = {
@@ -378,6 +411,8 @@ export type MissionView = {
     proposed_tasks: MissionTaskSpec[];
     budget: MissionBudget | null;
     usage: LocalRunUsage | null;
+    cost_usage?: { buckets: Record<string, number>; unknown_runs: number; comparable: boolean };
+    effective_wait?: MissionEffectiveWait | null;
     handoff?: MissionHandoff | null;
     workflow?: MissionWorkflowPin | null;
     assignment?: MissionRoleAssignmentRecord | null;
@@ -420,6 +455,7 @@ export type MissionSnapshot = {
     mission: MissionView;
     events: MissionEvent[];
     cursor: number;
+    requires_snapshot?: boolean;
 };
 
 export type CatalogPage<T> = {
@@ -4274,6 +4310,7 @@ export const agentApi = {
     syncAIClient: (target: string, expectedRevision?: string, acceptDrift?: boolean) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision, acceptDrift }),
     syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
+    getMissionFollowUpReview: (digest: string) => invoke<unknown>('get_mission_follow_up_review', { digest }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
     setApprovalProfile: (profile: string, confirmed = false, durationSeconds?: number) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed, ...(durationSeconds !== undefined ? { durationSeconds } : {}) }),
     setApprovalNotificationMode: (mode: string) => invoke<{ profile: string; notification_mode: string }>('set_approval_notification_mode', { mode }),

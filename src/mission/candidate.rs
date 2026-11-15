@@ -120,10 +120,15 @@ pub(crate) fn protected_files(
     }).collect::<Vec<_>>();
     let identity = scoped_candidate_identity(workspace, &task.read_paths)?;
     let files = identity["files"].as_object().ok_or("candidate file manifest missing")?;
-    Ok(Value::Object(files.iter().filter(|(label, _)| {
+    Ok(Value::Object(files.iter().filter(|(label, value)| {
         let path = Path::new(label);
         let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-        !writes.iter().any(|write| path.starts_with(write))
+        // A missing read directory can be a required parent of an authorized
+        // output. Creating that directory must not look like deleting a
+        // protected file. Existing files at that path and new siblings still
+        // remain protected; unrelated missing inputs retain their null entry.
+        !writes.iter().any(|write| path.starts_with(write)
+            || (value.is_null() && write.starts_with(&path)))
     }).map(|(key, value)| (key.clone(), value.clone())).collect()))
 }
 
@@ -173,6 +178,31 @@ mod tests {
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
         std::fs::remove_file(root.join("test/added.js")).unwrap();
         std::fs::write(root.join("test/app.js"), "changed check").unwrap();
+        assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn protected_manifest_allows_creation_of_authorized_parent_directories() {
+        let root = std::env::temp_dir().join(format!("mission-protected-parent-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task = serde_json::from_value(json!({"id":"plan", "title":"plan",
+            "read_paths":["reports", "unavailable-input.txt"],
+            "write_paths":["reports/nested/plan.json"],
+            "execution":{"executor":"himind.fixture","role_id":"plan"}})).unwrap();
+        let baseline = protected_files(&root, &task).unwrap();
+        assert_eq!(baseline, json!({"unavailable-input.txt":null}));
+        std::fs::create_dir_all(root.join("reports/nested")).unwrap();
+        std::fs::write(root.join("reports/nested/plan.json"), "authorized report").unwrap();
+        assert_eq!(baseline, protected_files(&root, &task).unwrap());
+        std::fs::write(root.join("reports/read-only.txt"), "unauthorized sibling").unwrap();
+        assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        std::fs::remove_file(root.join("reports/read-only.txt")).unwrap();
+        std::fs::write(root.join("unavailable-input.txt"), "created outside write scope").unwrap();
+        assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        std::fs::remove_file(root.join("unavailable-input.txt")).unwrap();
+        std::fs::remove_dir_all(root.join("reports")).unwrap();
+        std::fs::write(root.join("reports"), "parent is an unauthorized file").unwrap();
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }

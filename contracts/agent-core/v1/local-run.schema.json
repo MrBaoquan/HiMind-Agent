@@ -46,6 +46,11 @@
     "runtime_provider": { "type": "string" },
     "workspace_ref": { "type": "string" },
     "current_step_id": { "type": "string" },
+    "pause_kind": {
+      "description": "等待原因；旧记录缺省为 none。",
+      "enum": ["none", "user", "approval", "feedback", "external"],
+      "default": "none"
+    },
     "completion_mode": {
       "enum": ["full", "partial"]
     },
@@ -102,6 +107,7 @@
           },
           "capability_id": { "type": "string" },
           "runtime_provider": { "type": "string" },
+          "model": { "type": "string" },
           "role_id": { "type": "string" },
           "attempt": { "type": "integer", "minimum": 0 },
           "started_at": { "type": "string" },
@@ -145,7 +151,7 @@
       }
     },
     "usage": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "input_tokens": { "type": "integer", "minimum": 0 },

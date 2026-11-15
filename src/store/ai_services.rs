@@ -525,13 +525,37 @@ pub(crate) fn test_service_with_endpoints(
     }
 }
 
+// One lock identity covers the directory AND its route selection. Never acquire
+// it inside the unlocked helpers: callers hold it over the complete read/modify/write.
+fn directory_lock() -> Result<super::atomic_file::AtomicFileLock, Box<dyn Error>> {
+    Ok(super::atomic_file::lock(&store_path()?)?)
+}
+
 fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
+    let _lock = directory_lock()?;
+    load_all_unlocked()
+}
+
+fn load_all_unlocked() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
     let path = store_path()?;
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    let persisted: BTreeMap<String, PersistedCustomAIService> =
-        serde_json::from_slice(&fs::read(path)?)?;
+    let persisted = match parse_directory(&fs::read(&path)?) {
+        Ok(value) => value,
+        Err(_) => {
+            let backup = fs::read(super::atomic_file::backup_path(&path))?;
+            let valid = parse_directory(&backup)?;
+            // Keep the failed bytes for investigation; never rotate them into .bak.
+            super::atomic_file::write_without_backup(&path.with_extension("json.corrupt"), &fs::read(&path)?)?;
+            super::atomic_file::write_without_backup(&path, &backup)?;
+            use sha2::{Digest, Sha256};
+            let version = format!("{:x}", Sha256::digest(&backup));
+            super::atomic_file::write_without_backup(&path.with_extension("recovery.json"),
+                &serde_json::to_vec(&serde_json::json!({"code":"previous_valid_version_restored", "version_sha256":version}))?)?;
+            valid
+        }
+    };
     Ok(persisted
         .into_iter()
         .map(|(id, item)| {
@@ -558,13 +582,31 @@ fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
         .collect())
 }
 
+fn parse_directory(bytes: &[u8]) -> Result<BTreeMap<String, PersistedCustomAIService>, Box<dyn Error>> {
+    let values: BTreeMap<String, PersistedCustomAIService> = serde_json::from_slice(bytes)?;
+    for (id, service) in &values {
+        if normalize_id(id)? != *id || service.id != *id || service.display_name.trim().is_empty() {
+            return Err("invalid service snapshot identity".into());
+        }
+        validate_base_url(&service.base_url)?;
+        // Validate protected values without including credentials in diagnostics.
+        unprotect_secret_for_current_user(&service.encrypted_api_key)
+            .map_err(|_| "invalid protected credential in snapshot")?;
+        if let Some(token) = &service.encrypted_balance_access_token {
+            unprotect_secret_for_current_user(token)
+                .map_err(|_| "invalid protected balance credential in snapshot")?;
+        }
+    }
+    Ok(values)
+}
+
 fn save_all(services: &BTreeMap<String, CustomAIService>) -> Result<(), Box<dyn Error>> {
     let path = store_path()?;
     let persisted = services
         .iter()
         .map(|(id, item)| (id.clone(), PersistedCustomAIService::from(item)))
         .collect::<BTreeMap<_, _>>();
-    fs::write(path, serde_json::to_vec_pretty(&persisted)?)?;
+    super::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&persisted)?)?;
     Ok(())
 }
 
@@ -677,14 +719,36 @@ pub(crate) fn list() -> Result<Vec<CustomAIService>, Box<dyn Error>> {
     Ok(services)
 }
 
+/// Startup diagnostics are intentionally read-only for references. The directory
+/// loader may restore a validated encrypted previous version, but routes are never
+/// reassigned or silently repaired here; an explicit delete retry converges them.
+pub(crate) fn diagnose_startup() {
+    match public_snapshot() {
+        Ok(snapshot) => {
+            if snapshot["consistency_diagnostics"].as_array().is_some_and(|items| !items.is_empty()) {
+                eprintln!("AI service configuration: dangling_service_reference; retry deletion or explicitly edit routes");
+            }
+        }
+        Err(_) => eprintln!("AI service configuration: invalid_snapshot; explicit configuration repair required"),
+    }
+}
+
 pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
-    let services = list()?;
-    let routes = load_selection()?.capability_routes;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?.into_values().collect::<Vec<_>>();
+    services.sort_by(|left, right| right.created_at.cmp(&left.created_at).then_with(|| left.id.cmp(&right.id)));
+    let routes = load_selection_unlocked()?.capability_routes;
+    // Read-only startup/settings diagnostic: never select a replacement service.
+    let diagnostics = routes.iter().flat_map(|(capability, entries)| {
+        entries.iter().filter(|entry| !services.iter().any(|s| s.id == entry.service_id))
+            .map(move |entry| serde_json::json!({"code":"dangling_service_reference", "capability":capability, "service_id":entry.service_id}))
+    }).collect::<Vec<_>>();
     Ok(serde_json::json!({
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
         "balances": crate::store::ai_service_balances::list(),
         // 唯一事实源：每个能力一条有序路由表（ADR 0023）。
         "capability_routes": routes,
+        "consistency_diagnostics": diagnostics,
     }))
 }
 
@@ -982,7 +1046,8 @@ fn upsert_internal(
         return Err("至少配置一个对话或媒体模型".into());
     }
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let existing = services.get(&id);
     let normalized_base_url = primary_endpoint.base_url.clone();
     let balance_profile_id = profile_override
@@ -1159,7 +1224,8 @@ fn next_copy_name(source_name: &str, services: &BTreeMap<String, CustomAIService
 /// 不经过前端明文；路由、默认服务与客户端分发关系不复制。
 pub(crate) fn duplicate(id: &str) -> Result<CustomAIService, Box<dyn Error>> {
     let source_id = normalize_id(id)?;
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let source = services
         .get(&source_id)
         .cloned()
@@ -1178,14 +1244,20 @@ pub(crate) fn duplicate(id: &str) -> Result<CustomAIService, Box<dyn Error>> {
 
 pub(crate) fn remove(id: &str) -> Result<bool, Box<dyn Error>> {
     let id = id.trim();
-    let mut services = load_all()?;
+    let _lock = directory_lock()?;
+    let mut services = load_all_unlocked()?;
     let removed = services.remove(id).is_some();
     if removed {
         save_all(&services)?;
-        let _ = crate::store::ai_service_balances::remove(id);
+    }
+    let _ = crate::store::ai_service_balances::remove(id);
+    // Retry cleanup even when the directory commit already removed this ID.
+    #[cfg(test)]
+    super::atomic_file::interruption_point("directory_committed");
+    {
         // 硬迁移后路由表是唯一事实源：删服务必须同时清掉所有能力里的引用，
         // 否则会留下指向不存在服务的悬空路由项。
-        let mut selection = load_selection()?;
+        let mut selection = load_selection_unlocked()?;
         let referenced = selection
             .capability_routes
             .values()
@@ -1359,7 +1431,7 @@ fn normalize_capability_routes(
     capability: &str,
     entries: Vec<CapabilityRouteEntry>,
 ) -> Result<Vec<CapabilityRouteEntry>, Box<dyn Error>> {
-    let services = load_all()?;
+    let services = load_all_unlocked()?;
     let mut seen = std::collections::BTreeSet::new();
     let mut normalized = Vec::new();
     for entry in entries {
@@ -1916,6 +1988,11 @@ impl LegacyAIServiceSelection {
 const SELECTION_SCHEMA_VERSION: u32 = 2;
 
 fn load_selection() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
+    let _lock = directory_lock()?;
+    load_selection_unlocked()
+}
+
+fn load_selection_unlocked() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
     let path = selection_path()?;
     if !path.is_file() {
         return Ok(PersistedAIServiceSelection {
@@ -1978,8 +2055,9 @@ pub(crate) fn set_capability_routes(
     if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
         return Err(format!("不支持的能力：{capability}").into());
     }
+    let _lock = directory_lock()?;
     let normalized = normalize_capability_routes(capability, entries)?;
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     if normalized.is_empty() {
         selection.capability_routes.remove(capability);
     } else {
@@ -2021,18 +2099,19 @@ pub(crate) fn set_media_service(
         )
         .into());
     }
+    let _lock = directory_lock()?;
     let id = id.trim();
     let selected = if id.is_empty() {
         None
     } else {
         let id = normalize_id(id)?;
         Some(
-            load_all()?
+            load_all_unlocked()?
                 .remove(&id)
                 .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
         )
     };
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     let value = selected.as_ref().map(|service| service.id.clone());
     set_primary_route(&mut selection, capability, value.as_deref());
     write_selection(&selection)?;
@@ -2094,18 +2173,19 @@ pub(crate) fn active_service_with_secret(
 /// 因此它在非测试构建里根本不存在。
 #[cfg(test)]
 pub(crate) fn set_active(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let _lock = directory_lock()?;
     let id = id.trim();
     let selected = if id.is_empty() {
         None
     } else {
         let id = normalize_id(id)?;
         Some(
-            load_all()?
+            load_all_unlocked()?
                 .remove(&id)
                 .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
         )
     };
-    let mut selection = load_selection()?;
+    let mut selection = load_selection_unlocked()?;
     let value = selected.as_ref().map(|service| service.id.clone());
     set_primary_route(&mut selection, CAP_CHAT, value.as_deref());
     write_selection(&selection)?;
@@ -2468,6 +2548,102 @@ mod tests {
             api_key: api_key.to_string(),
             endpoints: Vec::new(),
         }
+    }
+
+    fn remediation_input(id: &str) -> CustomAIServiceInput {
+        let mut input = balance_test_service("sk-fictional-remediation");
+        input.id = id.into();
+        input
+    }
+
+    #[test]
+    fn remediation_child() {
+        let Ok(operation) = std::env::var("HIMIND_CONFIG_CHILD") else { return; };
+        match operation.as_str() {
+            "update" => { super::upsert(remediation_input("new")).unwrap(); }
+            "delete" => { super::remove("old").unwrap(); }
+            _ => panic!("unknown child operation"),
+        }
+    }
+
+    #[test]
+    fn remediation_process_interruptions_and_delete_retry() {
+        with_isolated_home(|| {
+            let root = super::store_path().unwrap().parent().unwrap().to_path_buf();
+            for point in ["before_temporary", "temporary_created", "temporary_written", "temporary_flushed", "before_replace", "after_replace", "directory_committed"] {
+                // Fresh child directory per boundary, always beneath the isolated test root.
+                let case = root.join(point);
+                std::env::set_var("HIMIND_AGENT_HOME", &case);
+                super::upsert(remediation_input("old")).unwrap();
+                super::upsert(remediation_input("keep")).unwrap();
+                super::set_capability_routes(CAP_CHAT, vec![super::CapabilityRouteEntry::new("old", ""), super::CapabilityRouteEntry::new("keep", "")]).unwrap();
+                let operation = if point == "directory_committed" { "delete" } else { "update" };
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "store::ai_services::tests::remediation_child", "--nocapture"])
+                    .env("HIMIND_AGENT_HOME", &case)
+                    .env("HIMIND_CONFIG_CHILD", operation)
+                    .env("HIMIND_CONFIG_INTERRUPT", point).output().unwrap();
+                assert_eq!(output.status.code(), Some(86), "boundary {point}: {}", String::from_utf8_lossy(&output.stderr));
+                assert!(super::load_all().unwrap().contains_key("keep"));
+                if point == "directory_committed" {
+                    let before = std::fs::read(super::selection_path().unwrap()).unwrap();
+                    let snapshot = super::public_snapshot().unwrap();
+                    assert_eq!(snapshot["consistency_diagnostics"].as_array().unwrap().len(), 1);
+                    assert_eq!(before, std::fs::read(super::selection_path().unwrap()).unwrap());
+                    assert!(!super::remove("old").unwrap());
+                    assert!(!super::remove("old").unwrap());
+                    assert_eq!(super::capability_routes(CAP_CHAT).unwrap(), vec![super::CapabilityRouteEntry::new("keep", "")]);
+                    super::remove("keep").unwrap();
+                    assert!(super::active_id().unwrap().is_none());
+                    assert!(super::public_snapshot().unwrap()["consistency_diagnostics"].as_array().unwrap().is_empty());
+                }
+                println!("interruption={point} child_exit=86 restart=ok");
+            }
+            std::env::set_var("HIMIND_AGENT_HOME", root);
+        });
+    }
+
+    #[test]
+    fn remediation_concurrent_different_services_no_lost_updates() {
+        with_isolated_home(|| {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let threads = ["left", "right"].into_iter().map(|id| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for n in 0..12 {
+                        let mut input = remediation_input(id);
+                        input.display_name = format!("{id}-{n}");
+                        super::upsert(input).unwrap();
+                    }
+                })
+            }).collect::<Vec<_>>();
+            barrier.wait();
+            for thread in threads { thread.join().unwrap(); }
+            let all = super::load_all().unwrap();
+            assert_eq!(all["left"].display_name, "left-11");
+            assert_eq!(all["right"].display_name, "right-11");
+        });
+    }
+
+    #[test]
+    fn remediation_recovery_rejects_corrupt_snapshot_and_records_safe_version() {
+        with_isolated_home(|| {
+            super::upsert(remediation_input("old")).unwrap();
+            super::upsert(remediation_input("new")).unwrap();
+            let path = super::store_path().unwrap();
+            std::fs::write(&path, b"broken-current").unwrap();
+            assert_eq!(super::load_all().unwrap().len(), 1);
+            let report = std::fs::read_to_string(path.with_extension("recovery.json")).unwrap();
+            assert!(!report.contains("sk-fictional"));
+            assert!(report.contains("version_sha256"));
+            assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), b"broken-current");
+            std::fs::write(&path, b"broken-again").unwrap();
+            std::fs::write(super::super::atomic_file::backup_path(&path), br#"{"bad":{"id":"other"}}"#).unwrap();
+            assert!(super::load_all().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"broken-again");
+
+        });
     }
 
     #[test]

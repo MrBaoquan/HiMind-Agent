@@ -1,0 +1,1301 @@
+{
+  "classification": "historical_real_model_runs_read_via_MCP_not_current_source_acceptance",
+  "records": [
+    {
+      "classification": "historical_real_model_run_observed_read_only",
+      "observed_via": "workflow.run.get",
+      "run": {
+        "schema_version": "local_run.v1",
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+        "interaction_id": "workflow_int_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+        "parent_run_id": "",
+        "parent_kind": "unspecified",
+        "source": "workflow",
+        "transport": "local",
+        "status": "succeeded",
+        "runtime_provider": "himind.builtin",
+        "workspace_ref": "C:/Users/Administrator/.codex/worktrees/mixed-executor-remediation/himind-agent",
+        "current_step_id": "",
+        "pause_kind": "none",
+        "completion_mode": "full",
+        "execution_plan": {
+          "workflow_id": "com.himind.mission.mission_1794473598404_ffe1e069",
+          "execution_policy": "strict",
+          "entrypoint": "full",
+          "exitpoint": "full",
+          "entry_step_id": "atomic-service-config",
+          "exit_step_id": "atomic-service-config",
+          "active_step_ids": [
+            "atomic-service-config"
+          ],
+          "seed_artifacts": [],
+          "assumptions": [],
+          "plan_digest": "sha256:4c843e312348d5350be8fb02f852fc64f1811ea0796b7fa9b633fd0578131644"
+        },
+        "steps": [
+          {
+            "step_id": "atomic-service-config",
+            "title": "服务配置原子持久化与删除恢复",
+            "status": "succeeded",
+            "capability_id": "atomic-service-config",
+            "runtime_provider": "himind.builtin",
+            "model": "himind:lucen:gpt-6.1-sol",
+            "role_id": "remediation.backend",
+            "attempt": 1,
+            "started_at": "1794479372",
+            "finished_at": "1794480759",
+            "error": ""
+          }
+        ],
+        "approvals": [],
+        "artifacts": [],
+        "usage": {
+          "input_tokens": 6813583,
+          "output_tokens": 11254,
+          "estimated_cost": 0,
+          "currency": "",
+          "billing_owner": "local"
+        },
+        "error": "",
+        "created_at": "1794479372",
+        "updated_at": "1794480759"
+      },
+      "execution": {
+        "expert": {
+          "expert_id": "com.himind.expert.software-engineer",
+          "expert_version": "1.0.0",
+          "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+        },
+        "executor": "himind.builtin",
+        "model": "himind:lucen:gpt-6.1-sol",
+        "role_id": "remediation.backend",
+        "service_id": "lucen"
+      },
+      "events": [
+        {
+          "schema_version": "runtime_event.v1",
+          "event_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config:atomic-service-config:2",
+          "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+          "step_id": "atomic-service-config",
+          "capability_id": "",
+          "sequence": 2,
+          "occurred_at": "1794480759",
+          "provider": "himind.builtin",
+          "event_type": "tool_completed",
+          "payload": {
+            "output_recorded": true,
+            "output": {
+              "schema_version": "workflow_runtime_result.v1",
+              "provider": "himind.builtin",
+              "workspace": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+              "summary": "B01/B02代码与验证已交付：目录级锁内读改写、可靠原子替换、合法加密上版恢复及无凭据版本诊断、删除幂等清引用、启动一致性诊断。真实隔离测试通过：服务配置46项、原子文件3项，覆盖7个子进程中断点、不同服务并发更新、损坏快照及重复删除；必需JSON检查退出码0。未操作生产配置。本结论仅表示交付就绪，不代表宿主正式VERIFY通过。",
+              "model": "himind:lucen:gpt-6.1-sol",
+              "service_source": "custom",
+              "endpoint": "http://localhost",
+              "passed": true,
+              "evidence": [
+                "reports/config/result.json",
+                "reports/config/ai-services-final.log",
+                "reports/config/atomic-file-final.log",
+                "reports/config/required-check.json",
+                "scripts/remediation/config-check.py"
+              ],
+              "next_steps": [
+                "宿主另行执行正式VERIFY；可通过 python scripts/remediation/config-check.py 复现测试。",
+                "跨文件删除中断采用诊断与显式重试收敛，并非双文件事务；物理断电、前端诊断呈现未验证，限制已记录。"
+              ]
+            },
+            "artifact_ids": [],
+            "evidence": {
+              "role_id": "remediation.backend",
+              "capability_id": "",
+              "runtime_provider": "himind.builtin",
+              "model": "himind:lucen:gpt-6.1-sol",
+              "inputs": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 21
+                },
+                "task": {
+                  "id": {
+                    "string_len": 21
+                  },
+                  "title": {
+                    "string_len": 14
+                  },
+                  "objective": {
+                    "string_len": 435
+                  },
+                  "depends_on": {
+                    "array_len": 1
+                  },
+                  "read_paths": {
+                    "array_len": 19
+                  },
+                  "write_paths": {
+                    "array_len": 6
+                  },
+                  "acceptance_criteria": {
+                    "array_len": 2
+                  },
+                  "required_checks": {
+                    "array_len": 1
+                  },
+                  "execution": {
+                    "expert": {
+                      "expert_id": "<nested>",
+                      "expert_version": "<nested>",
+                      "expert_digest": "<nested>"
+                    },
+                    "executor": {
+                      "string_len": 14
+                    },
+                    "model": {
+                      "string_len": 24
+                    },
+                    "role_id": {
+                      "string_len": 19
+                    },
+                    "service_id": {
+                      "string_len": 5
+                    }
+                  },
+                  "repair_of": {
+                    "string_len": 0
+                  }
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                },
+                "workflow_context": {
+                  "workflow": {
+                    "id": {
+                      "string_len": 49
+                    },
+                    "version": {
+                      "string_len": 5
+                    }
+                  },
+                  "input": {
+                    "workspace_root": {
+                      "string_len": 79
+                    },
+                    "mission_id": {
+                      "string_len": 30
+                    },
+                    "task_id": {
+                      "string_len": 21
+                    },
+                    "task": {
+                      "id": "<nested>",
+                      "title": "<nested>",
+                      "objective": "<nested>",
+                      "depends_on": "<nested>",
+                      "read_paths": "<nested>",
+                      "write_paths": "<nested>",
+                      "acceptance_criteria": "<nested>",
+                      "required_checks": "<nested>",
+                      "execution": "<nested>",
+                      "repair_of": "<nested>"
+                    },
+                    "approved_paths": {
+                      "array_len": 51
+                    },
+                    "approved_absolute_read_paths": {
+                      "array_len": 0
+                    },
+                    "approved_absolute_write_paths": {
+                      "array_len": 0
+                    },
+                    "candidate_acceptance": {
+                      "array_len": 4
+                    }
+                  },
+                  "steps": {},
+                  "parent_steps": {},
+                  "candidate": null,
+                  "loops": {},
+                  "artifacts": {
+                    "array_len": 0
+                  },
+                  "run": {
+                    "run_id": {
+                      "string_len": 73
+                    },
+                    "status": {
+                      "string_len": 6
+                    },
+                    "workspace_ref": {
+                      "string_len": 79
+                    }
+                  },
+                  "step_id": {
+                    "string_len": 21
+                  }
+                }
+              },
+              "artifact_ids": []
+            }
+          }
+        }
+      ],
+      "step_evidence": {
+        "atomic-service-config": {
+          "role_id": "remediation.backend",
+          "capability_id": "",
+          "runtime_provider": "himind.builtin",
+          "model": "himind:lucen:gpt-6.1-sol",
+          "inputs": {
+            "workspace_root": {
+              "string_len": 79
+            },
+            "mission_id": {
+              "string_len": 30
+            },
+            "task_id": {
+              "string_len": 21
+            },
+            "task": {
+              "id": {
+                "string_len": 21
+              },
+              "title": {
+                "string_len": 14
+              },
+              "objective": {
+                "string_len": 435
+              },
+              "depends_on": {
+                "array_len": 1
+              },
+              "read_paths": {
+                "array_len": 19
+              },
+              "write_paths": {
+                "array_len": 6
+              },
+              "acceptance_criteria": {
+                "array_len": 2
+              },
+              "required_checks": {
+                "array_len": 1
+              },
+              "execution": {
+                "expert": {
+                  "expert_id": "<nested>",
+                  "expert_version": "<nested>",
+                  "expert_digest": "<nested>"
+                },
+                "executor": {
+                  "string_len": 14
+                },
+                "model": {
+                  "string_len": 24
+                },
+                "role_id": {
+                  "string_len": 19
+                },
+                "service_id": {
+                  "string_len": 5
+                }
+              },
+              "repair_of": {
+                "string_len": 0
+              }
+            },
+            "approved_paths": {
+              "array_len": 51
+            },
+            "approved_absolute_read_paths": {
+              "array_len": 0
+            },
+            "approved_absolute_write_paths": {
+              "array_len": 0
+            },
+            "candidate_acceptance": {
+              "array_len": 4
+            },
+            "workflow_context": {
+              "workflow": {
+                "id": {
+                  "string_len": 49
+                },
+                "version": {
+                  "string_len": 5
+                }
+              },
+              "input": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 21
+                },
+                "task": {
+                  "id": "<nested>",
+                  "title": "<nested>",
+                  "objective": "<nested>",
+                  "depends_on": "<nested>",
+                  "read_paths": "<nested>",
+                  "write_paths": "<nested>",
+                  "acceptance_criteria": "<nested>",
+                  "required_checks": "<nested>",
+                  "execution": "<nested>",
+                  "repair_of": "<nested>"
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                }
+              },
+              "steps": {},
+              "parent_steps": {},
+              "candidate": null,
+              "loops": {},
+              "artifacts": {
+                "array_len": 0
+              },
+              "run": {
+                "run_id": {
+                  "string_len": 73
+                },
+                "status": {
+                  "string_len": 6
+                },
+                "workspace_ref": {
+                  "string_len": 79
+                }
+              },
+              "step_id": {
+                "string_len": 21
+              }
+            }
+          },
+          "artifact_ids": []
+        }
+      }
+    },
+    {
+      "classification": "historical_real_model_run_observed_read_only",
+      "observed_via": "workflow.run.get",
+      "run": {
+        "schema_version": "local_run.v1",
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_budget-state-contract",
+        "interaction_id": "workflow_int_mission_mission_1794473598404_ffe1e069_budget-state-contract",
+        "parent_run_id": "",
+        "parent_kind": "unspecified",
+        "source": "workflow",
+        "transport": "local",
+        "status": "succeeded",
+        "runtime_provider": "himind.builtin",
+        "workspace_ref": "C:/Users/Administrator/.codex/worktrees/mixed-executor-remediation/himind-agent",
+        "current_step_id": "",
+        "pause_kind": "none",
+        "completion_mode": "full",
+        "execution_plan": {
+          "workflow_id": "com.himind.mission.mission_1794473598404_ffe1e069",
+          "execution_policy": "strict",
+          "entrypoint": "full",
+          "exitpoint": "full",
+          "entry_step_id": "budget-state-contract",
+          "exit_step_id": "budget-state-contract",
+          "active_step_ids": [
+            "budget-state-contract"
+          ],
+          "seed_artifacts": [],
+          "assumptions": [],
+          "plan_digest": "sha256:c86d542658cc65f6093b52ef7e678729b5aaf16fabbbeaa3bdc2c39d4cf15e21"
+        },
+        "steps": [
+          {
+            "step_id": "budget-state-contract",
+            "title": "预算币种与统一待处理状态",
+            "status": "succeeded",
+            "capability_id": "budget-state-contract",
+            "runtime_provider": "himind.builtin",
+            "model": "himind:lucen:gpt-6.1-sol",
+            "role_id": "remediation.backend",
+            "attempt": 1,
+            "started_at": "1794484593",
+            "finished_at": "1794486721",
+            "error": ""
+          }
+        ],
+        "approvals": [],
+        "artifacts": [],
+        "usage": {
+          "input_tokens": 8642004,
+          "output_tokens": 23313,
+          "estimated_cost": 0,
+          "currency": "",
+          "billing_owner": "local"
+        },
+        "error": "",
+        "created_at": "1794484593",
+        "updated_at": "1794486722"
+      },
+      "execution": {
+        "expert": {
+          "expert_id": "com.himind.expert.software-engineer",
+          "expert_version": "1.0.0",
+          "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+        },
+        "executor": "himind.builtin",
+        "model": "himind:lucen:gpt-6.1-sol",
+        "role_id": "remediation.backend",
+        "service_id": "lucen"
+      },
+      "events": [
+        {
+          "schema_version": "runtime_event.v1",
+          "event_id": "workflow_run_mission_mission_1794473598404_ffe1e069_budget-state-contract:budget-state-contract:2",
+          "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_budget-state-contract",
+          "step_id": "budget-state-contract",
+          "capability_id": "",
+          "sequence": 2,
+          "occurred_at": "1794486722",
+          "provider": "himind.builtin",
+          "event_type": "tool_completed",
+          "payload": {
+            "output_recorded": true,
+            "output": {
+              "schema_version": "workflow_runtime_result.v1",
+              "provider": "himind.builtin",
+              "workspace": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+              "summary": "B05/B08后端候选交付就绪：实现币种分桶与未知/混合成本保守门控、同读事务有效等待DTO及游标，保留主动增额、双计划hash、全部限额、运行中禁止和原键幂等重试。F01–F10已逐例运行真实Store测试；最终73项Mission测试、20项app handler测试及必需JSON检查均退出码0。本结论仅表示当前任务送验就绪，不代表宿主正式VERIFY通过。",
+              "model": "himind:lucen:gpt-6.1-sol",
+              "service_source": "custom",
+              "endpoint": "http://localhost",
+              "passed": true,
+              "evidence": [
+                "reports/budget/result.json",
+                "reports/budget/fixture-checks.json",
+                "reports/budget/final-checks.json",
+                "reports/budget/mission-final.log",
+                "reports/budget/handlers-final.log",
+                "reports/budget/required-check.log",
+                "reports/budget/hashes.json",
+                "reports/budget/frontend-handoff.md",
+                "reports/budget/dto-sample.json"
+              ],
+              "next_steps": [
+                "前端按交接说明消费effective_wait、cost_usage及requires_snapshot，保留稳定request_id。",
+                "宿主另行启动正式VERIFY，核查真实接口与前端消费；本阶段未冒充MCP网络端到端、浏览器或生产部署验证。"
+              ]
+            },
+            "artifact_ids": [],
+            "evidence": {
+              "role_id": "remediation.backend",
+              "capability_id": "",
+              "runtime_provider": "himind.builtin",
+              "model": "himind:lucen:gpt-6.1-sol",
+              "inputs": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 21
+                },
+                "task": {
+                  "id": {
+                    "string_len": 21
+                  },
+                  "title": {
+                    "string_len": 12
+                  },
+                  "objective": {
+                    "string_len": 558
+                  },
+                  "depends_on": {
+                    "array_len": 1
+                  },
+                  "read_paths": {
+                    "array_len": 19
+                  },
+                  "write_paths": {
+                    "array_len": 9
+                  },
+                  "acceptance_criteria": {
+                    "array_len": 2
+                  },
+                  "required_checks": {
+                    "array_len": 1
+                  },
+                  "execution": {
+                    "expert": {
+                      "expert_id": "<nested>",
+                      "expert_version": "<nested>",
+                      "expert_digest": "<nested>"
+                    },
+                    "executor": {
+                      "string_len": 14
+                    },
+                    "model": {
+                      "string_len": 24
+                    },
+                    "role_id": {
+                      "string_len": 19
+                    },
+                    "service_id": {
+                      "string_len": 5
+                    }
+                  },
+                  "repair_of": {
+                    "string_len": 0
+                  }
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                },
+                "workflow_context": {
+                  "workflow": {
+                    "id": {
+                      "string_len": 49
+                    },
+                    "version": {
+                      "string_len": 5
+                    }
+                  },
+                  "input": {
+                    "workspace_root": {
+                      "string_len": 79
+                    },
+                    "mission_id": {
+                      "string_len": 30
+                    },
+                    "task_id": {
+                      "string_len": 21
+                    },
+                    "task": {
+                      "id": "<nested>",
+                      "title": "<nested>",
+                      "objective": "<nested>",
+                      "depends_on": "<nested>",
+                      "read_paths": "<nested>",
+                      "write_paths": "<nested>",
+                      "acceptance_criteria": "<nested>",
+                      "required_checks": "<nested>",
+                      "execution": "<nested>",
+                      "repair_of": "<nested>"
+                    },
+                    "approved_paths": {
+                      "array_len": 51
+                    },
+                    "approved_absolute_read_paths": {
+                      "array_len": 0
+                    },
+                    "approved_absolute_write_paths": {
+                      "array_len": 0
+                    },
+                    "candidate_acceptance": {
+                      "array_len": 4
+                    }
+                  },
+                  "steps": {},
+                  "parent_steps": {},
+                  "candidate": null,
+                  "loops": {},
+                  "artifacts": {
+                    "array_len": 0
+                  },
+                  "run": {
+                    "run_id": {
+                      "string_len": 73
+                    },
+                    "status": {
+                      "string_len": 6
+                    },
+                    "workspace_ref": {
+                      "string_len": 79
+                    }
+                  },
+                  "step_id": {
+                    "string_len": 21
+                  }
+                }
+              },
+              "artifact_ids": []
+            }
+          }
+        }
+      ],
+      "step_evidence": {
+        "budget-state-contract": {
+          "role_id": "remediation.backend",
+          "capability_id": "",
+          "runtime_provider": "himind.builtin",
+          "model": "himind:lucen:gpt-6.1-sol",
+          "inputs": {
+            "workspace_root": {
+              "string_len": 79
+            },
+            "mission_id": {
+              "string_len": 30
+            },
+            "task_id": {
+              "string_len": 21
+            },
+            "task": {
+              "id": {
+                "string_len": 21
+              },
+              "title": {
+                "string_len": 12
+              },
+              "objective": {
+                "string_len": 558
+              },
+              "depends_on": {
+                "array_len": 1
+              },
+              "read_paths": {
+                "array_len": 19
+              },
+              "write_paths": {
+                "array_len": 9
+              },
+              "acceptance_criteria": {
+                "array_len": 2
+              },
+              "required_checks": {
+                "array_len": 1
+              },
+              "execution": {
+                "expert": {
+                  "expert_id": "<nested>",
+                  "expert_version": "<nested>",
+                  "expert_digest": "<nested>"
+                },
+                "executor": {
+                  "string_len": 14
+                },
+                "model": {
+                  "string_len": 24
+                },
+                "role_id": {
+                  "string_len": 19
+                },
+                "service_id": {
+                  "string_len": 5
+                }
+              },
+              "repair_of": {
+                "string_len": 0
+              }
+            },
+            "approved_paths": {
+              "array_len": 51
+            },
+            "approved_absolute_read_paths": {
+              "array_len": 0
+            },
+            "approved_absolute_write_paths": {
+              "array_len": 0
+            },
+            "candidate_acceptance": {
+              "array_len": 4
+            },
+            "workflow_context": {
+              "workflow": {
+                "id": {
+                  "string_len": 49
+                },
+                "version": {
+                  "string_len": 5
+                }
+              },
+              "input": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 21
+                },
+                "task": {
+                  "id": "<nested>",
+                  "title": "<nested>",
+                  "objective": "<nested>",
+                  "depends_on": "<nested>",
+                  "read_paths": "<nested>",
+                  "write_paths": "<nested>",
+                  "acceptance_criteria": "<nested>",
+                  "required_checks": "<nested>",
+                  "execution": "<nested>",
+                  "repair_of": "<nested>"
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                }
+              },
+              "steps": {},
+              "parent_steps": {},
+              "candidate": null,
+              "loops": {},
+              "artifacts": {
+                "array_len": 0
+              },
+              "run": {
+                "run_id": {
+                  "string_len": 73
+                },
+                "status": {
+                  "string_len": 6
+                },
+                "workspace_ref": {
+                  "string_len": 79
+                }
+              },
+              "step_id": {
+                "string_len": 21
+              }
+            }
+          },
+          "artifact_ids": []
+        }
+      }
+    },
+    {
+      "classification": "historical_real_model_run_observed_read_only",
+      "observed_via": "workflow.run.get",
+      "run": {
+        "schema_version": "local_run.v1",
+        "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-service-ui-delivery-11",
+        "interaction_id": "workflow_int_mission_mission_1794473598404_ffe1e069_repair-service-ui-delivery-11",
+        "parent_run_id": "",
+        "parent_kind": "unspecified",
+        "source": "workflow",
+        "transport": "local",
+        "status": "succeeded",
+        "runtime_provider": "personal.codex",
+        "workspace_ref": "C:/Users/Administrator/.codex/worktrees/mixed-executor-remediation/himind-agent",
+        "current_step_id": "",
+        "pause_kind": "none",
+        "completion_mode": "full",
+        "execution_plan": {
+          "workflow_id": "com.himind.mission.mission_1794473598404_ffe1e069",
+          "execution_policy": "strict",
+          "entrypoint": "full",
+          "exitpoint": "full",
+          "entry_step_id": "repair-service-ui-delivery-11",
+          "exit_step_id": "repair-service-ui-delivery-11",
+          "active_step_ids": [
+            "repair-service-ui-delivery-11"
+          ],
+          "seed_artifacts": [],
+          "assumptions": [],
+          "plan_digest": "sha256:9c94ae873e7b71f67f33543da4d25d050df3c10c170b9d98794e1d5b9cf0cba5"
+        },
+        "steps": [
+          {
+            "step_id": "repair-service-ui-delivery-11",
+            "title": "修复构建模式回归失败并完成服务界面阶段交付",
+            "status": "succeeded",
+            "capability_id": "repair-service-ui-delivery-11",
+            "runtime_provider": "personal.codex",
+            "model": "",
+            "role_id": "remediation.frontend",
+            "attempt": 1,
+            "started_at": "1794531888",
+            "finished_at": "1794532703",
+            "error": ""
+          }
+        ],
+        "approvals": [],
+        "artifacts": [],
+        "usage": null,
+        "error": "",
+        "created_at": "1794531888",
+        "updated_at": "1794532703"
+      },
+      "execution": {
+        "expert": {
+          "expert_id": "com.himind.expert.senior-ui-designer",
+          "expert_version": "1.1.0",
+          "expert_digest": "sha256:30c2ff1e01ebb3cb5eebfe45b2c203a1e76b834c6f26e286c7a6c4fb302a1cc4"
+        },
+        "executor": "personal.codex",
+        "model": "",
+        "role_id": "remediation.frontend",
+        "service_id": ""
+      },
+      "events": [
+        {
+          "schema_version": "runtime_event.v1",
+          "event_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-service-ui-delivery-11:repair-service-ui-delivery-11:2",
+          "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-service-ui-delivery-11",
+          "step_id": "repair-service-ui-delivery-11",
+          "capability_id": "",
+          "sequence": 2,
+          "occurred_at": "1794532703",
+          "provider": "personal.codex",
+          "event_type": "tool_completed",
+          "payload": {
+            "output_recorded": true,
+            "output": {
+              "schema_version": "workflow_runtime_result.v1",
+              "provider": "personal.codex",
+              "workspace": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+              "summary": "已修复普通构建与缺失的三模式回归入口。六项必需检查按原顺序均退出0，重跑前后候选文件无变化，浏览器与服务已清理。阶段交付就绪，正式 VERIFY 留给宿主。",
+              "passed": true,
+              "evidence": [
+                "reports/service-ui/repair11/delivery.md",
+                "reports/service-ui/repair11/source-diff.patch",
+                "reports/service-ui/repair11/evidence-index.json",
+                "reports/service-ui/result.json",
+                "C:/Users/Administrator/AppData/Local/HiMindAgent/cache/mission-checks/8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c/c461a1ed5d5a0f35cda078c2231e185a5d48abc8bf62f2405cb6057754441fda/d11/final-replay.json"
+              ]
+            },
+            "artifact_ids": [],
+            "evidence": {
+              "role_id": "remediation.frontend",
+              "capability_id": "",
+              "runtime_provider": "personal.codex",
+              "model": null,
+              "inputs": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 29
+                },
+                "task": {
+                  "id": {
+                    "string_len": 29
+                  },
+                  "title": {
+                    "string_len": 21
+                  },
+                  "objective": {
+                    "string_len": 641
+                  },
+                  "depends_on": {
+                    "array_len": 1
+                  },
+                  "read_paths": {
+                    "array_len": 19
+                  },
+                  "write_paths": {
+                    "array_len": 7
+                  },
+                  "acceptance_criteria": {
+                    "array_len": 9
+                  },
+                  "required_checks": {
+                    "array_len": 6
+                  },
+                  "execution": {
+                    "expert": {
+                      "expert_id": "<nested>",
+                      "expert_version": "<nested>",
+                      "expert_digest": "<nested>"
+                    },
+                    "executor": {
+                      "string_len": 14
+                    },
+                    "model": {
+                      "string_len": 0
+                    },
+                    "role_id": {
+                      "string_len": 20
+                    },
+                    "service_id": {
+                      "string_len": 0
+                    }
+                  },
+                  "repair_of": {
+                    "string_len": 29
+                  }
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                },
+                "feedback_context": {
+                  "policy": {
+                    "string_len": 186
+                  },
+                  "plan_sha256": {
+                    "string_len": 64
+                  },
+                  "observations": {
+                    "array_len": 2
+                  },
+                  "truncated": "boolean"
+                },
+                "host_runtime_resources": {
+                  "schema_version": {
+                    "string_len": 24
+                  },
+                  "source": {
+                    "string_len": 4
+                  },
+                  "root": {
+                    "string_len": 199
+                  },
+                  "mission_id": {
+                    "string_len": 30
+                  },
+                  "task_id": {
+                    "string_len": 29
+                  },
+                  "authority": {
+                    "string_len": 28
+                  },
+                  "allowed_operations": {
+                    "array_len": 3
+                  },
+                  "retention": {
+                    "string_len": 62
+                  }
+                },
+                "workflow_context": {
+                  "workflow": {
+                    "id": {
+                      "string_len": 49
+                    },
+                    "version": {
+                      "string_len": 5
+                    }
+                  },
+                  "input": {
+                    "workspace_root": {
+                      "string_len": 79
+                    },
+                    "mission_id": {
+                      "string_len": 30
+                    },
+                    "task_id": {
+                      "string_len": 29
+                    },
+                    "task": {
+                      "id": "<nested>",
+                      "title": "<nested>",
+                      "objective": "<nested>",
+                      "depends_on": "<nested>",
+                      "read_paths": "<nested>",
+                      "write_paths": "<nested>",
+                      "acceptance_criteria": "<nested>",
+                      "required_checks": "<nested>",
+                      "execution": "<nested>",
+                      "repair_of": "<nested>"
+                    },
+                    "approved_paths": {
+                      "array_len": 51
+                    },
+                    "approved_absolute_read_paths": {
+                      "array_len": 0
+                    },
+                    "approved_absolute_write_paths": {
+                      "array_len": 0
+                    },
+                    "candidate_acceptance": {
+                      "array_len": 4
+                    },
+                    "feedback_context": {
+                      "policy": "<nested>",
+                      "plan_sha256": "<nested>",
+                      "observations": "<nested>",
+                      "truncated": "<nested>"
+                    },
+                    "host_runtime_resources": {
+                      "schema_version": "<nested>",
+                      "source": "<nested>",
+                      "root": "<nested>",
+                      "mission_id": "<nested>",
+                      "task_id": "<nested>",
+                      "authority": "<nested>",
+                      "allowed_operations": "<nested>",
+                      "retention": "<nested>"
+                    }
+                  },
+                  "steps": {},
+                  "parent_steps": {},
+                  "candidate": null,
+                  "loops": {},
+                  "artifacts": {
+                    "array_len": 0
+                  },
+                  "run": {
+                    "run_id": {
+                      "string_len": 81
+                    },
+                    "status": {
+                      "string_len": 6
+                    },
+                    "workspace_ref": {
+                      "string_len": 79
+                    }
+                  },
+                  "step_id": {
+                    "string_len": 29
+                  }
+                }
+              },
+              "artifact_ids": []
+            }
+          }
+        }
+      ],
+      "step_evidence": {
+        "repair-service-ui-delivery-11": {
+          "role_id": "remediation.frontend",
+          "capability_id": "",
+          "runtime_provider": "personal.codex",
+          "model": null,
+          "inputs": {
+            "workspace_root": {
+              "string_len": 79
+            },
+            "mission_id": {
+              "string_len": 30
+            },
+            "task_id": {
+              "string_len": 29
+            },
+            "task": {
+              "id": {
+                "string_len": 29
+              },
+              "title": {
+                "string_len": 21
+              },
+              "objective": {
+                "string_len": 641
+              },
+              "depends_on": {
+                "array_len": 1
+              },
+              "read_paths": {
+                "array_len": 19
+              },
+              "write_paths": {
+                "array_len": 7
+              },
+              "acceptance_criteria": {
+                "array_len": 9
+              },
+              "required_checks": {
+                "array_len": 6
+              },
+              "execution": {
+                "expert": {
+                  "expert_id": "<nested>",
+                  "expert_version": "<nested>",
+                  "expert_digest": "<nested>"
+                },
+                "executor": {
+                  "string_len": 14
+                },
+                "model": {
+                  "string_len": 0
+                },
+                "role_id": {
+                  "string_len": 20
+                },
+                "service_id": {
+                  "string_len": 0
+                }
+              },
+              "repair_of": {
+                "string_len": 29
+              }
+            },
+            "approved_paths": {
+              "array_len": 51
+            },
+            "approved_absolute_read_paths": {
+              "array_len": 0
+            },
+            "approved_absolute_write_paths": {
+              "array_len": 0
+            },
+            "candidate_acceptance": {
+              "array_len": 4
+            },
+            "feedback_context": {
+              "policy": {
+                "string_len": 186
+              },
+              "plan_sha256": {
+                "string_len": 64
+              },
+              "observations": {
+                "array_len": 2
+              },
+              "truncated": "boolean"
+            },
+            "host_runtime_resources": {
+              "schema_version": {
+                "string_len": 24
+              },
+              "source": {
+                "string_len": 4
+              },
+              "root": {
+                "string_len": 199
+              },
+              "mission_id": {
+                "string_len": 30
+              },
+              "task_id": {
+                "string_len": 29
+              },
+              "authority": {
+                "string_len": 28
+              },
+              "allowed_operations": {
+                "array_len": 3
+              },
+              "retention": {
+                "string_len": 62
+              }
+            },
+            "workflow_context": {
+              "workflow": {
+                "id": {
+                  "string_len": 49
+                },
+                "version": {
+                  "string_len": 5
+                }
+              },
+              "input": {
+                "workspace_root": {
+                  "string_len": 79
+                },
+                "mission_id": {
+                  "string_len": 30
+                },
+                "task_id": {
+                  "string_len": 29
+                },
+                "task": {
+                  "id": "<nested>",
+                  "title": "<nested>",
+                  "objective": "<nested>",
+                  "depends_on": "<nested>",
+                  "read_paths": "<nested>",
+                  "write_paths": "<nested>",
+                  "acceptance_criteria": "<nested>",
+                  "required_checks": "<nested>",
+                  "execution": "<nested>",
+                  "repair_of": "<nested>"
+                },
+                "approved_paths": {
+                  "array_len": 51
+                },
+                "approved_absolute_read_paths": {
+                  "array_len": 0
+                },
+                "approved_absolute_write_paths": {
+                  "array_len": 0
+                },
+                "candidate_acceptance": {
+                  "array_len": 4
+                },
+                "feedback_context": {
+                  "policy": "<nested>",
+                  "plan_sha256": "<nested>",
+                  "observations": "<nested>",
+                  "truncated": "<nested>"
+                },
+                "host_runtime_resources": {
+                  "schema_version": "<nested>",
+                  "source": "<nested>",
+                  "root": "<nested>",
+                  "mission_id": "<nested>",
+                  "task_id": "<nested>",
+                  "authority": "<nested>",
+                  "allowed_operations": "<nested>",
+                  "retention": "<nested>"
+                }
+              },
+              "steps": {},
+              "parent_steps": {},
+              "candidate": null,
+              "loops": {},
+              "artifacts": {
+                "array_len": 0
+              },
+              "run": {
+                "run_id": {
+                  "string_len": 81
+                },
+                "status": {
+                  "string_len": 6
+                },
+                "workspace_ref": {
+                  "string_len": 79
+                }
+              },
+              "step_id": {
+                "string_len": 29
+              }
+            }
+          },
+          "artifact_ids": []
+        }
+      }
+    }
+  ]
+}

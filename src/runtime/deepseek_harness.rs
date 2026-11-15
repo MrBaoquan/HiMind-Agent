@@ -8,7 +8,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -513,6 +513,7 @@ struct RuntimePackageManifest {
 struct Invocation {
     executable: OsString,
     args: Vec<OsString>,
+    prompt: String,
     workspace: PathBuf,
     home: PathBuf,
     api_key: String,
@@ -1206,6 +1207,7 @@ fn prepare_interactive_launch_with(
         let invocation = Invocation {
             executable: executable.clone(),
             args: Vec::new(),
+            prompt: String::new(),
             workspace: workspace.clone(),
             home: home.clone(),
             api_key: credential.api_key.clone(),
@@ -1276,6 +1278,7 @@ pub(crate) struct WorkflowRuntimeOutcome {
 
 #[derive(Debug)]
 pub(crate) struct WorkflowRuntimeFailure {
+    pub provenance: Option<Value>,
     pub message: String,
     pub usage: Option<crate::agent_core_contracts::LocalRunUsage>,
     /// A nonzero CLI exit can carry a completed negative review. Retain it as
@@ -1307,6 +1310,7 @@ pub(crate) fn execute_workflow(
         is_canceled,
         ControlPlaneFallback::Fail,
         LaunchHome::Interactive,
+        None,
     )
 }
 
@@ -1331,6 +1335,23 @@ pub(crate) fn execute_workflow_in_run_home(
     access: WorkflowAccess,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
+    execute_workflow_in_run_home_with_resources(options, workspace, prompt, timeout_seconds,
+        disable_tools, run_id, step_id, model_alias, access, is_canceled, None)
+}
+
+pub(crate) fn execute_workflow_in_run_home_with_resources(
+    options: &Options,
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    disable_tools: bool,
+    run_id: &str,
+    step_id: &str,
+    model_alias: Option<&str>,
+    access: WorkflowAccess,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    resources: Option<&crate::mission::CheckRuntimeResources>,
+) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     execute_workflow_with(
         options,
         workspace,
@@ -1342,6 +1363,7 @@ pub(crate) fn execute_workflow_in_run_home(
         is_canceled,
         ControlPlaneFallback::Fail,
         LaunchHome::Run { run_id, step_id },
+        resources,
     )
 }
 
@@ -1397,6 +1419,7 @@ pub(crate) fn execute_workflow_allow_degraded(
         is_canceled,
         ControlPlaneFallback::Degrade,
         LaunchHome::Interactive,
+        None,
     )
 }
 
@@ -1411,6 +1434,7 @@ fn execute_workflow_with(
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
     fallback: ControlPlaneFallback,
     home_mode: LaunchHome<'_>,
+    resources: Option<&crate::mission::CheckRuntimeResources>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     let workspace = process::canonical_workspace(workspace)?;
     let prompt = prompt.trim();
@@ -1450,19 +1474,13 @@ fn execute_workflow_with(
         format!("{prompt}\n\nHiMind image evidence: if read_image refuses an authorized image because its extension differs from its bytes, preserve the original. Activate MCP capability media.image.read using system.capability.activate, then call system.capability.invoke with id=media.image.read and arguments={{workspace_root: the assigned workspace, path: the original image path}}. This returns image pixels to your current model; it does not call another service or modify evidence. If unavailable, state the observation limit honestly.")
     } else { prompt.to_string() };
     command
-        .args([
-            OsString::from("--profile"),
-            OsString::from(HIMIND_HEADLESS_PROFILE),
-            OsString::from("--patch"),
-            patch.as_os_str().to_os_string(),
-            OsString::from(prompt),
-        ])
+        .args(headless_args(&patch))
         .current_dir(&launch.workspace)
         .env(DSH_HOME_ENV, &launch.home)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
         .env("DSH_PERMISSION_MODE", access.dsh_mode())
         .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(headless_prompt_input(&launch.home, &prompt)?))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !launch.api_key.trim().is_empty() {
@@ -1475,6 +1493,7 @@ fn execute_workflow_with(
         command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     }
     process::remove_himind_secret_environment(&mut command);
+    if let Some(resources) = resources { resources.apply(&mut command)?; }
     command.env("DEEPSEEK_API_KEY", &launch.api_key);
     command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     let lease_session = match home_mode {
@@ -1487,9 +1506,9 @@ fn execute_workflow_with(
         Some(lease)
     } else { None };
     process::configure_hidden_process(&mut command);
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().map(process::capture_output);
-    let stderr = child.stderr.take().map(process::capture_output);
+    let (mut child, tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
+    let stdout = child.stdout.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
+    let stderr = child.stderr.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
     let status_result = process::wait_for_child_with_timeout_and_cancel(
         &mut child,
         "HIMIND_DSH_TIMEOUT_SECONDS",
@@ -1497,15 +1516,27 @@ fn execute_workflow_with(
         "DeepSeek Harness workflow runtime",
         || is_canceled(),
     );
-    let stdout = process::join_output(stdout);
-    let stderr = process::join_output(stderr);
+    // The root may have exited while a worker still owns inherited pipes.
+    drop(tree);
+    let drain=std::time::Instant::now();
+    while stdout.as_ref().is_some_and(|pipe|!pipe.finished()) || stderr.as_ref().is_some_and(|pipe|!pipe.finished()) {
+        if drain.elapsed()>=std::time::Duration::from_secs(2) {break;}
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let captured=stdout.map(|pipe|pipe.finish_complete()).transpose()
+        .and_then(|stdout|Ok((stdout.unwrap_or_default(),stderr.map(|pipe|pipe.finish()).transpose()?.unwrap_or_default())));
     let usage_home = match home_mode {
         LaunchHome::Run { step_id, .. } if !step_id.trim().is_empty() => launch
             .home.parent().and_then(Path::parent).unwrap_or(&launch.home),
         _ => &launch.home,
     };
     let usage_result = crate::mission::read_projection_usage(usage_home);
+    let (stdout,stderr)=captured.map_err(|error|Box::new(WorkflowRuntimeFailure {
+        provenance:None,
+        message:error.to_string(),usage:usage_result.as_ref().ok().cloned().flatten(),report:None,
+    }) as Box<dyn Error>)?;
     let status = status_result.map_err(|error| Box::new(WorkflowRuntimeFailure {
+        provenance:None,
         message: error.to_string(), usage: usage_result.as_ref().ok().cloned().flatten(),
         report: None,
     }) as Box<dyn Error>)?;
@@ -1533,6 +1564,7 @@ fn execute_workflow_with(
             format!("DSH workflow runtime failed (exit {exit}): {summarized}")
         };
         return Err(Box::new(WorkflowRuntimeFailure { message,
+            provenance:Some(json!({"provider":"himind.builtin","exit_code":status.code(),"model":launch.default_model,"service_source":launch.service_source})),
             usage: usage_result.as_ref().ok().cloned().flatten(),
             report: workflow_failure_report(&stdout, &stderr) }));
     }
@@ -1608,6 +1640,7 @@ fn prepare_independent_interactive_launch(
     let invocation = Invocation {
         executable: executable.clone().into(),
         args: Vec::new(),
+        prompt: String::new(),
         workspace: workspace.clone(),
         home: home.clone(),
         api_key: api_key.clone(),
@@ -2458,7 +2491,12 @@ fn execute_claimed(
     claim: &AgentRunClaim,
 ) -> Result<Value, Box<dyn Error>> {
     let invocation = build_invocation(options, claim)?;
-    process::verify_command(&invocation.executable, &["--version"])
+    let mut cancel_guard = crate::api::client::TaskCancelGuard::new();
+    let cancel = std::cell::RefCell::new(&mut cancel_guard);
+    process::verify_command_with_cancel(&invocation.executable, &["--version"],
+        std::time::Duration::from_secs(5), &|| {
+            cancel.borrow_mut().check(client,options,agent_id,&task.id)?; Ok(false)
+        })
         .map_err(|error| format!("DeepSeek Harness CLI is unavailable: {error}"))?;
     ensure_home_config(&invocation, options)?;
     let instruction_snapshot =
@@ -2475,10 +2513,10 @@ fn execute_claimed(
         &options.agent_credential(),
     )?;
     let _renewal = process::start_run_lease_renewal(client, options, agent_id, claim);
-    let mut child = spawn(&invocation)?;
-    let stdout = child.stdout.take().map(process::capture_output);
-    let stderr = child.stderr.take().map(process::capture_output);
-    let status = process::wait_for_child(
+    let (mut child, tree) = spawn(&invocation)?;
+    let stdout = child.stdout.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
+    let stderr = child.stderr.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
+    let status_result = process::wait_for_child(
         client,
         options,
         agent_id,
@@ -2487,25 +2525,49 @@ fn execute_claimed(
         "HIMIND_DSH_TIMEOUT_SECONDS",
         DEFAULT_TIMEOUT_SECONDS,
         "DeepSeek Harness",
-    )?;
-    let stdout = process::join_output(stdout);
-    let stderr = process::join_output(stderr);
+    );
+    drop(tree);
+    let drain=std::time::Instant::now();
+    while stdout.as_ref().is_some_and(|pipe|!pipe.finished()) || stderr.as_ref().is_some_and(|pipe|!pipe.finished()) {
+        if drain.elapsed()>=std::time::Duration::from_secs(2) {break;}
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let usage=crate::mission::read_projection_usage(&invocation.home).ok().flatten();
+    let failure=|message:String| -> Box<dyn Error> {Box::new(WorkflowRuntimeFailure {
+        message,usage:usage.clone(),report:None,provenance:Some(json!({"provider":"himind.builtin","model":invocation.model})),
+    })};
+    let status=status_result.map_err(|error|failure(error.to_string()))?;
+    let failure=|message:String| -> Box<dyn Error> {Box::new(WorkflowRuntimeFailure {
+        message,usage:usage.clone(),report:None,provenance:Some(json!({
+            "provider":"himind.builtin","model":invocation.model,"exit_code":status.code(),
+            "model_source":"claim_scoped_himind_service",
+        })),
+    })};
+    let stdout=stdout.map(|pipe|pipe.finish_complete()).transpose().map_err(|error|failure(error.to_string()))?.unwrap_or_default();
+    let stderr=stderr.map(|pipe|pipe.finish()).transpose().map_err(|error|failure(error.to_string()))?.unwrap_or_default();
     if !status.success() {
         let detail = if stderr.trim().is_empty() {
             stdout
         } else {
             stderr
         };
-        return Err(format!(
+        return Err(failure(format!(
             "DeepSeek Harness execution failed (exit={}): {}",
             status.code().unwrap_or(-1),
             process::redact_error(&detail, claim, &options.agent_credential())
-        )
-        .into());
+        )));
     }
     let final_message = stdout.trim().to_string();
     if final_message.is_empty() {
-        return Err("DeepSeek Harness returned an empty final response".into());
+        return Err(failure("DeepSeek Harness returned an empty final response".into()));
+    }
+    let report=crate::workflow::parse_runtime_payload(&final_message);
+    if report.as_ref().is_some_and(|report|report.get("passed").and_then(Value::as_bool)==Some(false))
+        || ((final_message.starts_with('{') || final_message.starts_with("```")) && report.is_none()) {
+        return Err(Box::new(WorkflowRuntimeFailure {
+            message:"HiMind AgentRun returned negative or incomplete structured delivery".into(),
+            report, usage, provenance:Some(json!({"provider":"himind.builtin","model":invocation.model,"exit_code":0})),
+        }));
     }
     Ok(json!({
         "run_id": claim.run.id,
@@ -2513,6 +2575,8 @@ fn execute_claimed(
         "completed": true,
         "final_message": process::summarize_output(&final_message, OUTPUT_CAPTURE_LIMIT),
         "billing_owner": "himind",
+        "usage":usage,
+        "model_source":"claim_scoped_himind_service",
         "instruction_snapshot": instruction_snapshot
     }))
 }
@@ -2553,13 +2617,8 @@ fn build_invocation(
     };
     Ok(Invocation {
         executable,
-        args: vec![
-            OsString::from("--profile"),
-            OsString::from(HIMIND_HEADLESS_PROFILE),
-            OsString::from("--patch"),
-            agent_overlay_path(&home).into_os_string(),
-            OsString::from(prompt),
-        ],
+        args: headless_args(&agent_overlay_path(&home)).into(),
+        prompt,
         workspace,
         home,
         api_key: claim.claim_token.clone(),
@@ -2590,7 +2649,7 @@ fn effective_access_mode(claim: &AgentRunClaim) -> Result<&str, Box<dyn Error>> 
     }
 }
 
-fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
+fn spawn(invocation: &Invocation) -> Result<(Child, crate::runtime::owned_tree::OwnedTree), Box<dyn Error>> {
     let mut command = dsh_command(&invocation.executable);
     process::remove_himind_secret_environment(&mut command);
     command
@@ -2603,7 +2662,7 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
         .env("DSH_PERMISSION_MODE", invocation.permission_mode)
         .env("HIMIND_AGENT_RUN_ID", &invocation.run_id)
         .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(headless_prompt_input(&invocation.home, &invocation.prompt)?))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.env_remove("OPENAI_API_KEY");
@@ -2611,7 +2670,130 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
     command.env_remove("GOOGLE_API_KEY");
     command.env_remove("GEMINI_API_KEY");
     process::configure_hidden_process(&mut command);
-    Ok(command.spawn()?)
+    crate::runtime::owned_tree::OwnedTree::spawn(&mut command)
+}
+
+fn headless_args(patch: &Path) -> [OsString; 5] {
+    ["--profile".into(), HIMIND_HEADLESS_PROFILE.into(), "--patch".into(),
+        patch.as_os_str().to_owned(), "-".into()]
+}
+
+/// DSH's headless `-` reads the complete UTF-8 task from standard input.
+/// A temporary file handle avoids both Windows' command-line limit and a
+/// blocking pipe write before timeout/cancellation supervision starts. The
+/// file is host-owned (outside the candidate) and removed on last handle close.
+fn headless_prompt_input(home: &Path, prompt: &str) -> std::io::Result<File> {
+    let path = home.join(format!(".headless-input-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE};
+        options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    #[cfg(not(windows))]
+    fs::remove_file(&path)?;
+    file.write_all(prompt.as_bytes())?;
+    file.rewind()?;
+    Ok(file)
+}
+
+#[cfg(all(test, windows))]
+mod headless_input_tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    fn fixture() -> &'static Path {
+        static EXE: OnceLock<PathBuf> = OnceLock::new();
+        EXE.get_or_init(|| {
+            let root = env::temp_dir().join(format!("himind-stdin-fixture-{}-{}", std::process::id(), rand::random::<u64>()));
+            fs::create_dir_all(&root).unwrap();
+            let source = root.join("fixture.rs");
+            fs::write(&source, r#"
+use std::{env,io::{Read,Write},thread,time::Duration};
+fn main() {
+ if env::args().any(|a|a=="--hang") {thread::sleep(Duration::from_secs(30));return;}
+ let mut data=Vec::new();std::io::stdin().read_to_end(&mut data).unwrap();
+ assert_eq!(env::args().last().unwrap(),"-");
+ std::io::stdout().write_all(&data).unwrap();
+}
+"#).unwrap();
+            let exe = root.join("input-fixture.exe");
+            let result = process::hidden_command("rustc").arg(source)
+                .args(["--edition=2021", "-C", "debuginfo=0", "-o"]).arg(&exe).output().unwrap();
+            assert!(result.status.success(), "fixture compile: {}", String::from_utf8_lossy(&result.stderr));
+            exe
+        })
+    }
+
+    fn home() -> PathBuf {
+        let root = env::temp_dir().join(format!("himind-headless-input-{}-{}", std::process::id(), rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn headless_stdin_roundtrips_large_unicode_and_shell_literals_without_206() {
+        let root = home();
+        let prompt = "完整失败证据 🧪 \"quoted\" \\path\\ $(literal) `literal`\r\n".repeat(20_000);
+        assert!(prompt.encode_utf16().count() > 32_767);
+        let mut command = process::hidden_command(fixture());
+        command.args(headless_args(Path::new("non-secret.patch.yml")))
+            .stdin(Stdio::from(headless_prompt_input(&root, &prompt).unwrap()))
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = command.spawn().unwrap().wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, prompt.as_bytes());
+        drop(command);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "temporary input must not persist");
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn headless_stdin_failed_spawn_cleans_up_and_does_not_expose_prompt() {
+        let root = home();
+        let prompt = "private failure evidence".repeat(10_000);
+        let mut command = process::hidden_command(root.join("missing.exe"));
+        command.args(headless_args(Path::new("overlay.yml")))
+            .stdin(Stdio::from(headless_prompt_input(&root, &prompt).unwrap()));
+        let error = command.spawn().unwrap_err();
+        assert!(!error.to_string().contains("private failure evidence"));
+        drop(command);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(&root).unwrap();
+    }
+
+    fn stop_unread_input(cancel: bool) {
+        let root = home();
+        let mut command = process::hidden_command(fixture());
+        command.arg("--hang").stdin(Stdio::from(headless_prompt_input(&root, &"unread".repeat(300_000)).unwrap()))
+            .stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let started = Instant::now();
+        let error = process::wait_for_child_until_with_cancel(&mut child, Duration::from_millis(150),
+            "headless input fixture", &mut || Ok(cancel)).unwrap_err();
+        assert!(error.to_string().contains(if cancel { "canceled" } else { "exceeded" }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "unread stdin must not prevent child reaping");
+        drop(child);
+        drop(command);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn headless_stdin_unread_large_request_remains_cancelable() { stop_unread_input(true); }
+
+    #[test]
+    fn headless_stdin_unread_large_request_remains_timeout_bounded() { stop_unread_input(false); }
 }
 
 /// Build the command used by an interactive DSH session.
@@ -2737,7 +2919,7 @@ fn ensure_home_config(
     options: &Options,
 ) -> Result<PathBuf, Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
-    ensure_himind_skill_adapter(&invocation.home, options)?;
+    if !executor_native_metadata_only() {ensure_himind_skill_adapter(&invocation.home, options)?;}
     migrate_legacy_managed_settings(&invocation.home)?;
     // 这次会话用不上工作台路由（未授权 / 授权过期 / 用户关掉对接）时，用户
     // 文档里若还留着 Agent 自有的 `himind-proxy`，Runtime 只会拿它去解析
@@ -2780,12 +2962,12 @@ fn ensure_himind_profile(
     // Runtime 的普通对话能力。
     let supports_agent_preset_v2 =
         runtime_supports_agent_preset_v2(Path::new(invocation.executable.as_os_str()));
-    if let Err(error) = sync_expert_presets(
+    if !executor_native_metadata_only() {if let Err(error) = sync_expert_presets(
         &home.join("profiles").join(HIMIND_PROFILE),
         supports_agent_preset_v2,
     ) {
         eprintln!("同步 DSH 专家预设失败：{error}");
-    }
+    }}
     Ok(())
 }
 
@@ -3363,10 +3545,12 @@ fn write_read_only_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>>
 fn write_mission_methods_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>> {
     // Mission roles already contain the pinned expert instructions. Loading
     // arbitrary host skills would silently change that method during a run.
+    // Mission alone schedules its steps. A nested Goal can enqueue a second
+    // turn after the step's final result and make headless report that turn.
     // Keep the assigned model, file tools, Shell and MCP image/lease tools.
     let base = fs::read_to_string(base_patch)?;
     let path = base_patch.with_extension("mission-methods.yml");
-    fs::write(&path, format!("{}\n- id: tool-skill\n  disabled: true\n", base.trim_end()))?;
+    fs::write(&path, format!("{}\n- id: tool-skill\n  disabled: true\n- id: tool-goal\n  disabled: true\n", base.trim_end()))?;
     Ok(path)
 }
 
@@ -3921,7 +4105,7 @@ fn append_local_gateway_profile(
             let service = parts.next().unwrap_or_default();
             let upstream = parts.next().unwrap_or_default();
             let metadata = metadata_by_service.entry(service.to_string()).or_insert_with(||
-                if Some(service) == selected_service {
+                if Some(service) == selected_service && !executor_native_metadata_only() {
                     crate::app::ai_provider_import::custom_service_model_metadata(service).unwrap_or_default()
                 } else { std::collections::BTreeMap::new() });
             metadata.get(upstream).cloned().unwrap_or_else(|| crate::api::ai::known_model_metadata(upstream))
@@ -3939,6 +4123,13 @@ fn append_local_gateway_profile(
         }
     }
     Ok(())
+}
+
+// The opt-in integration producer must not initialize workbench sync merely
+// to render model metadata. Ordinary runtime behavior retains its catalog.
+fn executor_native_metadata_only()->bool {
+    #[cfg(all(test,windows))] {return crate::runtime::executor_live::native_active();}
+    #[cfg(not(all(test,windows)))] {false}
 }
 
 fn read_user_model_selection(home: &Path) -> Result<Option<UserModelSelection>, Box<dyn Error>> {
@@ -4882,6 +5073,20 @@ pub(crate) fn interactive_executable() -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
+pub(crate) fn executor_installed_runtime_only()->Result<PathBuf,Box<dyn Error>> {
+    // The fixed-route producer accepts the installed managed package only;
+    // an arbitrary executable override cannot become an inference entry.
+    let state=load_runtime_state()?.ok_or("installed runtime state missing")?;
+    validate_runtime_agent_compatibility(&state.min_agent_version,&state.max_agent_version)?;
+    let executable=PathBuf::from(state.executable_path);
+    if !managed_executable_path(&executable) {return Err("installed runtime identity invalid".into());}
+    if let Some(explicit)=env::var_os("HIMIND_DSH_EXECUTABLE") {
+        if PathBuf::from(explicit).canonicalize()?!=executable.canonicalize()? {return Err("runtime override is not the installed package".into());}
+    }
+    Ok(executable)
+}
+
 /// DSH 最近使用过、且当前仍然存在的工作区。
 ///
 /// 主入口（侧栏 HiMind AI）不带工作目录，早期实现退回进程当前目录，而桌面启动器
@@ -5289,16 +5494,76 @@ mod tests {
         let root = std::env::temp_dir().join(format!("himind-mission-methods-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&root).unwrap();
         let base = root.join("agent.patch.yml");
-        let source = "- id: agent-default-model\n  config:\n    model: pinned\n- id: tool-pwsh\n  disabled: false\n- id: tool-fs\n  disabled: false\n- id: himind-agent-mcp\n  disabled: false\n";
+        let source = "- id: agent-default-model\n  config:\n    model: pinned\n- id: tool-pwsh\n  disabled: false\n- id: tool-bash\n  disabled: false\n- id: tool-fs\n  disabled: false\n- id: tool-fs-search\n  disabled: false\n- id: himind-agent-mcp\n  disabled: false\n- id: tool-goal\n  disabled: false\n- id: tool-skill\n  disabled: false\n";
         std::fs::write(&base, source).unwrap();
         let overlay = std::fs::read_to_string(super::write_mission_methods_overlay(&base).unwrap()).unwrap();
         let rows: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
         let disabled = rows.as_sequence().unwrap().iter().filter(|row| row["disabled"] == true)
             .map(|row| row["id"].as_str().unwrap()).collect::<Vec<_>>();
-        assert_eq!(disabled, vec!["tool-skill"]);
-        assert!(overlay.contains("model: pinned"));
+        assert_eq!(disabled, vec!["tool-skill", "tool-goal"]);
+        // Apply rows in overlay order, as the runtime patch does: an earlier
+        // explicit enabled row must not re-enable either scheduling method.
+        let mut effective = std::collections::BTreeMap::new();
+        for row in rows.as_sequence().unwrap() {
+            effective.insert(row["id"].as_str().unwrap(), row.clone());
+        }
+        for id in ["tool-skill", "tool-goal"] { assert_eq!(effective[id]["disabled"], true); }
+        for id in ["tool-pwsh", "tool-bash", "tool-fs", "tool-fs-search", "himind-agent-mcp"] {
+            assert_eq!(effective[id]["disabled"], false);
+        }
+        assert_eq!(effective["agent-default-model"]["config"]["model"], "pinned");
         assert_eq!(std::fs::read_to_string(&base).unwrap(), source);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mission_methods_overlay_does_not_change_native_goal_or_other_sessions() {
+        let root = std::env::temp_dir().join(format!("himind-mission-goal-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let native = "- id: tool-goal\n  disabled: false\n- id: tool-skill\n  disabled: false\n";
+        let base = root.join("native.patch.yml");
+        let other = root.join("other.patch.yml");
+        std::fs::write(&base, native).unwrap();
+        std::fs::write(&other, native).unwrap();
+        let mission = super::write_mission_methods_overlay(&base).unwrap();
+        assert_ne!(mission, base);
+        assert_eq!(std::fs::read_to_string(&base).unwrap(), native);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), native);
+        // Reapplying a Mission patch still ends with both methods disabled.
+        let repeated = super::write_mission_methods_overlay(&mission).unwrap();
+        let rows: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(repeated).unwrap()).unwrap();
+        for id in ["tool-goal", "tool-skill"] {
+            assert_eq!(rows.as_sequence().unwrap().iter().rev().find(|r| r["id"] == id).unwrap()["disabled"], true);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires the caller-owned remediation TEST build-signing configuration"]
+    fn executor_test_build_signing_matches_effective_test_inputs() {
+        use rsa::pkcs8::DecodePublicKey;
+        use sha2::{Digest, Sha256};
+        let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let root = PathBuf::from(std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("own test root"))
+            .canonicalize().unwrap();
+        for (public_env, id_env, compiled_public, compiled_id) in [
+            ("HIMIND_SIGNING_PUBLIC_KEY_PATH", "HIMIND_SIGNING_KEY_ID",
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-update-public-key.pem")),
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"))),
+            ("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", "HIMIND_EXTENSION_SIGNING_KEY_ID",
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-public-key.pem")),
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-key-id.txt"))),
+        ] {
+            let path = PathBuf::from(std::env::var_os(public_env).expect("explicit test public material"))
+                .canonicalize().unwrap();
+            assert!(path.starts_with(&root), "test public material ownership mismatch");
+            let public = std::fs::read(&path).unwrap();
+            assert_eq!(hash(compiled_public.as_bytes()), hash(&public), "{public_env} material mismatch");
+            let id = std::env::var(id_env).expect("explicit test key ID");
+            assert!(id.starts_with("executor-test-"), "only TEST signing configuration allowed");
+            assert_eq!(hash(compiled_id.as_bytes()), hash(id.as_bytes()), "{id_env} configuration mismatch");
+            assert!(rsa::RsaPublicKey::from_public_key_pem(compiled_public).is_ok(), "TEST public material must use product RSA format");
+        }
     }
 
     #[test]

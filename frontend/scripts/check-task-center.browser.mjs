@@ -5,17 +5,29 @@ import { dirname, resolve } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'vite';
 import react from '@vitejs/plugin-react';
+import {execFileSync} from 'node:child_process';
+import {createRuntime} from './remediation/service-ui-runtime.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const evidence = process.env.MISSION_UI_EVIDENCE || resolve(root, '../target/mission-assignment-ui');
+const runtime = createRuntime('browser');
+const evidence = runtime.directory;
+const shortTemporary=execFileSync('python',['-c','import ctypes,sys; b=ctypes.create_unicode_buffer(32768); assert ctypes.windll.kernel32.GetShortPathNameW(sys.argv[1],b,len(b)); print(b.value)',runtime.temporary],{encoding:'utf8',windowsHide:true}).trim();
+Object.assign(process.env,{TEMP:shortTemporary,TMP:shortTemporary,TMPDIR:shortTemporary});
 mkdirSync(evidence, {recursive:true});
 const require = createRequire(import.meta.url);
 const { chromium } = process.env.PLAYWRIGHT_MODULE
   ? await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE).href)
   : require('playwright');
 
-const server=await createServer({root,configFile:false,plugins:[react()],server:{host:'127.0.0.1',port:0}});
+const server=await createServer({root,cacheDir:runtime.cache,configFile:false,plugins:[react()],server:{host:'127.0.0.1',port:0}});
 await server.listen();
-const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_EXECUTABLE?{executablePath:process.env.CHROMIUM_EXECUTABLE}:{})});
+let browser;
+try {
+ browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_EXECUTABLE?{executablePath:process.env.CHROMIUM_EXECUTABLE}:{})});
+} catch(error) {
+ writeFileSync(resolve(evidence,'chromium-default-failure.txt'),String(error));
+ if(process.env.CHROMIUM_EXECUTABLE) throw error;
+ browser=await chromium.launch({headless:true,channel:'msedge'});
+}
 const errors=[];
 try {
  const page=await browser.newPage({viewport:{width:1280,height:900}});
@@ -28,13 +40,13 @@ try {
  assert.equal(await page.locator('[data-task-id="activity:mission-run"]').count(),0);
  assert.equal(await page.locator('[data-task-id="activity:report-child"]').count(),0);
  assert.equal(await page.locator('[data-task-id="activity:unknown"]').count(),1);
-  assert.match(await page.locator('[data-task-id="mission:m-stalled"]').innerText(),/需处理失败/);
+  assert.match(await page.locator('[data-task-id="mission:m-stalled"]').innerText(),/状态待核对/);
  await page.getByRole('tab',{name:/待我处理/}).click();
- assert.equal(await rows.count(),4);
+ assert.equal(await rows.count(),3);
  assert.equal(await page.getByRole('button',{name:'批准',exact:true}).count(),0);
  assert.equal(await page.locator('[data-task-id="activity:external"]').count(),0);
  assert.equal(await page.locator('[data-task-id="activity:canceled"]').count(),0);
-  assert.equal(await page.locator('[data-task-id="mission:m-stalled"]').count(),1);
+  assert.equal(await page.locator('[data-task-id="mission:m-stalled"]').count(),0);
  await page.getByRole('tab',{name:/全部/}).click();
  const pending=page.locator('[data-task-id="mission:m-confirm"]');
  const todoId=await pending.getAttribute('data-todo-id');
@@ -49,7 +61,7 @@ try {
  await page.waitForFunction(()=>document.querySelector('.mission-detail-head')?.textContent.includes('执行中'));
  await page.getByRole('button',{name:'待处理入口'}).click();
  assert.equal(await page.locator('[data-todo-id="'+todoId+'"]').count(),0);
- assert.equal(await page.getByTestId('badge').textContent(),'3');
+ assert.equal(await page.getByTestId('badge').textContent(),'2');
  const executionId='run:feedback:s1:feedback';
  assert.equal(await page.locator('[data-todo-id="'+executionId+'"]').count(),1);
  await page.getByRole('button',{name:'任务入口'}).click();
@@ -68,7 +80,7 @@ try {
  await page.getByRole('button',{name:'返回我的任务',exact:true}).click();
  await page.getByRole('button',{name:'待验收任务',exact:true}).click();
  assert.equal(await page.locator('.mission-detail-head .collaboration-task-status').textContent(),'待核验');
- await page.getByText('实现专家已提交结果，系统将运行必需检查，并安排另一位专家核对；通过后子任务才算完成。',{exact:true}).waitFor();
+ await page.getByText(/实现专家已提交结果；系统将运行必需检查/).waitFor();
  assert.equal(await page.locator('.mission-stage-rail [aria-current="step"] strong').textContent(),'独立验收');
  assert.equal(await page.getByRole('button',{name:'查看验收详情',exact:true}).count(),1);
  await page.getByRole('button',{name:'查看验收详情',exact:true}).click();

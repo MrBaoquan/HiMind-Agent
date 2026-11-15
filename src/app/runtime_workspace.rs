@@ -137,7 +137,7 @@ pub(crate) fn resolve(input: &WorkspaceResolution) -> Result<Value, Box<dyn Erro
             return Err("此任务当前没有待恢复的命令环境阻塞".into());
         }
         if input.action == "full_access" && mission.tasks.iter().any(|task| !crate::workflow::supports_full_access(&task.spec.execution.executor)) {
-            return Err("完全访问模式需要所有任务选择 HiMind AI 或 ACP 执行器".into());
+            return Err("完全访问模式需要所有任务选择 HiMind AI、Codex 或 ACP 执行器".into());
         }
     }
     let lock_root = crate::store::paths::agent_home().join("runtime-workspace-locks");

@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react';
-import type { ApprovalFact, ApprovalItem } from '../services/agentApi';
+import { agentApi, missionFollowUpReviewDigest, type ApprovalFact, type ApprovalItem } from '../services/agentApi';
 import { CheckCircle2, ClipboardCheck, Clock3, History, MonitorUp, Settings2, ShieldAlert, Upload, XCircle } from 'lucide-react';
 import { EmptyState, PageHeader } from '../components/Common';
 
@@ -73,6 +73,48 @@ function ApprovalTabs({ activeTab, pendingCount, historyCount, onChange }: {
   );
 }
 
+function ApprovalDescription({ description }: { description: string }) {
+  const digest = missionFollowUpReviewDigest(description);
+  const [review, setReview] = useState({ loading: false, text: '', error: '' });
+  const fullTextStyle = {
+    whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto',
+    maxHeight: '24rem', margin: '8px 0', padding: '8px',
+    border: '1px solid var(--border)', borderRadius: '6px',
+    font: 'inherit', fontSize: '12px', userSelect: 'text',
+  } as const;
+
+  async function readReview() {
+    if (!digest || review.loading) return;
+    setReview({ loading: true, text: '', error: '' });
+    try {
+      const value = await agentApi.getMissionFollowUpReview(digest);
+      setReview({ loading: false, text: JSON.stringify(value, null, 2) ?? '', error: '' });
+    } catch (error) {
+      setReview({ loading: false, text: '', error: String(error) });
+    }
+  }
+
+  return (
+    <>
+      <div className="desc">{description}</div>
+      <details style={{ marginTop: '6px', minWidth: 0 }}>
+        <summary style={{ cursor: 'pointer', color: 'var(--primary)' }}>展开完整说明{digest ? '与任务' : ''}</summary>
+        <pre tabIndex={0} aria-label="完整审批说明" style={fullTextStyle}>{description}</pre>
+        {digest ? (
+          <div>
+            <button type="button" className="btn" disabled={review.loading} onClick={() => void readReview()}>
+              {review.loading ? '正在读取完整任务…' : '读取完整任务'}
+            </button>
+            <p style={{ overflowWrap: 'anywhere', fontSize: '12px' }}>任务摘要：{digest}</p>
+            {review.error ? <p role="alert">完整任务读取失败：{review.error}</p> : null}
+            {review.text ? <pre tabIndex={0} aria-label="完整跟进任务 JSON" style={fullTextStyle}>{review.text}</pre> : null}
+          </div>
+        ) : null}
+      </details>
+    </>
+  );
+}
+
 function PendingApprovals({ approvals, onRespond }: { approvals: ApprovalItem[]; onRespond: (id: string, approved: boolean) => void }) {
   if (approvals.length === 0) {
     return <EmptyState icon={ClipboardCheck} title="没有待处理请求" text="新的敏感操作请求会显示在这里。" />;
@@ -84,7 +126,7 @@ function PendingApprovals({ approvals, onRespond }: { approvals: ApprovalItem[];
           <div className={`approval-icon ${item.request_type}`}>
             {item.request_type === 'remote_connect' ? <MonitorUp size={18} /> : <Upload size={18} />}
           </div>
-          <div className="info"><div className="title">{item.title}</div><div className="desc">{item.description}</div></div>
+          <div className="info"><div className="title">{item.title}</div><ApprovalDescription key={item.description} description={item.description} /></div>
           <span className="timer">
             <Clock3 size={14} />
             {item.timeout_seconds === 0
@@ -110,7 +152,7 @@ function ApprovalHistory({ history }: { history: ApprovalFact[] }) {
       {history.slice(0, 100).map(item => (
         <div className="approval-item approval-history-item" key={item.id}>
           <div className={`approval-icon approval-status-${item.status}`}><FactIcon status={item.status} /></div>
-          <div className="info"><div className="title">{item.title}</div><div className="desc">{item.description}</div></div>
+          <div className="info"><div className="title">{item.title}</div><ApprovalDescription key={item.description} description={item.description} /></div>
           <span className={`approval-status approval-status-${item.status}`}>{STATUS_LABEL[item.status]}</span>
           <time className="timer" dateTime={new Date(item.created_at_unix * 1000).toISOString()}>{formatTime(item.created_at_unix)}</time>
         </div>

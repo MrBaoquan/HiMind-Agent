@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import './ServiceUi.css';
 import { Check, ChevronDown, ChevronLeft, ChevronRight, CircleDashed, CircleX, Copy, ExternalLink, Info, Pencil, PlugZap, RefreshCw, Search, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
 import { Pill } from '../components/Common';
 import { BusyIndicator } from '../components/BusyIndicator';
+import { ModalSurface } from '../components/ModalSurface';
 import { useConfirm } from '../components/ConfirmDialog';
 import { fallbackAiServicePresets, type AiServicePreset } from './aiServicePresets';
 import { inferBalanceProfile } from './balanceProfileMatching';
@@ -222,8 +224,13 @@ export function AiProvidersPanel({
   const [capabilityFilter, setCapabilityFilter] = useState<'all' | AIServiceCapability>('all');
   const [selectedPreset, setSelectedPreset] = useState<string>('');
   const [presetCategory, setPresetCategory] = useState<string>('');
-  const modalRef = useRef<HTMLElement | null>(null);
-  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const stepTitleRef = useRef<HTMLHeadingElement>(null);
+  const pendingFieldFocus = useRef<string | null>(null);
+  const saveLock = useRef(false);
+  const [fieldError, setFieldError] = useState<{ field: string; step: FormStep; message: string } | null>(null);
+  const [catalogState, setCatalogState] = useState<'loading' | 'ready' | 'error' | 'denied'>('loading');
+  const [catalogTime, setCatalogTime] = useState<string | null>(null);
+  const [catalogRevision, setCatalogRevision] = useState(0);
   const confirm = useConfirm();
 
   const customServices = aiServices?.custom?.services ?? [];
@@ -231,7 +238,7 @@ export function AiProvidersPanel({
   const routeTable = aiServices?.custom?.capability_routes ?? {};
   const activeServiceId = primaryRouteServiceId(routeTable, 'chat');
   const managed = aiServices?.managed ?? { available: false };
-  const clientStatuses = aiServices?.clients?.targets ?? [];
+  const clientStatuses = [...new Map((aiServices?.clients?.targets ?? []).map(client => [client.target, client])).values()];
   const serviceCount = customServices.length;
   const editing = editingServiceId !== null;
 
@@ -241,50 +248,30 @@ export function AiProvidersPanel({
 
   useEffect(() => {
     let canceled = false;
+    setCatalogState('loading');
     void agentApi.getMediaProviderCatalog()
-      .then((catalog) => { if (!canceled) setProviderCatalog(catalog); })
-      .catch(() => { if (!canceled) setProviderCatalog(null); });
+      .then((catalog) => { if (!canceled) { setProviderCatalog(catalog); setCatalogTime(new Date().toISOString()); setCatalogState('ready'); } })
+      .catch((error) => { if (!canceled) setCatalogState(/403|forbidden|permission|无权限/i.test(String(error)) ? 'denied' : 'error'); });
     return () => { canceled = true; };
-  }, [aiServices]);
+  }, [aiServices, catalogRevision]);
 
-  useEffect(() => {
-    if (!formOpen) {
-      restoreFocusRef.current?.focus();
-      restoreFocusRef.current = null;
-      return;
-    }
-    const modal = modalRef.current;
-    if (!modal) return;
-    const focusable = () => Array.from(modal.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    )).filter((element) => element.offsetParent !== null);
-    window.setTimeout(() => focusable()[0]?.focus(), 0);
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !saving) {
-        setFormOpen(false);
-        setEditingServiceId(null);
-        return;
-      }
-      if (event.key !== 'Tab') return;
-      const elements = focusable();
-      if (!elements.length) return;
-      const first = elements[0];
-      const last = elements[elements.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [formOpen, saving]);
+  useLayoutEffect(() => {
+    if (formOpen && pendingFieldFocus.current) {
+      document.getElementById(`ai-service-${pendingFieldFocus.current}`)?.focus();
+      pendingFieldFocus.current = null;
+    } else if (formOpen) stepTitleRef.current?.focus({ preventScroll: true });
+    else setFieldError(null);
+  }, [formOpen, formStep]);
 
-  function serviceHealth(service: CustomAIService) {
+  useLayoutEffect(() => {
+    if (formError && fieldError) document.getElementById('ai-service-error-link')?.focus();
+  }, [formError, fieldError]);
+
+  function serviceHealth(service: CustomAIService): { text: string; kind: 'neutral' | 'success' | 'warn' } {
+    if (catalogState !== 'ready') return { text: '健康未知', kind: 'neutral' };
     const provider = providerCatalog?.providers.find(item => item.id === service.id);
-    return serviceHealthLabel(provider, Boolean(provider?.has_api_key ?? service.models.length));
+    if (!provider) return { text: '健康未知', kind: 'neutral' };
+    return serviceHealthLabel(provider, Boolean(provider.has_api_key));
   }
 
   function routeBadges(service: CustomAIService) {
@@ -473,26 +460,55 @@ export function AiProvidersPanel({
   function goNext() {
     const error = formStep === 0 ? connectionStepError() : capabilityStepError();
     if (error) {
-      setFormError(error);
+      showValidation(error);
       return;
     }
     setFormError('');
+    setFieldError(null);
     setFormStep(current => Math.min(2, current + 1) as FormStep);
   }
 
   function goBack() {
     setFormError('');
+    setFieldError(null);
     setFormStep(current => Math.max(0, current - 1) as FormStep);
   }
 
+  function showValidation(message: string, sourceField?: string) {
+    const capability = enabledCapabilities.find(item => message.includes(`「${AI_SERVICE_CAPABILITY_LABELS[item]}」`));
+    const field = sourceField ?? (message.includes('服务名称') ? 'display_name' : message.includes('API Key') ? 'api_key'
+      : message.includes('Base URL') ? 'base_url' : message.includes('User ID') ? 'balance_user_id'
+      : capability ? ({ chat: 'model', 'image.generate': 'image_model', 'image.edit': 'image_edit_model', 'video.generate': 'video_model', 'audio.speech': 'speech_model', 'audio.transcribe': 'transcribe_model', 'vision.describe': 'vision_model' }[capability]) : 'capabilities');
+    const step: FormStep = ['display_name', 'api_key', 'base_url'].includes(field) ? 0 : field === 'balance_user_id' ? 2 : 1;
+    setFieldError({ field, step, message });
+    setFormError(message);
+  }
+
+  function fieldProps(field: string) {
+    return { id: `ai-service-${field}`, 'aria-invalid': fieldError?.field === field || undefined,
+      'aria-describedby': fieldError?.field === field ? 'ai-service-field-error' : undefined };
+  }
+
+  function locateError() {
+    if (!fieldError) return;
+    if (formStep === fieldError.step) document.getElementById(`ai-service-${fieldError.field}`)?.focus();
+    else { pendingFieldFocus.current = fieldError.field; setFormStep(fieldError.step); }
+  }
+
   async function saveService() {
+    if (saveLock.current) return;
+    saveLock.current = true;
+    try { await performSave(); } finally { saveLock.current = false; }
+  }
+
+  async function performSave() {
     const error = connectionStepError() || capabilityStepError();
     if (error) {
-      setFormError(error);
+      showValidation(error);
       return;
     }
     if (draft.balance_profile_id === 'new-api' && !draft.balance_user_id.trim()) {
-      setFormError('New API 余额查询需要填写 User ID。');
+      showValidation('New API 余额查询需要填写 User ID。');
       return;
     }
     const enabled = new Set(enabledCapabilities);
@@ -564,7 +580,11 @@ export function AiProvidersPanel({
       setPresetCategory('');
       setFormOpen(false);
     } catch (error) {
-      setFormError(formatAIServiceError(error, '保存服务失败，请检查连接信息后重试。'));
+      const message = formatAIServiceError(error, '保存 AI 服务失败，请检查连接信息后重试。');
+      const sourceField = ['display_name', 'api_key', 'base_url', 'balance_user_id', 'image_edit_model', 'image_model', 'video_model', 'speech_model', 'transcribe_model', 'vision_model', 'model']
+        .find(field => new RegExp(`\\b${field}\\b`).test(message));
+      if (sourceField) showValidation(message, sourceField);
+      else { setFieldError(null); setFormError(message); }
     } finally {
       setSaving(false);
     }
@@ -646,13 +666,13 @@ export function AiProvidersPanel({
     setCloningServiceId(service.id);
     setConnectionChecks(current => ({
       ...current,
-      [service.id]: { state: 'busy', message: '正在复制服务和加密凭据…' },
+        [service.id]: { state: 'busy', message: '正在复制 AI 服务和加密凭据…' },
     }));
     try {
       const cloned = await onCloneAIService(service.id);
       setConnectionChecks(current => ({
         ...current,
-        [service.id]: { state: 'ok', message: `已克隆为 ${cloned.display_name}` },
+        [service.id]: { state: 'ok', message: `AI 服务已复制为 ${cloned.display_name}` },
       }));
       openEditService(cloned);
       setFormNotice('已复制连接信息、模型、能力与加密凭据。可修改名称或参数后保存为新服务。');
@@ -661,7 +681,7 @@ export function AiProvidersPanel({
         ...current,
         [service.id]: {
           state: 'error',
-          message: formatAIServiceError(error, '克隆 AI 服务失败'),
+          message: formatAIServiceError(error, '复制 AI 服务失败'),
         },
       }));
     } finally {
@@ -670,7 +690,6 @@ export function AiProvidersPanel({
   }
 
   function openNewService() {
-    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedPreset('');
     setPresetCategory('');
     setEditingServiceId(null);
@@ -683,7 +702,6 @@ export function AiProvidersPanel({
   }
 
   function openEditService(service: CustomAIService) {
-    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedPreset('');
     setPresetCategory('');
     setEditingServiceId(service.id);
@@ -743,30 +761,35 @@ export function AiProvidersPanel({
   }
   return (
     <div className="ai-providers-view">
+      <div className="ai-catalog-state" role={catalogState === 'error' || catalogState === 'denied' ? 'alert' : 'status'} aria-busy={catalogState === 'loading'}>
+        {catalogState === 'loading' ? '正在读取健康目录，AI 服务配置仍可操作。' : catalogState === 'denied' ? '无权限读取健康目录；请联系管理员授权，配置列表不受影响。' : catalogState === 'error' ? '健康目录读取失败；健康状态未知，配置列表不受影响。' : providerCatalog?.providers.some(provider => provider.health.state === 'degraded' || provider.health.state === 'unavailable') ? '健康目录已更新，部分 AI 服务不可用；请检查对应连接。' : '健康目录已更新；可逐项检查 AI 服务连接。'}
+        <span>{catalogTime ? `最近成功快照：${catalogTime}` : '尚无成功快照'}</span>
+        {catalogState === 'error' || catalogState === 'denied' ? <button className="btn" onClick={() => setCatalogRevision(value => value + 1)}>重试健康目录</button> : null}
+      </div>
       <section className={`ai-overview ${serviceCount ? 'ready' : 'attention'}`}>
         <div className="ai-overview-main">
           <div className="ai-overview-icon"><PlugZap size={20} /></div>
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">AI 服务</span>
-            <strong>{serviceCount ? `${serviceCount} 个本机服务` : '还没有可用的 AI 服务'}</strong>
+            <strong>{serviceCount ? `${serviceCount} 个本机 AI 服务` : '还没有可用的 AI 服务'}</strong>
             <span>一个服务可承载对话或媒体能力；默认路由在「能力路由」查看。</span>
           </div>
         </div>
         <div className="ai-overview-actions">
-          <button className="btn btn-primary" onClick={openNewService}>新增服务</button>
+          <button className="btn btn-primary" onClick={openNewService}>新增 AI 服务</button>
         </div>
       </section>
 
       <section className="ai-managed-section" aria-labelledby="ai-managed-title">
         <div className="ai-section-heading">
-          <div><h3 id="ai-managed-title">工作台服务</h3><span>由 AI 工作台管理，不计入本机服务数量。</span></div>
+          <div><h3 id="ai-managed-title">工作台 AI 服务</h3><span>由 AI 工作台管理，不计入本机 AI 服务数量。</span></div>
         </div>
         <ManagedSourceRow managed={managed} active={!activeServiceId} clientStatuses={clientStatuses} onOpenAccount={onOpenAccount} onRefresh={onRefresh} />
       </section>
 
       <section className="ai-client-section" aria-labelledby="ai-services-title">
         <div className="ai-section-heading">
-          <div><h3 id="ai-services-title">本机服务</h3><span>连接、凭据和能力在这里管理；路由与工具分发在各自页面完成。</span></div>
+          <div><h3 id="ai-services-title">本机 AI 服务</h3><span>连接、凭据和能力在这里管理；路由与工具分发在各自页面完成。</span></div>
           <div className="ai-section-tail"><Pill kind="neutral">{serviceCount}</Pill></div>
         </div>
 
@@ -804,27 +827,27 @@ export function AiProvidersPanel({
               onRemove={() => void onRemoveAIService(service.id)}
             />
           ))}
-          {!serviceCount ? <div className="ai-empty-row"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>暂无本机 AI 服务，点「新增服务」连接一个模型来源。</span></div> : null}
+          {!serviceCount ? <div className="ai-empty-row" role="status"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>{aiServices ? '暂无本机 AI 服务，点「新增 AI 服务」连接一个模型来源。' : '正在读取 AI 服务配置，请稍候；若持续无响应请刷新。'}</span></div> : null}
           {serviceCount && !filteredServices.length ? <div className="ai-empty-row"><span className="ai-empty-icon"><Search size={14} /></span><span>没有匹配的服务，换一个关键词或能力筛选。</span></div> : null}
         </div>
       </section>
 
       {formOpen ? (
-        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) closeForm(); }}>
-          <section ref={modalRef} className="modal ai-service-modal" role="dialog" aria-modal="true" aria-labelledby="ai-service-modal-title">
+        <ModalSurface className="modal ai-service-modal" titleId="ai-service-modal-title" onClose={closeForm}>
+          <div aria-busy={saving}>
             <div className="modal-header">
               <div>
-                <h3 id="ai-service-modal-title">{editing ? '编辑 AI 服务' : '新增 AI 服务'}</h3>
+                <h3 id="ai-service-modal-title" ref={stepTitleRef} tabIndex={-1} data-initial-focus>{editing ? '编辑 AI 服务' : '新增 AI 服务'} · {['连接', '能力与模型', '高级与用量'][formStep]}</h3>
                 <p>连接信息和密钥只保存在本机。</p>
               </div>
               <button className="btn btn-icon" title="关闭" aria-label="关闭" disabled={saving} onClick={closeForm}><X size={16} /></button>
             </div>
             <div className="modal-body ai-service-modal-body">
-              {formError ? <div className="ai-service-form-error" role="alert"><CircleX size={15} /><span>{formError}</span></div> : null}
+              {formError ? <div className="ai-service-form-error" role="alert"><CircleX size={15} /><span id="ai-service-field-error">{formError}{fieldError ? <a id="ai-service-error-link" href={`#ai-service-${fieldError.field}`} onClick={event => { event.preventDefault(); locateError(); }}>定位并修正字段</a> : null}</span></div> : null}
               {formNotice ? <div className="ai-service-form-notice" role="status"><Info size={15} /><span>{formNotice}</span></div> : null}
               <div className="ai-service-steps" aria-label="配置步骤">
                 {['连接', '能力与模型', '高级与用量'].map((label, index) => (
-                  <span key={label} className={`ai-service-step${formStep === index ? ' active' : ''}${formStep > index ? ' complete' : ''}`}>
+                  <span key={label} aria-current={formStep === index ? 'step' : undefined} className={`ai-service-step${formStep === index ? ' active' : ''}${formStep > index ? ' complete' : ''}`}>
                     <b>{formStep > index ? <Check size={12} /> : index + 1}</b>{label}
                   </span>
                 ))}
@@ -837,20 +860,21 @@ export function AiProvidersPanel({
                     {usingFallbackPresets ? <span className="ai-service-preset-source" title="连接 AI 工作台后会改用工作台目录里的服务与模型">未连接 AI 工作台，使用内置预设</span> : null}
                   </div>
                   <div className="ai-service-preset-tabs">
-                    <button type="button" className={`ai-service-preset-tab${!presetCategory ? ' active' : ''}`} onClick={() => { setPresetCategory(''); setSelectedPreset(''); setDraft(emptyDraft); setEnabledCapabilities(['chat']); }}>
+                    <button type="button" aria-pressed={!presetCategory} className={`ai-service-preset-tab${!presetCategory ? ' active' : ''}`} onClick={() => { setPresetCategory(''); setSelectedPreset(''); }}>
                       <Pencil size={13} />手动配置
                     </button>
                     {presetGroups.map((group) => (
-                      <button key={group.name} type="button" className={`ai-service-preset-tab${presetCategory === group.name ? ' active' : ''}`} onClick={() => setPresetCategory(group.name)}>
+                      <button key={group.name} type="button" aria-pressed={presetCategory === group.name} className={`ai-service-preset-tab${presetCategory === group.name ? ' active' : ''}`} onClick={() => setPresetCategory(group.name)}>
                         <Sparkles size={13} />{group.name}
                       </button>
                     ))}
                   </div>
-                  {activePresetGroup ? <div className="ai-service-preset-list">
+                  {activePresetGroup ? <div className="ai-service-preset-list" role="group" aria-label="AI 服务预设">
                     {activePresetGroup.items.map((preset) => (
-                      <button key={preset.id} type="button" className={`ai-service-preset-chip${selectedPreset === preset.id ? ' active' : ''}`} title={preset.description} onClick={() => applyPreset(preset.id)}>
+                      <label key={preset.id} className={`ai-service-preset-chip${selectedPreset === preset.id ? ' active' : ''}`} title={preset.description}>
+                        <input type="radio" name="ai-service-preset" value={preset.id} checked={selectedPreset === preset.id} onChange={() => applyPreset(preset.id)} />
                         <strong>{preset.name}</strong><span>{preset.description}</span>
-                      </button>
+                      </label>
                     ))}
                   </div> : <div className="ai-service-preset-hint"><Sparkles size={13} />选择常用服务后会自动填入连接信息、能力和推荐模型。</div>}
                 </div>
@@ -858,9 +882,9 @@ export function AiProvidersPanel({
                 <div className="ai-service-form-group">
                   <div className="ai-service-group-label">连接</div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>服务名称</span><input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder="例如：公司模型 / Fish Audio" /></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
-                    <label className="field-label ai-service-field"><span>Base URL</span><input value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://api.example.com/v1" /></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>服务名称</span><input {...fieldProps('display_name')} value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder="例如：公司模型 / Fish Audio" /></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input {...fieldProps('api_key')} type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
+                    <label className="field-label ai-service-field"><span>Base URL</span><input {...fieldProps('base_url')} value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://api.example.com/v1" /></label>
                     <label className="field-label ai-service-field"><span>接口类型</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                   </div>
                   <small className="ai-service-hint">主协议用于服务连接；媒体适配器在下一步选择。</small>
@@ -879,7 +903,7 @@ export function AiProvidersPanel({
               {formStep === 1 ? <>
                 <div className="ai-service-form-group">
                   <div className="ai-service-group-label">启用能力</div>
-                  <div className="ai-capability-picker">
+                  <div className="ai-capability-picker" tabIndex={-1} {...fieldProps('capabilities')}>
                     {AI_SERVICE_CAPABILITIES.map(capability => (
                       <label key={capability} className={`ai-capability-option${enabledCapabilities.includes(capability) ? ' selected' : ''}`}>
                         <input type="checkbox" checked={enabledCapabilities.includes(capability)} onChange={() => toggleCapability(capability)} />
@@ -892,7 +916,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('chat') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>对话</strong><span>HiMind 对话和工具分发使用</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>对话默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-4.1 / deepseek-chat" /></label>
+                    <label className="field-label ai-service-field"><span>对话默认模型</span><input {...fieldProps('model')} value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-4.1 / deepseek-chat" /></label>
                     <label className="field-label ai-service-field"><span>可用模型</span><input value={draft.models} onChange={(event) => setDraft((current) => ({ ...current, models: event.target.value }))} placeholder="多个模型用逗号分隔" /></label>
                   </div>
                   <button className="btn ai-service-fetch-models" title={isVolcengineAgentPlan(draft.base_url) ? 'Agent Plan 不提供 /models；模型由目录提供' : !draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
@@ -904,7 +928,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('image.generate') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>生图</strong><span>文本生成图片</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>生图模型</span><input value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
+                    <label className="field-label ai-service-field"><span>生图模型</span><input {...fieldProps('image_model')} value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
                     <label className="field-label ai-service-field"><span>生图适配器</span><select value={draft.image_adapter || 'openai-images'} onChange={(event) => setDraft((current) => ({ ...current, image_adapter: event.target.value }))}><option value="openai-images">OpenAI Images</option><option value="ark-images">火山方舟</option></select></label>
                     <label className="field-label ai-service-field ai-service-field-wide"><span>其它生图模型</span><input value={draft.image_models} onChange={(event) => setDraft((current) => ({ ...current, image_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
@@ -913,7 +937,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('image.edit') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>改图</strong><span>参考图编辑 / 图生图</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>改图模型</span><input value={draft.image_edit_model} onChange={(event) => setDraft((current) => ({ ...current, image_edit_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seededit" /></label>
+                    <label className="field-label ai-service-field"><span>改图模型</span><input {...fieldProps('image_edit_model')} value={draft.image_edit_model} onChange={(event) => setDraft((current) => ({ ...current, image_edit_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seededit" /></label>
                     <label className="field-label ai-service-field"><span>改图适配器</span><select value={draft.image_edit_adapter || 'openai-images-edit'} onChange={(event) => setDraft((current) => ({ ...current, image_edit_adapter: event.target.value }))}><option value="openai-images-edit">OpenAI Images Edits</option><option value="ark-images">火山方舟</option></select></label>
                     <label className="field-label ai-service-field ai-service-field-wide"><span>其它改图模型</span><input value={draft.image_edit_models} onChange={(event) => setDraft((current) => ({ ...current, image_edit_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
@@ -922,7 +946,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('video.generate') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>视频</strong><span>文生视频 / 图生视频</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>生视频模型</span><input value={draft.video_model} onChange={(event) => setDraft((current) => ({ ...current, video_model: event.target.value }))} placeholder="如 doubao-seedance-2-5-…" /></label>
+                    <label className="field-label ai-service-field"><span>生视频模型</span><input {...fieldProps('video_model')} value={draft.video_model} onChange={(event) => setDraft((current) => ({ ...current, video_model: event.target.value }))} placeholder="如 doubao-seedance-2-5-…" /></label>
                     <label className="field-label ai-service-field"><span>视频适配器</span><select value={draft.video_adapter || 'ark-video'} onChange={(event) => setDraft((current) => ({ ...current, video_adapter: event.target.value }))}><option value="ark-video">火山方舟 Seedance</option><option value="wan-video">阿里云百炼万相</option></select></label>
                     <label className="field-label ai-service-field ai-service-field-wide"><span>其它视频模型</span><input value={draft.video_models} onChange={(event) => setDraft((current) => ({ ...current, video_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
@@ -932,7 +956,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('audio.speech') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>语音合成</strong><span>单次 TTS Provider 调用</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>语音合成模型</span><input value={draft.speech_model} onChange={(event) => setDraft((current) => ({ ...current, speech_model: event.target.value }))} placeholder="如 tts-1 / s2.1-pro-free" /></label>
+                    <label className="field-label ai-service-field"><span>语音合成模型</span><input {...fieldProps('speech_model')} value={draft.speech_model} onChange={(event) => setDraft((current) => ({ ...current, speech_model: event.target.value }))} placeholder="如 tts-1 / s2.1-pro-free" /></label>
                     <label className="field-label ai-service-field"><span>语音合成适配器</span><select value={draft.speech_adapter || 'openai-speech'} onChange={(event) => setDraft((current) => ({ ...current, speech_adapter: event.target.value }))}><option value="openai-speech">OpenAI 兼容</option><option value="fish-audio-tts">Fish Audio</option></select></label>
                     <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音合成模型</span><input value={draft.speech_models} onChange={(event) => setDraft((current) => ({ ...current, speech_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
@@ -941,7 +965,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('audio.transcribe') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>语音转写</strong><span>单次 ASR Provider 调用</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>语音转写模型</span><input value={draft.transcribe_model} onChange={(event) => setDraft((current) => ({ ...current, transcribe_model: event.target.value }))} placeholder="如 whisper-1 / transcribe-1-pro" /></label>
+                    <label className="field-label ai-service-field"><span>语音转写模型</span><input {...fieldProps('transcribe_model')} value={draft.transcribe_model} onChange={(event) => setDraft((current) => ({ ...current, transcribe_model: event.target.value }))} placeholder="如 whisper-1 / transcribe-1-pro" /></label>
                     <label className="field-label ai-service-field"><span>语音转写适配器</span><select value={draft.transcribe_adapter || 'openai-audio'} onChange={(event) => setDraft((current) => ({ ...current, transcribe_adapter: event.target.value }))}><option value="openai-audio">OpenAI 兼容</option><option value="fish-audio-asr">Fish Audio</option></select></label>
                     <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音转写模型</span><input value={draft.transcribe_models} onChange={(event) => setDraft((current) => ({ ...current, transcribe_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
@@ -949,7 +973,7 @@ export function AiProvidersPanel({
                 {enabledCapabilities.includes('vision.describe') ? <div className="ai-capability-card">
                   <div className="ai-capability-card-head"><strong>视觉理解</strong><span>看图打标、OCR 与画面理解</span></div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>视觉理解模型（可留空）</span><input value={draft.vision_model} onChange={(event) => setDraft((current) => ({ ...current, vision_model: event.target.value }))} placeholder={draft.model.trim() ? `留空则跟随对话模型：${draft.model.trim()}` : '留空则跟随对话模型'} /></label>
+                    <label className="field-label ai-service-field"><span>视觉理解模型（可留空）</span><input {...fieldProps('vision_model')} value={draft.vision_model} onChange={(event) => setDraft((current) => ({ ...current, vision_model: event.target.value }))} placeholder={draft.model.trim() ? `留空则跟随对话模型：${draft.model.trim()}` : '留空则跟随对话模型'} /></label>
                     <label className="field-label ai-service-field"><span>其它视觉理解模型</span><input value={draft.vision_models} onChange={(event) => setDraft((current) => ({ ...current, vision_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
                   </div>
                   <small className="ai-service-hint">与对话同一协议，不需要适配器；留空则跟随对话模型。</small>
@@ -980,7 +1004,7 @@ export function AiProvidersPanel({
                   </div> : null}
                   {draft.balance_profile_id === 'new-api' ? <div className="ai-service-form-grid">
                     <label className="field-label ai-service-field"><span>New API Access Token（可留空使用 API Key）</span><input type="password" value={draft.balance_access_token} onChange={(event) => setDraft((current) => ({ ...current, balance_access_token: event.target.value }))} placeholder={editing ? '留空以保留当前 Token' : 'Access Token'} /></label>
-                    <label className="field-label ai-service-field"><span>New API User ID</span><input value={draft.balance_user_id} onChange={(event) => setDraft((current) => ({ ...current, balance_user_id: event.target.value }))} placeholder="用户 ID" /></label>
+                    <label className="field-label ai-service-field"><span>New API User ID</span><input {...fieldProps('balance_user_id')} value={draft.balance_user_id} onChange={(event) => setDraft((current) => ({ ...current, balance_user_id: event.target.value }))} placeholder="用户 ID" /></label>
                   </div> : null}
                   <small className="ai-service-hint">仅手动查询；请求留在服务同源。</small>
                 </div>
@@ -991,8 +1015,8 @@ export function AiProvidersPanel({
                 {formStep < 2 ? <button className="btn btn-primary" disabled={saving} onClick={goNext}>下一步<ChevronRight size={14} /></button> : <button className="btn btn-primary" disabled={saving} onClick={() => void saveService()}>{saving ? '保存中...' : editing ? '保存修改' : '保存服务'}</button>}
               </div>
             </div>
-          </section>
-        </div>
+          </div>
+        </ModalSurface>
       ) : null}
     </div>
   );
@@ -1093,9 +1117,9 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
         <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={connectionCheck?.state === 'busy' || !hasChat} title={hasChat ? '检查对话模型列表接口' : '媒体服务需通过能力路由实际调用验证'} aria-label={`检查 ${service.display_name}`} onClick={onCheckConnection}>
           {connectionCheck?.state === 'busy' ? <BusyIndicator size={12} /> : <RefreshCw size={14} />}
         </button>
-        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={cloneBusy} title="复制连接、模型、能力和加密凭据，创建独立服务" aria-label={`克隆 ${service.display_name}`} onClick={onClone}>{cloneBusy ? <BusyIndicator size={12} /> : <Copy size={14} />}</button>
-        <button type="button" className="btn btn-icon ai-service-icon-btn" title="编辑连接、模型与能力" aria-label={`编辑 ${service.display_name}`} onClick={onEdit}><Pencil size={14} /></button>
-        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={!canDelete} title={canDelete ? '删除这个服务' : '有 AI 工具正在使用该服务，请先取消分发'} aria-label={`删除 ${service.display_name}`} onClick={() => { void confirm({ title: `删除 AI 服务「${service.display_name}」？`, description: '删除后需要重新填写连接信息和密钥才能再使用。', confirmText: '删除' }).then((accepted) => { if (accepted) onRemove(); }); }}><Trash2 size={14} /></button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={cloneBusy} title="复制连接、模型、能力和加密凭据，创建独立 AI 服务" aria-label={`复制 AI 服务 ${service.display_name}`} onClick={onClone}>{cloneBusy ? <BusyIndicator size={12} /> : <Copy size={14} />}</button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" title="编辑 AI 服务连接、模型与能力" aria-label={`编辑 AI 服务 ${service.display_name}`} onClick={onEdit}><Pencil size={14} /></button>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={!canDelete} title={canDelete ? '删除这个 AI 服务' : '有 AI 工具正在使用该 AI 服务，请先取消分发'} aria-label={`删除 AI 服务 ${service.display_name}`} onClick={() => { void confirm({ title: `删除 AI 服务「${service.display_name}」？`, description: '删除后需要重新填写连接信息和密钥才能再使用。', confirmText: '删除' }).then((accepted) => { if (accepted) onRemove(); }); }}><Trash2 size={14} /></button>
       </div>
     </article>
   );
@@ -1114,7 +1138,7 @@ function ManagedSourceRow({ managed, active, clientStatuses, onOpenAccount, onRe
       <article className={`ai-client-row ai-service-row${active ? ' active' : ''}`}>
         <div className="ai-client-icon target"><ShieldCheck size={18} /></div>
         <div className="ai-client-copy">
-          <strong>工作台模型服务</strong>
+          <strong>工作台 AI 服务</strong>
           <span>{managed.model} · {models} · {managed.base_url}</span>
           <div className="ai-service-fact-line">
             <span className="ai-service-health is-neutral"><span className="status-dot" aria-hidden="true" />工作台</span>
@@ -1126,26 +1150,26 @@ function ManagedSourceRow({ managed, active, clientStatuses, onOpenAccount, onRe
   }
   const reason = managed.reason ?? 'unknown';
   const reasonText: Record<string, string> = {
-    not_authorized: '工作台服务未连接',
+    not_authorized: '工作台 AI 服务未连接',
     user_mismatch: '工作台账号不一致',
-    independent: '未连接工作台服务',
-    no_credential: '工作台服务未配置',
-    not_ready: '工作台服务暂不可用',
+    independent: '未连接工作台 AI 服务',
+    no_credential: '工作台 AI 服务未配置',
+    not_ready: '工作台 AI 服务暂不可用',
     network_error: '工作台连接失败',
-    dashboard_error: '工作台服务读取失败',
-    parse_error: '工作台服务读取失败',
+    dashboard_error: '工作台 AI 服务读取失败',
+    parse_error: '工作台 AI 服务读取失败',
   };
   return (
     <section className="ai-managed-strip">
       <div className="ai-managed-icon muted">{reason === 'not_authorized' ? <CircleDashed size={18} /> : <CircleX size={18} />}</div>
       <div className="ai-managed-copy">
-        <strong>{reasonText[reason] ?? '工作台服务不可用'}</strong>
+        <strong>{reasonText[reason] ?? '工作台 AI 服务不可用'}</strong>
         <span>{reason === 'not_authorized' || reason === 'user_mismatch' ? '连接账号后即可使用' : reason === 'network_error' || reason === 'dashboard_error' || reason === 'parse_error' ? '请稍后重试' : '请在工作台完成配置'}</span>
       </div>
       <div className="ai-managed-actions">
         {reason === 'not_authorized' || reason === 'user_mismatch' ? <button className="btn" onClick={onOpenAccount}><ExternalLink size={13} />连接账号</button> : null}
         {reason === 'no_credential' || reason === 'not_ready' ? <button className="btn" onClick={onOpenAccount}><ExternalLink size={13} />配置服务</button> : null}
-        {reason === 'network_error' || reason === 'dashboard_error' || reason === 'parse_error' ? <button className="btn btn-icon" title="重新读取工作台服务" aria-label="重新读取工作台服务" onClick={onRefresh}><RefreshCw size={14} /></button> : null}
+        {reason === 'network_error' || reason === 'dashboard_error' || reason === 'parse_error' ? <button className="btn btn-icon" title="重新读取工作台 AI 服务" aria-label="重新读取工作台 AI 服务" onClick={onRefresh}><RefreshCw size={14} /></button> : null}
       </div>
     </section>
   );

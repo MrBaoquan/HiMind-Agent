@@ -1,0 +1,24 @@
+[
+  {
+    "command": "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+    "exit_code": 1,
+    "evidence": [
+      "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\required-check.stdout.log",
+      "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\required-check.stderr.log"
+    ],
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+    "classification": "reviewer_actual_execution_not_host_VERIFY"
+  },
+  {
+    "command": "python -c \"import json; from pathlib import Path; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p['passed'] is False and p['status']=='changes_required' and p['changes_required'] is True; assert len(p['backlog'])==13; assert [b['id'] for b in p['backlog']]==['B%02d'%i for i in range(1,14)]; assert p['blocking_findings'] and p['producer_task_ids']; assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations','summary','next_steps']); assert all(c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in p['checks']); assert all(b['checks'] and b['limitations'] and b['passed'] is False for b in p['backlog']); assert len(p['fixture_matrix'])==10; assert all(v=={'status':'excluded_by_user','passed':None,'blocking':False,'future_obligation':False} for v in p['excluded_by_user'].values()); assert p['deployment']['executed'] is False and p['deployment']['checklist_released'] is False; assert Path('docs/mixed-remediation-delivery.md').is_file(); assert not json.load(open('reports/final/audit-after.json',encoding='utf-8'))['changes_during_review']\"",
+    "exit_code": 0,
+    "evidence": [
+      "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\failure-report-integrity.stdout.log",
+      "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\14271e8d82cb82c53284a241797cd9cb7d7244e69caa85b7ca64bccc642fb426\\final-validation\\failure-report-integrity.stderr.log"
+    ],
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "classification": "reviewer_actual_execution_not_host_VERIFY"
+  }
+]

@@ -1,0 +1,334 @@
+{
+  "area": "visual",
+  "summary": "保留克制、紧凑的桌面设置方向及八项有效问题，六主题均已定点复核源码与AX。本轮通过media.image.read逐张观察七张安装截图，修正旧版未见像素说明。原型保留字号、收缩布局、dialog、radio、错误关联、摘要和六状态演示，仅补充hidden强制隐藏规则。未进行原型渲染、交互或无障碍实测；不代表产品整改或正式VERIFY通过。",
+  "coverage": [
+    {
+      "topic": "hierarchy_and_density",
+      "status": "finding",
+      "evidence": "styles.css:4776-4778与5585、5683存在字号令牌冲突；UI-005。安装services.ax.txt提供概览/列表结构，不提供像素布局证据。"
+    },
+    {
+      "topic": "forms_and_selection",
+      "status": "finding",
+      "evidence": "AiProvidersPanel:843-853只用active选择；473-481与823校验无字段定位；UI-002/003。"
+    },
+    {
+      "topic": "modal_and_focus",
+      "status": "finding",
+      "evidence": "AiProvidersPanel:250-283有document级焦点循环，812-820非原生模态；UI-001。实际键盘路径未测。"
+    },
+    {
+      "topic": "feedback_and_motion",
+      "status": "finding",
+      "evidence": "AiToolsPanel:140-161摘要未纳入待同步，目录失败静默见UI-007/008；styles.css:5522-5544有减少动效规则，未验证实际动画。"
+    },
+    {
+      "topic": "responsive_layout",
+      "status": "finding",
+      "evidence": "styles.css:5594-5605固定动作第三列、2991双列表单，UI-006为源码假设；已有路由598/460px容器回落，未实测响应式。"
+    },
+    {
+      "topic": "contrast_and_accessibility",
+      "status": "finding",
+      "evidence": "已有语义色与焦点环，但合成颜色对比度未测；重复tabpanel与runtime.ax.txt:46-47相符，UI-004。"
+    }
+  ],
+  "findings": [
+    {
+      "id": "UI-001",
+      "title": "服务表单自管模态，与原生确认框焦点责任不统一",
+      "priority": "P1",
+      "confidence": "confirmed",
+      "impact": "源码确认非原生模态与document级Tab监听，组件未设置背景inert；保存冲突又打开原生确认框时可能干扰内层焦点。确认的是实现分叉，实际跳焦/穿透未复现。凭据录入核心路径的潜在影响高，故P1。",
+      "recommendation": "复用已有ModalSurface/showModal，删除外层document级Tab循环；切步聚焦标题，关闭回原触发器。验收新增→Tab/Shift+Tab→冲突确认→取消→Esc焦点仅在最上层，NVDA/讲述人确认背景不可浏览。依据APG Modal Dialog、WCAG2.4.3/2.4.7。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 258,
+          "line_end": 283,
+          "quote": "document.addEventListener('keydown', onKeyDown);"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 812,
+          "line_end": 820,
+          "quote": "<section ref={modalRef} className=\"modal ai-service-modal\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"ai-service-modal-title\">"
+        },
+        {
+          "path": "source/frontend/src/components/ModalSurface.tsx",
+          "line_start": 19,
+          "line_end": 23,
+          "quote": "dialog.showModal();"
+        },
+        {
+          "path": "evidence/ui/service-create.ax.txt",
+          "observation": "289行起为新增对话框，19-288行仍列背景内容；仅AX快照，不证明实际读屏穿透或键盘路径。"
+        }
+      ]
+    },
+    {
+      "id": "UI-002",
+      "title": "预设分类与条目只有视觉选中状态",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "active类未暴露pressed/checked，AX分类是普通按钮；辅助技术难获知当前所选。P2为选择反馈受损，不等于键盘无法点击。",
+      "recommendation": "分类用aria-pressed按钮组，预设用原生radio，步骤用有序列表和aria-current=step。验收AX能获知分类、预设及当前步骤；键盘可选择。依据WCAG4.1.2/1.3.1。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 843,
+          "line_end": 845,
+          "quote": "<button key={group.name} type=\"button\" className={`ai-service-preset-tab${presetCategory === group.name ? ' active' : ''}`} onClick={() => setPresetCategory(group.name)}>"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 849,
+          "line_end": 853,
+          "quote": "<button key={preset.id} type=\"button\" className={`ai-service-preset-chip${selectedPreset === preset.id ? ' active' : ''}`} title={preset.description} onClick={() => applyPreset(preset.id)}>"
+        },
+        {
+          "path": "evidence/ui/service-create.ax.txt",
+          "observation": "305-316行分类为普通按钮，295-301行步骤为文本；未测试选择后的AX状态。"
+        },
+        {
+          "path": "evidence/ui/service-create.png",
+          "observation": "本轮实际观察手动配置为蓝底白字，其余分类为浅灰，步骤1为深色圆点；像素体现选择，但不证明AX选择状态。"
+        }
+      ]
+    },
+    {
+      "id": "UI-003",
+      "title": "校验只有全局错误，缺少字段关联与分步定位",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "校验仅setFormError，字段未关联aria-invalid/describedby，切步仅更新state；长表单要自行定位，故P2。源码确认，安装错误态未复现。",
+      "recommendation": "建立字段错误映射、稳定id、aria-invalid/describedby；摘要链接字段并接收焦点；切步聚焦标题，末步发现早期字段错误返回对应步骤。验收逐个必填错误可直达，读屏读出名称、错误与修正要求。依据WCAG3.3.1/3.3.3/2.4.3。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 473,
+          "line_end": 481,
+          "quote": "setFormError(error);\n      return;"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 823,
+          "line_end": 824,
+          "quote": "{formError ? <div className=\"ai-service-form-error\" role=\"alert\"><CircleX size={15} /><span>{formError}</span></div> : null}"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 861,
+          "line_end": 864,
+          "quote": "<label className=\"field-label ai-service-field\"><span>Base URL</span><input value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder=\"https://api.example.com/v1\" /></label>"
+        }
+      ]
+    },
+    {
+      "id": "UI-004",
+      "title": "运行环境重复同id的tabpanel",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "父子均声明ai-panel-acp，aria-controls目标不唯一；AX有嵌套同名面板。P2为语义关系含混，未实听重复播报。",
+      "recommendation": "只由AiConnectionsPage持有tabpanel/id，AcpProfilesPanel改普通容器。验收该id数量为1，AX只有一个运行环境面板。依据APG Tabs、WCAG1.3.1/4.1.2，不援引已移除的解析条款。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiConnectionsPage.tsx",
+          "line_start": 185,
+          "line_end": 187,
+          "quote": "<div id=\"ai-panel-acp\" role=\"tabpanel\" aria-labelledby=\"ai-tab-acp\">"
+        },
+        {
+          "path": "source/frontend/src/pages/AcpProfilesPanel.tsx",
+          "line_start": 167,
+          "line_end": 169,
+          "quote": "<div id=\"ai-panel-acp\" role=\"tabpanel\" aria-labelledby=\"ai-tab-acp\">"
+        },
+        {
+          "path": "evidence/ui/runtime.ax.txt",
+          "observation": "46、47行连续两个运行环境面板，均ID: ai-panel-acp。"
+        }
+      ]
+    },
+    {
+      "id": "UI-005",
+      "title": "重要元信息字号绕过现有令牌",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "meta令牌12px，事实行11、备用模型9.5且透明度0.75；重要模型信息扫描负担增加，故P2。确认取值冲突，不声称像素模糊或对比度失败。",
+      "recommendation": "事实行及备用模型meta12，名称body13/600，标题14；数字tabular-nums；间距4/8/12/16/24/32，控件32、表单36px。行尾建议32px命中，现有28px不低于WCAG24px，不算AA失败。验收对应选择器不再有9.5/10/11px裸字号，200%长内容不丢失。本地令牌优先于通用字号经验。",
+      "evidence": [
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 4776,
+          "line_end": 4778,
+          "quote": "--fs-meta: 12px;\n  --fs-body: 13px;\n  --fs-title: 14px;"
+        },
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 5584,
+          "line_end": 5585,
+          "quote": ".ai-service-fact-line > span { min-width: 0; font-size: 11px; }"
+        },
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 5680,
+          "line_end": 5683,
+          "quote": ".ai-route-fallback-chip em { font-size: 9.5px; font-style: normal; opacity: .75; }"
+        }
+      ]
+    },
+    {
+      "id": "UI-006",
+      "title": "固定动作列与双列表单存在窄容器挤压风险",
+      "priority": "P2",
+      "confidence": "hypothesis",
+      "impact": "820px以下四按钮约124px仍锁第三列；表单双列无专属回落。320px/200%可能压缩名称URL，若成立妨碍识别与编辑，故P2。未渲染，不能断言已溢出。",
+      "recommendation": "服务容器小于480px时动作第二行，表单可用宽小于440px时单列，步骤条可换行；保留路由已有598/460px回落。验收内容列320/390/480/620/880px、200%、120字符URL与50%文案膨胀，量边界遮挡而非只scrollWidth。依据WCAG1.4.4/1.4.10。",
+      "evidence": [
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 5594,
+          "line_end": 5596,
+          "quote": ".ai-service-row { grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); }"
+        },
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 5604,
+          "line_end": 5606,
+          "quote": ".ai-service-row .ai-client-registration-actions { grid-column: 3; grid-row: 1; padding-top: 0; border-top: 0; }"
+        },
+        {
+          "path": "source/frontend/styles.css",
+          "line_start": 2991,
+          "line_end": 2991,
+          "quote": ".ai-service-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }"
+        }
+      ]
+    },
+    {
+      "id": "UI-007",
+      "title": "工具概览已就绪与待更新提示竞争",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "摘要仅依赖attention，未纳入pendingClientSync；AX同时已就绪、待处理0及1个待更新，首扫下一步含混，故P2。不判定底层状态分类错误。",
+      "recommendation": "概览分可运行事实与需行动事实，如12个可用·1个待更新；同步异常优先更新/查看差异，接入全部降级。验收ready+needs_update/failed/conflict概览与行一致。依据系统状态可见性。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiToolsPanel.tsx",
+          "line_start": 140,
+          "line_end": 140,
+          "quote": "const pendingClientSync = clients.filter((entry) => entry.state === 'imported' && ['needs_update', 'failed', 'conflict'].includes(entry.sync_state ?? ''));"
+        },
+        {
+          "path": "source/frontend/src/pages/AiToolsPanel.tsx",
+          "line_start": 158,
+          "line_end": 161,
+          "quote": "const headline = attention.length ? `${attention.length} 个工具待处理` : '工具已就绪';"
+        },
+        {
+          "path": "evidence/ui/ai-connections.ax.txt",
+          "observation": "49-50行已就绪/都已接好，65行待处理0，75-78行1个待更新及更新全部。只观察文本并存，不判断视觉位置。"
+        },
+        {
+          "path": "evidence/ui/ai-connections.png",
+          "observation": "本轮实际观察：上方绿色工具已就绪区及主按钮接入全部，下方另有1个已注册工具待更新与更新全部；首屏同时竞争。只适用于安装版。"
+        }
+      ]
+    },
+    {
+      "id": "UI-008",
+      "title": "目录失败静默退化，缺少部分可用提示",
+      "priority": "P2",
+      "confidence": "confirmed",
+      "impact": "失败置null，继续按模型数量推断凭据配置；用户不知道健康信息未更新，故P2。当前文案未直接声称连接成功，故障态未复现。",
+      "recommendation": "局部显示健康信息暂不可用·配置仍可编辑·重试；保留列表和旧余额时间，未知用中性。加载/真实空/失败分开，上层状态支持交所有者，不擅改接口契约。验收仅目录失败不清列表，重试恢复且status/alert可感知。依据六状态完备性、WCAG4.1.3。",
+      "evidence": [
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 242,
+          "line_end": 247,
+          "quote": ".catch(() => { if (!canceled) setProviderCatalog(null); });"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 285,
+          "line_end": 288,
+          "quote": "return serviceHealthLabel(provider, Boolean(provider?.has_api_key ?? service.models.length));"
+        },
+        {
+          "path": "source/frontend/src/pages/AiProvidersPanel.tsx",
+          "line_start": 188,
+          "line_end": 192,
+          "quote": "return { text: '凭据已配置', kind: 'success' };"
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "current_repair_context": {
+      "host_event": "mission_1794443924791_2d612a63:263",
+      "host_check": {
+        "command": "python contracts/check.py visual",
+        "exit_code": 0,
+        "elapsed_ms": 210,
+        "output_sha256": "2ac5e7759b6e3430364a372eae5748cc90d5c1d1ad38ec42615bb03200a2dcf1",
+        "test_summary": null,
+        "error": null,
+        "tap_totals": null,
+        "scope": "本轮变更前版本，不覆盖本轮变更；最终检查以随后执行记录绑定"
+      },
+      "local_check": "最终落盘后执行必需命令；真实结果见本会话工具执行记录，不引用历史绿色替代。",
+      "formal_verify": "由宿主随后独立执行，本阶段不执行"
+    },
+    "initial_check": {
+      "command": "python contracts/check.py visual",
+      "exit_code": 1,
+      "diagnostic": "AssertionError: Substantive Markdown report required (contracts/check.py:52)",
+      "tap_totals": null
+    },
+    "repair_check": {
+      "command": "python contracts/check.py visual",
+      "exit_code": 0,
+      "stdout": {
+        "passed": true,
+        "stage": "visual",
+        "source_files_unchanged": true,
+        "meaning": "Structural and evidence checks only; independent semantic review still required."
+      },
+      "scope": "结构、引用及源码基线检查；不代表渲染、交互、独立复核或Mission通过"
+    },
+    "prototype": {
+      "path": "reports/prototype.html",
+      "implemented_for": [
+        "UI-001",
+        "UI-002",
+        "UI-003",
+        "UI-005",
+        "UI-006",
+        "UI-007",
+        "UI-008"
+      ],
+      "render_check": "unverified",
+      "keyboard": "unverified",
+      "focus": "unverified",
+      "responsive": "unverified",
+      "motion": "unverified",
+      "minimal_repair": {
+        "finding_id": "UI-008",
+        "location": "reports/prototype.html:3 [hidden]",
+        "change": "增加[hidden]{display:none!important}，防止.row的display:flex覆盖隐藏；保障加载/空/错误/无权限及筛选空的行隐藏设计",
+        "verification": "静态规则核对；运行未验证"
+      }
+    }
+  },
+  "limitations": [
+    "七张安装截图本轮通过media.image.read按内容解码只读观察；旧版read_image格式不匹配不再等于本轮未观察。预览可能重编码/缩放，不能据此测字号、对比度或原始像素尺寸。",
+    "安装证据v0.3.92(e630a08)，source含未提交修改，不保证运行版本一致。",
+    "未构建启动应用、保存配置、执行连接/能力自检或读取真实凭据；仅修改visual.json、visual.md及prototype.html。原型为内存虚构数据演示，不代表产品修复。",
+    "未执行产品或原型的目标视口、200%、长文本、键盘、焦点、读屏、主题、减少动效及空错注入测试；已有安装截图不是本轮原型渲染证据。",
+    "未测合成对比度及实际命中；color-scheme:light不代表深色通过或必须新增第二主题。",
+    "无权限适用边界及上层加载失败映射未确认；未验证不等于不适用。",
+    "指定check仅验证结构、引用、源码基线；送验建议不是宿主最终通过。"
+  ]
+}

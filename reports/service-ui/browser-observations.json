@@ -1,0 +1,240 @@
+{
+  "observations": [
+    {
+      "phase": "before-conditional-layout",
+      "width": 320,
+      "metrics": {
+        "viewport": 320,
+        "document": 320,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "before-conditional-form",
+      "width": 320,
+      "metrics": {
+        "viewport": 320,
+        "document": 320,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 294,
+            "scroll": 294,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "grid": "125px 125px"
+    },
+    {
+      "phase": "before-conditional-layout",
+      "width": 390,
+      "metrics": {
+        "viewport": 390,
+        "document": 390,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "before-conditional-form",
+      "width": 390,
+      "metrics": {
+        "viewport": 390,
+        "document": 390,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 364,
+            "scroll": 364,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "grid": "160px 160px"
+    },
+    {
+      "phase": "before-conditional-layout",
+      "width": 480,
+      "metrics": {
+        "viewport": 480,
+        "document": 480,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "before-conditional-form",
+      "width": 480,
+      "metrics": {
+        "viewport": 480,
+        "document": 480,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 454,
+            "scroll": 454,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "grid": "205px 205px"
+    },
+    {
+      "phase": "before-conditional-layout",
+      "width": 620,
+      "metrics": {
+        "viewport": 620,
+        "document": 620,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "before-conditional-form",
+      "width": 620,
+      "metrics": {
+        "viewport": 620,
+        "document": 620,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 594,
+            "scroll": 594,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "grid": "275px 275px"
+    },
+    {
+      "phase": "before-conditional-layout",
+      "width": 880,
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "before-conditional-form",
+      "width": 880,
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 598,
+            "scroll": 598,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "grid": "277px 277px"
+    },
+    {
+      "phase": "expanded-copy-long-url",
+      "width": 320,
+      "metrics": {
+        "viewport": 320,
+        "document": 320,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "expanded-copy-long-url",
+      "width": 390,
+      "metrics": {
+        "viewport": 390,
+        "document": 390,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "expanded-copy-long-url",
+      "width": 480,
+      "metrics": {
+        "viewport": 480,
+        "document": 480,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "expanded-copy-long-url",
+      "width": 620,
+      "metrics": {
+        "viewport": 620,
+        "document": 620,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "expanded-copy-long-url",
+      "width": 880,
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "css-zoom-200",
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": []
+      }
+    },
+    {
+      "phase": "css-zoom-200-form",
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 438,
+            "scroll": 438,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      }
+    },
+    {
+      "phase": "dark-reduced-motion",
+      "metrics": {
+        "viewport": 880,
+        "document": 880,
+        "outside": [],
+        "dialogs": [
+          {
+            "width": 598,
+            "scroll": 598,
+            "height": 638,
+            "scrollHeight": 638
+          }
+        ]
+      },
+      "motion": {
+        "transition": "1e-05s",
+        "animation": "1e-05s"
+      }
+    }
+  ],
+  "errors": []
+}

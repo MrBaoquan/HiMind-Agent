@@ -1,0 +1,45 @@
+{
+  "schema_version": "executor_repair6_observations.v1",
+  "authority": "applied_task_contract_not_feedback",
+  "feedback_facts": {
+    "765": "Current late ordinary usage path inspected; added same-transaction terminal outbox refresh and actual cancel/projection-before-return success/error handshake.",
+    "764": "Replaced resource-contained invented route and Options::from_env. Native consumer protects existing snapshots before recovery-capable service load; known model metadata avoids workbench init.",
+    "759": "Current mission_step_timeout clamp, narrow prestart reconciliation and guarded legacy-claim INSERT SELECT retained; current regressions actually executed. 81 external host tests are observation only.",
+    "737": "Both fail_when branches, atomic ordinary usage event/snapshot and strict transactional terminal-cancel no-op retained and actually executed.",
+    "736": "No additional authority inferred from feedback. Current applied task explicitly authorizes native existing-runtime access."
+  },
+  "diagnosis_evidence": {
+    "current_source_diagnostic_groups": 19,
+    "actual_test_executions": 429,
+    "unique_tests": 424,
+    "all_groups_passed": true,
+    "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\353c3732c56a674278ee792808e7265b3f858cd267f46d6f0cc662cef41ba483\\executor-lifecycle-repair\\early-regressions.json",
+    "classification": "diagnostic_current_source_before_final_freeze_not_required_check_replacement"
+  },
+  "transcripts": {
+    "prior_repair5_raw_logs_read": false,
+    "reason": "Previous task absolute cache is not currently authorized; requested an authorized copy or read grant. Prior reports preserve historical failures. Current defects were reproduced/checked through the current product entry.",
+    "authorized_copy_requested": true
+  },
+  "source_sha256": {
+    "src/runtime/codex_usage_delivery.rs": "e724683e4491148da42c15a7c456a4222907ad078bdc790449700e624914b9f3",
+    "src/workflow/runner.rs": "32f2b3cad9f5575a627ee28058abbefc71331d86b05cd1de58349443b9facf7e",
+    "src/app/mission_dispatch.rs": "5dca7e42d8c8c8b261069eb9dba5b042bf54e4ddf54af044051d6bcf1b0ead1b",
+    "src/mission/store.rs": "f4f89a498669b8f0883d9b59bdabe8c61b193863d5b51a5295fa0055497ad84f",
+    "src/mission/checks.rs": "1b15ad8e3fdf0dbf2c62ee73cf02c21febeff98c2b14926b156d07d138459fd3"
+  },
+  "next_steps": [
+    "Provide the repair5 raw test transcript copy within the confirmed read scope; reconcile its original failures against the current fixes.",
+    "Reevaluate this task delivery and rerun the original report assertions after the transcript requirement is satisfied.",
+    "Supervisor separately runs formal VERIFY, independent QA, final review, final build/deployment and installed B01-B13 acceptance."
+  ],
+  "final_candidate_id": "a29e1357a0b90a719031add11866b30162cf6d71e27bca4e3dc2886ba7629a73",
+  "final_product_execution": {
+    "passed": true,
+    "test_count": 431,
+    "unique_test_count": 426,
+    "elapsed_ms": 30578,
+    "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\353c3732c56a674278ee792808e7265b3f858cd267f46d6f0cc662cef41ba483\\executor-lifecycle-repair\\checks.json",
+    "sha256": "407337d8c00445b40ff2544829e68ba484cc90766503ac6a7deab15c6ef3ccca"
+  }
+}

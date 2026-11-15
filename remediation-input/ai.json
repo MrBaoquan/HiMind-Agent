@@ -1,0 +1,77 @@
+{
+  "area": "ai",
+  "summary": "当前源码形成服务/能力路由目录、环回推理网关、客户端投影与执行器适配四层；Mission另行持久化指派、用量和预算恢复。定向静态复核确认五项风险：目录非原子写、跨文件删除不一致、上游错误向客户端未脱敏、成功体读取错误被吞及成本跨币种累加。未做生产调用、故障注入或安装版交互。修复的是审查报告，不是产品源码。",
+  "coverage": [
+    {"topic":"service_model_catalog","status":"finding","evidence":"source/src/store/ai_services.rs:34-74 定义三种协议，135-220 定义多端点与协议族去重；1078-1116 保存模型/凭据/端点。source/src/app/builtin_ai_router.rs:64-131 从配置目录生成服务模型别名和默认模型；AI-001/002涉及目录持久化。目录存在不代表上游模型可用，未做在线探测。"},
+    {"topic":"gateway_routing_and_fallback","status":"finding","evidence":"source/src/app/inference_gateway.rs:1530-1614 按本机令牌及协议授权，仅同Provider/上游模型/协议候选参与同请求切换；1001-1055 可重试HTTP及网络错误切换；2390-2417 展示Anthropic到Chat翻译后的发送，3432-3473 兼容矩阵规格化。AI-004覆盖响应恢复边界。已写出后的无缝续流未验证。"},
+    {"topic":"credentials_and_redaction","status":"finding","evidence":"source/src/store/ai_services.rs:1082-1087 空密钥更新保留旧密文，新密钥调用当前用户保护；source/src/store/credentials.rs:571-596 封装DPAPI密文。网关仅转发白名单头（4253-4265），日志摘要先脱敏（3933-3948），但翻译失败响应直接发送原始错误体（AI-003）。未读取真实凭据。"},
+    {"topic":"usage_budget_resume","status":"finding","evidence":"source/src/app/inference_gateway.rs:4505-4536 写本机请求台账；source/src/runtime/deepseek_harness.rs:1499-1517 从run级home取聚合usage；source/src/mission/checks.rs:99-132 包含cache读写token；source/src/mission/store.rs:973-1049 按run去重记录及累计，435-528 对预算扩展request_id/计划哈希/等待状态作事务保护。AI-005指出成本币种未统一；未验证真实账单或重启续跑。"},
+    {"topic":"executor_client_boundary","status":"reviewed","evidence":"source/src/runtime/builtin.rs:14-63 用AIRuntimeAdapter隔离引擎；source/src/app/builtin_ai_router.rs:41-61 启动独立进程寿命环回路由、64-110 每请求目录解析及默认别名；source/src/mission/assignment.rs:5-25 校验专家版本摘要，29-75 校验执行器可用性及模型与service_id组合，ACP允许保留原客户端模型。未把客户端绑定当作执行授权；未执行真实ACP/Codex/DSH任务。"},
+    {"topic":"configuration_ownership","status":"finding","evidence":"source/src/store/ai_services.rs:135-220 endpoints为事实源，1092-1095 标量投影跟随主端点，1945-1998 能力路由表原子写及首项默认；source/src/app/inference_gateway.rs:59-83 端口环境变量/持久化/默认优先级。AI-001/002针对持久化和双文件边界，不以模块数量作问题依据。"}
+  ],
+  "findings": [
+    {
+      "id":"AI-001","title":"服务目录直接覆盖写入，进程中断可破坏唯一配置文件","priority":"P1","confidence":"confirmed",
+      "trigger":"保存或复制服务时进程在fs::write截断与写完之间中断，或发生部分写入/磁盘错误。",
+      "impact":"load_all直接解析整个JSON，坏文件会阻断服务目录读取及依赖目录的路由。P1因可能使全部本机服务不可用；不是声称已发生故障。",
+      "recommendation":"将目录更新放在同一文件锁的读改写临界区，采用同目录临时文件写入/刷新/原子替换，保留可验证上一版本并提供显式恢复事件。故障注入中断每个写阶段，验收旧版或新版至少一份可解析；并发写不同服务不能丢失。先复用现有atomic_file设施，再评估数据库迁移。",
+      "evidence":[
+        {"path":"source/src/store/ai_services.rs","line_start":528,"line_end":534,"quote":"let persisted: BTreeMap<String, PersistedCustomAIService> =\n        serde_json::from_slice(&fs::read(path)?)?;"},
+        {"path":"source/src/store/ai_services.rs","line_start":561,"line_end":568,"quote":"fs::write(path, serde_json::to_vec_pretty(&persisted)?)?;"},
+        {"path":"source/src/store/ai_services.rs","line_start":1115,"line_end":1116,"quote":"services.insert(id.clone(), service.clone());\n    save_all(&services)?;"}
+      ]
+    },
+    {
+      "id":"AI-002","title":"删除服务先提交目录，再清路由，失败后重试无法自愈","priority":"P1","confidence":"confirmed",
+      "trigger":"remove成功保存服务目录后、完成load_selection或write_selection前出错或进程退出；之后再次删除同一id。",
+      "impact":"服务已不存在但路由仍引用它；重试时removed为false跳过清理，可能留下默认路由或备用指向不存在服务。P1因会影响默认推理与故障恢复，具体用户错误形态未实测。",
+      "recommendation":"短期让清引用操作不依赖removed且幂等，并在启动时校验悬空引用、返回可操作诊断；长期将目录和路由放入同一事务或带事务日志的版本化配置。验收在两次写之间强制终止后重启/重试能恢复一致状态，其他路由顺序不变。回退保留迁移前两文件快照，不能仅交换写顺序。",
+      "evidence":[
+        {"path":"source/src/store/ai_services.rs","line_start":1179,"line_end":1188,"quote":"let removed = services.remove(id).is_some();\n    if removed {\n        save_all(&services)?;"},
+        {"path":"source/src/store/ai_services.rs","line_start":1193,"line_end":1205,"quote":"write_selection(&selection)?;"}
+      ]
+    },
+    {
+      "id":"AI-003","title":"协议翻译错误响应把上游原始错误体返回客户端，绕过摘要脱敏","priority":"P1","confidence":"confirmed",
+      "trigger":"Anthropic入口转Chat上游收到非成功且非400/422/404响应，例如401/403/500，错误体回显凭据或敏感请求内容。",
+      "impact":"代码把原始字节转成detail并送到客户端错误message；即便本机日志摘要脱敏，客户端及其日志仍可能收到上游回显秘密。P1是条件性泄漏通道确认，不是已观察到真实密钥泄漏。",
+      "recommendation":"建立统一public error DTO，返回安全错误码、request_id和经过脱敏/限长的必要说明，不透传任意错误页；所有直通及互译分支共享该边界。用虚构Bearer、x-api-key和供应商回显文本覆盖401/403/500测试，断言响应与日志均无原值，仍可凭request_id定位。",
+      "evidence":[
+        {"path":"source/src/app/inference_gateway.rs","line_start":2420,"line_end":2424,"quote":"let detail = String::from_utf8_lossy(&raw_error).to_string();"},
+        {"path":"source/src/app/inference_gateway.rs","line_start":2451,"line_end":2488,"quote":"\"error\": { \"type\": \"api_error\", \"message\": detail },"},
+        {"path":"source/src/app/inference_gateway.rs","line_start":3933,"line_end":3936,"quote":"let redacted = crate::approval::manager::redact_message(text);"}
+      ]
+    },
+    {
+      "id":"AI-004","title":"非流式成功体读取忽略I/O错误，可把截断响应记为成功","priority":"P2","confidence":"confirmed",
+      "trigger":"上游已返回成功状态，但读取body中途断连或超时，且已读数据未超过响应上限。",
+      "impact":"read_success_body忽略read_to_end的错误并返回Ok(raw)，调用方仍按上游成功状态写出，JSON解析失败只产生缺失用量；record_usage以HTTP状态判成功。P2因损害错误定位和重试决策，不断言所有断流均触发。",
+      "recommendation":"返回区分I/O失败、超限、完整响应的类型；未写客户端响应前对I/O失败返回结构化502并标记usage不完整；已写出流记录transport_outcome而不是只看HTTP状态。伪上游发送200后截断body，验收不返回成功JSON、不静默成功记账，并保留request_id及终止原因。",
+      "evidence":[
+        {"path":"source/src/app/inference_gateway.rs","line_start":4279,"line_end":4287,"quote":"let _ = reader.read_to_end(&mut raw);"},
+        {"path":"source/src/app/inference_gateway.rs","line_start":2338,"line_end":2361,"quote":"let usage = serde_json::from_slice::<Value>(&raw)\n            .map(|value| extract_usage(&response_binding.protocol, &value))\n            .unwrap_or_default();"},
+        {"path":"source/src/app/inference_gateway.rs","line_start":4525,"line_end":4531,"quote":"status: if status < 400 { \"success\" } else { \"failure\" }.to_string(),"}
+      ]
+    },
+    {
+      "id":"AI-005","title":"Mission成本累计只验证币种非空，未阻止不同币种相加","priority":"P2","confidence":"confirmed",
+      "trigger":"同一Mission有多个执行器或运行，run_usage_recorded上报不同非空currency且estimated_cost均合法，Mission声明max_cost。",
+      "impact":"预算门控直接将不同计价单位相加，record_run_usage返回总额却沿用最近一次usage的currency，成本展示与限额比较可能失真。P2因当前DSH路径currency为空会保守阻断成本预算，混币场景是条件风险而非已有账单损失。",
+      "recommendation":"在预算契约声明唯一计价币种；拒绝不匹配usage进入可比较总额，或按币种分桶并显式阻断跨币种预算。若引入汇率须固定来源/时间/精度并同时保留原币金额，禁止隐式换算。验收USD+CNY不能作为单币总额比较，空币种维持保守阻断，request_id重放不重复记账或扩预算。",
+      "evidence":[
+        {"path":"source/src/mission/store.rs","line_start":1774,"line_end":1786,"quote":"estimated_cost += cost.unwrap_or(0.0);"},
+        {"path":"source/src/mission/store.rs","line_start":1794,"line_end":1803,"quote":"if !estimated_cost.is_finite() || estimated_cost >= limit {"},
+        {"path":"source/src/mission/store.rs","line_start":1028,"line_end":1046,"quote":"currency: usage.currency.clone(),"}
+      ]
+    }
+  ],
+  "required_check": {"command":"python contracts/check.py ai","status":"passed","exit_code":0,"observed_output":{"passed":true,"stage":"ai","source_files_unchanged":true,"meaning":"Structural and evidence checks only; independent semantic review still required."},"scope":"worker必需检查，不是宿主正式VERIFY；未输出数字TAP汇总"},
+  "limitations": [
+    "只审当前source快照，非HEAD替代；未构建/修改生产程序，未联网、未读取真实配置或凭据，未做故障注入与真实交互。confirmed指静态代码行为可确认，后果均有触发条件。",
+    "安装版evidence/ui来源v0.3.92（e630a08）与当前源码不保证一致。本专项未使用截图作缺陷证据，也未声称安装UI或当前UI交互、键盘、响应式已验证。",
+    "source/src/inference目录及顶层inference文件的定向查找未找到；实际入口为source/src/app/inference_gateway.rs及其必要调用链。不据此推断全仓不存在其他推理实现。",
+    "修复前worker执行python contracts/check.py ai实际exit_code=1，错误为KeyError: 'area'；当时ai.json为{}且ai.md缺失。此结果不能反推宿主历史失败正文。",
+    "宿主历史事件mission_1794443924791_2d612a63:293记录python contracts/check.py ai退出1、216ms、output_sha256=e07c8c4a5c2b9cd2c371e53472324a6f411cf59e3b78be74207fea60a29a8205；未提供输出正文或数字TAP汇总。原review-ai运行超过900秒终止，不把该记录当本worker成功检查。",
+    "检查脚本仅做源码基线与结构/引用一致性检查，不代表产品行为已修复、单元测试通过或独立语义验收完成。最终本次退出码见实际工具执行及Markdown检查记录。"
+  ]
+}

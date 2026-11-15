@@ -1,0 +1,144 @@
+{
+  "passed": true,
+  "task_id": "repair-service-ui-user-scope-1",
+  "summary": "Current scoped business checks ready; original frontend and all assertions retained. Deferred coverage excluded. Final frozen six-check outcome is referenced separately.",
+  "phase": "business_ready_pending_frozen_six",
+  "implemented_backlog_ids": [
+    "B06",
+    "B07",
+    "B10",
+    "B11",
+    "B12",
+    "B13"
+  ],
+  "implemented_backlog_origin": "Inherited production implementation, independently browser-regressed in this task; no new product delta.",
+  "changed_files": [
+    "reports/service-ui/result.json",
+    "reports/service-ui/user-scope-1/delivery.md",
+    "reports/service-ui/user-scope-1/evidence-index.json",
+    "reports/service-ui/user-scope-1/history/archive.json",
+    "reports/service-ui/user-scope-1/history/independent-qa-1__delivery.md",
+    "reports/service-ui/user-scope-1/history/independent-qa-1__evidence-index.json",
+    "reports/service-ui/user-scope-1/history/independent-qa-1__protected-provenance.json",
+    "reports/service-ui/user-scope-1/history/independent-qa-1__source-diff.patch",
+    "reports/service-ui/user-scope-1/history/result.json",
+    "reports/service-ui/user-scope-1/protected-provenance.json",
+    "reports/service-ui/user-scope-1/source-review.json",
+    "scripts/remediation/service-ui-user-scope.py"
+  ],
+  "checks": [
+    {
+      "command": "npm --prefix frontend ci",
+      "cwd": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\s",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\prepare-ci.log",
+      "sha256": "25306c4390454078d272f14d2417e3d5a2eaddbf41a395d00c9439e7f4ea0c24",
+      "started_at": "2026-11-13T15:05:38.135674+00:00",
+      "finished_at": "2026-11-13T15:05:43.367474+00:00",
+      "timed_out": false,
+      "startup_error": null,
+      "test_summary": null,
+      "classification": "current-task-execution",
+      "source_manifest": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\prepare-ci-source.json",
+      "source_manifest_sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+    },
+    {
+      "command": "node frontend/scripts/remediation/service-ui-browser.mjs",
+      "cwd": "C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-browser.log",
+      "sha256": "caea63f1c0c1bd8ed7ca8300353164d7e79feb1c8b4474eea6d3ef988614294c",
+      "started_at": "2026-11-13T15:06:03.837070+00:00",
+      "finished_at": "2026-11-13T15:06:18.533454+00:00",
+      "timed_out": false,
+      "startup_error": null,
+      "test_summary": null,
+      "classification": "current-task-execution",
+      "source_manifest": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-browser-source.json",
+      "source_manifest_sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+    },
+    {
+      "command": "npm --prefix frontend run build",
+      "cwd": "C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-build.log",
+      "sha256": "58250b5732152bdaceb247fbcc537b62c3f62726f3842e95d40df635827da49f",
+      "started_at": "2026-11-13T15:06:03.797202+00:00",
+      "finished_at": "2026-11-13T15:06:06.472589+00:00",
+      "timed_out": false,
+      "startup_error": null,
+      "test_summary": null,
+      "classification": "current-task-execution",
+      "source_manifest": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-build-source.json",
+      "source_manifest_sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+    },
+    {
+      "command": "node frontend/scripts/remediation/service-ui-build-modes.mjs",
+      "cwd": "C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-modes.log",
+      "sha256": "5c2b95095f4bfe3140c1d757071a2bf53e94c7aa50dc48ddd2487c43929706ca",
+      "started_at": "2026-11-13T15:06:03.860820+00:00",
+      "finished_at": "2026-11-13T15:06:20.325173+00:00",
+      "timed_out": false,
+      "startup_error": null,
+      "test_summary": null,
+      "classification": "current-task-execution",
+      "source_manifest": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-modes-source.json",
+      "source_manifest_sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+    },
+    {
+      "command": "node --test frontend/scripts/remediation/service-ui-runtime.test.mjs",
+      "cwd": "C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+      "exit_code": 0,
+      "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-runtime.log",
+      "sha256": "dce9f2020844c8ab0abfe95133d9b93c7874dd923f55b3c920699f58e0ee395a",
+      "started_at": "2026-11-13T15:06:03.873330+00:00",
+      "finished_at": "2026-11-13T15:06:04.331047+00:00",
+      "timed_out": false,
+      "startup_error": null,
+      "test_summary": null,
+      "classification": "current-task-execution",
+      "source_manifest": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\current-runtime-source.json",
+      "source_manifest_sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+    }
+  ],
+  "limitations": [
+    "Screen-reader speech and ALL 200% zoom are user_deferred/not_in_current_scope, neither passed nor current blockers. No NVDA/Narrator/native zoom/Computer Use was attempted. Existing unchanged CSS zoom fixtures run only as supplementary evidence, not a native zoom claim.",
+    "Real Chrome production-component API fixture with fictitious data; installed/live backend, credentials, mixed-executor handoff and deployment acceptance are not claimed.",
+    "Light/dark media preference and reduced motion tested against the project fixed light palette; no independent dark palette or whole-site AA certification claimed.",
+    "npm ci uses an exact current frontend source/lockfile copy under this task root; original browser/build/build-mode commands run directly in candidate. Dependency toolchain hashes are compared. Generated artifacts do not replace installed/live acceptance.",
+    "Protected file ownership remains unresolved: accessible initial/HEAD baselines and provenance are recorded read-only; formal host:candidate-integrity/protected checks remain host owned.",
+    "Previous native evidence, Computer Use stop and unverified OS screen-reader flag restoration remain historical limitations unchanged; no settings work performed in this task.",
+    "Existing four high npm advisories and chunk-size warning remain. Empty historical test_summary is not a TAP count; usage/cost stay unknown.",
+    "Conservative repeated-use operator scenario retained. No product priority, dependency, service, model, system configuration, other producer, commit/push/deploy changes or Mission-wide/independent signoff.",
+    "passed describes business-stage readiness before the frozen final replay. Final six raw outcomes and local invariant comparison are external immutable-run evidence referenced below; a final stage-ready recommendation requires all six actual successes."
+  ],
+  "deferred": {
+    "screen_reader_speech": {
+      "status": "user_deferred",
+      "scope": "not_in_current_scope",
+      "passed": null,
+      "blocking": false,
+      "authority": "direct human instruction; native event825 supplied in task contract"
+    },
+    "all_200_percent_zoom_including_native": {
+      "status": "user_deferred",
+      "scope": "not_in_current_scope",
+      "passed": null,
+      "blocking": false,
+      "authority": "direct human instruction; native event825 supplied in task contract"
+    }
+  },
+  "source_identity": {
+    "path": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\source-before.json",
+    "sha256": "aadef71099beb786c3fff23275bfff3c7bb1cac870b6df8d2fdb076a47672a54"
+  },
+  "evidence_index": "reports/service-ui/user-scope-1/evidence-index.json",
+  "final_read_only_replay": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\final-checks.json",
+  "local_integrity": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\e9b5df8d40fee4ecaebd6ddbafbe55b4877ab92bb8101aefe2ea129e3c7586d9\\q\\local-integrity.json",
+  "previous_failure_archive": "reports/service-ui/user-scope-1/history/result.json",
+  "formal_verify": "host owned; not invoked or awaited",
+  "usage": null,
+  "cost": null
+}

@@ -1262,9 +1262,9 @@ fn validate_files_only_support(
         let policy = role.map(|role| role.tool_policy.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.tool_policy.trim());
         if policy != "files_only" && runtime.permission_mode != "full_access" { return; }
         let provider = role.map(|role| role.runtime_provider.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.provider.trim());
-        if policy != "files_only" && runtime.permission_mode == "full_access" && crate::runtime::acp::is_provider(provider) {
+        if policy != "files_only" && runtime.permission_mode == "full_access" && (provider == "personal.codex" || crate::runtime::acp::is_provider(provider)) {
             if !runtime_reports.iter().any(|report| report.provider == provider && report.status == "ready") {
-                push_blocker(diagnostics, "runtime.full_access_unsupported", "runtime", format!("ACP executor {provider} is unavailable for step {id}"), "请检查 ACP 执行器配置。", true);
+                push_blocker(diagnostics, "runtime.full_access_unsupported", "runtime", format!("executor {provider} is unavailable for step {id}"), "请检查所选执行器的安装和配置。", true);
             }
             return;
         }
@@ -2053,6 +2053,27 @@ mod tests {
         package.steps.push(manual);
         assert!(super::step_has_executor(&package.steps[0]));
         assert!(super::step_has_executor(&package.steps[1]));
+    }
+
+    #[test]
+    fn codex_full_access_preflight_requires_ready_provider_and_still_rejects_files_only() {
+        let mut package = package(Vec::new());
+        package.steps[0].role_id = "implementer".into();
+        package.roles.insert("implementer".into(), crate::workflow::WorkflowRole {
+            runtime_provider: "personal.codex".into(), tool_policy: "default".into(), ..Default::default()
+        });
+        package.steps[0].runtime = Some(serde_json::from_value(json!({
+            "provider":"auto", "permission_mode":"full_access", "prompt":"Implement"
+        })).unwrap());
+        let mut diagnostics = Vec::new();
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "unavailable")], &mut diagnostics);
+        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported"));
+        package.roles.get_mut("implementer").unwrap().tool_policy = "files_only".into();
+        diagnostics.clear();
+        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
+        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported" || item.code == "runtime.files_only_unsupported"));
     }
 
     #[test]

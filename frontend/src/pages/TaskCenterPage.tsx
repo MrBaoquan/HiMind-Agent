@@ -36,7 +36,7 @@ import { formatError } from '../types';
 import { CollaborationTaskDetail, CreateMissionDialog } from './MissionTeamPanel';
 import { useMissionCatalog, type MissionCatalog } from './useMissionCatalog';
 import { executionTodoId, activityNeedsUser, activityStatusLabel, projectTasks, missionTodo, workspaceKey, EMPTY_TASK_CONTEXT, type TaskListContext } from './taskCenterModel';
-import { missionNextAction, missionProgress, missionStage, missionStatusLabel, MISSION_STAGE_LABELS } from './missionView';
+import { missionActionActor, missionWait, missionResponsibility, missionNextAction, missionProgress, missionStage, missionStatusLabel, MISSION_STAGE_LABELS } from './missionView';
 
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
 
@@ -249,7 +249,10 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
     const timer = window.setInterval(() => { if (document.visibilityState !== 'hidden') void load(true, ++tick % 6 === 0); }, 5000);
     return () => window.clearInterval(timer);
   }, [load]);
-  const {rows, related} = useMemo(() => projectTasks(catalog.missions, items), [catalog.missions, items]);
+  const {rows, related} = useMemo(() => projectTasks(catalog.missions, items, catalog.activities || items), [catalog.missions, catalog.activities, items]);
+  const missionActivities = (id: string) => [...new Map([
+    ...(related.get('mission:'+id) || []), ...(catalog.activities || []).filter(item => item.mission_id === id),
+  ].map(item => [item.workflow_run_id || item.id, item])).values()];
   const scoped = rows.filter(row => (!context.workspace || (context.workspace === '__unknown' ? !row.workspace : workspaceKey(row.workspace) === context.workspace))
     && (!context.method || row.method === context.method)
     && (!context.query.trim() || (row.search + ' ' + row.client).toLowerCase().includes(context.query.trim().toLowerCase())));
@@ -279,7 +282,7 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
     </div> : undefined} />
     {missionId ? <CollaborationTaskDetail key={missionId} missionId={missionId} openAssignmentRevision={missionNavigationRevision}
       onBack={()=>openMission('')} onRefresh={catalog.refresh} onMissionChanged={catalog.upsert}
-      relatedActivities={related.get('mission:'+missionId) || []} onOpenWorkflowRun={openRun} />
+      relatedActivities={missionActivities(missionId)} onOpenWorkflowRun={openRun} />
     : selectedActivity ? <section className="mission-detail">
       <button className="btn" onClick={()=>{restoreScroll.current=true;setActivityId('');}}>返回我的任务</button>
       <header className="mission-detail-hero"><div><h2>{selectedActivity.title}</h2><p>{selectedActivity.subtitle || '执行记录'}</p></div><strong>{activityStatusLabel(selectedActivity) || taskStatusLabel(selectedActivity.status)}</strong></header>
@@ -295,14 +298,14 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
         <div className="task-center-filters" role="tablist" aria-label="任务视图">{([{id:'all',label:'全部'},{id:'attention',label:'待我处理'},{id:'running',label:'进行中'},{id:'ended',label:'已结束'}] as const).map(v=><button key={v.id} role="tab" aria-selected={context.view===v.id} className={context.view===v.id?'active':''} onClick={()=>update({view:v.id})}>{v.label}<small>{counts[v.id]}</small></button>)}</div>
         <p className="task-list-scope">显示最近读取的 {rows.length} 项顶层任务；待我处理表示需要你的行动，可与进行中重叠。</p>
         {error || catalog.error ? <div className="task-center-alert" role="alert"><AlertCircle size={16}/><span>{error || catalog.error}</span><button className="btn" onClick={()=>{void load();void catalog.refresh();}}>重新读取</button></div> : null}
-        {loading && !rows.length ? <div className="task-center-loading"><BusyIndicator/>正在读取任务</div>
+        {(loading || catalog.loading) && !rows.length ? <div className="task-center-loading"><BusyIndicator/>正在读取任务</div>
           : filtered.length ? <div className="task-center-list">{filtered.map(row=>{
             if (row.mission) {
-              const mission=row.mission; const progress=missionProgress(mission); const todo=missionTodo(mission);
-              return <article className="task-center-row mission-task-entry" key={row.id} data-task-id={row.id} data-todo-id={todo?.id}>
-                <div className="task-center-row-main"><div className="task-center-row-title"><button type="button" className="task-title-link" onClick={()=>openMission(mission.mission_id)}>{row.title}</button><span className="task-center-source">协作任务</span><span className={'collaboration-task-status status-'+mission.status}>{missionStatusLabel(mission)}</span></div>
+              const mission=row.mission; const progress=missionProgress(mission); const activities=missionActivities(mission.mission_id); const todo=missionTodo(mission, activities); const wait=missionWait(mission);
+              return <article className="task-center-row mission-task-entry" key={row.id} data-task-id={row.id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, activities)}>
+                <div className="task-center-row-main"><div className="task-center-row-title"><button type="button" className="task-title-link" onClick={()=>openMission(mission.mission_id)}>{row.title}</button><span className="task-center-source">协作任务</span><span className={'collaboration-task-status status-'+mission.status}>{missionStatusLabel(mission, [], activities)}</span></div>
                 <div className="task-center-row-meta"><span title={row.workspace}>{row.workspace || '未记录工作区'}</span><span>来源：{row.client}</span>{row.trigger?<span>{row.trigger}</span>:null}<time>{formatRelativeTime(row.updatedAt,now)}</time></div>
-                <p className="task-row-next">{missionNextAction(mission)}</p><div className="task-center-row-meta"><span>阶段：{MISSION_STAGE_LABELS[missionStage(mission)]}</span>{progress.total?<span>{progress.done}/{progress.total} 项已通过验收 · {progress.awaitingVerification} 项待验收</span>:<span>未记录执行进度</span>}<button type="button" className="task-center-row-action" onClick={()=>openMission(mission.mission_id)}>{todo ? todo.action : '查看任务'}</button></div></div>
+                <p className="task-row-next">{missionNextAction(mission, [], activities)}</p><p className="task-row-next muted">{missionResponsibility(mission, activities)}</p><div className="task-center-row-meta"><span>阶段：{MISSION_STAGE_LABELS[missionStage(mission)]}</span>{progress.total?<span>{progress.done}/{progress.total} 项原始交付已通过验收 · {progress.awaitingVerification} 项待验收</span>:<span>未记录执行进度</span>}<button type="button" className="task-center-row-action" onClick={()=>openMission(mission.mission_id)}>{todo ? todo.action : '查看任务'}</button></div></div>
               </article>;
             }
             const item=row.activity!; const entry=item.source==='dashboard'?fromTask(item as unknown as AgentTaskHistoryItem):fromActivity(item);

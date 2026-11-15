@@ -1048,6 +1048,11 @@ pub(crate) fn get_approval_history(
 }
 
 #[tauri::command]
+pub(crate) fn get_mission_follow_up_review(digest: String) -> Result<serde_json::Value, String> {
+    crate::approval::policy::read_mission_follow_up_review(&digest)
+}
+
+#[tauri::command]
 pub(crate) fn respond_approval(
     state: State<'_, AgentState>,
     id: String,

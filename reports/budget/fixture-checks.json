@@ -1,0 +1,68 @@
+[
+  {
+    "evidence": "reports/budget/f01.log",
+    "exit_code": 0,
+    "case": "f01",
+    "command": "cargo test mission::store::budget_remediation_tests::f01 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f02.log",
+    "exit_code": 0,
+    "case": "f02",
+    "command": "cargo test mission::store::budget_remediation_tests::f02 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f03.log",
+    "exit_code": 0,
+    "case": "f03",
+    "command": "cargo test mission::store::budget_remediation_tests::f03 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f04.log",
+    "exit_code": 0,
+    "case": "f04",
+    "command": "cargo test mission::store::budget_remediation_tests::f04 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f05.log",
+    "exit_code": 0,
+    "case": "f05",
+    "command": "cargo test mission::store::budget_remediation_tests::f05 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f06.log",
+    "exit_code": 0,
+    "case": "f06",
+    "command": "cargo test mission::store::budget_remediation_tests::f06 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f07.log",
+    "exit_code": 0,
+    "case": "f07",
+    "command": "cargo test mission::store::budget_remediation_tests::f07 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f08.log",
+    "exit_code": 0,
+    "case": "f08",
+    "command": "cargo test mission::store::budget_remediation_tests::f08 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f09.log",
+    "exit_code": 0,
+    "case": "f09",
+    "command": "cargo test mission::store::budget_remediation_tests::f09 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/f10.log",
+    "exit_code": 0,
+    "case": "f10",
+    "command": "cargo test mission::store::budget_remediation_tests::f10 -- --nocapture --test-threads=1"
+  },
+  {
+    "evidence": "reports/budget/b05.log",
+    "exit_code": 0,
+    "case": "b05",
+    "command": "cargo test mission::store::budget_remediation_tests::b05 -- --nocapture --test-threads=1"
+  }
+]

@@ -66,6 +66,7 @@ pub(crate) use runner::{
     WorkflowStepExecution, WorkflowStepExecutor,
 };
 pub(crate) use runtime::execute_runtime_step;
+pub(crate) use runtime::execute_runtime_step_with_resources;
 pub(crate) use store::{package_digest, InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
@@ -1896,13 +1897,13 @@ pub(crate) fn validate_runtime_permission_mode(provider: &str, mode: &str) -> Re
     match mode {
         "" | "workspace_write" => Ok(()),
         "full_access" if provider == "auto" || supports_full_access(provider) => Ok(()),
-        "full_access" => Err(format!("provider {provider} cannot enforce permission_mode=full_access; select HiMind AI or an ACP executor")),
+        "full_access" => Err(format!("provider {provider} cannot enforce permission_mode=full_access; select HiMind AI, Codex or an ACP executor")),
         _ => Err(format!("unsupported runtime permission_mode: {mode}")),
     }
 }
 
 pub(crate) fn supports_full_access(provider: &str) -> bool {
-    provider == "himind.builtin" || crate::runtime::acp::is_provider(provider)
+    matches!(provider, "himind.builtin" | "personal.codex") || crate::runtime::acp::is_provider(provider)
 }
 
 fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
@@ -3655,3 +3656,5 @@ mod tests {
         .is_err());
     }
 }
+
+pub(crate) use runtime::parse_runtime_payload;

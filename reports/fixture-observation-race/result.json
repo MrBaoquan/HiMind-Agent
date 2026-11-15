@@ -1,0 +1,198 @@
+{
+  "schema_version": "fixture_observation_race_result.v1",
+  "mission_id": "mission_1794699212443_c4cf558b",
+  "task_id": "fixture-observation-byte-evidence-repair-v3",
+  "repair_of": "fixture-observation-whitespace-repair-v2",
+  "passed": true,
+  "summary": "Evidence handoff ready: only this report is edited; current source binding digests are recorded, historical host whitespace success is retained, and missing trusted pre-v2 baseline and exact byte-diff evidence are explicitly handed back to the host. This stage does not establish exact four-byte deletion, independent VERIFY success, functional regression success, or Mission acceptance.",
+  "changed_files": [
+    "reports/fixture-observation-race/result.json"
+  ],
+  "candidate_binding": {
+    "mission_id": "mission_1794699212443_c4cf558b",
+    "task_id": "fixture-observation-byte-evidence-repair-v3",
+    "run_id": "workflow_run_mission_mission_1794699212443_c4cf558b_fixture-observation-byte-evidence-repair-v3",
+    "candidate_id": null,
+    "candidate_id_source": "Host workflow_context.candidate is null; no immutable host candidate ID or Git revision supplied or queried.",
+    "source": "Worker Get-Item.Length and Get-FileHash -Algorithm SHA256 over authorized current files; corrected PowerShell cmdlet-only command succeeded. These are current-byte binding observations, not historical diff evidence.",
+    "files": [
+      {"path":"src/runtime/codex.rs","bytes":53985,"sha256":"a089a31e060dbd6a565dff8ba220601e15c67df39f1ce8066557665ba331fea0"},
+      {"path":"src/runtime/process.rs","bytes":53830,"sha256":"9dd5eeb6a84da556611b8c3505b5ba5fce26d68531654dddad2ca0ffdb601926"},
+      {"path":"src/runtime/owned_tree.rs","bytes":14709,"sha256":"076ba14bfc52b4e071b210374028a4d8acdf705a8a5b24a7a436718c31518a44"},
+      {"path":"src/store/paths.rs","bytes":28531,"sha256":"a6468a1ed1b531c5f541506a3a2f6569914299e9da61155413722d78f753287f"},
+      {"path":"Cargo.toml","bytes":2542,"sha256":"2f92d2c0a591871a22c68414f5df73f7282de17e52bfa5a72b75e8a4f174b7e0"},
+      {"path":"Cargo.lock","bytes":163763,"sha256":"540018b2ec3701872c24e16ef22d1c4a1d449a617d15175422a066e928b161c7"}
+    ],
+    "relationship": "Current working source retained from the v2 repair; byte identity to a host-frozen v2 candidate is not independently established. No source writes performed by v3.",
+    "scope_limit": "Six measured files only, not a full repository identity or a 19-file protected-set verification."
+  },
+  "independent_byte_evidence": {
+    "status": "pending_host_evidence",
+    "trusted_pre_v2_baseline": null,
+    "host_frozen_v2_candidate": null,
+    "host_exact_diff": null,
+    "source": "No trusted baseline bytes, candidate manifest or host-generated exact diff was supplied in authorized task input; no specific evidence artifact under this task's host_runtime_resources was referenced. Older report snapshot references were not followed into other host roots.",
+    "reason_v2_not_accepted": "v2 independent verification did not pass: the claim of only four ASCII-space bytes removed has not been established against a trusted pre-v2 baseline. This reason is retained from the current task contract; no detailed VERIFY artifact or event ID was supplied, and none is invented.",
+    "required_host_attachments": [
+      "Original v2 execution-before trusted baseline bytes plus immutable identity, SHA-256, byte length and provenance.",
+      "Host-retained v2 candidate bytes plus immutable identity, SHA-256, byte length and provenance.",
+      "Host snapshot binding the current candidate to this task/run and the recorded current source hashes.",
+      "Host exact binary comparison of pre-v2 baseline to v2 candidate, and v2 candidate to current candidate: offsets, removed/added bytes and unchanged prefix/suffix evidence; verify only four 0x20 bytes removed at the specified blank line and all other source bytes unchanged."
+    ],
+    "prohibitions": "Do not reconstruct a baseline by inserting spaces into current bytes. 53989-to-53985 self-report and any claim of 19 protected files matching are not independent proof for codex.rs. Worker does not modify host or invoke formal VERIFY."
+  },
+  "stage_status": {
+    "evidence_handoff": "ready_for_host_review_with_explicit_historical_evidence_gap",
+    "whitespace_validation": "historical_host_exit_0_not_rerun_by_v3",
+    "independent_byte_review": "pending_host_trusted_baseline_and_exact_diff",
+    "functional_regression": "functional regression pending supervisor verification",
+    "formal_verify": "not_executed_by_worker",
+    "passed_meaning": "Current evidence handoff delivery only, using authorized historical required-check success; missing historical byte proof remains a host follow-up, not a claim of strict acceptance."
+  },
+  "implementation_self_report_classification": "The retained hunk explanations and previous_report_retained are historical implementation-side descriptions, not independently reverified source diffs. v3 preserves all source bytes and therefore does not alter cfg(test), handle ownership, bounded handshake, 1-second timeout, elapsed<4s, exit/OpenProcess assertions or RAII hooks.",
+  "worker_execution_notes": [
+    "Initial digest command failed with PowerShell ParserError (exit_code=1) because foreach output was piped directly; it performed no writes. Corrected cmdlet command produced the six bindings. This failure was not git diff --check and is not hidden by its historical success.",
+    "No cargo, model/CLI subprocess, extra subagent, installation, config/database/service modification, Git commit/push or formal VERIFY performed."
+  ],
+  "exact_test_only_hunk_explanation": [
+    {
+      "file": "src/runtime/codex.rs",
+      "scope": "cfg(test) tests module, Windows executor_agent_run_launch_resume_liveness_final_and_usage only",
+      "changes": "Add local TerminateHook RAII guard preserving/restoring the prior thread-local FnOnce hook even on panic. The existing timeout/cancel observer opens both parent and child ProcessProbe handles, asserts both alive, publishes readiness with Release, sends one bounded-channel acknowledgment, and retains both handles through the original real exit assertions. Cancellation reads readiness with Acquire rather than root.pid existence. Before explicit termination the test hook waits at most one second for acknowledgment. Preserve the exact execute timeout argument 1, elapsed <4 seconds, all eight cases, fresh/resume loops, and every original exit/final/usage assertion. No sleeps increased or retries added."
+    },
+    {
+      "file": "src/runtime/owned_tree.rs",
+      "scope": "Windows cfg(test) hook declaration/invocation and cfg(all(test,windows)) re-export only",
+      "changes": "Add thread-local BEFORE_TERMINATE FnOnce hook; take and invoke it immediately before TerminateJobObject in explicit terminate(), rather than relying on later BEFORE_CLOSE. The callback is removed before invocation and the test-local RAII guard restores the previous callback on unwind."
+    },
+    {
+      "file": "src/runtime/process.rs",
+      "scope": "cfg(all(test,windows)) codex_test_support::ProcessProbe::open only",
+      "changes": "Retain the failing OpenProcess assertion and include actual std::io::Error::last_os_error() in its failure diagnostic."
+    }
+  ],
+  "checks": [
+    {
+      "executed": true,
+      "executed_by": "host",
+      "executed_in_current_worker_task": false,
+      "event_id": "mission_1794699212443_c4cf558b:1168",
+      "exit_code": 0,
+      "elapsed_ms": 224,
+      "output_sha256": "a2ae32946a315464764059c3eef8900410c4c0e44eab5f22a1a6899ab56074ff",
+      "test_summary": "",
+      "tap_statistics": null,
+      "passed": true,
+      "command": "git diff --check",
+      "classification": "Historical host whitespace validation only; supplied by current task contract",
+      "diagnostic": "Not rerun by v3 worker. No TAP counts supplied. This host success does not supersede historical failures or establish exact byte differences or functional acceptance."
+    }
+  ],
+  "original_failure_retained": {
+    "description": "Original observer could open ProcessProbe handles after cancel killed the fixture on root.pid appearance; timeout explicitly terminated before any OwnedTree Drop BEFORE_CLOSE synchronization. Original failure is not reclassified as functional success and previous reports were not changed.",
+    "native_failure_reproduced_in_this_stage": false
+  },
+  "evidence": [
+    "Current worker binding observations: six authorized file lengths and SHA-256 digests in candidate_binding.files; these bind current bytes only.",
+    "Current read of src/runtime/codex.rs:808-822 shows an empty displayed line 815 before fn claim; no source rewrite performed. Displayed text alone is not historical exact-byte proof.",
+    "Historical host required-check success: mission_1794699212443_c4cf558b:1168, git diff --check, exit_code=0, elapsed_ms=224; output digest retained in checks. Not executed by v3 worker.",
+    "Historical v2 implementation self-report only: initial line 815 contained four ASCII spaces; length changed 53989 to 53985 with prefix/suffix preserved. These prior claims are retained but not independently established by the current digest or by protected-file matches.",
+    "Trusted pre-v2 baseline, frozen v2 candidate identity and host exact byte-diff artifact remain unavailable in supplied authorized evidence; required host attachments are enumerated in independent_byte_evidence."
+  ],
+  "limitations": [
+    "functional regression pending supervisor verification"
+  ],
+  "production_claims": [],
+  "next_steps": [
+    "Hand off to host formal VERIFY for exact source diff review and focused native lifecycle regression.",
+    "functional regression pending supervisor verification; this stage does not claim independent acceptance."
+  ],
+  "previous_report_retained": {
+    "schema_version": "fixture_observation_race_result.v1",
+    "mission_id": "mission_1794699212443_c4cf558b",
+    "task_id": "fixture-observation-race-fix",
+    "passed": false,
+    "summary": "Implemented the scoped test-only observer handshake; delivery is not ready because mandatory git diff --check returned exit code 2 for pre-existing trailing whitespace outside the race-fix hunk. No native regression was run or claimed.",
+    "changed_files": [
+      "src/runtime/codex.rs",
+      "src/runtime/process.rs",
+      "src/runtime/owned_tree.rs",
+      "reports/fixture-observation-race/result.json"
+    ],
+    "exact_test_only_hunk_explanation": [
+      {
+        "file": "src/runtime/codex.rs",
+        "scope": "cfg(test) tests module, Windows executor_agent_run_launch_resume_liveness_final_and_usage only",
+        "changes": "Add local TerminateHook RAII guard preserving/restoring the prior thread-local FnOnce hook even on panic. The existing timeout/cancel observer opens both parent and child ProcessProbe handles, asserts both alive, publishes readiness with Release, sends one bounded-channel acknowledgment, and retains both handles through the original real exit assertions. Cancellation reads readiness with Acquire rather than root.pid existence. Before explicit termination the test hook waits at most one second for acknowledgment. Preserve the exact execute timeout argument 1, elapsed <4 seconds, all eight cases, fresh/resume loops, and every original exit/final/usage assertion. No sleeps increased or retries added."
+      },
+      {
+        "file": "src/runtime/owned_tree.rs",
+        "scope": "Windows cfg(test) hook declaration/invocation and cfg(all(test,windows)) re-export only",
+        "changes": "Add thread-local BEFORE_TERMINATE FnOnce hook; take and invoke it immediately before TerminateJobObject in explicit terminate(), rather than relying on later BEFORE_CLOSE. The callback is removed before invocation and the test-local RAII guard restores the previous callback on unwind."
+      },
+      {
+        "file": "src/runtime/process.rs",
+        "scope": "cfg(all(test,windows)) codex_test_support::ProcessProbe::open only",
+        "changes": "Retain the failing OpenProcess assertion and include actual std::io::Error::last_os_error() in its failure diagnostic."
+      }
+    ],
+    "checks": [
+      {
+        "command": "git diff --check",
+        "classification": "host whitespace validation only",
+        "exit_code": 2,
+        "passed": false,
+        "diagnostic": "src/runtime/codex.rs:815: trailing whitespace. The pre-existing four-space blank line preceding fn claim is untouched; it was visible in the initial diff and preserved source snapshot."
+      },
+      {
+        "command": "git diff --no-index -- <assigned-resource>/fixture-observation-race/<name>.before src/runtime/<name>",
+        "classification": "task-only source diff inspection against pre-edit snapshots",
+        "summary": "Reviewed only the test hunks described above; initial working tree already contained unrelated source changes and untracked owned_tree.rs. Those pre-existing changes were not authored or reverted by this task."
+      }
+    ],
+    "original_failure_retained": {
+      "description": "Original observer could open ProcessProbe handles after cancel killed the fixture on root.pid appearance; timeout explicitly terminated before any OwnedTree Drop BEFORE_CLOSE synchronization. Original failure is not reclassified as functional success and previous reports were not changed.",
+      "native_failure_reproduced_in_this_stage": false
+    },
+    "evidence": [
+      "Pre-edit byte copies are retained under the assigned host resource root in fixture-observation-race/codex.rs.before, process.rs.before, and owned_tree.rs.before.",
+      "Tool transcript records the exact task-only source diff and mandatory whitespace-check exit code 2."
+    ],
+    "limitations": [
+      "functional regression pending supervisor verification"
+    ],
+    "production_claims": [],
+    "next_steps": [
+      "Supervisor must resolve the conflict between mandatory whitespace validation and preserving the unrelated pre-existing codex.rs blank-line bytes; authorize its cleanup if desired, then rerun git diff --check.",
+      "Supervisor independently reviews exact source diffs and runs the focused native lifecycle regression before full final validation. This report is not independent VERIFY or Mission acceptance."
+    ]
+  },
+  "history": [
+    {
+      "description": "Original native implementation delivery failure retained; not reclassified as success.",
+      "event_id": "mission_1794699212443_c4cf558b:1132",
+      "status": "failed"
+    },
+    {
+      "status": "canceled",
+      "description": "Previous run canceled at time limit; no implementation delivered, as reported in host observation 1141.",
+      "event_id": "mission_1794699212443_c4cf558b:1139",
+      "task_id": "fixture-observation-whitespace-repair-v1"
+    },
+    {
+      "tap_statistics": null,
+      "exit_code": 2,
+      "passed": false,
+      "command": "git diff --check",
+      "event_id": "mission_1794699212443_c4cf558b:1143",
+      "description": "Host-observed previous whitespace failure; no TAP counts provided."
+    },
+    {
+      "exit_code": 2,
+      "description": "Initial byte edit used character offset as byte offset, damaged preceding brace and left target whitespace. Failed check exposed this; preceding original brace restored before final check. edit tool restoration failed with Win32 1175 and did not alter file; byte-aware restoration succeeded.",
+      "passed": false,
+      "command": "git diff --check",
+      "task_id": "fixture-observation-whitespace-repair-v2"
+    }
+  ]
+}

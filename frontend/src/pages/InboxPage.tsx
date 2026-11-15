@@ -70,7 +70,7 @@ export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTod
         <div className="inbox-grid">
           {missionTodos.length ? <section className="card inbox-section">
             <div className="inbox-section-header"><div><strong>协作任务待办</strong><span>需要处理的协作任务</span></div><Pill kind="warn">{missionTodos.length}</Pill></div>
-            <div className="inbox-item-list">{missionTodos.map(todo => <button type="button" className="inbox-item inbox-item-button" data-todo-id={todo.id} key={todo.id} onClick={() => onOpenMission?.(todo.missionId)}>
+            <div className="inbox-item-list">{missionTodos.map(todo => <button type="button" className="inbox-item inbox-item-button" data-todo-id={todo.id} data-snapshot-cursor={todo.cursor} data-wait-reason={todo.reason} data-wait-actor={todo.actor} key={todo.id} onClick={() => onOpenMission?.(todo.missionId)}>
               <div className="inbox-item-icon workflow"><ShieldCheck size={18}/></div><div className="inbox-item-main"><strong>{todo.title}</strong><span>{todo.action}</span></div><ArrowRight size={17}/>
             </button>)}</div>
           </section>:null}

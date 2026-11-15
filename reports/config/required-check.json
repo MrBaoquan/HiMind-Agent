@@ -1,0 +1,7 @@
+{
+  "command": "python -c \"import json; p=json.load(open('reports/config/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": "",
+  "classification": "delivery_report_assertion"
+}

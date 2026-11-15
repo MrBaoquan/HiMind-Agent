@@ -103,7 +103,10 @@ enum CapabilityHandler {
     MissionAssignmentOptions,
     MissionAssignmentApply,
     MissionPlanConfirm,
+    MissionFollowUpAdd,
+    MissionPendingRepairCancel,
     MissionBudgetExtend,
+    MissionFeedbackSubmit,
     MissionVerificationRetry,
     MissionControl,
     MissionWorkflowExport,
@@ -2001,6 +2004,25 @@ impl CapabilityGateway {
                 CapabilityHandler::MissionEventsList,
             ),
             registration(
+                "mission.feedback.submit",
+                "提交协作任务审查意见",
+                "追加当前已确认计划的审查观察，仅供后续输入使用，不承诺实时注入；不改变绑定、授权、任务状态或检查，不自动重开完成任务。",
+                "local_write",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1,"maxLength":160},
+                    "input":{"type":"object","properties":{
+                        "request_id":{"type":"string","minLength":1,"maxLength":200},
+                        "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                        "target_task_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":160},
+                            "minItems":1,"maxItems":8,"uniqueItems":true},
+                        "message":{"type":"string","minLength":1,"maxLength":8000},
+                        "evidence_refs":{"type":"array","maxItems":16,
+                            "items":{"type":"string","minLength":1,"maxLength":1024}}
+                    },"required":["request_id","expected_plan_sha256","target_task_ids","message"],"additionalProperties":false}
+                },"required":["mission_id","input"],"additionalProperties":false}),
+                CapabilityHandler::MissionFeedbackSubmit,
+            ),
+            registration(
                 "mission.assignment.options",
                 "读取协作任务指派选项",
                 "返回固定 Workflow 的角色、推荐执行器/服务/模型和可用性；只读，不改变 Mission。",
@@ -2047,6 +2069,31 @@ impl CapabilityGateway {
                     "additionalProperties":false
                 }),
                 CapabilityHandler::MissionPlanConfirm,
+            ),
+            registration(
+                "mission.follow_up.add",
+                "提交精确的协作跟进任务",
+                "在当前确认计划内为失败叶任务添加跟进；下游复核失败时，可在无在途任务的边界将已完成的原始交付退回原专家（不能直接重开历史修复分支），必须同批安排有序下游重验及另一已指派角色、不同固定专家的失败下游复核重试。默认禁止扩大父任务读范围；可选顶层 read_scope_extension{paths,authorized_by,reason} 必须基于既有用户明确只读授权，paths 精确等于本批真正新增读取集合，仅 waiting 且无 running/awaiting_verification 时应用，路径存在、逐级无链接/reparse 且真实路径在工作区内。完整声明纳入 R3 审批及原子事件，保留原计划、历史、workspace 与 confirmation；写范围、执行绑定及原检查不扩展，正式独立核验另行执行。任务 ID 是幂等键，精确重放先判断，不受后续活动或路径消失影响；需要高风险审批。",
+                "local_write",
+                crate::mission::follow_up::input_schema(),
+                CapabilityHandler::MissionFollowUpAdd,
+            ),
+            registration(
+                "mission.task.cancel_pending",
+                "撤销尚未启动的返工任务",
+                "仅在派发暂停且执行和占用已排空时撤销未启动的返工叶任务；保留原交付责任与历史，不取消原始任务、不改变权限或绑定。request_id 精确重放不重复写入。",
+                "local_write",
+                json!({"type":"object","additionalProperties":false,
+                    "required":["schema_version","mission_id","expected_plan_sha256","task_id","request_id","reason"],
+                    "properties":{
+                        "schema_version":{"type":"string","enum":["mission.task.cancel_pending.v1"]},
+                        "mission_id":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[A-Za-z0-9_.-]+$"},
+                        "task_id":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[A-Za-z0-9_.-]+$"},
+                        "request_id":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[A-Za-z0-9_.-]+$"},
+                        "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                        "reason":{"type":"string","minLength":1,"maxLength":2000}
+                    }}),
+                CapabilityHandler::MissionPendingRepairCancel,
             ),
             registration(
                 "mission.verification.retry",
@@ -4016,6 +4063,13 @@ impl CapabilityGateway {
         if capability_id == "mission.plan.confirm" {
             policy::mission_plan_confirmation_target(&input)?;
         }
+        // Keep the exact successfully validated display. Never regenerate it
+        // through target_description's infallible fallback during approval.
+        let follow_up_review_target = if capability_id == "mission.follow_up.add" {
+            Some(policy::mission_follow_up_add_target(&input)?)
+        } else if capability_id == "mission.task.cancel_pending" {
+            Some(policy::mission_pending_repair_cancellation_target(&input)?)
+        } else { None };
         if capability_id == "mission.budget.extend" {
             policy::mission_budget_extension_target(&input)?;
         }
@@ -4042,7 +4096,8 @@ impl CapabilityGateway {
         {
             let risk_level =
                 policy::effective_risk_level(capability_id, &registration.descriptor.risk_level);
-            let target = policy::target_description(capability_id, &input);
+            let target = follow_up_review_target.clone()
+                .unwrap_or_else(|| policy::target_description(capability_id, &input));
             let approved = self
                 .approval_manager
                 .request_capability_approval(
@@ -4252,11 +4307,29 @@ impl CapabilityGateway {
                     &approved_absolute_read_paths, &approved_absolute_write_paths, confirmed_by,
                 )?)?)
             }
+            CapabilityHandler::MissionFollowUpAdd => {
+                // Recheck an external review receipt after approval; a tampered
+                // file never substitutes for the in-memory approved arguments.
+                policy::mission_follow_up_add_target(&input)?;
+                let request: crate::mission::follow_up::MissionFollowUpAdd = serde_json::from_value(input)?;
+                // Approval above uses the same exact payload; the store checks
+                // the confirmed hash and idempotency under its write lock.
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?
+                    .add_follow_up_tasks_for_mcp(&request)?)?)
+            }
+            CapabilityHandler::MissionPendingRepairCancel => {
+                crate::mission::MissionStore::validate_pending_repair_cancellation(&input)?;
+                Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?
+                    .cancel_pending_repair_for_mcp(&input)?)?)
+            }
             CapabilityHandler::MissionVerificationRetry => {
                 let mission_id = input["mission_id"].as_str().ok_or("mission_id missing")?;
                 let task_id = input["task_id"].as_str().ok_or("task_id missing")?;
                 let request = serde_json::from_value(input["input"].clone())?;
                 Ok(serde_json::to_value(crate::app::mission_dispatch::retry_verification(mission_id, task_id, &request)?)?)
+            }
+            CapabilityHandler::MissionFeedbackSubmit => {
+                crate::app::mission_commands::submit_mission_feedback_for_mcp(&input)
             }
             CapabilityHandler::MissionBudgetExtend => {
                 let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
@@ -7919,6 +7992,9 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
         CapabilityHandler::DashboardProjectExhibitAttach
             | CapabilityHandler::DashboardProjectExhibitDetach
             | CapabilityHandler::MediaJobCancel
+            | CapabilityHandler::MissionFeedbackSubmit
+            | CapabilityHandler::MissionFollowUpAdd
+            | CapabilityHandler::MissionPendingRepairCancel
     ) {
         "conditional"
     } else {
@@ -9898,6 +9974,147 @@ fn authoring_upgrade_hint(asset_kind: &str, asset_id: &str, minimum: &str) -> St
 mod tests {
     use super::*;
     use crate::capability::types::{InvocationSource, InvocationTransport};
+
+    #[test]
+    fn pending_repair_cancel_registry_exposes_only_strict_plan_bound_withdrawal() {
+        let gateway = CapabilityGateway::new(Options::from_env(), Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        let registration = registry.get("mission.task.cancel_pending").unwrap();
+        assert!(matches!(registration.handler, CapabilityHandler::MissionPendingRepairCancel));
+        let descriptor = &registration.descriptor;
+        assert_eq!(descriptor.risk_level, "local_write");
+        assert_eq!(policy::effective_risk_level(&descriptor.id, &descriptor.risk_level), "R3");
+        assert!(descriptor.approval_required);
+        assert_eq!(descriptor.idempotency, "conditional");
+        assert_eq!(descriptor.retry_policy, "idempotency_key");
+        let valid = json!({"schema_version":"mission.task.cancel_pending.v1", "mission_id":"mission_test",
+            "expected_plan_sha256":"a".repeat(64), "task_id":"pending-repair", "request_id":"scope-change-1",
+            "reason":"Human changed the current delivery scope"});
+        validate_capability_input_schema(&descriptor.input_schema, &valid).unwrap();
+        for field in ["execution", "approved_paths", "confirmed_by", "schema_version", "task_id", "request_id", "reason", "expected_plan_sha256"] {
+            let mut invalid = valid.clone();
+            invalid[field] = match field {
+                "schema_version" => json!("mission.task.cancel_pending.v2"),
+                "task_id" => json!("../escape"),
+                "request_id" | "reason" => json!(""),
+                "expected_plan_sha256" => json!("bad"),
+                _ => json!(true),
+            };
+            assert!(validate_capability_input_schema(&descriptor.input_schema, &invalid).is_err()
+                || crate::mission::MissionStore::validate_pending_repair_cancellation(&invalid).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn mission_follow_up_registry_is_native_strict_r3_and_conditionally_idempotent() {
+        let gateway = CapabilityGateway::new(Options::from_env(), Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        let registration = registry.get("mission.follow_up.add").unwrap();
+        assert!(matches!(registration.handler, CapabilityHandler::MissionFollowUpAdd));
+        let descriptor = &registration.descriptor;
+        assert_eq!(descriptor.version, "1.0.0");
+        assert_eq!(descriptor.source, "builtin");
+        assert_eq!(descriptor.risk_level, "local_write");
+        assert_eq!(policy::effective_risk_level(&descriptor.id, &descriptor.risk_level), "R3");
+        assert!(descriptor.approval_required);
+        assert_eq!(descriptor.idempotency, "conditional");
+        assert_eq!(descriptor.retry_policy, "idempotency_key");
+        assert!(!policy::is_local_ai_configuration_capability(&descriptor.id));
+        assert!(required_platform_scope(&descriptor.id).is_none());
+        let valid = json!({"schema_version":"mission.follow_up.add.v1","mission_id":"mission_test",
+            "expected_plan_sha256":"a".repeat(64),"reason":"Explicit user correction",
+            "tasks":[{"id":"repair-6","title":"Correct delivery","objective":"Consume authorized runtime resources",
+                "repair_of":"repair-5","depends_on":[],"read_paths":["src"],"write_paths":["src"],
+                "acceptance_criteria":["Real delivery passes"],"required_checks":["cargo test"]}]});
+        validate_capability_input_schema(&descriptor.input_schema, &valid).unwrap();
+        policy::mission_follow_up_add_target(&valid).unwrap();
+        let mut extended = valid.clone();
+        extended["tasks"][0]["read_paths"] = json!(["src", "contracts"]);
+        extended["read_scope_extension"] = json!({"paths":["contracts"],
+            "authorized_by":"user:existing-explicit-permission", "reason":"Independent QA compilation inputs"});
+        validate_capability_input_schema(&descriptor.input_schema, &extended).unwrap();
+        let target: Value = serde_json::from_str(&policy::mission_follow_up_add_target(&extended).unwrap()).unwrap();
+        assert_eq!(target["request"], extended);
+        assert_eq!(target["payload_sha256"], policy::args_digest(&extended).unwrap());
+        for field in ["unknown", "empty", "count", "authorized_by", "reason", "missing", "absolute", "duplicate", "override"] {
+            let mut invalid = extended.clone();
+            match field {
+                "unknown" => invalid["read_scope_extension"]["allow_all"] = json!(true),
+                "empty" => invalid["read_scope_extension"]["paths"] = json!([]),
+                "count" => invalid["read_scope_extension"]["paths"] = json!((0..129).map(|i| format!("inputs/{i}")).collect::<Vec<_>>()),
+                "authorized_by" => invalid["read_scope_extension"]["authorized_by"] = json!("x".repeat(161)),
+                "reason" => invalid["read_scope_extension"]["reason"] = json!("x".repeat(2001)),
+                "missing" => { invalid["read_scope_extension"].as_object_mut().unwrap().remove("authorized_by"); },
+                "absolute" => invalid["read_scope_extension"]["paths"] = json!(["C:/private"]),
+                "duplicate" => invalid["read_scope_extension"]["paths"] = json!(["contracts", "contracts"]),
+                _ => invalid["read_scope_extension"]["write_paths"] = json!(["contracts"]),
+            }
+            let typed_invalid = serde_json::from_value::<crate::mission::follow_up::MissionFollowUpAdd>(invalid.clone())
+                .map(|request| request.validate().is_err()).unwrap_or(true);
+            assert!(validate_capability_input_schema(&descriptor.input_schema, &invalid).is_err() || typed_invalid, "{field}");
+            assert!(policy::mission_follow_up_add_target(&invalid).is_err(), "{field}");
+        }
+        let mut null = valid.clone(); null["read_scope_extension"] = Value::Null;
+        validate_capability_input_schema(&descriptor.input_schema, &null).unwrap();
+        policy::mission_follow_up_add_target(&null).unwrap();
+        for field in ["outer", "execution", "version", "count", "hash", "objective", "path", "checks"] {
+            let mut invalid = valid.clone();
+            match field {
+                "outer" => invalid["approved_paths"] = json!(["."]),
+                "execution" => invalid["tasks"][0]["execution"] = json!({"executor":"personal.codex"}),
+                "version" => invalid["schema_version"] = json!("mission.follow_up.add.v2"),
+                "count" => invalid["tasks"] = json!([]),
+                "hash" => invalid["expected_plan_sha256"] = json!("bad"),
+                "objective" => invalid["tasks"][0]["objective"] = json!("x".repeat(8001)),
+                "path" => invalid["tasks"][0]["read_paths"] = json!(["x".repeat(1025)]),
+                _ => { invalid["tasks"][0].as_object_mut().unwrap().remove("required_checks"); }
+            }
+            assert!(validate_capability_input_schema(&descriptor.input_schema, &invalid).is_err(), "{field}");
+            assert!(policy::mission_follow_up_add_target(&invalid).is_err(), "{field}");
+        }
+        let mut invalid = valid;
+        invalid["tasks"][0]["read_paths"] = json!(["src/../outside"]);
+        assert!(policy::mission_follow_up_add_target(&invalid).is_err());
+    }
+
+    #[test]
+    fn mission_feedback_mcp_registration_is_strict_local_write_without_high_risk_approval() {
+        let gateway = CapabilityGateway::new(Options::from_env(), Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        let registration = registry.get("mission.feedback.submit").unwrap();
+        assert!(matches!(registration.handler, CapabilityHandler::MissionFeedbackSubmit));
+        let descriptor = &registration.descriptor;
+        assert_eq!(descriptor.risk_level, "local_write");
+        assert!(!descriptor.approval_required);
+        assert_eq!(descriptor.idempotency, "conditional");
+        assert_eq!(descriptor.retry_policy, "idempotency_key");
+        assert!(policy::risk_rank(policy::effective_risk_level(&descriptor.id, &descriptor.risk_level)) < policy::risk_rank("R3"));
+        let valid = json!({"mission_id":"mission-test","input":{"request_id":"review",
+            "expected_plan_sha256":"a".repeat(64),"target_task_ids":["fix"],"message":"P1: inspect output"}});
+        validate_capability_input_schema(&descriptor.input_schema, &valid).unwrap();
+        for field in ["outer", "inner", "duplicates", "message", "targets", "refs"] {
+            let mut invalid = valid.clone();
+            match field {
+                "outer" => invalid["authorize"] = json!(true),
+                "inner" => invalid["input"]["passed"] = json!(true),
+                "duplicates" => invalid["input"]["target_task_ids"] = json!(["fix","fix"]),
+                "message" => invalid["input"]["message"] = json!("x".repeat(8001)),
+                "targets" => invalid["input"]["target_task_ids"] = json!([]),
+                _ => invalid["input"]["evidence_refs"] = json!(vec!["ref"; 17]),
+            }
+            // The shared schema checker implements a deliberate subset;
+            // uniqueItems is advertised to clients and enforced by the typed
+            // handler contract, not by that generic schema helper.
+            let rejected_by_contract = serde_json::from_value::<crate::mission::MissionFeedbackSubmit>(invalid.clone())
+                .map(|request| request.input.validate().is_err()).unwrap_or(true);
+            assert!(rejected_by_contract, "handler contract must reject {field}");
+            if field != "duplicates" {
+                assert!(validate_capability_input_schema(&descriptor.input_schema, &invalid).is_err(), "{field}");
+            } else {
+                assert_eq!(descriptor.input_schema["properties"]["input"]["properties"]["target_task_ids"]["uniqueItems"], true);
+            }
+        }
+    }
 
     #[test]
     fn local_ui_reads_skip_agent_core_audit_but_important_sources_keep_it() {

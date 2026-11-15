@@ -1,0 +1,96 @@
+{
+  "passed": true,
+  "classification": "actual current reviewer commands; no QA prepare/stage/independent entry, paid calls, build or deployment",
+  "checks": [
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 62,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\required-1.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\required-1.stderr.log"
+      ],
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "classification": "reviewer_current_original_required_check_not_host_VERIFY"
+    },
+    {
+      "command": "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; assert all(isinstance(f,str) and '..' not in f.split('/') and (f=='docs/mixed-remediation-delivery.md' or f.startswith('reports/final/')) for f in fs); assert not p.get('blocking_findings')\"",
+      "argv": [
+        "python",
+        "-c",
+        "import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; assert all(isinstance(f,str) and '..' not in f.split('/') and (f=='docs/mixed-remediation-delivery.md' or f.startswith('reports/final/')) for f in fs); assert not p.get('blocking_findings')"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 47,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\required-2.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\required-2.stderr.log"
+      ],
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "classification": "reviewer_current_original_required_check_not_host_VERIFY"
+    },
+    {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-center-model.mts",
+      "argv": [
+        "node",
+        "--experimental-strip-types",
+        "frontend/scripts/check-task-center-model.mts"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 156,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\task-center-model.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\task-center-model.stderr.log"
+      ],
+      "stdout_sha256": "2abf7f7cbf22458987ab410ef85cb48c8d5a586b65f11822495b1ac8fa7d2c02",
+      "stderr_sha256": "696b4f03a7b1c53c3d0e22c928d5c9a7ebc636eea394266c68813a2b66924c0f",
+      "classification": "reviewer_current_cheap_contract_regression_not_browser_or_installed_acceptance"
+    },
+    {
+      "command": "node --experimental-strip-types frontend/scripts/check-task-view.mts",
+      "argv": [
+        "node",
+        "--experimental-strip-types",
+        "frontend/scripts/check-task-view.mts"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 157,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\task-view.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\task-view.stderr.log"
+      ],
+      "stdout_sha256": "86533bd914f72c3ad0eb87b6a2f86bc39da1544374f4bcd4903c1fcf5b04a0fb",
+      "stderr_sha256": "e7930ebf30771f7f58c3bee11d66eb70962b6c0ffc2098493887dab2b467cc55",
+      "classification": "reviewer_current_cheap_contract_regression_not_browser_or_installed_acceptance"
+    }
+  ],
+  "report_sha256": "e8b1a323a6f97586e6d6a5a029ff97dd488b184db89da33678b1df14a10bb7df",
+  "scope_invariant": {
+    "passed": true,
+    "authorized_changes_observed": [
+      "docs/mixed-remediation-delivery.md",
+      "reports/final/difference-index.json",
+      "reports/final/result.json",
+      "reports/final/review-evidence.json"
+    ],
+    "other_authorized_BIZ_changes": [],
+    "history_bytes_unchanged": true,
+    "transferred_bundle_hashes_unchanged": true,
+    "host_root_sha256_mission_task_matches": true,
+    "current_final_report_sha256": "e8b1a323a6f97586e6d6a5a029ff97dd488b184db89da33678b1df14a10bb7df",
+    "classification": "this reviewer time interval and authorized read scope only; not audit of external main repository"
+  },
+  "summary": "Two original required_checks passed0/0 against unchanged final report; two relevant cheap contract checks passed; not host formal VERIFY.",
+  "next_steps": [
+    "将本次交付及最终原检查回执送宿主；宿主另行启动正式VERIFY，不自行调用。",
+    "后续由supervisor完成最终源码集成、并行改动保护、deploy-local与安装态健康/混合Mission/UI/预算检查及必要回滚。",
+    "保留FREV-E01原失败、1083退出1、readiness1取消及其余失败祖先，不自动重开已完成QA11或执行远端Dashboard操作。"
+  ]
+}

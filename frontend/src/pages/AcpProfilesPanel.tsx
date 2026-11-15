@@ -165,14 +165,14 @@ export function AcpProfilesPanel({ snapshot, busyAction, onSave, onSetEnabled, o
   }
 
   return (
-    <div id="ai-panel-acp" role="tabpanel" aria-labelledby="ai-tab-acp">
+    <div className="acp-profiles-content">
       <section className="ai-overview ready">
         <div className="ai-overview-main">
           <div className="ai-overview-icon"><Bot size={20} /></div>
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">运行环境</span>
             <strong>{readyCount ? `${readyCount} 个可用` : '还没有可用的运行环境'}</strong>
-            <span>工作流的 AI 步骤在这里挑执行方。</span>
+            <span>这里只表示运行环境可用性，不改变任务显式选择；远程任务默认执行工具在设置中配置，已有任务不受影响。</span>
           </div>
         </div>
         <div className="ai-overview-stats" aria-label="运行环境统计">

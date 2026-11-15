@@ -31,7 +31,15 @@
     .source strong { font-size: 12px; font-weight: 600; }
     .source span { margin-top: 1px; color: var(--muted); font-size: 10px; }
     .queue { padding: 2px 7px; border-radius: 4px; color: #4b5563; background: var(--surface-muted); font-size: 10px; font-weight: 500; white-space: nowrap; }
-    .notice-body { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px; padding: 15px 14px 13px; }
+    .notice-header, .countdown, .actions { flex-shrink: 0; }
+    .notice-body { min-height: 0; flex: 1; overflow: auto; display: grid; grid-template-columns: 42px minmax(0, 1fr); align-content: start; gap: 12px; padding: 15px 14px 13px; }
+    .notice-body > div { min-width: 0; }
+    details { margin-top: 6px; font-size: 11px; }
+    summary { color: var(--primary); cursor: pointer; }
+    summary:focus-visible, pre:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+    .full-text { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; margin: 8px 0; padding: 7px; border: 1px solid var(--border); border-radius: 6px; font: 11px/1.5 Consolas, monospace; }
+    .review-digest { overflow-wrap: anywhere; color: var(--muted); font-size: 10px; }
+    .review-error { color: var(--danger); overflow-wrap: anywhere; }
     .type-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 8px; color: #b45309; background: #fffbeb; }
     .type-icon.upload { color: #1d4ed8; background: #eff6ff; }
     .type-icon svg { width: 20px; height: 20px; }
@@ -65,6 +73,21 @@
     let approvals = [];
     let busy = false;
     let errorMessage = '';
+    let displayedKey = '';
+    let reviewState = { loading: false, text: '', error: '' };
+
+    function missionFollowUpReviewDigest(description) {
+      const targets = description.split(/\r?\n/).filter(line => line.startsWith('目标：'));
+      if (targets.length !== 1) return null;
+      try {
+        const target = JSON.parse(targets[0].slice('目标：'.length));
+        return target && !Array.isArray(target) && target.review_mode === 'full_review_required'
+          && typeof target.payload_sha256 === 'string' && /^[0-9a-f]{64}$/.test(target.payload_sha256)
+          ? target.payload_sha256 : null;
+      } catch {
+        return null;
+      }
+    }
 
     if (!invoke && new URLSearchParams(location.search).has('preview')) {
       approvals = [{
@@ -85,6 +108,7 @@
     function render() {
       const root = document.getElementById('app');
       if (!approvals.length) {
+        displayedKey = '';
         root.innerHTML = '<div class="empty" role="status">请求已处理，窗口即将关闭</div>';
         return;
       }
@@ -95,32 +119,92 @@
       const percent = Math.max(0, Math.min(100, (remaining / total) * 100));
       const persistent = Number(current.timeout_seconds) === 0;
       const isRemote = current.request_type === 'remote_connect';
+      const description = String(current.description || '');
+      const digest = missionFollowUpReviewDigest(description);
+      const nextKey = JSON.stringify([current.id, current.title, current.request_type, description]);
+      // Polling must not replace the details node: preserve expansion, focus,
+      // text selection and both scroll positions while the request is unchanged.
+      if (displayedKey !== nextKey) {
+        displayedKey = nextKey;
+        reviewState = { loading: false, text: '', error: '' };
       root.innerHTML = `
         <section class="notice" aria-labelledby="approval-title">
           <header class="notice-header">
             <div class="app-mark" aria-hidden="true">P</div>
             <div class="source"><strong>HiMind Agent</strong><span>敏感操作需要你的确认</span></div>
-            ${approvals.length > 1 ? `<span class="queue">1 / ${approvals.length}</span>` : ''}
+            <span class="queue"></span>
           </header>
           <div class="notice-body">
             <div class="type-icon ${isRemote ? '' : 'upload'}" aria-hidden="true">${isRemote ? icons.remote : icons.upload}</div>
             <div>
               <div class="type-row"><span class="type-label">${escapeHtml(labelForType(current.request_type))}</span><span class="request-id">${escapeHtml(current.id)}</span></div>
               <h1 id="approval-title" title="${escapeHtml(current.title || '')}">${escapeHtml(current.title || '有新的审批请求')}</h1>
-              <p class="description">${escapeHtml(current.description || '请确认是否允许执行此操作。')}</p>
+              <p class="description">${escapeHtml(description || '请确认是否允许执行此操作。')}</p>
+              <details>
+                <summary>展开完整说明${digest ? '与任务' : ''}</summary>
+                <pre class="full-text" tabindex="0" aria-label="完整审批说明">${escapeHtml(description)}</pre>
+                ${digest ? `<button type="button" data-action="read-review">读取完整任务</button>
+                  <p class="review-digest">任务摘要：${escapeHtml(digest)}</p>
+                  <p class="review-error" data-review-error role="alert" hidden></p>
+                  <pre class="full-text" data-review-text tabindex="0" aria-label="完整跟进任务 JSON" hidden></pre>` : ''}
+              </details>
             </div>
           </div>
           <div class="countdown ${!persistent && remaining <= 8 ? 'urgent' : ''}">
             <div class="countdown-meta"><span>${persistent ? '审批会持续等待' : '超时后自动拒绝'}</span><strong>${persistent ? '等待人工决定' : `剩余 ${remaining} 秒`}</strong></div>
             <div class="progress" aria-hidden="true"><span style="width:${persistent ? 100 : percent}%"></span></div>
           </div>
-          ${errorMessage ? `<div class="error" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
+          <div class="error" data-error role="alert" hidden></div>
           <footer class="actions">
             <button type="button" class="text" data-action="open-main" ${busy ? 'disabled' : ''}>查看详情</button>
             <button type="button" data-action="deny" ${busy ? 'disabled' : ''}>拒绝</button>
             <button type="button" class="primary" data-action="approve" ${busy ? 'disabled' : ''}>${busy ? '处理中...' : '允许操作'}</button>
           </footer>
         </section>`;
+      }
+      const queue = root.querySelector('.queue');
+      queue.hidden = approvals.length <= 1;
+      queue.textContent = `1 / ${approvals.length}`;
+      const countdown = root.querySelector('.countdown');
+      countdown.classList.toggle('urgent', !persistent && remaining <= 8);
+      countdown.querySelector('.countdown-meta span').textContent = persistent ? '审批会持续等待' : '超时后自动拒绝';
+      countdown.querySelector('strong').textContent = persistent ? '等待人工决定' : `剩余 ${remaining} 秒`;
+      countdown.querySelector('.progress span').style.width = `${persistent ? 100 : percent}%`;
+      const error = root.querySelector('[data-error]');
+      error.hidden = !errorMessage;
+      if (error.textContent !== errorMessage) error.textContent = errorMessage;
+      root.querySelectorAll('[data-action]').forEach(button => {
+        button.disabled = busy || (button.dataset.action === 'read-review' && (reviewState.loading || !invoke));
+      });
+      root.querySelector('[data-action="approve"]').textContent = busy ? '处理中...' : '允许操作';
+      if (digest) {
+        root.querySelector('[data-action="read-review"]').textContent = reviewState.loading ? '正在读取完整任务…' : '读取完整任务';
+        const reviewError = root.querySelector('[data-review-error]');
+        reviewError.hidden = !reviewState.error;
+        if (reviewError.textContent !== reviewState.error) reviewError.textContent = reviewState.error;
+        const reviewText = root.querySelector('[data-review-text]');
+        reviewText.hidden = !reviewState.text;
+        // textContent escapes JSON without interpreting any receipt HTML.
+        if (reviewText.textContent !== reviewState.text) reviewText.textContent = reviewState.text;
+      }
+    }
+
+    async function readReview() {
+      const current = approvals[0];
+      const digest = current && missionFollowUpReviewDigest(String(current.description || ''));
+      if (!digest || !invoke || busy || reviewState.loading) return;
+      const key = displayedKey;
+      reviewState = { loading: true, text: '', error: '' };
+      render();
+      try {
+        const value = await invoke('get_mission_follow_up_review', { digest });
+        if (displayedKey !== key) return;
+        reviewState = { loading: false, text: JSON.stringify(value, null, 2) ?? '', error: '' };
+      } catch (error) {
+        if (displayedKey !== key) return;
+        reviewState = { loading: false, text: '', error: '完整任务读取失败：' + String(error) };
+      }
+      render();
     }
 
     function labelForType(type) {
@@ -171,6 +255,7 @@
       const action = target.getAttribute('data-action');
       if (action === 'approve') void respond(true);
       if (action === 'deny') void respond(false);
+      if (action === 'read-review') void readReview();
       if (action === 'open-main' && invoke && !busy) void invoke('show_main_window');
     });
 

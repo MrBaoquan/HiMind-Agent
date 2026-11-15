@@ -274,7 +274,7 @@ console.log('task view checks passed');
 // Environment waiting survives later telemetry and cannot leak across plans.
 import {missionRuntimeBlocked, missionStatusLabel, missionNextAction} from '../src/pages/missionView.ts';
 import type {MissionView, MissionEvent} from '../src/services/agentApi.ts';
-const environmentMission = {status:'waiting',plan_sha256:'current-plan'} as MissionView;
+const environmentMission = {status:'waiting',plan_sha256:'current-plan', confirmation:{plan_sha256:'current-plan'}, effective_wait:{contract_version:'mission.wait.v1',plan_sha256:'current-plan',cursor:2,reason:'environment_blocked',actor:'user',environment_blocked:true,can_resume:false,can_increase_budget:true}} as MissionView;
 const runtimeEvents = [
   {event_type:'runtime_workspace_blocked',payload:{plan_sha256:'current-plan'}},
   {event_type:'task_progress',payload:{}},
@@ -284,4 +284,5 @@ assert.equal(missionStatusLabel(environmentMission,runtimeEvents),'命令环境�
 assert.equal(missionNextAction(environmentMission,runtimeEvents),'选择工作区授权或仅用文件工具继续');
 assert.equal(missionRuntimeBlocked({...environmentMission,plan_sha256:'new-plan'},runtimeEvents),false);
 assert.equal(missionRuntimeBlocked({...environmentMission,status:'completed'},runtimeEvents),false);
-assert.equal(missionRuntimeBlocked(environmentMission,[...runtimeEvents,{event_type:'runtime_workspace_resolved'} as MissionEvent]),false);
+assert.equal(missionRuntimeBlocked(environmentMission,[...runtimeEvents,{event_type:'runtime_workspace_resolved'} as MissionEvent]),true, 'historical events cannot override the authoritative DTO');
+assert.equal(missionRuntimeBlocked({...environmentMission,effective_wait:null},runtimeEvents),false, 'missing association stays unknown');

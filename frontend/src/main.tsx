@@ -125,7 +125,7 @@ function settingsWindowQuery(): { panel: SettingsWindowPanel; section: SettingsS
       panel: route.panel,
       section: route.section,
       tab: route.tab,
-      aiTab: aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',
+      aiTab: aiTab === 'services' || aiTab === 'gateway' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',
     };
   } catch {
     return null;
@@ -2118,7 +2118,7 @@ function AgentApp() {
     />;
 
   const workflowUserTodos = (workflowCenter?.runs || []).filter(workflowNeedsUser);
-  const missionTodos = missionCatalog.missions.flatMap(mission => { const todo = missionTodo(mission); return todo ? [todo] : []; });
+  const missionTodos = missionCatalog.missions.flatMap(mission => { const todo = missionTodo(mission, missionCatalog.activities); return todo ? [todo] : []; });
   const workflowApprovalCount = workflowUserTodos.length + missionTodos.length;
   // 顶栏状态入口、侧栏徽标、常驻运行条共用同一份口径：排队、运行、等待处理的运行都算「在跑」。
   const activeRuns = (workflowCenter?.runs || []).filter(item => ['queued', 'running', 'waiting'].includes(item.run.status));
@@ -2257,7 +2257,7 @@ function AgentApp() {
       onRemoveTarget={removeMcpTarget}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
-      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型来源已保存'); } catch (error) { notify('error', formatError(error, '保存模型来源失败')); throw error; } }}
+      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', 'AI 服务已保存'); } catch (error) { notify('error', formatError(error, '保存 AI 服务失败')); throw error; } }}
       onSetCapabilityRoutes={async (capability, entries) => {
         try {
           await agentApi.setCapabilityRoutes(capability, entries);
@@ -2269,15 +2269,15 @@ function AgentApp() {
           throw error;
         }
       }}
-      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型来源已删除', '删除模型来源失败')}
+      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, 'AI 服务已删除', '删除 AI 服务失败')}
       onCloneAIService={async (id) => {
         try {
           const cloned = await agentApi.cloneAIService(id);
           await refreshAIServices();
-          notify('success', `已克隆为「${cloned.display_name}」`);
+          notify('success', `AI 服务已复制为「${cloned.display_name}」`);
           return cloned;
         } catch (error) {
-          notify('error', formatError(error, '克隆模型来源失败'));
+          notify('error', formatError(error, '复制 AI 服务失败'));
           throw error;
         }
       }}

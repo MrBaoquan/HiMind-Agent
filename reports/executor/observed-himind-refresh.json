@@ -1,0 +1,112 @@
+{
+  "classification": "current_read_of_historical_real_himind_run_not_current_source_execution",
+  "observed_via": "workflow.run.get",
+  "run": {
+    "schema_version": "local_run.v1",
+    "run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+    "interaction_id": "workflow_int_mission_mission_1794473598404_ffe1e069_atomic-service-config",
+    "parent_run_id": "",
+    "parent_kind": "unspecified",
+    "source": "workflow",
+    "transport": "local",
+    "status": "succeeded",
+    "runtime_provider": "himind.builtin",
+    "workspace_ref": "C:/Users/Administrator/.codex/worktrees/mixed-executor-remediation/himind-agent",
+    "current_step_id": "",
+    "pause_kind": "none",
+    "completion_mode": "full",
+    "execution_plan": {
+      "workflow_id": "com.himind.mission.mission_1794473598404_ffe1e069",
+      "execution_policy": "strict",
+      "entrypoint": "full",
+      "exitpoint": "full",
+      "entry_step_id": "atomic-service-config",
+      "exit_step_id": "atomic-service-config",
+      "active_step_ids": [
+        "atomic-service-config"
+      ],
+      "seed_artifacts": [],
+      "assumptions": [],
+      "plan_digest": "sha256:4c843e312348d5350be8fb02f852fc64f1811ea0796b7fa9b633fd0578131644"
+    },
+    "steps": [
+      {
+        "step_id": "atomic-service-config",
+        "title": "服务配置原子持久化与删除恢复",
+        "status": "succeeded",
+        "capability_id": "atomic-service-config",
+        "runtime_provider": "himind.builtin",
+        "model": "himind:lucen:gpt-6.1-sol",
+        "role_id": "remediation.backend",
+        "attempt": 1,
+        "started_at": "1794479372",
+        "finished_at": "1794480759",
+        "error": ""
+      }
+    ],
+    "approvals": [],
+    "artifacts": [],
+    "usage": {
+      "input_tokens": 6813583,
+      "output_tokens": 11254,
+      "estimated_cost": 0,
+      "currency": "",
+      "billing_owner": "local"
+    },
+    "error": "",
+    "created_at": "1794479372",
+    "updated_at": "1794480759"
+  },
+  "permission_mode": "not_recorded_in_historical_input",
+  "execution_binding": {
+    "expert": {
+      "expert_id": "com.himind.expert.software-engineer",
+      "expert_version": "1.0.0",
+      "expert_digest": "sha256:918bd9b650e7774af29d527bf2e1d1872eeabb8df313e93cc8c2f2f015926ae4"
+    },
+    "executor": "himind.builtin",
+    "model": "himind:lucen:gpt-6.1-sol",
+    "role_id": "remediation.backend",
+    "service_id": "lucen"
+  },
+  "events": [
+    {
+      "event_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config:atomic-service-config:1",
+      "occurred_at": "1794479372",
+      "event_type": "tool_started",
+      "provider": "himind.builtin"
+    },
+    {
+      "event_id": "workflow_run_mission_mission_1794473598404_ffe1e069_atomic-service-config:atomic-service-config:2",
+      "occurred_at": "1794480759",
+      "event_type": "tool_completed",
+      "provider": "himind.builtin",
+      "output": {
+        "schema_version": "workflow_runtime_result.v1",
+        "provider": "himind.builtin",
+        "workspace": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+        "summary": "B01/B02代码与验证已交付：目录级锁内读改写、可靠原子替换、合法加密上版恢复及无凭据版本诊断、删除幂等清引用、启动一致性诊断。真实隔离测试通过：服务配置46项、原子文件3项，覆盖7个子进程中断点、不同服务并发更新、损坏快照及重复删除；必需JSON检查退出码0。未操作生产配置。本结论仅表示交付就绪，不代表宿主正式VERIFY通过。",
+        "model": "himind:lucen:gpt-6.1-sol",
+        "service_source": "custom",
+        "endpoint": "http://localhost",
+        "passed": true,
+        "evidence": [
+          "reports/config/result.json",
+          "reports/config/ai-services-final.log",
+          "reports/config/atomic-file-final.log",
+          "reports/config/required-check.json",
+          "scripts/remediation/config-check.py"
+        ],
+        "next_steps": [
+          "宿主另行执行正式VERIFY；可通过 python scripts/remediation/config-check.py 复现测试。",
+          "跨文件删除中断采用诊断与显式重试收敛，并非双文件事务；物理断电、前端诊断呈现未验证，限制已记录。"
+        ]
+      }
+    }
+  ],
+  "limits": [
+    "No new provider execution performed by this read",
+    "Historical successful HiMind run does not verify current OwnedTree code",
+    "Permission mode is not inferred from OS access"
+  ]
+}

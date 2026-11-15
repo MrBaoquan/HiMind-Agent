@@ -37,32 +37,32 @@ const pendingVerification=mission('active',{tasks:[{status:'awaiting_verificatio
 assert.equal(missionNextAction(pendingVerification),'1 项结果待核验');
 assert.equal(missionStatusLabel(pendingVerification),'待核验');
 const preparingEvent=[{event_type:'verification_preparing'} as never];
-assert.equal(missionStatusLabel(pendingVerification,preparingEvent),'系统检查中');
-assert.equal(missionNextAction(pendingVerification,preparingEvent),'系统正在运行必需检查');
+assert.equal(missionStatusLabel(pendingVerification,preparingEvent),'待核验');
+assert.equal(missionNextAction(pendingVerification,preparingEvent),'1 项结果待核验', 'stale preparing event is not a live process');
 const supervisorError=[{event_type:'mission_supervisor_error',summary:'文件检查失败'} as never];
-assert.equal(missionStatusLabel(pendingVerification,supervisorError),'暂时无法推进');
-assert.equal(missionVerificationExplanation(pendingVerification,supervisorError),'文件检查失败');
-assert.equal(missionStatusLabel(pendingVerification,[...supervisorError,...preparingEvent]),'系统检查中');
+assert.equal(missionStatusLabel(pendingVerification,supervisorError),'待核验');
+assert.match(missionVerificationExplanation(pendingVerification,supervisorError),/不推断进度/);
+assert.equal(missionStatusLabel(pendingVerification,[...supervisorError,...preparingEvent]),'待核验');
 assert.match(missionVerificationExplanation(pendingVerification),/系统将运行必需检查/);
 assert.match(missionVerificationExplanation(pendingVerification),/另一位专家核对/);
 assert.equal(missionFlow(pendingVerification)[3].state,'current');
 const activeVerification=mission('active',{tasks:[{status:'awaiting_verification',verification_run_id:'run-verify',verification_passed:null}]});
-assert.equal(missionNextAction(activeVerification),'1 项由另一位专家核验中');
-assert.equal(missionStatusLabel(activeVerification),'核验进行中');
+assert.equal(missionNextAction(activeVerification),'1 项核验任务已派发，等待状态更新');
+assert.equal(missionStatusLabel(activeVerification),'核验任务已派发');
 assert.match(missionVerificationExplanation(activeVerification),/另一位专家核对/);
 assert.equal(missionFlow(mission('waiting',{tasks:[{status:'awaiting_verification',verification_run_id:''}]}))[3].state,'current');
-assert.equal(missionStatusLabel(mission('waiting'),[{event_type:'mission_pause'} as never]),'已暂停');
-assert.equal(missionStatusLabel(mission('waiting'),[{event_type:'mission_waiting'} as never]),'等待处理');
+assert.equal(missionStatusLabel(mission('waiting'),[{event_type:'mission_pause'} as never]),'等待原因未确认');
+assert.equal(missionStatusLabel(mission('waiting'),[{event_type:'mission_waiting'} as never]),'等待原因未确认');
 const budgetExhaustedEvent=[{event_type:'budget_exhausted'} as never];
-assert.equal(missionStatusLabel(mission('waiting'),budgetExhaustedEvent),'预算已用尽');
-assert.equal(missionNextAction(mission('waiting'),budgetExhaustedEvent),'增加预算并继续');
+assert.equal(missionStatusLabel(mission('waiting'),budgetExhaustedEvent),'等待原因未确认');
+assert.match(missionNextAction(mission('waiting'),budgetExhaustedEvent),/资格未确认/);
 assert.equal(missionFlow(mission('active',{tasks:[{status:'awaiting_verification'},{status:'running'}]}))[2].state,'current');
 const stalled=mission('active',{tasks:[{status:'failed',verification_passed:false,spec:{id:'fix',repair_of:''}}, {status:'blocked',spec:{id:'review',repair_of:''}}]});
-assert.equal(missionStatusLabel(stalled),'任务已停下，需处理失败');
-assert.match(missionNextAction(stalled),/任务已停下|返工次数已用完/);
-assert.equal(missionFlow(stalled)[3].state,'current');
-assert.equal(projectTasks([stalled],[]).rows[0].needsUser,true);
-assert.equal(missionTodo(stalled)?.kind,'attention');
+assert.equal(missionStatusLabel(stalled),'状态待核对');
+assert.match(missionNextAction(stalled),/等待系统更新/);
+assert.equal(missionFlow(stalled)[2].state,'current');
+assert.equal(projectTasks([stalled],[]).rows[0].needsUser,false);
+assert.equal(missionTodo(stalled),null, 'coordination gap is not proof that a user action is required');
 assert.ok(!missionNextAction(mission('completed')).includes('沉淀'));
 for(const kind of ['external','user','','unknown']) assert.equal(activityNeedsUser(run('r',{status:'waiting',pause_kind:kind})),false);
 for(const kind of ['approval','feedback','form','evidence']) assert.equal(activityNeedsUser(run('r',{status:'waiting',pause_kind:kind})),true);
@@ -82,3 +82,72 @@ console.log('task center model checks passed: ownership, cycles, views, user act
 assert.equal(projectTasks([mission('canceled')], [userRun]).rows[0].needsUser,false);
 assert.equal(projectTasks([], [run('root',{status:'canceled'}),run('child',{parent_run_id:'root',status:'waiting',pause_kind:'approval'})]).rows[0].needsUser,false);
 assert.equal(executionTodoId('r1','s1','feedback'),'run:r1:s1:feedback');
+
+// B08: all surfaces consume the same associated reason, actor, eligibility/cursor.
+import {missionWait, missionDeliveries, missionResponsibility, eventLabel} from '../src/pages/missionView.ts';
+import {retainBudgetRequest,clearBudgetRequest,pendingBudgetRequest} from '../src/pages/missionBudgetRequest.ts';
+const waitDto = {contract_version:'mission.wait.v1',plan_sha256:'hash',cursor:5,reason:'budget_exhausted',actor:'user',budget_reason:'Token 100/100',environment_blocked:false,can_increase_budget:true,can_resume:false};
+const waitingBudget=mission('waiting',{confirmation:{plan_sha256:'hash'},effective_wait:waitDto});
+for(const telemetry of [[],[{event_type:'budget_exhausted'},{event_type:'task_progress'}],[{event_type:'mission_feedback_submitted'}]]) {
+ assert.equal(missionStatusLabel(waitingBudget,telemetry as never),'预算已用尽');
+ assert.equal(missionNextAction(waitingBudget,telemetry as never),'增加预算并继续');
+}
+assert.equal(missionTodo(waitingBudget)?.cursor,5);
+assert.equal(missionTodo(waitingBudget)?.reason,'budget_exhausted');
+assert.equal(missionTodo(waitingBudget)?.actor,'user');
+assert.equal(projectTasks([waitingBudget],[]).rows[0].needsUser,true);
+for(const extra of [{effective_wait:null},{effective_wait:{...waitDto,contract_version:'future'}},{effective_wait:{...waitDto,plan_sha256:'other'}},{confirmation:{plan_sha256:'old'}},{effective_wait:{...waitDto,cursor:-1}}]) {
+ const unknown=mission('waiting',{...waitingBudget,...extra});
+ assert.equal(missionWait(unknown),null);assert.equal(missionTodo(unknown),null);
+ assert.equal(missionStatusLabel(unknown),'等待原因未确认');
+}
+const paused={...waitingBudget,effective_wait:{...waitDto,reason:'manual_pause',can_resume:true}};
+assert.equal(missionStatusLabel(paused),'已暂停');assert.equal(missionTodo(paused),null);
+assert.match(missionResponsibility(paused),/由你决定/);assert.equal(missionWait(paused)?.can_increase_budget,true);
+const system={...waitingBudget,effective_wait:{...waitDto,reason:'system_verification',actor:'system',can_increase_budget:false}};
+assert.equal(missionTodo(system),null);assert.match(missionNextAction(system),/不重复执行实现/);
+const rootTask=(id:string,status:string,repair_of='')=>({spec:{id,repair_of},status,attempt_run_id:id+'-run',verification_run_id:id+'-verify',evidence_refs:[]});
+const repaired=mission('active',{tasks:[rootTask('a','failed'),rootTask('b','blocked'),rootTask('r1','failed','a'),rootTask('r2','completed','r1')]});
+assert.equal(missionProgress(repaired).total,2);assert.equal(missionProgress(repaired).done,1);
+assert.equal(missionDeliveries(repaired).groups[0].attempts.length,3);
+const malformed=mission('active',{tasks:[rootTask('a','failed','b'),rootTask('b','failed','a'),rootTask('missing','failed','absent')]});
+assert.equal(missionProgress(malformed).total,0);assert.equal(missionDeliveries(malformed).unassociated.length,3);
+const newRevision=mission('active',{tasks:[...repaired.tasks,rootTask('r3','ready','r2')]});
+assert.equal(missionProgress(newRevision).done,0, 'old successes cannot complete a newer repair');
+const input={expected_plan_sha256:'hash',additional_rounds:0,additional_minutes:0,additional_repair_attempts:0,additional_tokens:50,unlimited_tokens:false,additional_cost:null};
+const original=retainBudgetRequest('m1',input);
+assert.deepEqual(retainBudgetRequest('m1',input),original);assert.deepEqual(pendingBudgetRequest('m1','hash'),original);
+assert.notEqual(retainBudgetRequest('m1',{...input,additional_tokens:60}).request_id,original.request_id);
+clearBudgetRequest('m1','hash');assert.equal(pendingBudgetRequest('m1','hash'),null);
+assert.match(eventLabel({event_type:'mission_feedback_submitted'} as never),/审查意见/);
+assert.match(eventLabel({event_type:'mission_follow_up_format_retry'} as never),/重试/);
+console.log('B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity');
+
+// QA-LEGACY-01: authoritative resume admission must agree with the user action.
+import {missionResumeAction, missionActionActor} from '../src/pages/missionView.ts';
+const legacy = mission('waiting',{confirmation:{plan_sha256:'hash'}, tasks:[rootTask('pending','awaiting_verification')],
+ effective_wait:{...waitDto,reason:'system_verification',actor:'system',can_resume:true,can_increase_budget:false}});
+assert.equal(missionResumeAction(legacy)?.label,'续跑待核验');
+assert.match(missionNextAction(legacy),/续跑待核验；不重复执行已完成的实现/);
+assert.match(missionResponsibility(legacy),/需要你手动续跑/);
+assert.equal(missionTodo(legacy)?.kind,'verification_resume');
+assert.equal(missionTodo(legacy)?.actor,'user'); assert.equal(missionActionActor(legacy),'user');
+assert.equal(projectTasks([legacy],[]).rows[0].needsUser,true);
+for(const patch of [{can_resume:false},{contract_version:'future'},{plan_sha256:'foreign'},
+ {cursor:-1},{actor:'unknown'},{reason:'unknown'},{reason:'budget_exhausted'},{environment_blocked:true}]) {
+ const denied={...legacy,effective_wait:{...legacy.effective_wait!,...patch}};
+ assert.equal(missionResumeAction(denied),null);
+}
+const pausedVerification={...legacy,effective_wait:{...legacy.effective_wait!,reason:'manual_pause',actor:'user'}};
+assert.equal(missionResumeAction(pausedVerification)?.optional,true);
+assert.equal(missionTodo(pausedVerification),null);
+assert.match(missionResponsibility(pausedVerification),/由你决定/);
+assert.equal(missionResumeAction({...legacy,tasks:[{...legacy.tasks[0],attempt_run_id:''}]}),null);
+console.log('QA-LEGACY-01 recovery action and manual-pause restrictions passed');
+
+// A state head beyond an event page is continuation, not a permanently invalid DTO.
+import {readMissionSnapshot} from '../src/pages/missionSnapshot.ts';
+const pageRequests:number[]=[];
+const paged=await readMissionSnapshot(async after=>{pageRequests.push(after);return {mission:{...waitingBudget,effective_wait:{...waitDto,cursor:12}},cursor:after===0?4:12,requires_snapshot:after===0,events:after===0?[{event_id:'e4',sequence:4}]:[{event_id:'e12',sequence:12}] } as never;},0);
+assert.deepEqual(pageRequests,[0,4]);assert.equal(paged.snapshot.cursor,12);assert.equal(paged.snapshot.events.length,2);assert.equal(paged.replace,true);
+await assert.rejects(readMissionSnapshot(async()=>({mission:{...waitingBudget,effective_wait:{...waitDto,cursor:12}},cursor:4,events:[]} as never),0),/分页未推进/);

@@ -76,7 +76,7 @@ fn run_copilot(
     claim: &AgentRunClaim,
     invocation: &CopilotInvocation,
 ) -> Result<Value, Box<dyn Error>> {
-    let mut child = spawn_copilot(invocation)?;
+    let (mut child, _tree) = spawn_copilot(invocation)?;
     let stdout = child.stdout.take().map(process::capture_output);
     let stderr = child.stderr.take().map(process::capture_output);
     let status = process::wait_for_child(
@@ -89,6 +89,7 @@ fn run_copilot(
         DEFAULT_TIMEOUT_SECONDS,
         "GitHub Copilot CLI",
     )?;
+    drop(_tree);
     let stdout = process::join_output(stdout);
     let stderr = process::join_output(stderr);
     if !status.success() {
@@ -153,7 +154,7 @@ fn build_prompt(claim: &AgentRunClaim) -> Result<String, Box<dyn Error>> {
     Ok(prompt)
 }
 
-fn spawn_copilot(invocation: &CopilotInvocation) -> Result<Child, Box<dyn Error>> {
+fn spawn_copilot(invocation: &CopilotInvocation) -> Result<(Child, crate::runtime::owned_tree::OwnedTree), Box<dyn Error>> {
     let mut command = Command::new(&invocation.executable);
     command
         .args(&invocation.args)
@@ -164,7 +165,7 @@ fn spawn_copilot(invocation: &CopilotInvocation) -> Result<Child, Box<dyn Error>
         .stderr(Stdio::piped());
     process::remove_himind_secret_environment(&mut command);
     process::configure_hidden_process(&mut command);
-    Ok(command.spawn()?)
+    crate::runtime::owned_tree::OwnedTree::spawn(&mut command)
 }
 
 pub(crate) fn resolve_copilot_executable() -> Result<(OsString, String), Box<dyn Error>> {

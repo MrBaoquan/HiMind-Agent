@@ -1,16 +1,24 @@
 import type { AgentActivityItem, MissionView, WorkflowCenterSnapshot } from '../services/agentApi';
-import { missionNextAction, missionStalled } from './missionView.ts';
+import { missionActionActor, missionResumeAction, missionRunningVerifications, missionNextAction, missionStalled, missionWait } from './missionView.ts';
 
 export const ENDED_STATUSES = new Set(['completed', 'succeeded', 'success', 'done', 'finished', 'failed', 'canceled', 'cancelled']);
-export type MissionTodo = { id: string; missionId: string; title: string; action: string; kind: 'assignment' | 'plan' | 'confirmation' | 'attention' };
-export function missionTodo(mission: MissionView): MissionTodo | null {
-  const kind = missionStalled(mission) ? 'attention'
+export type MissionTodo = { id: string; missionId: string; title: string; action: string; kind: 'assignment' | 'plan' | 'confirmation' | 'attention' | 'budget' | 'environment' | 'verification_resume'; cursor?: number; reason?: string; actor?: string };
+export function missionTodo(mission: MissionView, activities: AgentActivityItem[] = []): MissionTodo | null {
+  if (ENDED_STATUSES.has(mission.status)) return null;
+  if (missionRunningVerifications(mission, activities).length) return null;
+  const wait = missionWait(mission);
+  const resume = missionResumeAction(mission, activities);
+  const kind = resume?.kind === 'verification' && !resume.optional ? 'verification_resume'
+    : mission.status === 'waiting' && wait?.actor === 'user' && wait.reason === 'budget_exhausted' ? 'budget'
+    : mission.status === 'waiting' && wait?.actor === 'user' && wait.environment_blocked ? 'environment'
+    : missionStalled(mission) ? 'attention'
     : mission.status === 'awaiting_assignment' ? 'assignment'
     : mission.status === 'draft' || mission.status === 'planned' ? 'plan'
     : mission.status === 'awaiting_confirmation' ? 'confirmation' : null;
   if (!kind) return null;
   return { id: ['mission', mission.mission_id, kind, mission.plan_sha256 || mission.plan_revision].join(':'),
-    missionId: mission.mission_id, title: mission.title, action: missionNextAction(mission), kind };
+    missionId: mission.mission_id, title: mission.title, action: missionNextAction(mission, [], activities), kind,
+    cursor: wait?.cursor, reason: wait?.reason, actor: missionActionActor(mission, activities) };
 }
 export function activityNeedsUser(item: Pick<AgentActivityItem, 'status' | 'pause_kind'>) {
   return item.status === 'waiting' && ['approval', 'feedback', 'form', 'evidence'].includes(item.pause_kind || '');
@@ -38,7 +46,7 @@ export function workspaceKey(value: string) {
 export type TaskProjection = { id: string; kind: 'mission' | 'activity'; mission?: MissionView; activity?: AgentActivityItem;
   title: string; workspace: string; client: string; method: string; trigger: string; status: string;
   updatedAt: string; needsUser: boolean; ended: boolean; search: string };
-export function projectTasks(missions: MissionView[], activities: AgentActivityItem[]) {
+export function projectTasks(missions: MissionView[], activities: AgentActivityItem[], statusActivities: AgentActivityItem[] = activities) {
   const missionIds = new Set(missions.map(m => m.mission_id));
   const byRun = new Map(activities.filter(a => a.workflow_run_id).map(a => [a.workflow_run_id!, a]));
   const byAttempt = new Map(missions.flatMap(m => m.tasks.filter(t => t.attempt_run_id).map(t => [t.attempt_run_id, m.mission_id] as const)));
@@ -68,7 +76,7 @@ export function projectTasks(missions: MissionView[], activities: AgentActivityI
     ...missions.map(m => ({ id: 'mission:' + m.mission_id, kind: 'mission' as const, mission: m,
       title: m.title, workspace: m.workspace.root, client: clientLabel(m.handoff?.source_client || ''),
       method: '协作任务', trigger: m.handoff?.source_client === 'agent-ui' ? 'Agent 中创建' : m.handoff ? '会话交接' : '', status: m.status, updatedAt: m.updated_at,
-      needsUser: !ENDED_STATUSES.has(m.status) && (missionStalled(m) || Boolean(missionTodo(m)) || (related.get('mission:'+m.mission_id) || []).some(activityNeedsUser)), ended: ENDED_STATUSES.has(m.status),
+      needsUser: !ENDED_STATUSES.has(m.status) && (missionStalled(m) || Boolean(missionTodo(m, statusActivities)) || (related.get('mission:'+m.mission_id) || []).some(activityNeedsUser)), ended: ENDED_STATUSES.has(m.status),
       search: [m.mission_id, m.title, m.objective, m.workspace.root, m.handoff?.source_client, m.handoff?.context_summary].join(' ') })),
     ...top.map(a => ({ id: 'activity:' + a.id, kind: 'activity' as const, activity: a, title: a.title,
       workspace: a.workspace_root || '', client: clientLabel(a.source_client || (a.source === 'dashboard' ? '工作台' : '')),

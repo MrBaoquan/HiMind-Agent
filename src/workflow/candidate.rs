@@ -261,14 +261,9 @@ mod tests {
 
     #[test]
     fn freezes_clean_git_head() {
-        let root = std::env::temp_dir().join(format!(
-            "himind-candidate-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Keep generated Git metadata below Windows path limits even when
+        // the host has assigned a long, task-bound temporary resource root.
+        let root = std::env::temp_dir().join(format!("c{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "--quiet"]);
         git(&root, &["config", "user.email", "test@example.com"]);
@@ -296,14 +291,7 @@ mod tests {
 
     #[test]
     fn rejects_dirty_workspace_when_disallowed() {
-        let root = std::env::temp_dir().join(format!(
-            "himind-candidate-dirty-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = std::env::temp_dir().join(format!("c{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "--quiet"]);
         git(&root, &["config", "user.email", "test@example.com"]);
@@ -336,14 +324,7 @@ mod tests {
 
     #[test]
     fn agent_metadata_does_not_change_candidate_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "himind-candidate-metadata-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = std::env::temp_dir().join(format!("c{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join(".himind")).unwrap();
         git(&root, &["init", "--quiet"]);
         git(&root, &["config", "user.email", "test@example.com"]);

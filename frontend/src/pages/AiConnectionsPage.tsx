@@ -1,4 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
+import './ServiceUi.css';
 import { PageHeader } from '../components/Common';
 import { AI_CONNECTIONS_DESCRIPTION, AI_CONNECTIONS_TAB_LABELS, AI_CONNECTIONS_TAB_ORDER, type AiConnectionsTab } from './aiConnectionsTabs';
 import { AcpProfilesPanel } from './AcpProfilesPanel';
@@ -182,6 +183,7 @@ export function AiConnectionsPage({
         ))}
       </div>
 
+      {TAB_ORDER.filter(tab => tab !== activeTab).map(tab => <div key={tab} id={`ai-panel-${tab}`} role="tabpanel" aria-labelledby={`ai-tab-${tab}`} hidden />)}
       {activeTab === 'acp' ? (
         <div id="ai-panel-acp" role="tabpanel" aria-labelledby="ai-tab-acp">
           <AcpProfilesPanel

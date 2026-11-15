@@ -1,0 +1,1641 @@
+{
+  "classification": "historical_previous_worker_report_not_current_execution",
+  "report": {
+    "schema_version": "executor_lifecycle_repair_result.v3",
+    "passed": false,
+    "mission_id": "mission_1794473598404_ffe1e069",
+    "task_id": "repair-executor-lifecycle-lineage-ownership-usage-3",
+    "role": "remediation.executor",
+    "phase": "deliver",
+    "readiness": "blocked_required_live_evidence_and_historical_diagnosis",
+    "summary": "结论：已实现取消事务与ACK后usage投影重建，修复当前回归中的根退出/继承管道问题。最终候选411次确定性测试执行全通过（406个不同测试）；原三个必需命令实际exit=1/1/1，首项29828ms，缺当前候选真实HiMind执行。727原始输出未获配，不能定位其具体失败断言。阶段交付未就绪。",
+    "next_steps": [
+      "提供本任务资源范围内可调用的既有HiMind签名运行入口/连接，保持lucen / himind:lucen:gpt-6.1-sol，不改变主任务personal.codex及空model/service绑定。",
+      "补齐当前最终候选真实HiMind任务、真实双向模型交接及launch/resume增量证据；接入同等严格的源码/工具链/产物/原始证据身份校验。",
+      "提供727原始输出文本或本任务资源根内副本，核对具体失败原因；不访问外部CONTROL。",
+      "若源码或检查变化则重新准备最终候选，再实际运行原三个必需命令；全部必需交付和检查就绪后提交后续独立QA与正式VERIFY。"
+    ],
+    "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+    "candidate_identity_evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepared.json",
+    "candidate_identity_scope": "All current source/tests/scripts/resources/build inputs and effective toolchain/configuration; report JSON is a separate delivery artifact.",
+    "execution_binding": {
+      "executor": "personal.codex",
+      "model": "",
+      "service_id": "",
+      "expert_id": "com.himind.expert.senior-system-architect",
+      "expert_version": "1.0.0"
+    },
+    "implemented_backlog_ids": [
+      "B05",
+      "B08"
+    ],
+    "implemented_backlog_scope": {
+      "B05": "Usage identity, trusted increment and durable caller projection contribution only; not complete budget backlog acceptance.",
+      "B08": "Executor lifecycle, cancellation recovery, product-entry and lineage regression contribution; preserve parallel capabilities and permission patch."
+    },
+    "changed_files": [
+      "docs/mixed-executor-runtime.md",
+      "reports/executor/lifecycle-checks.json",
+      "reports/executor/manifest.json",
+      "reports/executor/real-codex-lifecycle.json",
+      "reports/executor/repair-plan.json",
+      "reports/executor/required-checks.json",
+      "reports/executor/result.json",
+      "scripts/remediation/executor-lifecycle-repair-checks.py",
+      "scripts/remediation/executor_lifecycle_support.py",
+      "src/runtime/codex.rs",
+      "src/runtime/codex_transport.rs",
+      "src/runtime/codex_usage_delivery.rs",
+      "src/runtime/owned_tree.rs",
+      "src/runtime/process.rs",
+      "src/workflow/runner.rs",
+      "src/workflow/runtime.rs"
+    ],
+    "changed_files_scope": "Actual third-repair differences against this task start snapshot; not whole-file authorship or inherited fixes.",
+    "checks": [
+      {
+        "name": "required-regression-final",
+        "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+        "argv": [
+          "python",
+          "scripts/remediation/executor-lifecycle-repair-checks.py"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 29828,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-regression-final-1794552452004283200.log",
+        "sha256": "1708a8c2c578a2572ec9b038fc30f67e473582379e508197cf0ff77986cd98e4",
+        "test_count": 411,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_final_frozen_candidate_original_required_check"
+      },
+      {
+        "command": "python -B scripts/remediation/executor-lifecycle-repair-checks.py --prepare",
+        "exit_code": 0,
+        "test_count": 2,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepared.json",
+        "sha256": "cbf07aa2f39030bbebb9d86ca99dfa69aa810d97264930bcb43fdd819761a378",
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_final_candidate_build_and_live_preparation_only; not_all_delivery_requirements"
+      },
+      {
+        "command": "cargo test --locked --bin himind-agent --no-run --message-format=json",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "himind-agent",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit_code": 0,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor\\repair2-prebuild-1794552314275090300.log",
+        "sha256": "ae7e4da1509987414ff368cda27c6584cf872ad581e24a1a4e808728b410c79c",
+        "elapsed_seconds": 28.672,
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "prepare-production-build",
+        "command": "cargo build --locked --bin himind-agent",
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--bin",
+          "himind-agent"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 35453,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepare-production-build-1794552343044250500.log",
+        "sha256": "6e50c6a5d34f0ffa7ad1979245b1914bc3dfe493475cadbb44d6d348df0a64fb",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "prepare-signature-fixture",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe workflow::store::tests::valid_signature_allows_required_install --exact --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "workflow::store::tests::valid_signature_allows_required_install",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 1485,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepare-signature-fixture-1794552378499183000.log",
+        "sha256": "8cce4f344364f4d2eaa20870a523d0f99f9ebc8a66ccf6c23c48f0d585deeb52",
+        "test_count": 1,
+        "passed_test_count": 1,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "workflow::store::tests::valid_signature_allows_required_install"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "effective-build-configuration",
+        "command": "cargo rustc --manifest-path C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\configuration-probe\\Cargo.toml --offline --profile test -vv -- --print=cfg",
+        "argv": [
+          "cargo",
+          "rustc",
+          "--manifest-path",
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\configuration-probe\\Cargo.toml",
+          "--offline",
+          "--profile",
+          "test",
+          "-vv",
+          "--",
+          "--print=cfg"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 250,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\effective-build-configuration-1794552379984687300.log",
+        "sha256": "37d2184bd2c8a74c77fec7b0661afff53423029adcfeae752459e753cb5ebd55",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "prepare-real-codex",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::codex::tests::executor_real_codex_launch_resume_shell_preflight --exact --ignored --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::codex::tests::executor_real_codex_launch_resume_shell_preflight",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 37688,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepare-real-codex-1794552380238497100.log",
+        "sha256": "43da1f5b8d9c7ba234cf725849e8e96d5ae687cab863268915cd3d5805a87629",
+        "test_count": 1,
+        "passed_test_count": 1,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::codex::tests::executor_real_codex_launch_resume_shell_preflight"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "effective-build-configuration",
+        "command": "cargo rustc --manifest-path C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\configuration-probe\\Cargo.toml --offline --profile test -vv -- --print=cfg",
+        "argv": [
+          "cargo",
+          "rustc",
+          "--manifest-path",
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\configuration-probe\\Cargo.toml",
+          "--offline",
+          "--profile",
+          "test",
+          "-vv",
+          "--",
+          "--print=cfg"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 219,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\effective-build-configuration-1794552452766013200.log",
+        "sha256": "6094ad19ca4ca1c1ddee0f4b86be6de75591ed2586d8b418a88d42e04de1ea66",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "runtime_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::tests:: --skip workflow:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::tests::",
+          "--skip",
+          "workflow::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 891,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\runtime_contract-1794552452992370100.log",
+        "sha256": "bfd2aceb06f53957feb5af2816b6ced4a61225a7481a09dda0258af8bc646f90",
+        "test_count": 5,
+        "passed_test_count": 5,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::tests::agent_run_context_preserves_work_item_correlation",
+          "runtime::tests::executor_agent_result_and_runtime_facts_survive_ledger_restart",
+          "runtime::tests::normalizes_structured_completion_nested_in_provider_event",
+          "runtime::tests::normalizes_structured_provider_completion",
+          "runtime::tests::parses_provider_agnostic_agent_run_envelope"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "lineage",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe executor_handoff --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "executor_handoff",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 1578,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\lineage-1794552453889633800.log",
+        "sha256": "065d08899c3d732ead3d8e870d41a1b23f75fbf17bc22af7fb9063b4d3b89ee0",
+        "test_count": 2,
+        "passed_test_count": 2,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "mission::executor_handoff::tests::handoff_paths_require_both_scopes_and_never_follow_absolute_evidence",
+          "mission::store::tests::executor_handoff_native_multihop_both_directions_preserves_failed_parents"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "usage",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::codex_usage::tests:: --skip usage_restart_worker --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::codex_usage::tests::",
+          "--skip",
+          "usage_restart_worker",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 860,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\usage-1794552455461977500.log",
+        "sha256": "c7b8298e5cb9fdadddd18ce997a5b4468b89c2d9302774a0cfe91b7555e6665c",
+        "test_count": 6,
+        "passed_test_count": 6,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::codex_usage::tests::usage_abandoned_turn_invalidates_baseline_after_restart",
+          "runtime::codex_usage::tests::usage_concurrent_resume_reservation_is_atomic_and_session_bound",
+          "runtime::codex_usage::tests::usage_exact_abc_crash_reentry_cannot_reuse_baseline_or_replace_pending",
+          "runtime::codex_usage::tests::usage_launch_resume_fixed_cumulative_fixture_and_replay",
+          "runtime::codex_usage::tests::usage_process_restart_preserves_baseline_and_immutable_receipt",
+          "runtime::codex_usage::tests::usage_unknown_baseline_reset_and_subset_failures_never_become_zero"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "ownership_windows",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::owned_tree::tests:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::owned_tree::tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 6047,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\ownership_windows-1794552452992370100.log",
+        "sha256": "62b20b0ce26a8e333e7262b201641afc6d4cf85c7c68d4ba7c3bd51c0df3bccf",
+        "test_count": 3,
+        "passed_test_count": 3,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::owned_tree::tests::ownership_immediate_descendant_root_exit_and_close_are_owned",
+          "runtime::owned_tree::tests::ownership_setup_failures_reap_suspended_child_before_code_runs",
+          "runtime::owned_tree::tests::ownership_transport_immediate_root_exit_cancel_timeout_and_shutdown"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "cancel_projection",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe workflow::runner::tests::executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite --exact --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "workflow::runner::tests::executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 2828,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\cancel_projection-1794552459049200700.log",
+        "sha256": "330e47d1ded0a4f273758cdcd9ce546c0a1a73999e94c09ea9e5c7cab20de9df",
+        "test_count": 1,
+        "passed_test_count": 1,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "workflow::runner::tests::executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "process_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::process::tests:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::process::tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 2344,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\process_contract-1794552461867923800.log",
+        "sha256": "4c708375bfe2f960db75ff45ea0f90b47771d2029c9ede93f43ae444f91a2fa9",
+        "test_count": 8,
+        "passed_test_count": 8,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::process::tests::executor_long_workspace_cwd_preserves_identity_and_starts_owned_process",
+          "runtime::process::tests::output_summary_keeps_context_and_tail",
+          "runtime::process::tests::process_cancellation_terminates_the_child",
+          "runtime::process::tests::process_timeout_terminates_the_child",
+          "runtime::process::tests::protocol_spool_bounds_memory_and_is_removed_on_error_or_drop",
+          "runtime::process::tests::protocol_spool_read_stops_and_closes_before_returning",
+          "runtime::process::tests::protocol_validation_bounds_control_fields_and_checks_ignored_utf8",
+          "runtime::process::tests::windows_prefers_pathext_suffixed_candidates"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "himind_stdin",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe headless_stdin_ --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "headless_stdin_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 2000,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_stdin-1794552464208688900.log",
+        "sha256": "13b664bbb10046df5f8812b0a70e263cb559a443c85d529ed343d66622645f25",
+        "test_count": 4,
+        "passed_test_count": 4,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_failed_spawn_cleans_up_and_does_not_expose_prompt",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_roundtrips_large_unicode_and_shell_literals_without_206",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_unread_large_request_remains_cancelable",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_unread_large_request_remains_timeout_bounded"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "codex_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::codex::tests:: --skip executor_real_codex_launch_resume_shell_preflight --skip executor_selection_restart_worker --skip executor_agent_receipt_restart_worker --skip executor_abc_interrupted_worker --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::codex::tests::",
+          "--skip",
+          "executor_real_codex_launch_resume_shell_preflight",
+          "--skip",
+          "executor_selection_restart_worker",
+          "--skip",
+          "executor_agent_receipt_restart_worker",
+          "--skip",
+          "executor_abc_interrupted_worker",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 13344,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\codex_contract-1794552452992370100.log",
+        "sha256": "30f0891ac11f4f1c97de7f6a82aabda6b7bc74e93e937f433b203e4b07f491b5",
+        "test_count": 11,
+        "passed_test_count": 11,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::codex::tests::executor_agent_run_launch_resume_liveness_final_and_usage",
+          "runtime::codex::tests::executor_agent_run_managed_claim_caller_receipt_recovery_preserves_failure",
+          "runtime::codex::tests::executor_agent_run_receipt_crash_restart_and_concurrent_recovery_are_once",
+          "runtime::codex::tests::executor_codex_selection_persists_revalidates_and_honors_pin",
+          "runtime::codex::tests::executor_codex_selection_restart_stale_schema_and_incompatible_fallback",
+          "runtime::codex::tests::executor_product_transport_exact_labca_rejects_stale_identity_before_provider",
+          "runtime::codex::tests::invocation_rejects_unsafe_resume_session_id",
+          "runtime::codex::tests::invocation_resumes_recorded_codex_session",
+          "runtime::codex::tests::invocation_uses_workspace_sandbox_and_stdin_prompt",
+          "runtime::codex::tests::parses_codex_thread_started_event",
+          "runtime::codex::tests::sandbox_mode_defaults_to_workspace_write"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "himind_runtime_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::deepseek_harness::tests:: --skip installed_runtime_revision_identity_and_status_use_package_version --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::deepseek_harness::tests::",
+          "--skip",
+          "installed_runtime_revision_identity_and_status_use_package_version",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 969,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_runtime_contract-1794552466339040400.log",
+        "sha256": "ee5d644a1d6e514b27193b4b0b807215d4a70de418ba065a4d541377905234b8",
+        "test_count": 74,
+        "passed_test_count": 74,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::deepseek_harness::tests::acp_alias_is_rejected_by_the_builtin_router",
+          "runtime::deepseek_harness::tests::agent_mcp_namespace_conflicts_are_rejected_before_dsh_boot",
+          "runtime::deepseek_harness::tests::agent_owned_settings_route_is_released_on_migration",
+          "runtime::deepseek_harness::tests::bundled_runtime_manifest_is_found_from_the_installed_layout",
+          "runtime::deepseek_harness::tests::connected_mode_degraded_session_never_projects_dashboard_provider",
+          "runtime::deepseek_harness::tests::customized_dsh_model_settings_are_preserved",
+          "runtime::deepseek_harness::tests::degraded_notice_points_to_ai_service_settings_only_when_credentials_are_missing",
+          "runtime::deepseek_harness::tests::degraded_session_releases_agent_owned_route",
+          "runtime::deepseek_harness::tests::dsh_mcp_launch_uses_the_active_mode_and_omits_dashboard_api_when_independent",
+          "runtime::deepseek_harness::tests::effective_capabilities_follow_the_office_engine_on_disk",
+          "runtime::deepseek_harness::tests::embedded_runtime_manifest_pins_an_exact_release",
+          "runtime::deepseek_harness::tests::existing_managed_profile_patch_is_migrated_without_losing_user_rows",
+          "runtime::deepseek_harness::tests::expert_preset_include_row_is_added_once_and_keeps_user_rows",
+          "runtime::deepseek_harness::tests::extracts_first_non_empty_version_line",
+          "runtime::deepseek_harness::tests::failed_cli_report_preserves_negative_output_without_accepting_log_fragments",
+          "runtime::deepseek_harness::tests::himind_profile_keeps_dsh_extension_surfaces_open",
+          "runtime::deepseek_harness::tests::himind_skill_adapter_accepts_portable_ready_skills",
+          "runtime::deepseek_harness::tests::himind_skill_adapter_only_hashes_name_collisions",
+          "runtime::deepseek_harness::tests::himind_skill_adapter_uses_valid_stable_names_and_one_frontmatter_block",
+          "runtime::deepseek_harness::tests::independent_dsh_launch_allows_incomplete_native_settings",
+          "runtime::deepseek_harness::tests::independent_dsh_launch_allows_missing_native_settings",
+          "runtime::deepseek_harness::tests::independent_profile_does_not_inject_dashboard_provider",
+          "runtime::deepseek_harness::tests::interactive_catalog_starts_with_the_default_and_removes_duplicates",
+          "runtime::deepseek_harness::tests::interactive_events_are_projected_without_engine_payloads",
+          "runtime::deepseek_harness::tests::interactive_home_migrates_legacy_data_once_and_skips_generated_skill_adapter",
+          "runtime::deepseek_harness::tests::interactive_overlay_uses_real_shared_rail_roots",
+          "runtime::deepseek_harness::tests::interactive_overlays_are_scoped_to_workspace",
+          "runtime::deepseek_harness::tests::interactive_tool_and_approval_events_only_expose_safe_labels",
+          "runtime::deepseek_harness::tests::legacy_runtime_gets_empty_v2_expert_presets",
+          "runtime::deepseek_harness::tests::local_gateway_overlay_pins_the_requested_model_alias",
+          "runtime::deepseek_harness::tests::managed_headless_profile_reuses_himind_services_without_web_surface",
+          "runtime::deepseek_harness::tests::managed_office_row_resolves_the_runtime_without_help_from_the_launcher",
+          "runtime::deepseek_harness::tests::managed_profile_adds_agent_mcp_and_himind_skills_without_disabling_dsh_roots",
+          "runtime::deepseek_harness::tests::managed_profile_declares_deepseek_context_window",
+          "runtime::deepseek_harness::tests::managed_profile_preserves_user_selected_custom_provider",
+          "runtime::deepseek_harness::tests::managed_profile_preserves_user_selected_himind_model_after_runtime_update",
+          "runtime::deepseek_harness::tests::managed_profile_routes_personal_mcp_through_agent_gateway",
+          "runtime::deepseek_harness::tests::managed_run_home_is_isolated_from_interactive_settings",
+          "runtime::deepseek_harness::tests::managed_web_profile_disables_dsh_browser_handoff",
+          "runtime::deepseek_harness::tests::managed_web_profile_does_not_hide_dsh_configuration_surfaces",
+          "runtime::deepseek_harness::tests::mcp_bridge_waits_at_least_as_long_as_the_slowest_enabled_downstream",
+          "runtime::deepseek_harness::tests::mission_methods_overlay_keeps_assigned_model_shell_files_and_mcp",
+          "runtime::deepseek_harness::tests::native_dsh_provider_config_reads_selected_provider_and_catalog",
+          "runtime::deepseek_harness::tests::no_tools_overlay_disables_every_model_facing_tool_row",
+          "runtime::deepseek_harness::tests::no_tools_overlay_follows_its_base_file",
+          "runtime::deepseek_harness::tests::office_rows_track_the_engine_on_disk",
+          "runtime::deepseek_harness::tests::older_and_reformatted_office_rows_are_still_recognised",
+          "runtime::deepseek_harness::tests::preflight_never_fails_the_install_and_degrades_only_the_missing_payload",
+          "runtime::deepseek_harness::tests::profile_migration_removes_agent_model_rows_even_with_js_tags",
+          "runtime::deepseek_harness::tests::profile_package_merge_drops_managed_bundles_an_older_agent_wrote",
+          "runtime::deepseek_harness::tests::profile_package_merge_preserves_user_plugins_and_required_bundles",
+          "runtime::deepseek_harness::tests::profile_route_uses_only_the_claim_scoped_himind_proxy",
+          "runtime::deepseek_harness::tests::project_overlay_passes_workspace_only_to_agent_mcp",
+          "runtime::deepseek_harness::tests::rail_state_is_shared_across_workspace_homes",
+          "runtime::deepseek_harness::tests::read_only_overlay_preserves_file_readers_and_removes_escalating_tools",
+          "runtime::deepseek_harness::tests::recent_workspace_prefers_latest_existing_directory",
+          "runtime::deepseek_harness::tests::requested_model_is_pinned_into_the_overlay",
+          "runtime::deepseek_harness::tests::run_home_without_step_keeps_the_legacy_path",
+          "runtime::deepseek_harness::tests::runtime_agent_compatibility_is_fail_closed",
+          "runtime::deepseek_harness::tests::runtime_alignment_accepts_exact_and_derived_packages",
+          "runtime::deepseek_harness::tests::runtime_environment_enables_node_compile_cache",
+          "runtime::deepseek_harness::tests::runtime_environment_points_at_the_launching_runtime",
+          "runtime::deepseek_harness::tests::runtime_environment_selects_patched_node_only_when_declared",
+          "runtime::deepseek_harness::tests::runtime_home_is_isolated_by_semantic_version",
+          "runtime::deepseek_harness::tests::runtime_manifest_paths_are_relative_and_versions_are_path_safe",
+          "runtime::deepseek_harness::tests::runtime_staging_path_preserves_version_and_digest",
+          "runtime::deepseek_harness::tests::selected_local_service_projects_to_independent_profile_without_editing_settings",
+          "runtime::deepseek_harness::tests::sfkey_provider_survives_agent_route_release",
+          "runtime::deepseek_harness::tests::unavailable_requested_model_fails_closed_and_lists_alternatives",
+          "runtime::deepseek_harness::tests::uninstall_removes_managed_files_and_preserves_user_home",
+          "runtime::deepseek_harness::tests::upgraded_profiles_drop_the_rows_an_older_agent_wrote",
+          "runtime::deepseek_harness::tests::workflow_launch_uses_a_run_scoped_home",
+          "runtime::deepseek_harness::tests::workflow_steps_get_isolated_homes_and_overlays",
+          "runtime::deepseek_harness::tests::yaml_scalar_quotes_model_and_url"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "himind_input_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::deepseek_harness::headless_input_tests:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::deepseek_harness::headless_input_tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 2391,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_input_contract-1794552466213086100.log",
+        "sha256": "689ceedc092f3961f2ef597dc8200921b71cd8456f74974786b655c4f4a393ed",
+        "test_count": 4,
+        "passed_test_count": 4,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_failed_spawn_cleans_up_and_does_not_expose_prompt",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_roundtrips_large_unicode_and_shell_literals_without_206",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_unread_large_request_remains_cancelable",
+          "runtime::deepseek_harness::headless_input_tests::headless_stdin_unread_large_request_remains_timeout_bounded"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "workflow_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe workflow:: --skip workflow::runtime:: --skip receipt_recovery_restart_worker --skip cancel_projection_process_worker --skip executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "workflow::",
+          "--skip",
+          "workflow::runtime::",
+          "--skip",
+          "receipt_recovery_restart_worker",
+          "--skip",
+          "cancel_projection_process_worker",
+          "--skip",
+          "executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 18156,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_contract-1794552456321737900.log",
+        "sha256": "acf40649ae10b46803d31c7ede05235af82b6210faef9f65cf7b99a9c26e2ad6",
+        "test_count": 166,
+        "passed_test_count": 166,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "workflow::authoring::tests::capability_test_allows_unavailable_workbench_capability_with_release_warning",
+          "workflow::authoring::tests::capability_test_blocks_when_workflow_preflight_is_not_ready",
+          "workflow::authoring::tests::capability_test_records_workflow_environment_binding",
+          "workflow::authoring::tests::local_dependency_version_gap_warns_but_release_is_strict",
+          "workflow::authoring::tests::optional_dependency_declared_as_object_does_not_block_the_lock",
+          "workflow::authoring::tests::preflight_environment_errors_are_local_warnings_but_contract_errors_block",
+          "workflow::authoring::tests::restaging_a_submitted_candidate_requires_a_new_version",
+          "workflow::authoring::tests::restaging_rebuilds_an_unsubmitted_candidate_when_the_source_changes",
+          "workflow::authoring::tests::saves_and_tests_an_immutable_workflow_candidate",
+          "workflow::authoring::tests::test_blocks_when_a_required_plugin_dependency_cannot_be_resolved",
+          "workflow::authoring::tests::test_rejects_source_changes_after_candidate_creation",
+          "workflow::candidate::tests::agent_metadata_does_not_change_candidate_identity",
+          "workflow::candidate::tests::freezes_clean_git_head",
+          "workflow::candidate::tests::rejects_dirty_workspace_when_disallowed",
+          "workflow::condition::tests::evaluates_structured_conditions_without_scripts",
+          "workflow::condition::tests::missing_path_fails_for_leaf_conditions",
+          "workflow::connector::tests::authenticated_http_health_check_injects_credential_header",
+          "workflow::connector::tests::executes_http_health_check_against_real_local_listener",
+          "workflow::connector::tests::rejects_direct_credential_target_input",
+          "workflow::connector::tests::validates_and_executes_restricted_http_health_checks",
+          "workflow::connector::tests::validates_connector_credentials",
+          "workflow::contract::tests::builds_static_dry_run_for_segmented_wechat_workflow",
+          "workflow::contract::tests::dry_run_summarizes_declared_roles",
+          "workflow::contract::tests::role_config_is_reported_with_effective_execution_settings",
+          "workflow::contract::tests::role_fixture_package_declares_a_full_software_team",
+          "workflow::executor::tests::keeps_only_declared_properties_for_step_scoped_input",
+          "workflow::executor::tests::parses_workflow_artifacts_and_usage",
+          "workflow::executor::tests::redacts_resolved_connector_secret_values_from_output",
+          "workflow::executor::tests::removes_credential_handles_from_capability_input",
+          "workflow::executor::tests::resolves_nested_input_templates_for_capability_steps",
+          "workflow::executor::tests::strips_context_for_strict_builtin_schemas",
+          "workflow::metrics::tests::aggregates_top_level_and_rework_runs",
+          "workflow::metrics::tests::counts_delegated_child_runs_as_teamwork_not_rework",
+          "workflow::metrics::tests::legacy_child_runs_without_parent_kind_stay_rework",
+          "workflow::preflight::tests::accepts_available_capability_and_tool",
+          "workflow::preflight::tests::auto_runtime_accepts_any_available_candidate",
+          "workflow::preflight::tests::blocks_missing_capability_and_tool",
+          "workflow::preflight::tests::codex_full_access_preflight_requires_ready_provider_and_still_rejects_files_only",
+          "workflow::preflight::tests::condition_disabled_step_is_not_validated",
+          "workflow::preflight::tests::condition_step_is_validated_once_run_input_enables_it",
+          "workflow::preflight::tests::connector_credential_preflight_exposes_configured_and_missing_handles",
+          "workflow::preflight::tests::connector_credential_target_covers_required_property",
+          "workflow::preflight::tests::connector_health_probe_failure_blocks_preflight",
+          "workflow::preflight::tests::connector_health_probe_filters_input_and_records_success",
+          "workflow::preflight::tests::connector_health_probe_rejects_mutating_target",
+          "workflow::preflight::tests::connector_http_health_probe_records_real_response",
+          "workflow::preflight::tests::explicit_runtime_provider_must_be_ready",
+          "workflow::preflight::tests::files_only_preflight_checks_inherited_role_provider_and_builtin_availability",
+          "workflow::preflight::tests::launch_form_field_covers_capability_required_property",
+          "workflow::preflight::tests::launch_form_field_mapping_covers_renamed_capability_property",
+          "workflow::preflight::tests::managed_connector_health_uses_authenticated_dashboard_capability",
+          "workflow::preflight::tests::missing_skill_dependency_blocks_preflight",
+          "workflow::preflight::tests::network_disabled_runtime_requires_provider_isolation",
+          "workflow::preflight::tests::optional_provider_not_ready_does_not_block_the_run",
+          "workflow::preflight::tests::optional_skill_dependency_only_warns",
+          "workflow::preflight::tests::rejects_environment_lock_provider_drift",
+          "workflow::preflight::tests::runtime_and_manual_steps_have_explicit_executors",
+          "workflow::preflight::tests::strict_workflow_requires_optional_form_field_to_be_declared_required",
+          "workflow::preflight::tests::tool_policy_none_is_checked_against_the_resolved_runtime",
+          "workflow::preflight::tests::undeclared_allow_network_does_not_require_isolation",
+          "workflow::presets::tests::default_label_prefers_the_workspace_leaf",
+          "workflow::presets::tests::merge_override_survives_empty_or_non_object_input",
+          "workflow::presets::tests::overrides_only_replace_the_keys_they_carry",
+          "workflow::presets::tests::preset_ids_are_path_safe",
+          "workflow::runner::tests::a_step_can_degrade_instead_of_failing_the_run",
+          "workflow::runner::tests::a_step_failure_still_fails_the_run_by_default",
+          "workflow::runner::tests::candidate_binding_rejects_a_different_candidate_id",
+          "workflow::runner::tests::delegate_branches_run_concurrently",
+          "workflow::runner::tests::delegate_step_creates_one_child_run_per_branch",
+          "workflow::runner::tests::delegate_step_fails_when_too_few_branches_succeed",
+          "workflow::runner::tests::delegated_agents_receive_completed_parent_plan_outputs",
+          "workflow::runner::tests::delegated_child_run_is_not_counted_as_rework",
+          "workflow::runner::tests::execution_selection_is_stripped_from_child_input",
+          "workflow::runner::tests::executor_cancel_rebuild_preserves_comparable_cost_and_unknown_currency",
+          "workflow::runner::tests::executor_ordinary_runtime_runner_rejects_matching_truncated_and_negative_finals",
+          "workflow::runner::tests::executor_usage_replay_retry_restart_and_unknown_currency",
+          "workflow::runner::tests::executor_workflow_receipt_commit_crash_recovers_once_after_restart",
+          "workflow::runner::tests::fail_when_turns_successful_output_into_a_failed_step",
+          "workflow::runner::tests::failed_acceptance_does_not_require_attestation_fields",
+          "workflow::runner::tests::loop_executes_child_runs_until_exit_condition",
+          "workflow::runner::tests::passed_acceptance_requires_a_non_empty_responsibility_chain",
+          "workflow::runner::tests::passed_acceptance_requires_stable_tester_id",
+          "workflow::runner::tests::paused_run_stops_advancing_until_resumed",
+          "workflow::runner::tests::resume_does_not_bypass_approval_or_feedback_waits",
+          "workflow::runner::tests::retry_rejects_running_and_unknown_steps",
+          "workflow::runner::tests::retry_resets_target_and_downstream_only",
+          "workflow::runner::tests::retry_step_clears_approvals_and_requeues",
+          "workflow::runner::tests::run_steps_carry_the_declared_role",
+          "workflow::runner::tests::runner_blocks_at_approval_and_completes_after_approval",
+          "workflow::runner::tests::runner_preserves_cancellation_that_arrives_during_a_step",
+          "workflow::runner::tests::runner_preserves_negative_runtime_report_and_usage_while_remaining_failed",
+          "workflow::runner::tests::runner_records_artifacts_and_passes_prior_output_to_resumed_steps",
+          "workflow::runner::tests::runner_records_the_model_each_step_actually_used",
+          "workflow::runner::tests::runner_stops_on_step_failure",
+          "workflow::runner::tests::segmented_entrypoint_does_not_break_inner_loop",
+          "workflow::runner::tests::segmented_plan_requires_declared_seed_or_fact_for_entry_requirements",
+          "workflow::runner::tests::segmented_run_executes_only_the_selected_subgraph",
+          "workflow::runner::tests::sequential_delegate_does_not_overlap_shared_writers",
+          "workflow::runner::tests::skipped_dependency_satisfies_downstream_step",
+          "workflow::runner::tests::step_evidence_is_recorded_and_collectable",
+          "workflow::runner::tests::step_input_snapshot_keeps_shape_without_values",
+          "workflow::runner::tests::strict_artifact_requires_matching_sha256",
+          "workflow::runner::tests::strict_artifact_schema_rejects_invalid_content",
+          "workflow::runner::tests::verify_rejects_modified_acceptance_evidence",
+          "workflow::store::tests::changed_content_for_same_version_is_rejected",
+          "workflow::store::tests::checksum_mismatch_is_rejected",
+          "workflow::store::tests::dependency_digest_ignores_packaging_metadata",
+          "workflow::store::tests::dependency_payload_digest_is_independent_of_install_route",
+          "workflow::store::tests::development_install_overrides_then_restores_the_release",
+          "workflow::store::tests::development_only_install_is_removed_without_a_release",
+          "workflow::store::tests::install_accepts_optional_detected_runtime_in_environment_lock",
+          "workflow::store::tests::install_list_disable_and_remove",
+          "workflow::store::tests::install_rejects_a_missing_locked_dependency",
+          "workflow::store::tests::install_rejects_environment_lock_with_undeclared_capability",
+          "workflow::store::tests::install_requires_a_release_lock_from_a_managed_catalog",
+          "workflow::store::tests::loads_an_exact_installed_version_after_upgrade",
+          "workflow::store::tests::malformed_signature_metadata_is_rejected",
+          "workflow::store::tests::reinstall_replaces_packaging_metadata_for_identical_content",
+          "workflow::store::tests::repeated_install_is_idempotent",
+          "workflow::store::tests::require_signature_rejects_package_without_checksums",
+          "workflow::store::tests::require_signature_rejects_package_without_signature",
+          "workflow::store::tests::retiring_a_workflow_clears_its_directory_ledger_and_provenance",
+          "workflow::store::tests::rollback_keeps_installation_when_target_version_is_unreadable",
+          "workflow::store::tests::rollback_restores_the_matching_release_lock_metadata",
+          "workflow::store::tests::run_interaction_rejects_package_content_replacement",
+          "workflow::store::tests::unreadable_package_is_reported_as_an_issue",
+          "workflow::store::tests::valid_signature_allows_required_install",
+          "workflow::tests::accepts_bounded_development_loop",
+          "workflow::tests::accepts_runtime_step_and_condition_contracts",
+          "workflow::tests::candidate_requires_one_freeze_step",
+          "workflow::tests::declaring_model_requires_an_explicit_provider",
+          "workflow::tests::execution_override_can_lower_loop_rounds_but_not_raise_them",
+          "workflow::tests::execution_override_can_only_tighten_risk_boundaries",
+          "workflow::tests::execution_override_can_raise_rounds_up_to_the_declared_limit",
+          "workflow::tests::execution_override_rejects_rounds_above_the_declared_limit",
+          "workflow::tests::execution_override_rejects_unknown_steps_and_bad_values",
+          "workflow::tests::launch_defaults_fill_missing_input_for_every_entrypoint",
+          "workflow::tests::legacy_loop_without_limit_keeps_lowering_only",
+          "workflow::tests::loads_wechat_experience_upload_package",
+          "workflow::tests::loop_limit_must_not_be_below_default",
+          "workflow::tests::model_alias_requires_a_namespace_prefix",
+          "workflow::tests::model_override_follows_the_declared_provider_namespace",
+          "workflow::tests::provider_and_model_overrides_apply_to_every_delegate_branch",
+          "workflow::tests::rejects_custom_ui_path_escape",
+          "workflow::tests::rejects_invalid_declarative_ui_field_type",
+          "workflow::tests::rejects_loop_without_iteration_condition",
+          "workflow::tests::rejects_missing_asset",
+          "workflow::tests::rejects_model_fallbacks_across_namespaces",
+          "workflow::tests::rejects_role_with_invalid_model_alias",
+          "workflow::tests::rejects_runtime_step_timeout_above_one_day",
+          "workflow::tests::rejects_runtime_step_with_invalid_model_alias",
+          "workflow::tests::rejects_step_dependency_cycles",
+          "workflow::tests::role_id_is_optional_but_validated",
+          "workflow::tests::runtime_provider_override_respects_declared_providers",
+          "workflow::tests::segmented_workflow_requires_declared_entry_and_exit_steps",
+          "workflow::tests::shipped_engine_build_workflow_waits_for_the_build",
+          "workflow::tests::strict_workflow_rejects_custom_entrypoints_and_exits",
+          "workflow::tests::ui_craft_team_is_a_review_confirm_delegate_acceptance_loop",
+          "workflow::tests::workflow_dependency_declarations_accept_string_and_object_forms",
+          "workflow::tests::workflow_dependency_declarations_reject_invalid_entries",
+          "workflow::tests::workflow_icon_is_optional_and_package_local",
+          "workflow::tests::workflow_package_future_schema_version_fails_closed",
+          "workflow::tests::workflow_package_unknown_fields_fail_closed",
+          "workflow::tests::workflow_package_v1_current_product_remains_compatible",
+          "workflow::tests::workflow_package_v1_legacy_fixture_remains_compatible",
+          "workflow::tests::workflow_view_accepts_theme_metadata_and_query_budget"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "acp_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::acp::tests:: --skip real_acp_catalog_probe --skip real_acp_executor_smoke --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "runtime::acp::tests::",
+          "--skip",
+          "real_acp_catalog_probe",
+          "--skip",
+          "real_acp_executor_smoke",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 578,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\acp_contract-1794552474477617700.log",
+        "sha256": "a9c963766dff7dffdc7177e17613bbcab2a0af4ca82fa1c75f82b5b312f2bd69",
+        "test_count": 15,
+        "passed_test_count": 15,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "runtime::acp::tests::acp_trace_full_mode_includes_redacted_payload",
+          "runtime::acp::tests::acp_trace_off_writes_no_file",
+          "runtime::acp::tests::acp_trace_summary_keeps_methods_without_payload",
+          "runtime::acp::tests::acp_usage_preserves_actual_total_and_does_not_invent_cost",
+          "runtime::acp::tests::falls_back_to_id_when_category_is_missing",
+          "runtime::acp::tests::handshake_without_model_option_yields_none",
+          "runtime::acp::tests::mcp_spec_is_serialized_into_session_new",
+          "runtime::acp::tests::permission_policy_allows_once_only_when_explicit",
+          "runtime::acp::tests::permission_policy_cancels_without_a_matching_option",
+          "runtime::acp::tests::permission_policy_denies_by_default",
+          "runtime::acp::tests::picks_the_model_config_option_by_category",
+          "runtime::acp::tests::probe_executables_reports_preset_prerequisites",
+          "runtime::acp::tests::unavailable_acp_profiles_report_why",
+          "runtime::acp::tests::version_directory_is_parsed_for_release_names_only",
+          "runtime::acp::tests::versioned_cli_candidates_prefer_the_newest_release"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "mission_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe mission::store::tests:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "mission::store::tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 10390,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\mission_contract-1794552468605999500.log",
+        "sha256": "0ebb272f5d1a8feac886d63698b070c870d312bda845afcf5e80d83199a37e6d",
+        "test_count": 54,
+        "passed_test_count": 54,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "mission::store::tests::absolute_approval_must_match_a_selected_plan_path",
+          "mission::store::tests::absolute_task_paths_wait_for_explicit_approval",
+          "mission::store::tests::absolute_write_requires_separate_explicit_approval",
+          "mission::store::tests::assigned_roles_are_required_before_planning_and_override_imported_bindings",
+          "mission::store::tests::budget_extension_allows_explicit_proactive_increase_but_rejects_stale_plan",
+          "mission::store::tests::confirmation_binds_exact_plan_hash",
+          "mission::store::tests::declared_cost_limit_fails_closed_when_usage_does_not_report_cost",
+          "mission::store::tests::dependency_cycle_is_rejected",
+          "mission::store::tests::device_and_parent_absolute_paths_are_rejected",
+          "mission::store::tests::dispatch_budget_is_persisted_and_terminal",
+          "mission::store::tests::downstream_review_reopens_producer_then_requires_separate_reverification",
+          "mission::store::tests::event_cursor_returns_only_new_events",
+          "mission::store::tests::execution_binding_change_invalidates_plan_hash",
+          "mission::store::tests::execution_binding_rejects_unsupported_or_mismatched_assignments",
+          "mission::store::tests::executor_handoff_native_multihop_both_directions_preserves_failed_parents",
+          "mission::store::tests::exhausted_token_budget_can_be_extended_and_resumed_idempotently",
+          "mission::store::tests::failed_task_is_not_resurrected_as_ready",
+          "mission::store::tests::follow_up_tasks_cannot_add_unapproved_absolute_paths",
+          "mission::store::tests::follow_up_tasks_cannot_write_outside_confirmed_scope",
+          "mission::store::tests::follow_up_validation_requires_confirmed_scope",
+          "mission::store::tests::generated_plan_reassignment_rehashes_and_follow_up_keeps_selected_expert",
+          "mission::store::tests::handoff_is_idempotent_and_requires_the_exact_workflow_pin",
+          "mission::store::tests::implementation_cannot_pass_without_independent_verification",
+          "mission::store::tests::independently_verified_repair_unblocks_the_original_dependency",
+          "mission::store::tests::legacy_database_without_idempotency_column_reopens_and_migrates",
+          "mission::store::tests::mission_feedback_concurrent_replay_records_once",
+          "mission::store::tests::mission_feedback_context_limits_recent_count_and_serialized_text",
+          "mission::store::tests::mission_feedback_context_matches_repair_ancestors_across_pages_and_isolates_other_targets_and_plans",
+          "mission::store::tests::mission_feedback_is_append_only_idempotent_and_preserves_running_authority",
+          "mission::store::tests::mission_feedback_rejects_stale_unknown_canceled_terminal_and_unconfirmed_without_events",
+          "mission::store::tests::mission_feedback_request_conflicts_compare_all_fields_and_survive_reopen",
+          "mission::store::tests::parent_directory_segments_are_rejected",
+          "mission::store::tests::pause_resume_and_cancel_survive_reopen_without_reauthorizing_work",
+          "mission::store::tests::plan_change_invalidates_previous_confirmation",
+          "mission::store::tests::proactive_budget_extension_preserves_runtime_blocks_and_rejects_inflight_work",
+          "mission::store::tests::recheck_preserves_failures_requires_baseline_and_is_idempotent",
+          "mission::store::tests::repair_budget_counts_follow_up_tasks",
+          "mission::store::tests::resuming_manually_paused_over_budget_mission_records_exhaustion_and_allows_extension",
+          "mission::store::tests::review_rework_covers_historical_repairs_but_requires_downstream_revision_order",
+          "mission::store::tests::runtime_full_access_requires_plan_confirmation_and_persists_recovery_choice",
+          "mission::store::tests::runtime_recovery_preserves_ready_task_and_is_bound_to_current_plan",
+          "mission::store::tests::runtime_recovery_respects_cancellation_and_expired_budget",
+          "mission::store::tests::selected_task_requires_selected_dependency",
+          "mission::store::tests::snapshot_global_sequence_gaps_from_other_missions_are_complete",
+          "mission::store::tests::snapshot_pagination_keeps_delivery_cursor_lossless_after_10000_events",
+          "mission::store::tests::source_retry_uses_first_dispatch_and_keeps_baseline_after_10000_events",
+          "mission::store::tests::token_budget_fails_closed_without_usage_evidence",
+          "mission::store::tests::token_budget_uses_actual_usage_and_stops_before_next_dispatch",
+          "mission::store::tests::unconfirmed_mission_never_exposes_ready_tasks",
+          "mission::store::tests::unknown_usage_can_be_reconciled_without_losing_history_or_double_counting",
+          "mission::store::tests::usage_recording_is_idempotent_per_run",
+          "mission::store::tests::verification_rejects_stale_implementation_run",
+          "mission::store::tests::verification_rejects_unadmitted_run",
+          "mission::store::tests::workspace_claim_is_idempotent_persistent_and_exclusive"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "workflow_runtime",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe workflow::runtime:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "workflow::runtime::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 26547,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_runtime-1794552452992370100.log",
+        "sha256": "6c0e08f9a5889aa4d7bfe6a618ebcab33655dc131d359a1d978305c50b7fba00",
+        "test_count": 36,
+        "passed_test_count": 36,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "workflow::runtime::tests::acp_model_alias_is_split_and_provider_matched",
+          "workflow::runtime::tests::auto_never_resolves_to_a_runtime_that_cannot_enforce_tool_none",
+          "workflow::runtime::tests::cli_model_alias_is_forwarded_to_the_matching_cli",
+          "workflow::runtime::tests::codex_cli_cancel_after_recoverable_notification_remains_canceled",
+          "workflow::runtime::tests::codex_cli_cancel_wins_over_emitted_final_and_exit",
+          "workflow::runtime::tests::codex_cli_exited_root_with_inherited_pipes_does_not_block_dispatch",
+          "workflow::runtime::tests::codex_cli_final_protocol_and_shutdown_are_fail_closed",
+          "workflow::runtime::tests::codex_cli_recoverable_error_keeps_working_past_shutdown_grace",
+          "workflow::runtime::tests::codex_cli_recoverable_notification_obeys_execution_timeout",
+          "workflow::runtime::tests::codex_cli_recoverable_notifications_zero_exit_without_bound_final_is_rejected",
+          "workflow::runtime::tests::codex_cli_turn_failed_after_notification_still_has_bounded_shutdown",
+          "workflow::runtime::tests::codex_completion_completed_requires_prior_final_for_shutdown",
+          "workflow::runtime::tests::codex_completion_error_notification_is_not_terminal",
+          "workflow::runtime::tests::codex_control_protocol_requires_object_event_item_and_error",
+          "workflow::runtime::tests::codex_failure_classification_retains_no_arbitrary_error_message",
+          "workflow::runtime::tests::codex_protocol_projects_large_tool_output_and_validates_its_tail",
+          "workflow::runtime::tests::codex_terminal_protocol_requires_complete_agent_message_and_turn",
+          "workflow::runtime::tests::codex_workflow_access_preserves_read_only_verification_and_explicit_full_access",
+          "workflow::runtime::tests::executor_discovery_cancel_and_timeout_do_not_launch_exec",
+          "workflow::runtime::tests::executor_prompt_transport_and_strict_payload",
+          "workflow::runtime::tests::executor_workflow_large_input_no_reader_cancel_timeout_and_output_first",
+          "workflow::runtime::tests::explicit_provider_is_never_rewritten_by_tool_policy",
+          "workflow::runtime::tests::files_only_policy_cannot_escalate_read_or_use_external_providers",
+          "workflow::runtime::tests::fixture_runtime_records_workspace_mutation_per_iteration",
+          "workflow::runtime::tests::full_access_requires_explicit_mode_and_preserves_read_and_files_only_limits",
+          "workflow::runtime::tests::model_namespace_must_match_the_runtime",
+          "workflow::runtime::tests::only_read_only_risk_steps_request_read_only_access",
+          "workflow::runtime::tests::rejects_network_disabled_policy_for_unisolated_provider",
+          "workflow::runtime::tests::resolves_runtime_workspace_from_input_path",
+          "workflow::runtime::tests::role_overrides_step_runtime_settings",
+          "workflow::runtime::tests::role_without_config_falls_back_to_step_settings",
+          "workflow::runtime::tests::runtime_context_redacts_secret_like_values",
+          "workflow::runtime::tests::runtime_payload_parses_fenced_json",
+          "workflow::runtime::tests::steps_with_input_artifacts_drop_upstream_outputs_from_the_prompt",
+          "workflow::runtime::tests::tool_policy_none_requires_a_provider_that_can_honor_it",
+          "workflow::runtime::tests::undeclared_role_id_does_not_break_execution"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "dispatch_contract",
+        "command": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe app::mission_dispatch::tests:: --nocapture --test-threads=1",
+        "argv": [
+          "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind-lifecycle-tests.exe",
+          "app::mission_dispatch::tests::",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_ms": 14516,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\dispatch_contract-1794552467312724300.log",
+        "sha256": "38c439f206d4ae12a902b7154e4d78dfc88aabf8910e0ce316d687e7b418daf6",
+        "test_count": 22,
+        "passed_test_count": 22,
+        "failed_test_count": 0,
+        "observed_tests": [
+          "app::mission_dispatch::tests::confirmed_full_access_reaches_codex_and_acp_task_runtime",
+          "app::mission_dispatch::tests::dispatch_verification_store_binds_current_run_and_latest_retry_after_10000_events",
+          "app::mission_dispatch::tests::executor_bidirectional_handoff_binds_run_hash_scope_permission_and_model_source",
+          "app::mission_dispatch::tests::implementation_input_separates_host_output_resources_from_business_approval",
+          "app::mission_dispatch::tests::implementation_prompt_deduplicates_without_feedback_and_preserves_constraints",
+          "app::mission_dispatch::tests::implementation_prompt_retains_distinct_original_step_values_and_nonobject_input",
+          "app::mission_dispatch::tests::mission_canceled_terminal_runner_error_finalizes_exact_attempt",
+          "app::mission_dispatch::tests::mission_cli_requires_complete_json_report_and_preserves_negative_failure",
+          "app::mission_dispatch::tests::mission_feedback_mcp_reaches_worker_and_independent_verifier_without_changing_bindings_or_scope",
+          "app::mission_dispatch::tests::mission_runtime_local_run_cancel_reaps_cli_tree_and_finishes_attempt",
+          "app::mission_dispatch::tests::mission_runtime_missing_run_binding_is_rejected_before_cli_spawn",
+          "app::mission_dispatch::tests::mission_runtime_pause_and_other_run_cancel_allow_negative_final",
+          "app::mission_dispatch::tests::negative_review_must_bind_the_task_plan_and_candidate",
+          "app::mission_dispatch::tests::task_package_uses_selected_expert_and_rejects_installed_digest_drift",
+          "app::mission_dispatch::tests::verification_evidence_requires_host_bound_identity_and_successful_checks",
+          "app::mission_dispatch::tests::verification_mutating_required_check_is_recorded_once_and_rejected",
+          "app::mission_dispatch::tests::verification_pause_during_check_does_not_admit_reviewer",
+          "app::mission_dispatch::tests::verification_prompt_bounds_unicode_and_unknown_manifests",
+          "app::mission_dispatch::tests::verification_prompt_compacts_manifests_without_changing_host_evidence",
+          "app::mission_dispatch::tests::verification_prompt_retains_bounded_protected_file_differences",
+          "app::mission_dispatch::tests::verification_provider_boundaries_preserve_read_only_risk_and_task_scope",
+          "app::mission_dispatch::tests::verification_read_only_required_check_still_completes"
+        ],
+        "assertions_passed": true,
+        "passed": true,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_frozen_candidate_current_execution"
+      },
+      {
+        "name": "required-result-final-1",
+        "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+        "argv": [
+          "python",
+          "-c",
+          "import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 219,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-result-final-1-1794552642614173400.log",
+        "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_exact_original_required_result_assertion",
+        "outcome": "failed_readiness_assertion_not_waived"
+      },
+      {
+        "name": "required-result-final-2",
+        "command": "python -c \"import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+        "argv": [
+          "python",
+          "-c",
+          "import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 500,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-result-final-2-1794552642838553000.log",
+        "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_exact_original_required_result_assertion",
+        "outcome": "failed_readiness_assertion_not_waived"
+      }
+    ],
+    "limitations": [
+      {
+        "id": "LIVE-HIMIND",
+        "blocking": true,
+        "summary": "本轮未执行当前候选真实HiMind任务；缺少可在本任务资源内使用的既有签名入口/连接。worker没有获配网关地址/凭据，不读取全局配置或启动默认宿主账本任务来绕开资源约束。"
+      },
+      {
+        "id": "LIVE-MIXED-HANDOFF",
+        "blocking": true,
+        "summary": "真实双向模型任务交接及HiMind launch/resume增量缺失；隔离产品多跳fixture和历史HiMind运行不替代本轮真实执行。"
+      },
+      {
+        "id": "HOST-727-RAW",
+        "blocking": true,
+        "summary": "727原始输出不在已提供授权输入/本任务资源中。已准确记录三个1和空test_summary；独立定位本轮入口负面门禁与实际产品回归缺陷，不能据此声称727具体断言原因已证实。"
+      },
+      {
+        "id": "ENTRY-EVIDENCE-BOUNDARIES",
+        "blocking": false,
+        "summary": "AC-05是真实WorkflowRunner.cancel及OS子进程终止/独立重启；旧版覆盖分支是显式注入。capability/service MCP参数查找仅源码审阅。Workflow receipt-commit及AgentRun完整managed/claim/caller使用helper错误注入；AgentRun完整路径为loopback API/CLI fixture，独立重启helper另行覆盖，不称真实远程生产验收。"
+      },
+      {
+        "id": "PLATFORM",
+        "blocking": false,
+        "summary": "Windows专属测试本轮在Windows实际运行；不宣称其他平台具备相同Job保证。活动成员+未关闭输出按失败处理；已干净EOF后仍回收Job成员。"
+      },
+      {
+        "id": "RECONCILIATION-COST",
+        "blocking": false,
+        "summary": "启动恢复扫描所有已完成绑定，包括已ACK项，增加I/O；重复与并发按持久快照重建，保持单receipt事件。"
+      },
+      {
+        "id": "STAGE-BOUNDARY",
+        "blocking": false,
+        "summary": "未调用独立QA、宿主正式VERIFY、最终复核或部署。这些属于后续阶段，未将尚未发生的正式VERIFY作为当前false原因。"
+      }
+    ],
+    "test_summary": {
+      "classification": "this_task_final_candidate_deterministic_product_tests",
+      "executions": 411,
+      "unique_observed_test_names": 406,
+      "passed_executions": 411,
+      "failed_executions": 0,
+      "ignored_count": 0,
+      "all_product_groups_passed": true,
+      "all_required_checks_passed": false,
+      "required_entry_elapsed_ms": 29828,
+      "per_group": [
+        {
+          "name": "effective-build-configuration",
+          "test_count": 0,
+          "passed_test_count": null,
+          "failed_test_count": null,
+          "exit_code": 0,
+          "elapsed_ms": 219,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\effective-build-configuration-1794552452766013200.log"
+        },
+        {
+          "name": "runtime_contract",
+          "test_count": 5,
+          "passed_test_count": 5,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 891,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\runtime_contract-1794552452992370100.log"
+        },
+        {
+          "name": "lineage",
+          "test_count": 2,
+          "passed_test_count": 2,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 1578,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\lineage-1794552453889633800.log"
+        },
+        {
+          "name": "usage",
+          "test_count": 6,
+          "passed_test_count": 6,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 860,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\usage-1794552455461977500.log"
+        },
+        {
+          "name": "ownership_windows",
+          "test_count": 3,
+          "passed_test_count": 3,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 6047,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\ownership_windows-1794552452992370100.log"
+        },
+        {
+          "name": "cancel_projection",
+          "test_count": 1,
+          "passed_test_count": 1,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 2828,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\cancel_projection-1794552459049200700.log"
+        },
+        {
+          "name": "process_contract",
+          "test_count": 8,
+          "passed_test_count": 8,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 2344,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\process_contract-1794552461867923800.log"
+        },
+        {
+          "name": "himind_stdin",
+          "test_count": 4,
+          "passed_test_count": 4,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 2000,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_stdin-1794552464208688900.log"
+        },
+        {
+          "name": "codex_contract",
+          "test_count": 11,
+          "passed_test_count": 11,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 13344,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\codex_contract-1794552452992370100.log"
+        },
+        {
+          "name": "himind_runtime_contract",
+          "test_count": 74,
+          "passed_test_count": 74,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 969,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_runtime_contract-1794552466339040400.log"
+        },
+        {
+          "name": "himind_input_contract",
+          "test_count": 4,
+          "passed_test_count": 4,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 2391,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\himind_input_contract-1794552466213086100.log"
+        },
+        {
+          "name": "workflow_contract",
+          "test_count": 166,
+          "passed_test_count": 166,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 18156,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_contract-1794552456321737900.log"
+        },
+        {
+          "name": "acp_contract",
+          "test_count": 15,
+          "passed_test_count": 15,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 578,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\acp_contract-1794552474477617700.log"
+        },
+        {
+          "name": "mission_contract",
+          "test_count": 54,
+          "passed_test_count": 54,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 10390,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\mission_contract-1794552468605999500.log"
+        },
+        {
+          "name": "workflow_runtime",
+          "test_count": 36,
+          "passed_test_count": 36,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 26547,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_runtime-1794552452992370100.log"
+        },
+        {
+          "name": "dispatch_contract",
+          "test_count": 22,
+          "passed_test_count": 22,
+          "failed_test_count": 0,
+          "exit_code": 0,
+          "elapsed_ms": 14516,
+          "timed_out": false,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\dispatch_contract-1794552467312724300.log"
+        }
+      ],
+      "domains": {
+        "lineage": {
+          "required_scenarios": 3,
+          "executed_required_scenarios": 3,
+          "test_count": 3,
+          "assertions_passed": true,
+          "execution_records": [
+            {
+              "name": "lineage",
+              "elapsed_ms": 1578,
+              "exit_code": 0,
+              "suite_test_count": 2,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\lineage-1794552453889633800.log"
+            },
+            {
+              "name": "mission_contract",
+              "elapsed_ms": 10390,
+              "exit_code": 0,
+              "suite_test_count": 54,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\mission_contract-1794552468605999500.log"
+            },
+            {
+              "name": "dispatch_contract",
+              "elapsed_ms": 14516,
+              "exit_code": 0,
+              "suite_test_count": 22,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\dispatch_contract-1794552467312724300.log"
+            }
+          ]
+        },
+        "ownership_windows": {
+          "required_scenarios": 3,
+          "executed_required_scenarios": 3,
+          "test_count": 3,
+          "assertions_passed": true,
+          "execution_records": [
+            {
+              "name": "ownership_windows",
+              "elapsed_ms": 6047,
+              "exit_code": 0,
+              "suite_test_count": 3,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\ownership_windows-1794552452992370100.log"
+            }
+          ]
+        },
+        "usage": {
+          "required_scenarios": 6,
+          "executed_required_scenarios": 6,
+          "test_count": 6,
+          "assertions_passed": true,
+          "execution_records": [
+            {
+              "name": "usage",
+              "elapsed_ms": 860,
+              "exit_code": 0,
+              "suite_test_count": 6,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\usage-1794552455461977500.log"
+            }
+          ]
+        },
+        "compatibility_and_input": {
+          "required_scenarios": 6,
+          "executed_required_scenarios": 6,
+          "test_count": 6,
+          "assertions_passed": true,
+          "execution_records": [
+            {
+              "name": "codex_contract",
+              "elapsed_ms": 13344,
+              "exit_code": 0,
+              "suite_test_count": 11,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\codex_contract-1794552452992370100.log"
+            },
+            {
+              "name": "workflow_runtime",
+              "elapsed_ms": 26547,
+              "exit_code": 0,
+              "suite_test_count": 36,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_runtime-1794552452992370100.log"
+            }
+          ]
+        },
+        "receipt_delivery": {
+          "required_scenarios": 6,
+          "executed_required_scenarios": 6,
+          "test_count": 6,
+          "assertions_passed": true,
+          "execution_records": [
+            {
+              "name": "cancel_projection",
+              "elapsed_ms": 2828,
+              "exit_code": 0,
+              "suite_test_count": 1,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\cancel_projection-1794552459049200700.log"
+            },
+            {
+              "name": "codex_contract",
+              "elapsed_ms": 13344,
+              "exit_code": 0,
+              "suite_test_count": 11,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\codex_contract-1794552452992370100.log"
+            },
+            {
+              "name": "workflow_contract",
+              "elapsed_ms": 18156,
+              "exit_code": 0,
+              "suite_test_count": 166,
+              "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\workflow_contract-1794552456321737900.log"
+            }
+          ]
+        },
+        "real_codex": {
+          "classification": "current_candidate_worker_live_execution_revalidated",
+          "test_count": 1,
+          "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor\\live-codex-e69d1c19811b62f4\\result.json",
+          "sha256": "e2a0817e60c011023fde6ab26a69f3d4b7b53aef1770f4a0aff83166c968845b",
+          "assertions_passed": true
+        },
+        "real_himind": {
+          "classification": "not_executed",
+          "test_count": 0,
+          "assertions_passed": false
+        }
+      },
+      "real_codex_preparation_test_count": 1
+    },
+    "source_review": {
+      "classification": "this_task_rechecked_source_not_live_billing_incident",
+      "before_sha256": {
+        "src/capability/service.rs": "1eee8e8463b5c76c6cafc11d9a0118b5248f3cf1290c13ed87fd89eaa78974e1",
+        "src/runtime/codex_usage_delivery.rs": "55c5f0ba3c994bf6498a833c56f963052395eed55541e8e2139836a9c4e5670d",
+        "src/store/local_runs.rs": "56b20cfbf0b98412d493d683e3ba4d00349d260023068888c044cf95e72099ba",
+        "src/workflow/runner.rs": "ca8eadb8c149ff5319e5e6f61b48f07958df5d87a9eb9de688e2668e893e54f4"
+      },
+      "all_match_724": true,
+      "write_boundary": "src/store and capability/service not modified; repair implemented in runtime delivery and WorkflowRunner cancel",
+      "final_sha256": {
+        "src/capability/service.rs": "1eee8e8463b5c76c6cafc11d9a0118b5248f3cf1290c13ed87fd89eaa78974e1",
+        "src/runtime/codex_usage_delivery.rs": "5ace16c913b81b52e8103a16fe49a9e84d76fae7a8988a9a5835717a97692f52",
+        "src/store/local_runs.rs": "56b20cfbf0b98412d493d683e3ba4d00349d260023068888c044cf95e72099ba",
+        "src/workflow/runner.rs": "57e64999bc53f9dddac09b1a1f0540527e2e40bea11c91e784165b1cdc55c45d"
+      },
+      "src_store_unchanged": true
+    },
+    "coverage_classification": {
+      "AC-05": "actual WorkflowRunner.cancel entry, deterministic commit hooks, real child termination and separate restart process; legacy stale overwrite explicitly injected; MCP service lookup reviewed only",
+      "exact_ABC": "actual AgentRun invocation/Codex transport, A real subprocess death before receipt, stale identity rejected before spawn",
+      "Workflow_U2-02": "AFTER_COMMIT helper error then separate recovery process; not real process death",
+      "AgentRun_U2-02_existing": "caller boundary helper plus separate restart process; no full remote claim coverage",
+      "AgentRun_U2-02_new": "full execute_managed/claim/execute_claimed/caller with loopback HTTP/CLI fixture; helper error injection, not live remote service",
+      "Windows": "actual Windows product paths and independent owned test descendant observations; no other platform claim",
+      "mixed_handoff": "nonempty accepted-leaf/native events/restricted artifact are isolated product fixtures; real two-model handoff still required"
+    },
+    "historical_host_observations": [
+      {
+        "event_id": "mission_1794473598404_ffe1e069:727",
+        "classification": "supplied_current_failure_baseline_not_local_execution",
+        "checks": [
+          {
+            "exit_code": 1,
+            "elapsed_ms": 43041,
+            "output_sha256": "59fe2929d37a78cefcadd8fd76de6470043e94803b87e9c434fc8e05d9bda87f",
+            "test_summary": ""
+          },
+          {
+            "exit_code": 1,
+            "elapsed_ms": 4125,
+            "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+            "test_summary": ""
+          },
+          {
+            "exit_code": 1,
+            "elapsed_ms": 3127,
+            "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+            "test_summary": ""
+          }
+        ],
+        "numeric_tap_total": null,
+        "raw_output_available": false
+      },
+      {
+        "event_id": "mission_1794473598404_ffe1e069:717",
+        "classification": "separate_supplied_historical_diagnostic_timeout",
+        "regression": {
+          "exit_code": -1,
+          "elapsed_ms": 62760,
+          "error": "terminated after exceeding 59 seconds",
+          "test_summary": ""
+        },
+        "remaining_checks": [
+          {
+            "exit_code": -1,
+            "elapsed_ms": 0,
+            "outcome": "not_executed_check_budget_exhausted",
+            "test_summary": ""
+          },
+          {
+            "exit_code": -1,
+            "elapsed_ms": 0,
+            "outcome": "not_executed_check_budget_exhausted",
+            "test_summary": ""
+          }
+        ],
+        "numeric_tap_total": null
+      }
+    ],
+    "historical_failure_diagnosis": {
+      "727": "Supplied current failing baseline only; raw log absent and numeric TAP unknown. No failing assertions inferred.",
+      "717": "Separate historical FOLLOW-UP timeout; remaining two commands did not execute.",
+      "this_task": "Fresh-root GetShortPathNameW initialization and root-exit inherited pipe failure were independently observed and repaired. Current entry executes all product domains and fails only the retained live HiMind gate. These observations do not authenticate a historical 727 assertion."
+    },
+    "budget_policy": {
+      "follow_up_total_seconds": 60,
+      "formal_verify_total": "min(mission_remaining,300s)",
+      "per_command": "min(remaining_total,300s)",
+      "entry_internal_seconds": 50
+    },
+    "fixtures": {
+      "fixed_cumulative_usage": {
+        "classification": "fixed_fixture_not_this_round_live",
+        "launch_raw": {
+          "input_tokens": 47224,
+          "output_tokens": 128
+        },
+        "resume_raw": {
+          "input_tokens": 95295,
+          "output_tokens": 480
+        },
+        "expected_increment": {
+          "input_tokens": 48071,
+          "output_tokens": 352
+        }
+      },
+      "historical_48094_319": "Feedback observation only; not this-round measurement."
+    },
+    "real_codex": {
+      "evidence": "reports/executor/real-codex-lifecycle.json",
+      "source_evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor\\live-codex-e69d1c19811b62f4\\result.json",
+      "source_sha256": "e2a0817e60c011023fde6ab26a69f3d4b7b53aef1770f4a0aff83166c968845b",
+      "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+      "classification": "this_task_current_frozen_candidate_real_model_launch_resume",
+      "cwd": "\\\\?\\C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor\\live-codex-e69d1c19811b62f4",
+      "permission": "danger-full-access",
+      "model_source": "personal_cli_config",
+      "launch_raw": {
+        "input_tokens": 47280,
+        "output_tokens": 142,
+        "cached_input_tokens": 27331,
+        "reasoning_output_tokens": 0
+      },
+      "resume_raw": {
+        "input_tokens": 95164,
+        "output_tokens": 322,
+        "cached_input_tokens": 66215,
+        "reasoning_output_tokens": 0
+      },
+      "resume_trusted_increment": {
+        "input_tokens": 47884,
+        "output_tokens": 180,
+        "cached_input_tokens": 38884,
+        "reasoning_output_tokens": 0
+      },
+      "counter_scope": "provider_session_cumulative",
+      "cost": null,
+      "cost_status": "unknown",
+      "primary_model_and_service_overrides_empty": true
+    },
+    "real_himind": {
+      "classification": "not_executed",
+      "test_count": 0,
+      "required_binding": {
+        "service_id": "lucen",
+        "model": "himind:lucen:gpt-6.1-sol"
+      },
+      "historical_evidence_only": [
+        "reports/executor/observed-himind-refresh.json",
+        "reports/executor/observed-failed-himind-run.json"
+      ]
+    },
+    "intermediate_evidence": [
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\negative-stale-cache.json",
+        "sha256": "812b790c99420001918e73c62f2fd90f3a7f5d2d36b49fc4a8e8de6ca3733594",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      },
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\pre-split-checks.json",
+        "sha256": "1b6f819da0ce69ac32c7e8baf60020018895dc1a2354737bd98b1eb5c5526c01",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      },
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\pre-root-close-checks.json",
+        "sha256": "d90fe222150abe1f7b8b0716a29a9a2056aa018af0cdaae0bca0283fb31ea77e",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      },
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-regression-delivery.json",
+        "sha256": "79baec7548942da8ba98799102a6eeda9f5d7a5cd742d7be219cafa89889c925",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      },
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\prepared-active-member-negative.json",
+        "sha256": "62d7a7f7f5347b389b5672e0b7bdafe67a9a2b861d02d86c3bebc621242c1a8b",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      },
+      {
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\focused-root-exit.json",
+        "sha256": "ee4bfe9fdd2c1163d1b986659ccd9a02a41da215417d5a72425f7c8907c3a705",
+        "classification": "this_task_intermediate_or_expected_negative; not_final_candidate_success"
+      }
+    ],
+    "resource_contract": {
+      "root": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95",
+      "authority": "host_owned_generated_outputs_only",
+      "business_source_authority": false,
+      "other_worker_cache_read": false,
+      "external_CONTROL_read": false
+    },
+    "host_formal_verify_invoked": false,
+    "independent_qa_invoked": false,
+    "deployment_invoked": false,
+    "required_check_outcomes": [
+      {
+        "name": "required-regression-final",
+        "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+        "argv": [
+          "python",
+          "scripts/remediation/executor-lifecycle-repair-checks.py"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 29828,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-regression-final-1794552452004283200.log",
+        "sha256": "1708a8c2c578a2572ec9b038fc30f67e473582379e508197cf0ff77986cd98e4",
+        "test_count": 411,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_final_frozen_candidate_original_required_check"
+      },
+      {
+        "name": "required-result-final-1",
+        "command": "python -c \"import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')\"",
+        "argv": [
+          "python",
+          "-c",
+          "import json; p=json.load(open('reports/executor/result.json',encoding='utf-8')); assert p.get('passed') is True; assert p.get('checks')"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 219,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-result-final-1-1794552642614173400.log",
+        "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_exact_original_required_result_assertion",
+        "outcome": "failed_readiness_assertion_not_waived"
+      },
+      {
+        "name": "required-result-final-2",
+        "command": "python -c \"import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)\"",
+        "argv": [
+          "python",
+          "-c",
+          "import json; from pathlib import Path; p=json.loads(Path('reports/executor/result.json').read_text(encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); assert any(c['command']=='python scripts/remediation/executor-lifecycle-repair-checks.py' and c['exit_code']==0 for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; roots=['src/runtime','src/mission','scripts','reports/executor','src/workflow']; files=['src/app/mission_dispatch.rs','src/app/mission_supervisor.rs','src/app/mission_commands.rs','src/agent_core_contracts.rs','docs/mixed-executor-runtime.md','src/capability/service.rs']; assert all(isinstance(f,str) and '..' not in f.split('/') and (f in files or any(f.startswith(r+'/') for r in roots)) for f in fs)"
+        ],
+        "exit_code": 1,
+        "elapsed_ms": 500,
+        "timed_out": false,
+        "evidence": "C:\\Users\\Administrator\\AppData\\Local\\HiMindAgent\\cache\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\2b537ac6f0e09e9e47e21bdeac19b748cdcdfb26a158cb78fa5b60f401bfaf95\\executor-lifecycle-repair\\required-result-final-2-1794552642838553000.log",
+        "sha256": "0e435cb95b38438426c72eb0920b4b02ac908246e0f95681e50f0a1f2741ed35",
+        "test_count": 0,
+        "candidate_id": "3b41749af4eb3db7d8f1bde5a0d84f606be2ec4460157512f56c936b2600b3b2",
+        "classification": "this_task_exact_original_required_result_assertion",
+        "outcome": "failed_readiness_assertion_not_waived"
+      }
+    ],
+    "required_total_elapsed_ms": 30547
+  }
+}

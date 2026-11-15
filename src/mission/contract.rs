@@ -157,6 +157,9 @@ pub(crate) struct MissionBudget {
     pub max_total_tokens: Option<u64>,
     #[serde(default)]
     pub max_cost: Option<f64>,
+    /// Explicit comparison unit. Legacy undeclared cost limits remain fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -176,6 +179,97 @@ pub(crate) struct MissionBudgetIncrease {
     pub unlimited_tokens: bool,
     #[serde(default)]
     pub additional_cost: Option<f64>,
+}
+
+/// Observations only. Evidence references are opaque strings, never path grants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionFeedbackInput {
+    pub request_id: String,
+    pub expected_plan_sha256: String,
+    pub target_task_ids: Vec<String>,
+    pub message: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionFeedbackSubmit {
+    pub mission_id: String,
+    pub input: MissionFeedbackInput,
+}
+
+impl MissionFeedbackInput {
+    pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
+        require_text("request_id", &self.request_id, 200)?;
+        require_sha256(&self.expected_plan_sha256)?;
+        if !(1..=8).contains(&self.target_task_ids.len()) {
+            return Err("target_task_ids must contain 1..8 unique tasks".into());
+        }
+        let mut seen = HashSet::new();
+        for id in &self.target_task_ids {
+            require_id("target_task_ids", id)?;
+            if !seen.insert(id) { return Err("target_task_ids must be unique".into()); }
+        }
+        // Review notes may contain line breaks; preserve the exact payload.
+        if self.message.trim().is_empty() || self.message.chars().count() > 8_000
+            || self.message.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+            return Err("message must contain 1..8000 characters of review text".into());
+        }
+        if self.evidence_refs.len() > 16 { return Err("evidence_refs exceeds 16 items".into()); }
+        for reference in &self.evidence_refs { require_text("evidence_refs", reference, 1_024)?; }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    fn input() -> MissionFeedbackInput {
+        MissionFeedbackInput { request_id: "review".into(), expected_plan_sha256: "a".repeat(64),
+            target_task_ids: vec!["task-1".into()], message: "待核实\nsecond line".into(), evidence_refs: vec![] }
+    }
+
+    #[test]
+    fn mission_feedback_contract_enforces_character_and_collection_bounds() {
+        let mut maximum = input();
+        maximum.request_id = "界".repeat(200);
+        maximum.message = "界".repeat(8_000);
+        maximum.target_task_ids = (0..8).map(|n| format!("task-{n}")).collect();
+        maximum.evidence_refs = vec!["界".repeat(1_024); 16];
+        maximum.validate().unwrap();
+        for field in ["request", "message", "targets", "refs", "reference", "duplicate", "empty_targets", "empty_message", "blank_message", "blank_request", "hash", "control"] {
+            let mut invalid = maximum.clone();
+            match field {
+                "request" => invalid.request_id.push('界'),
+                "message" => invalid.message.push('界'),
+                "targets" => invalid.target_task_ids.push("task-9".into()),
+                "refs" => invalid.evidence_refs.push("extra".into()),
+                "reference" => invalid.evidence_refs[0].push('界'),
+                "duplicate" => invalid.target_task_ids[1] = invalid.target_task_ids[0].clone(),
+                "empty_targets" => invalid.target_task_ids.clear(),
+                "empty_message" => invalid.message.clear(),
+                "blank_message" => invalid.message = " \n\t".into(),
+                "blank_request" => invalid.request_id = " ".into(),
+                "hash" => invalid.expected_plan_sha256 = "z".repeat(64),
+                _ => invalid.message = "note\0injection".into(),
+            }
+            assert!(invalid.validate().is_err(), "{field}");
+        }
+        input().validate().unwrap();
+    }
+
+    #[test]
+    fn mission_feedback_contract_rejects_unknown_envelope_and_input_fields() {
+        let valid = serde_json::json!({"mission_id":"mission-test","input":input()});
+        serde_json::from_value::<MissionFeedbackSubmit>(valid.clone()).unwrap();
+        let mut invalid = valid.clone(); invalid["approve_paths"] = serde_json::json!(["C:/private"]);
+        assert!(serde_json::from_value::<MissionFeedbackSubmit>(invalid).is_err());
+        let mut invalid = valid; invalid["input"]["passed"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MissionFeedbackSubmit>(invalid).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -369,6 +463,27 @@ pub(crate) struct MissionTaskView {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct MissionCostUsage {
+    pub buckets: std::collections::BTreeMap<String, f64>,
+    pub unknown_runs: u64,
+    pub comparable: bool,
+}
+
+/// Additive v1 DTO shared by list, inbox and detail; never grants permission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct MissionEffectiveWait {
+    pub contract_version: String,
+    pub plan_sha256: String,
+    pub cursor: u64,
+    pub reason: String,
+    pub actor: String,
+    pub budget_reason: Option<String>,
+    pub environment_blocked: bool,
+    pub can_increase_budget: bool,
+    pub can_resume: bool,
+}
+
 fn default_plan_mode() -> MissionPlanMode { MissionPlanMode::Generated }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -390,6 +505,10 @@ pub(crate) struct MissionView {
     #[serde(default)]
     pub proposed_tasks: Vec<MissionTaskSpec>,
     pub budget: Option<MissionBudget>,
+    #[serde(default)]
+    pub cost_usage: MissionCostUsage,
+    #[serde(default)]
+    pub effective_wait: Option<MissionEffectiveWait>,
     /// Accumulated usage from dispatched LocalRuns. `None` keeps the distinction
     /// between "not declared" and "not reported"; an empty struct is not used to
     /// imply that a Runtime consumed zero tokens.

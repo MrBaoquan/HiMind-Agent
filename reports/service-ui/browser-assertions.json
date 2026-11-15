@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "classification": "real-browser-production-components-with-mocked-api",
+  "checks": [
+    "five deep links and keyboard tabs",
+    "native nested modal focus/esc/restore",
+    "required-field error links",
+    "radio keyboard and pressed/current",
+    "save busy double-submit guard",
+    "health failure isolated from configuration",
+    "empty and filtered empty"
+  ],
+  "errors": []
+}

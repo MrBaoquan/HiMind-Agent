@@ -428,6 +428,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::test_mcp_server,
             super::commands::get_pending_approvals,
             super::commands::get_approval_history,
+            super::commands::get_mission_follow_up_review,
             super::commands::respond_approval,
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,

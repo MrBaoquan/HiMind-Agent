@@ -9569,6 +9569,7 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
 /// repairing here keeps the provider available after ordinary upgrades without
 /// requiring the user to repeat the import flow.
 pub(crate) fn reconcile_vscode_import(options: &Options) {
+    crate::store::ai_services::diagnose_startup();
     if !vscode_import_status_path(options).is_file() {
         return;
     }

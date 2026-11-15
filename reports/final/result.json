@@ -1,0 +1,2689 @@
+{
+  "schema_version": "mixed_remediation_final_review.v3",
+  "mission_id": "mission_1794473598404_ffe1e069",
+  "task_id": "repair-final-review-evidence-handoff-2",
+  "repair_of": "repair-final-review-readiness-1",
+  "role_id": "remediation.reviewer",
+  "expert": {
+    "expert_id": "com.himind.expert.project-architect",
+    "expert_version": "1.0.0",
+    "expert_digest": "sha256:88bb04bd2125cc4dc22ed8171e48b0318cdce19560563f4ff188b59bf4119029"
+  },
+  "execution_binding": {
+    "executor": "personal.codex",
+    "model": "",
+    "service_id": ""
+  },
+  "passed": true,
+  "status": "ready_for_host_review",
+  "changes_required": false,
+  "summary": "FREV-E01以本任务根内完整immutable副本核验解除；B01–B13、F01–F10及适用生命周期/普通UI覆盖已独立读码读证。仅部署前交付送验建议；两条原required_checks结果在required-checks.json按最终report hash记录，宿主正式VERIFY随后另行启动。",
+  "implemented_backlog_ids": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B09",
+    "B10",
+    "B11",
+    "B12",
+    "B13"
+  ],
+  "implementation_attribution": "IDs denote independently reviewed upstream work; this reviewer implemented no BIZ. Baseline/concurrent/prestart/proactive budget capabilities are preserved and not claimed as new achievement.",
+  "this_task_implemented_backlog_ids": [],
+  "changed_files": [
+    "reports/final/result.json",
+    "reports/final/review-evidence.json",
+    "reports/final/difference-index.json",
+    "reports/final/required-checks.json",
+    "docs/mixed-remediation-delivery.md"
+  ],
+  "backlog": [
+    {
+      "id": "B01",
+      "title": "目录锁内原子读改写与上一版本恢复",
+      "candidate_files_reviewed": [
+        "src/store/ai_services.rs",
+        "src/store/atomic_file.rs"
+      ],
+      "summary": "目录级锁覆盖读改写；临时文件sync_all后原子替换；上一份加密目录经身份、URL和受保护凭据解析后恢复，保留损坏文件及版本hash。",
+      "source_evidence": [
+        "src/store/ai_services.rs:530",
+        "src/store/ai_services.rs:585",
+        "src/store/atomic_file.rs:78",
+        "src/store/ai_services.rs:2570"
+      ],
+      "test_scenarios_reviewed": [
+        "remediation_process_interruptions_and_delete_retry",
+        "remediation_concurrent_different_services_no_lost_updates",
+        "remediation_recovery_rejects_corrupt_snapshot_and_records_safe_version"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "在临时写、刷新、替换前后逐点终止，重启至少旧/新一份可解析；恢复记录配置版本且不含凭据",
+        "并发修改两个不同服务无丢失更新；损坏快照不被自动恢复为有效版本"
+      ],
+      "review_evidence": "原日志49项配置/原子文件回归中，七个中断点的子进程实际exit86，重读可解析；并发不同服务与损坏备份拒绝均有命名测试。不是断电/硬件持久性认证。",
+      "checks": [
+        {
+          "name": "config",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe store::ai_services store::atomic_file --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-config-1794648876818014000.log",
+          "sha256": "dfa4174121886267a8681270c955363a7c6d5ada4748266957b74abf23157486",
+          "rust_summaries": [
+            [
+              "ok",
+              "49",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "store::ai_services::tests::accepts_public_hyphenated_protocol_values",
+            "store::ai_services::tests::active_service_selection_is_explicit_and_clears_on_remove",
+            "store::ai_services::tests::agent_plan_probe_uses_minimal_messages_request",
+            "store::ai_services::tests::audio_provider_slots_round_trip_without_business_fields",
+            "store::ai_services::tests::balance_profile_is_persisted_preserved_and_cache_cleared_on_key_rotation",
+            "store::ai_services::tests::builtin_adapter_registry_covers_all_media_capabilities",
+            "store::ai_services::tests::capability_routes_reject_unknown_services_and_dedupe_entries",
+            "store::ai_services::tests::custom_service_roundtrips_with_encrypted_key",
+            "store::ai_services::tests::duplicate_endpoints_in_one_family_collapse_to_the_first",
+            "store::ai_services::tests::duplicate_service_keeps_credentials_and_allocates_unique_identity",
+            "store::ai_services::tests::each_media_capability_can_pin_its_own_service",
+            "store::ai_services::tests::empty_route_model_follows_the_service_default_binding",
+            "store::ai_services::tests::fetch_models_does_not_duplicate_full_messages_base_endpoint",
+            "store::ai_services::tests::fetch_models_parses_openai_models_payload",
+            "store::ai_services::tests::fetch_models_rejects_non_success_status",
+            "store::ai_services::tests::fetch_models_uses_anthropic_headers_and_v1_path",
+            "store::ai_services::tests::identifies_volcengine_agent_plan_as_catalog_only",
+            "store::ai_services::tests::image_service_selection_is_independent_from_the_chat_service",
+            "store::ai_services::tests::legacy_image_fields_are_backfilled_into_the_generate_slot",
+            "store::ai_services::tests::legacy_selection_file_migrates_to_the_capability_route_table",
+            "store::ai_services::tests::legacy_service_without_endpoints_upgrades_to_single_endpoint",
+            "store::ai_services::tests::media_bindings_reject_unknown_capabilities_and_fields",
+            "store::ai_services::tests::media_capability_keeps_its_extra_models_through_the_legacy_image_projection",
+            "store::ai_services::tests::media_only_service_can_save_without_chat_model",
+            "store::ai_services::tests::media_slots_cover_edit_and_mirror_the_legacy_image_projection",
+            "store::ai_services::tests::multi_protocol_endpoints_persist_and_project_to_scalar_fields",
+            "store::ai_services::tests::new_api_balance_token_is_encrypted_and_not_returned_in_public_service",
+            "store::ai_services::tests::parses_known_protocols_and_rejects_unknown_ones",
+            "store::ai_services::tests::probe_chat_connection_does_not_duplicate_full_messages_base_endpoint",
+            "store::ai_services::tests::provider_catalog_reports_media_without_exposing_secrets",
+            "store::ai_services::tests::public_service_suggests_balance_template_from_exact_base_url_only",
+            "store::ai_services::tests::rejects_invalid_service_input",
+            "store::ai_services::tests::remediation_child",
+            "store::ai_services::tests::remediation_concurrent_different_services_no_lost_updates",
+            "store::ai_services::tests::remediation_process_interruptions_and_delete_retry",
+            "store::ai_services::tests::remediation_recovery_rejects_corrupt_snapshot_and_records_safe_version",
+            "store::ai_services::tests::remote_http_warning_only_for_non_loopback",
+            "store::ai_services::tests::removing_a_service_prunes_it_from_every_capability_route",
+            "store::ai_services::tests::save_normalizes_full_endpoint_base_urls",
+            "store::ai_services::tests::save_normalizes_secondary_endpoints_before_dedupe",
+            "store::ai_services::tests::save_rejects_protocol_endpoint_family_mismatch",
+            "store::ai_services::tests::save_rejects_query_and_fragment_in_base_url",
+            "store::ai_services::tests::service_exists_detects_saved_ids",
+            "store::ai_services::tests::service_without_chat_or_media_model_is_rejected",
+            "store::ai_services::tests::store_path_is_under_agent_home",
+            "store::ai_services::tests::updating_service_without_key_preserves_existing_secret",
+            "store::atomic_file::tests::failed_replace_preserves_destination",
+            "store::atomic_file::tests::replacement_keeps_last_good_backup",
+            "store::atomic_file::tests::temporary_path_stays_short_for_long_destination_names"
+          ],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "src/store/ai_services.rs": "e5423450f3bdd8126169616c6ea2282ed0112526a2e82a8bb598d86a138b20e3",
+        "src/store/atomic_file.rs": "f77ffe4b22917f6880dfeb5b01b659eb8e17efc75a7a8ecb41ef9715bf0ece68"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B02",
+      "title": "删除幂等清引用及启动一致性诊断",
+      "candidate_files_reviewed": [
+        "src/store/ai_services.rs",
+        "src/app/ai_provider_import.rs"
+      ],
+      "summary": "相同ID删除重试仍清理全部能力路由；保留剩余顺序；启动/公开快照诊断悬空引用，不自动换选服务。",
+      "source_evidence": [
+        "src/store/ai_services.rs:722",
+        "src/store/ai_services.rs:1245",
+        "src/store/ai_services.rs:2588"
+      ],
+      "test_scenarios_reviewed": [
+        "remediation_process_interruptions_and_delete_retry",
+        "removing_a_service_prunes_it_from_every_capability_route"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "目录提交后、路由提交前终止，重启并重试删除相同id，全部悬空引用消失",
+        "清理不存在id可重复执行，其他默认/备用相对顺序不变；启动检测不擅自选择新服务"
+      ],
+      "review_evidence": "原日志覆盖目录已提交、路由未提交时退出及相同ID删除重试；启动诊断只读，不替换默认服务，剩余路由顺序不变。",
+      "checks": [
+        {
+          "name": "config",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe store::ai_services store::atomic_file --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-config-1794648876818014000.log",
+          "sha256": "dfa4174121886267a8681270c955363a7c6d5ada4748266957b74abf23157486",
+          "rust_summaries": [
+            [
+              "ok",
+              "49",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "store::ai_services::tests::accepts_public_hyphenated_protocol_values",
+            "store::ai_services::tests::active_service_selection_is_explicit_and_clears_on_remove",
+            "store::ai_services::tests::agent_plan_probe_uses_minimal_messages_request",
+            "store::ai_services::tests::audio_provider_slots_round_trip_without_business_fields",
+            "store::ai_services::tests::balance_profile_is_persisted_preserved_and_cache_cleared_on_key_rotation",
+            "store::ai_services::tests::builtin_adapter_registry_covers_all_media_capabilities",
+            "store::ai_services::tests::capability_routes_reject_unknown_services_and_dedupe_entries",
+            "store::ai_services::tests::custom_service_roundtrips_with_encrypted_key",
+            "store::ai_services::tests::duplicate_endpoints_in_one_family_collapse_to_the_first",
+            "store::ai_services::tests::duplicate_service_keeps_credentials_and_allocates_unique_identity",
+            "store::ai_services::tests::each_media_capability_can_pin_its_own_service",
+            "store::ai_services::tests::empty_route_model_follows_the_service_default_binding",
+            "store::ai_services::tests::fetch_models_does_not_duplicate_full_messages_base_endpoint",
+            "store::ai_services::tests::fetch_models_parses_openai_models_payload",
+            "store::ai_services::tests::fetch_models_rejects_non_success_status",
+            "store::ai_services::tests::fetch_models_uses_anthropic_headers_and_v1_path",
+            "store::ai_services::tests::identifies_volcengine_agent_plan_as_catalog_only",
+            "store::ai_services::tests::image_service_selection_is_independent_from_the_chat_service",
+            "store::ai_services::tests::legacy_image_fields_are_backfilled_into_the_generate_slot",
+            "store::ai_services::tests::legacy_selection_file_migrates_to_the_capability_route_table",
+            "store::ai_services::tests::legacy_service_without_endpoints_upgrades_to_single_endpoint",
+            "store::ai_services::tests::media_bindings_reject_unknown_capabilities_and_fields",
+            "store::ai_services::tests::media_capability_keeps_its_extra_models_through_the_legacy_image_projection",
+            "store::ai_services::tests::media_only_service_can_save_without_chat_model",
+            "store::ai_services::tests::media_slots_cover_edit_and_mirror_the_legacy_image_projection",
+            "store::ai_services::tests::multi_protocol_endpoints_persist_and_project_to_scalar_fields",
+            "store::ai_services::tests::new_api_balance_token_is_encrypted_and_not_returned_in_public_service",
+            "store::ai_services::tests::parses_known_protocols_and_rejects_unknown_ones",
+            "store::ai_services::tests::probe_chat_connection_does_not_duplicate_full_messages_base_endpoint",
+            "store::ai_services::tests::provider_catalog_reports_media_without_exposing_secrets",
+            "store::ai_services::tests::public_service_suggests_balance_template_from_exact_base_url_only",
+            "store::ai_services::tests::rejects_invalid_service_input",
+            "store::ai_services::tests::remediation_child",
+            "store::ai_services::tests::remediation_concurrent_different_services_no_lost_updates",
+            "store::ai_services::tests::remediation_process_interruptions_and_delete_retry",
+            "store::ai_services::tests::remediation_recovery_rejects_corrupt_snapshot_and_records_safe_version",
+            "store::ai_services::tests::remote_http_warning_only_for_non_loopback",
+            "store::ai_services::tests::removing_a_service_prunes_it_from_every_capability_route",
+            "store::ai_services::tests::save_normalizes_full_endpoint_base_urls",
+            "store::ai_services::tests::save_normalizes_secondary_endpoints_before_dedupe",
+            "store::ai_services::tests::save_rejects_protocol_endpoint_family_mismatch",
+            "store::ai_services::tests::save_rejects_query_and_fragment_in_base_url",
+            "store::ai_services::tests::service_exists_detects_saved_ids",
+            "store::ai_services::tests::service_without_chat_or_media_model_is_rejected",
+            "store::ai_services::tests::store_path_is_under_agent_home",
+            "store::ai_services::tests::updating_service_without_key_preserves_existing_secret",
+            "store::atomic_file::tests::failed_replace_preserves_destination",
+            "store::atomic_file::tests::replacement_keeps_last_good_backup",
+            "store::atomic_file::tests::temporary_path_stays_short_for_long_destination_names"
+          ],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "src/store/ai_services.rs": "e5423450f3bdd8126169616c6ea2282ed0112526a2e82a8bb598d86a138b20e3",
+        "src/app/ai_provider_import.rs": "ad477db258eead029d7a5a54264c6ad1b0f65af8f5ad4152712b272c51ce323a"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B03",
+      "title": "统一公开错误DTO与脱敏边界",
+      "candidate_files_reviewed": [
+        "src/app/inference_gateway.rs"
+      ],
+      "summary": "公开错误只返回安全code/message/request_id；上游原始错误不作为公开正文；SSE事件完整分类后才转发，不能从多data行漏出错误原文。",
+      "source_evidence": [
+        "src/app/inference_gateway.rs:4245",
+        "src/app/inference_gateway.rs:4369",
+        "src/app/inference_gateway.rs:4659",
+        "src/app/inference_gateway.rs:7283"
+      ],
+      "test_scenarios_reviewed": [
+        "remediation_error_matrix_real_loopback",
+        "remediation_stream_multidata_error_no_leak"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "虚构Bearer和x-api-key回显的401/403/500在所有错误分支响应与日志均无原值",
+        "客户端仍得到安全code与request_id，限长异常HTML不透传，凭request_id可关联安全诊断"
+      ],
+      "review_evidence": "原日志80项网关回归包含7种直通/互译组合×401/403/500，虚构Bearer/x-api-key回显不进入公开响应与日志；多data行SSE负例保留。",
+      "checks": [
+        {
+          "name": "gateway",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe app::inference_gateway:: app::chat_responses:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-gateway-1794648877965042200.log",
+          "sha256": "44b1143cc3e2a595b9cabbf164fc699aed8935a32ec49ab2fff051bccd574451",
+          "rust_summaries": [
+            [
+              "ok",
+              "80",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "app::chat_responses::tests::chat_optional_tool_arguments_remain_optional_in_responses",
+            "app::chat_responses::tests::request_drops_tool_choice_when_no_tool_survives_translation",
+            "app::chat_responses::tests::request_maps_messages_tools_and_limits",
+            "app::chat_responses::tests::request_strips_reasoning_tags_from_assistant_history",
+            "app::chat_responses::tests::response_maps_incomplete_to_length_finish_reason",
+            "app::chat_responses::tests::response_maps_text_and_tool_calls_to_chat",
+            "app::chat_responses::tests::response_strips_reasoning_tags_from_non_streaming_text",
+            "app::chat_responses::tests::stream_emits_finish_and_done_when_upstream_ends_early",
+            "app::chat_responses::tests::stream_failure_marks_failed_and_suppresses_done",
+            "app::chat_responses::tests::stream_maps_text_and_tool_events_to_chat_chunks",
+            "app::chat_responses::tests::stream_strips_reasoning_tags_split_across_chunks",
+            "app::inference_gateway::tests::aggregated_models_payload_uses_exposed_aliases",
+            "app::inference_gateway::tests::aggregated_models_payload_uses_exposed_aliases",
+            "app::inference_gateway::tests::already_degraded_features_are_not_relisted_as_cause",
+            "app::inference_gateway::tests::anthropic_entry_translates_to_responses_upstream",
+            "app::inference_gateway::tests::anthropic_native_400_diagnostic_carries_request_structure",
+            "app::inference_gateway::tests::anthropic_tool_result_image_gets_specific_diagnostic_feature",
+            "app::inference_gateway::tests::api_path_accepts_both_v1_and_bare_forms",
+            "app::inference_gateway::tests::authorize_falls_back_to_model_only_when_unambiguous",
+            "app::inference_gateway::tests::authorize_prefers_token_and_rejects_unknown_tokens",
+            "app::inference_gateway::tests::chat_entry_translates_to_responses_upstream",
+            "app::inference_gateway::tests::claude_desktop_alias_is_stable_and_collision_resistant",
+            "app::inference_gateway::tests::claude_desktop_alias_resolves_back_to_the_route",
+            "app::inference_gateway::tests::claude_desktop_models_payload_uses_anthropic_aliases",
+            "app::inference_gateway::tests::degraded_gateway_tool_history_is_not_imitable_prose",
+            "app::inference_gateway::tests::downgrades_responses_tool_history_to_messages",
+            "app::inference_gateway::tests::empty_content_in_request_wins_over_misleading_upstream_wording",
+            "app::inference_gateway::tests::gateway_binding_debug_redacts_upstream_and_local_secrets",
+            "app::inference_gateway::tests::gateway_port_resolution_prefers_env_then_setting_then_default",
+            "app::inference_gateway::tests::gateway_port_round_trips_through_settings_file",
+            "app::inference_gateway::tests::gateway_routes_alias_and_rewrites_upstream_model",
+            "app::inference_gateway::tests::generic_request_format_diagnostic_no_longer_gives_false_instruction",
+            "app::inference_gateway::tests::generic_upstream_400_returns_safe_structured_diagnostic",
+            "app::inference_gateway::tests::head_parsing_keeps_method_path_and_lowercase_headers",
+            "app::inference_gateway::tests::native_responses_non_streaming_sanitizes_output_text",
+            "app::inference_gateway::tests::native_responses_request_sanitizes_assistant_history_only",
+            "app::inference_gateway::tests::native_responses_sse_sanitizes_split_reasoning_tags",
+            "app::inference_gateway::tests::native_responses_stream_sanitizes_reasoning_tags_end_to_end",
+            "app::inference_gateway::tests::observed_fallbacks_predegrade_future_requests",
+            "app::inference_gateway::tests::occupied_preferred_port_fails_when_clients_are_bound",
+            "app::inference_gateway::tests::occupied_preferred_port_falls_back_only_without_bindings",
+            "app::inference_gateway::tests::opencode_session_header_is_stable_per_conversation",
+            "app::inference_gateway::tests::outbound_budget_exceeded_returns_structured_413",
+            "app::inference_gateway::tests::oversized_declared_body_returns_structured_413",
+            "app::inference_gateway::tests::per_client_inflight_slots_are_bounded_and_released",
+            "app::inference_gateway::tests::remediation_body_limit_and_timeout_real_loopback",
+            "app::inference_gateway::tests::remediation_body_truncated_and_complete_real_loopback",
+            "app::inference_gateway::tests::remediation_error_matrix_real_loopback",
+            "app::inference_gateway::tests::remediation_stream_boundaries_real_loopback",
+            "app::inference_gateway::tests::remediation_stream_multidata_error_no_leak",
+            "app::inference_gateway::tests::request_and_response_models_are_mapped_to_aliases",
+            "app::inference_gateway::tests::request_ids_are_unique_and_thread_local",
+            "app::inference_gateway::tests::request_profile_lists_structure_without_content",
+            "app::inference_gateway::tests::response_tool_output_media_fallback_strips_tool_images_only",
+            "app::inference_gateway::tests::responses_fallback_removes_tool_media_then_history",
+            "app::inference_gateway::tests::responses_gateway_pre_normalizes_limited_tool_history",
+            "app::inference_gateway::tests::responses_gateway_retries_transient_upstream_500_once",
+            "app::inference_gateway::tests::responses_request_through_gateway_offloads_large_images_before_upstream",
+            "app::inference_gateway::tests::route_failover_handles_403",
+            "app::inference_gateway::tests::route_failover_handles_429",
+            "app::inference_gateway::tests::route_failover_treats_auth_rate_limit_and_transient_as_retryable",
+            "app::inference_gateway::tests::route_health_marks_403_and_429_as_cooling_down",
+            "app::inference_gateway::tests::same_request_route_failover_skips_failed_primary",
+            "app::inference_gateway::tests::sse_scanner_ignores_done_and_partial_lines",
+            "app::inference_gateway::tests::sse_scanner_merges_split_anthropic_usage",
+            "app::inference_gateway::tests::sse_scanner_reads_responses_completed_usage",
+            "app::inference_gateway::tests::stream_usage_flag_is_injected_only_when_missing",
+            "app::inference_gateway::tests::strips_unsupported_responses_tools_but_keeps_functions",
+            "app::inference_gateway::tests::token_is_read_from_either_authorization_or_api_key",
+            "app::inference_gateway::tests::token_selects_route_by_exposed_model",
+            "app::inference_gateway::tests::translated_send_helper_retries_transient_500_once",
+            "app::inference_gateway::tests::unsupported_tools_fallback_drops_tool_choice_when_no_tool_remains",
+            "app::inference_gateway::tests::upstream_404_returns_gateway_diagnostic_with_upstream_url",
+            "app::inference_gateway::tests::upstream_error_summary_keeps_shape_and_redacts_credentials",
+            "app::inference_gateway::tests::upstream_failure_log_line_includes_url_and_redacts_credentials",
+            "app::inference_gateway::tests::upstream_not_found_payload_is_actionable_for_both_client_shapes",
+            "app::inference_gateway::tests::upstream_skeleton_is_char_bounded_and_keeps_words",
+            "app::inference_gateway::tests::upstream_url_does_not_duplicate_v1",
+            "app::inference_gateway::tests::upstream_url_handles_versioned_and_full_endpoint_bases",
+            "app::inference_gateway::tests::usage_extraction_matches_each_protocol"
+          ],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "src/app/inference_gateway.rs": "f5eefacf299b5d2973c0ed67fd9d35b4e4ee4aa35925ad0ec7a2afeeb08488ad"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B04",
+      "title": "区分完整响应、读取失败与流式中断",
+      "candidate_files_reviewed": [
+        "src/app/inference_gateway.rs",
+        "src/app/chat_responses.rs"
+      ],
+      "summary": "响应体截断、超限、超时分型；首字节前结构化502，流开始后记录中断及usage_complete=false，不自动重放工具。",
+      "source_evidence": [
+        "src/app/inference_gateway.rs:4240",
+        "src/app/inference_gateway.rs:4493",
+        "src/app/inference_gateway.rs:4528",
+        "src/app/inference_gateway.rs:7305"
+      ],
+      "test_scenarios_reviewed": [
+        "remediation_body_truncated_and_complete_real_loopback",
+        "remediation_body_limit_and_timeout_real_loopback",
+        "remediation_stream_boundaries_real_loopback"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "伪上游200后截断/超时：写出前返回结构化502，不记为静默成功，记录request_id与usage不完整",
+        "超限与I/O错误不同码；已写出流只标中断，不自动重放工具调用或承诺无缝续流"
+      ],
+      "review_evidence": "真实loopback伪上游覆盖200后截断、限长、超时、SSE首字节前后；已开始流只记中断、不伪造完成、不重放。",
+      "checks": [
+        {
+          "name": "gateway",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe app::inference_gateway:: app::chat_responses:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-gateway-1794648877965042200.log",
+          "sha256": "44b1143cc3e2a595b9cabbf164fc699aed8935a32ec49ab2fff051bccd574451",
+          "rust_summaries": [
+            [
+              "ok",
+              "80",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "app::chat_responses::tests::chat_optional_tool_arguments_remain_optional_in_responses",
+            "app::chat_responses::tests::request_drops_tool_choice_when_no_tool_survives_translation",
+            "app::chat_responses::tests::request_maps_messages_tools_and_limits",
+            "app::chat_responses::tests::request_strips_reasoning_tags_from_assistant_history",
+            "app::chat_responses::tests::response_maps_incomplete_to_length_finish_reason",
+            "app::chat_responses::tests::response_maps_text_and_tool_calls_to_chat",
+            "app::chat_responses::tests::response_strips_reasoning_tags_from_non_streaming_text",
+            "app::chat_responses::tests::stream_emits_finish_and_done_when_upstream_ends_early",
+            "app::chat_responses::tests::stream_failure_marks_failed_and_suppresses_done",
+            "app::chat_responses::tests::stream_maps_text_and_tool_events_to_chat_chunks",
+            "app::chat_responses::tests::stream_strips_reasoning_tags_split_across_chunks",
+            "app::inference_gateway::tests::aggregated_models_payload_uses_exposed_aliases",
+            "app::inference_gateway::tests::aggregated_models_payload_uses_exposed_aliases",
+            "app::inference_gateway::tests::already_degraded_features_are_not_relisted_as_cause",
+            "app::inference_gateway::tests::anthropic_entry_translates_to_responses_upstream",
+            "app::inference_gateway::tests::anthropic_native_400_diagnostic_carries_request_structure",
+            "app::inference_gateway::tests::anthropic_tool_result_image_gets_specific_diagnostic_feature",
+            "app::inference_gateway::tests::api_path_accepts_both_v1_and_bare_forms",
+            "app::inference_gateway::tests::authorize_falls_back_to_model_only_when_unambiguous",
+            "app::inference_gateway::tests::authorize_prefers_token_and_rejects_unknown_tokens",
+            "app::inference_gateway::tests::chat_entry_translates_to_responses_upstream",
+            "app::inference_gateway::tests::claude_desktop_alias_is_stable_and_collision_resistant",
+            "app::inference_gateway::tests::claude_desktop_alias_resolves_back_to_the_route",
+            "app::inference_gateway::tests::claude_desktop_models_payload_uses_anthropic_aliases",
+            "app::inference_gateway::tests::degraded_gateway_tool_history_is_not_imitable_prose",
+            "app::inference_gateway::tests::downgrades_responses_tool_history_to_messages",
+            "app::inference_gateway::tests::empty_content_in_request_wins_over_misleading_upstream_wording",
+            "app::inference_gateway::tests::gateway_binding_debug_redacts_upstream_and_local_secrets",
+            "app::inference_gateway::tests::gateway_port_resolution_prefers_env_then_setting_then_default",
+            "app::inference_gateway::tests::gateway_port_round_trips_through_settings_file",
+            "app::inference_gateway::tests::gateway_routes_alias_and_rewrites_upstream_model",
+            "app::inference_gateway::tests::generic_request_format_diagnostic_no_longer_gives_false_instruction",
+            "app::inference_gateway::tests::generic_upstream_400_returns_safe_structured_diagnostic",
+            "app::inference_gateway::tests::head_parsing_keeps_method_path_and_lowercase_headers",
+            "app::inference_gateway::tests::native_responses_non_streaming_sanitizes_output_text",
+            "app::inference_gateway::tests::native_responses_request_sanitizes_assistant_history_only",
+            "app::inference_gateway::tests::native_responses_sse_sanitizes_split_reasoning_tags",
+            "app::inference_gateway::tests::native_responses_stream_sanitizes_reasoning_tags_end_to_end",
+            "app::inference_gateway::tests::observed_fallbacks_predegrade_future_requests",
+            "app::inference_gateway::tests::occupied_preferred_port_fails_when_clients_are_bound",
+            "app::inference_gateway::tests::occupied_preferred_port_falls_back_only_without_bindings",
+            "app::inference_gateway::tests::opencode_session_header_is_stable_per_conversation",
+            "app::inference_gateway::tests::outbound_budget_exceeded_returns_structured_413",
+            "app::inference_gateway::tests::oversized_declared_body_returns_structured_413",
+            "app::inference_gateway::tests::per_client_inflight_slots_are_bounded_and_released",
+            "app::inference_gateway::tests::remediation_body_limit_and_timeout_real_loopback",
+            "app::inference_gateway::tests::remediation_body_truncated_and_complete_real_loopback",
+            "app::inference_gateway::tests::remediation_error_matrix_real_loopback",
+            "app::inference_gateway::tests::remediation_stream_boundaries_real_loopback",
+            "app::inference_gateway::tests::remediation_stream_multidata_error_no_leak",
+            "app::inference_gateway::tests::request_and_response_models_are_mapped_to_aliases",
+            "app::inference_gateway::tests::request_ids_are_unique_and_thread_local",
+            "app::inference_gateway::tests::request_profile_lists_structure_without_content",
+            "app::inference_gateway::tests::response_tool_output_media_fallback_strips_tool_images_only",
+            "app::inference_gateway::tests::responses_fallback_removes_tool_media_then_history",
+            "app::inference_gateway::tests::responses_gateway_pre_normalizes_limited_tool_history",
+            "app::inference_gateway::tests::responses_gateway_retries_transient_upstream_500_once",
+            "app::inference_gateway::tests::responses_request_through_gateway_offloads_large_images_before_upstream",
+            "app::inference_gateway::tests::route_failover_handles_403",
+            "app::inference_gateway::tests::route_failover_handles_429",
+            "app::inference_gateway::tests::route_failover_treats_auth_rate_limit_and_transient_as_retryable",
+            "app::inference_gateway::tests::route_health_marks_403_and_429_as_cooling_down",
+            "app::inference_gateway::tests::same_request_route_failover_skips_failed_primary",
+            "app::inference_gateway::tests::sse_scanner_ignores_done_and_partial_lines",
+            "app::inference_gateway::tests::sse_scanner_merges_split_anthropic_usage",
+            "app::inference_gateway::tests::sse_scanner_reads_responses_completed_usage",
+            "app::inference_gateway::tests::stream_usage_flag_is_injected_only_when_missing",
+            "app::inference_gateway::tests::strips_unsupported_responses_tools_but_keeps_functions",
+            "app::inference_gateway::tests::token_is_read_from_either_authorization_or_api_key",
+            "app::inference_gateway::tests::token_selects_route_by_exposed_model",
+            "app::inference_gateway::tests::translated_send_helper_retries_transient_500_once",
+            "app::inference_gateway::tests::unsupported_tools_fallback_drops_tool_choice_when_no_tool_remains",
+            "app::inference_gateway::tests::upstream_404_returns_gateway_diagnostic_with_upstream_url",
+            "app::inference_gateway::tests::upstream_error_summary_keeps_shape_and_redacts_credentials",
+            "app::inference_gateway::tests::upstream_failure_log_line_includes_url_and_redacts_credentials",
+            "app::inference_gateway::tests::upstream_not_found_payload_is_actionable_for_both_client_shapes",
+            "app::inference_gateway::tests::upstream_skeleton_is_char_bounded_and_keeps_words",
+            "app::inference_gateway::tests::upstream_url_does_not_duplicate_v1",
+            "app::inference_gateway::tests::upstream_url_handles_versioned_and_full_endpoint_bases",
+            "app::inference_gateway::tests::usage_extraction_matches_each_protocol"
+          ],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "src/app/inference_gateway.rs": "f5eefacf299b5d2973c0ed67fd9d35b4e4ee4aa35925ad0ec7a2afeeb08488ad",
+        "src/app/chat_responses.rs": "5fe4489f9756cf22e881883f9738ca1b502e433eca04a06789cf4dd055afe91c"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B05",
+      "title": "预算币种与可信用量契约",
+      "candidate_files_reviewed": [
+        "src/mission/contract.rs",
+        "src/mission/store.rs",
+        "src/runtime/codex_usage.rs",
+        "src/runtime/deepseek_harness.rs"
+      ],
+      "summary": "成本按currency分桶；混币/未知/旧缺完整性事件不可用于单币成本门控；同run归并不重算，同request扩展摘要幂等，旧计划拒绝。",
+      "source_evidence": [
+        "src/mission/contract.rs:162",
+        "src/mission/store.rs:2182",
+        "src/mission/store.rs:2401",
+        "src/mission/store.rs:2418"
+      ],
+      "test_scenarios_reviewed": [
+        "b05_currency_buckets_unknown_cost_and_run_usage_are_restart_idempotent",
+        "f03_dropped_response_concurrent_same_key_restart_and_pause_return_current_state"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "USD+CNY分桶且不可作为单币限额比较，空币种/未上报成本仍停止成本预算派发",
+        "同run用量和同request_id预算扩展重放不重复；旧plan_sha256扩展被拒，重启后结论一致"
+      ],
+      "review_evidence": "实际隔离SQLite按currency分桶；缺currency/trusted/complete及混币保守阻断。run最新投影和request摘要幂等；Codex累计与本次增量分别核实。未知成本不补零。",
+      "checks": [
+        {
+          "name": "budget",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe mission::store::budget_remediation_tests:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-budget-1794648953323865900.log",
+          "sha256": "45bfa0f28d5bc93b4c137191d0764e213eb2d0b14e95abc1881e06ea78258cf6",
+          "rust_summaries": [
+            [
+              "ok",
+              "13",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "mission::store::budget_remediation_tests::b05_currency_buckets_unknown_cost_and_run_usage_are_restart_idempotent",
+            "mission::store::budget_remediation_tests::f01_progress_does_not_hide_exhaustion_and_extension_never_dispatches",
+            "mission::store::budget_remediation_tests::f02_extension_preserves_environment_block_and_existing_authorized_resolution",
+            "mission::store::budget_remediation_tests::f03_dropped_response_concurrent_same_key_restart_and_pause_return_current_state",
+            "mission::store::budget_remediation_tests::f04_restart_and_repeated_out_of_order_cursor_reads_do_not_reapply_events",
+            "mission::store::budget_remediation_tests::f05_stale_missing_mismatched_confirmation_and_active_reject_but_manual_pause_accepts",
+            "mission::store::budget_remediation_tests::f06_running_present_rejects_then_explicit_retry_rechecks_all_gates",
+            "mission::store::budget_remediation_tests::f06_sqlite_transaction_barrier_rechecks_running_before_any_budget_write",
+            "mission::store::budget_remediation_tests::f07_every_remaining_limit_and_untrusted_cost_reject_without_mutation",
+            "mission::store::budget_remediation_tests::f08_parameter_validation_and_overflow_leave_all_persisted_state_unchanged",
+            "mission::store::budget_remediation_tests::f09_legacy_explicit_resume_diagnostic_then_explicit_extension_no_automatic_action",
+            "mission::store::budget_remediation_tests::f09_unsafe_legacy_diagnosis_is_read_only_and_extension_rechecks_inflight_and_cost",
+            "mission::store::budget_remediation_tests::f10_new_consumption_exhausts_again_and_old_plan_events_do_not_complete_or_activate"
+          ],
+          "assertion_lines": []
+        },
+        {
+          "name": "usage",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe runtime::codex_usage::tests:: --skip usage_restart_worker --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-usage-1794648968643533800.log",
+          "sha256": "2c0b3f6d4e87d886394bf8a92b846aa0d25b72348a561fc307c724cdd494c3a6",
+          "rust_summaries": [
+            [
+              "ok",
+              "6",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "runtime::codex_usage::tests::usage_abandoned_turn_invalidates_baseline_after_restart",
+            "runtime::codex_usage::tests::usage_concurrent_resume_reservation_is_atomic_and_session_bound",
+            "runtime::codex_usage::tests::usage_exact_abc_crash_reentry_cannot_reuse_baseline_or_replace_pending",
+            "runtime::codex_usage::tests::usage_launch_resume_fixed_cumulative_fixture_and_replay",
+            "runtime::codex_usage::tests::usage_process_restart_preserves_baseline_and_immutable_receipt",
+            "runtime::codex_usage::tests::usage_unknown_baseline_reset_and_subset_failures_never_become_zero"
+          ],
+          "assertion_lines": []
+        },
+        {
+          "name": "executor",
+          "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-product-1794649092042206400.log",
+          "sha256": "c150cbec2701227f00cdb98cc3ff8e41d685acef19806e4f21b9fe5473b4adfb",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "# tests 468",
+            "# pass 468",
+            "# fail 0"
+          ]
+        }
+      ],
+      "source_hashes": {
+        "src/mission/contract.rs": "b3b0cc89e37e09f3d8f1e99b302356851ae96b31f3fd47e366ac880e109e5a94",
+        "src/mission/store.rs": "b94ffd22f96bf6cb08986866782c5754f14dbc1b5aec4dc82cda2008740ac3bf",
+        "src/runtime/codex_usage.rs": "98ee46ae50d4ae0ad378623ad839e0636fb828acd00ed40d95480feeb960ebbf",
+        "src/runtime/deepseek_harness.rs": "823a81097046f966013c4168050aca034f14a2bbe4252de9e285b09b325fda33"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B06",
+      "title": "统一服务术语与默认来源说明",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/AiProvidersPanel.tsx",
+        "frontend/src/pages/AiServiceRoutesPanel.tsx",
+        "frontend/src/pages/AiConnectionsPage.tsx"
+      ],
+      "summary": "服务表单、反馈及路由上下文使用AI服务术语；五页签ID保留，默认模型和任务/环境绑定作用域分别说明。",
+      "source_evidence": [
+        "frontend/src/pages/AiProvidersPanel.tsx:840",
+        "frontend/src/pages/AiConnectionsPage.tsx:169",
+        "frontend/src/pages/AiServiceRoutesPanel.tsx"
+      ],
+      "test_scenarios_reviewed": [
+        "five deep links and keyboard tabs",
+        "service CRUD terminology and routing default contexts"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "服务新增/编辑/删除/复制及失败反馈均称AI服务；保留五页签id和深链",
+        "远程任务默认、运行环境可用性、任务显式选择分别就近说明；空模型标跟随服务默认，无解析结果标未解析，不宣称覆盖已有任务"
+      ],
+      "review_evidence": "真实Chrome生产组件+mock API核对AI服务术语、五页签深链及默认/任务/环境绑定的就近说明；并未改变解析策略。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/AiProvidersPanel.tsx": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e",
+        "frontend/src/pages/AiServiceRoutesPanel.tsx": "1d1c4d4a6bea4e2a311cf30eda3a736e52d17504c9121e8b4f8ff1092eea94b8",
+        "frontend/src/pages/AiConnectionsPage.tsx": "ec04c7d7e3396b92fa0f0436d2f1111f47763983528feaea9f88fff6c63754ea"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B07",
+      "title": "工具可用与需行动同快照摘要",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/aiToolConnections.ts",
+        "frontend/src/pages/AiToolsPanel.tsx"
+      ],
+      "summary": "Map按工具身份归并；ready与needsAction分别投影，摘要/筛选取相同connections，携带同一快照时间；冲突提供差异入口。",
+      "source_evidence": [
+        "frontend/src/pages/aiToolConnections.ts:82",
+        "frontend/src/pages/AiToolsPanel.tsx:140",
+        "frontend/src/pages/AiToolsPanel.tsx:243"
+      ],
+      "test_scenarios_reviewed": [
+        "ready plus needs_update/failed/conflict, duplicate tool IDs and K=1",
+        "conflict opens diff without automatic overwrite"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "ready+needs_update/failed/conflict分别测试，按工具id去重；K=1时待处理至少1且筛选定位相同行",
+        "可运行数量与需更新数量并列、未接入另列；冲突主操作查看差异，不自动覆盖；统计携带同一快照时间"
+      ],
+      "review_evidence": "Map按工具id去重，同connections派生ready与attention及筛选；浏览器覆盖ready+needs_update/failed/conflict、K=1、冲突仅差异操作。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/aiToolConnections.ts": "d6fa10b72adbe03b57f020b71325269684474b2611436ecbf3dfe1c7526e99a4",
+        "frontend/src/pages/AiToolsPanel.tsx": "8734b12d141134e345e9366c6e52e644ea8bca563fcab5981d93d8535f2abda0"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B08",
+      "title": "跨层有效预算等待、事务门控与安全恢复",
+      "candidate_files_reviewed": [
+        "src/mission/store.rs",
+        "src/mission/budget_remediation_tests.rs",
+        "src/app/mission_commands.rs",
+        "src/app/mission_supervisor.rs",
+        "frontend/src/pages/missionView.ts",
+        "frontend/src/pages/missionSnapshot.ts",
+        "frontend/src/pages/missionBudgetRequest.ts"
+      ],
+      "summary": "立即事务内重检waiting、双hash、Running/AwaitingVerification及全部限额；同键同摘要返回当前Mission；环境阻塞仍waiting。列表/待办/详情消费同计划cursor DTO，前端保留原增额键。",
+      "source_evidence": [
+        "src/mission/store.rs:498",
+        "src/mission/store.rs:2488",
+        "src/mission/budget_remediation_tests.rs:231",
+        "frontend/src/pages/missionView.ts:34",
+        "frontend/src/pages/missionSnapshot.ts:4",
+        "frontend/src/pages/missionBudgetRequest.ts:15"
+      ],
+      "test_scenarios_reviewed": [
+        "F01",
+        "F02",
+        "F03",
+        "F04",
+        "F05",
+        "F06",
+        "F07",
+        "F08",
+        "F09",
+        "F10",
+        "BUDGET-AWAIT-01",
+        "QA-LEGACY-01"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "IA-003/IA-004/ACC-001：budget_exhausted→task_progress在新契约下经事务复核足额扩展成功；当前实现新请求拒绝，前端入口不代表修复",
+        "列表/待办/详情同快照原因、行动者、资格及游标；环境/预算需要处理，主动暂停/系统核验另分组；缺关联显示未知",
+        "保留waiting、双计划哈希、无Running、参数及全部限额/可信成本复算；仅明确批准额度，不默认不限额、不扩大权限",
+        "同键同摘要只一次扩展，同键异参拒绝；丢响应原键重试返回当前Mission，不强制激活；重放不重复用量/派发",
+        "逐例运行fixture_spec，记录目标与当前差异；模拟与源码静态检查不能替代真实接口输出"
+      ],
+      "review_evidence": "13项实际Store预算测试覆盖F01–F10；浏览器b-FYDdun经隔离JSON桥调用当前Store，验证丢响应原键重试/暂停重放/环境阻塞。F05主动暂停增额按明确保留的既有授权；F09是新版Store安全语义及组件契约，未运行旧后端二进制。",
+      "checks": [
+        {
+          "name": "budget",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe mission::store::budget_remediation_tests:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-budget-1794648953323865900.log",
+          "sha256": "45bfa0f28d5bc93b4c137191d0764e213eb2d0b14e95abc1881e06ea78258cf6",
+          "rust_summaries": [
+            [
+              "ok",
+              "13",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "mission::store::budget_remediation_tests::b05_currency_buckets_unknown_cost_and_run_usage_are_restart_idempotent",
+            "mission::store::budget_remediation_tests::f01_progress_does_not_hide_exhaustion_and_extension_never_dispatches",
+            "mission::store::budget_remediation_tests::f02_extension_preserves_environment_block_and_existing_authorized_resolution",
+            "mission::store::budget_remediation_tests::f03_dropped_response_concurrent_same_key_restart_and_pause_return_current_state",
+            "mission::store::budget_remediation_tests::f04_restart_and_repeated_out_of_order_cursor_reads_do_not_reapply_events",
+            "mission::store::budget_remediation_tests::f05_stale_missing_mismatched_confirmation_and_active_reject_but_manual_pause_accepts",
+            "mission::store::budget_remediation_tests::f06_running_present_rejects_then_explicit_retry_rechecks_all_gates",
+            "mission::store::budget_remediation_tests::f06_sqlite_transaction_barrier_rechecks_running_before_any_budget_write",
+            "mission::store::budget_remediation_tests::f07_every_remaining_limit_and_untrusted_cost_reject_without_mutation",
+            "mission::store::budget_remediation_tests::f08_parameter_validation_and_overflow_leave_all_persisted_state_unchanged",
+            "mission::store::budget_remediation_tests::f09_legacy_explicit_resume_diagnostic_then_explicit_extension_no_automatic_action",
+            "mission::store::budget_remediation_tests::f09_unsafe_legacy_diagnosis_is_read_only_and_extension_rechecks_inflight_and_cost",
+            "mission::store::budget_remediation_tests::f10_new_consumption_exhausts_again_and_old_plan_events_do_not_complete_or_activate"
+          ],
+          "assertion_lines": []
+        },
+        {
+          "name": "mission",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe mission::store::tests:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-mission-1794648956385050100.log",
+          "sha256": "22164d9e7f67f363039a6fcb3ce616f6920e260681cc2009f7559cb5000666e6",
+          "rust_summaries": [
+            [
+              "ok",
+              "56",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "mission::store::tests::absolute_approval_must_match_a_selected_plan_path",
+            "mission::store::tests::absolute_task_paths_wait_for_explicit_approval",
+            "mission::store::tests::absolute_write_requires_separate_explicit_approval",
+            "mission::store::tests::assigned_roles_are_required_before_planning_and_override_imported_bindings",
+            "mission::store::tests::budget_extension_allows_explicit_proactive_increase_but_rejects_stale_plan",
+            "mission::store::tests::confirmation_binds_exact_plan_hash",
+            "mission::store::tests::declared_cost_limit_fails_closed_when_usage_does_not_report_cost",
+            "mission::store::tests::dependency_cycle_is_rejected",
+            "mission::store::tests::device_and_parent_absolute_paths_are_rejected",
+            "mission::store::tests::dispatch_budget_is_persisted_and_terminal",
+            "mission::store::tests::downstream_review_reopens_producer_then_requires_separate_reverification",
+            "mission::store::tests::event_cursor_returns_only_new_events",
+            "mission::store::tests::execution_binding_change_invalidates_plan_hash",
+            "mission::store::tests::execution_binding_rejects_unsupported_or_mismatched_assignments",
+            "mission::store::tests::executor_handoff_native_multihop_both_directions_preserves_failed_parents",
+            "mission::store::tests::executor_legacy_claim_restore_rechecks_current_task_atomically",
+            "mission::store::tests::executor_recovery_projection_missing_claim_fails_closed_before_legacy_restore",
+            "mission::store::tests::exhausted_token_budget_can_be_extended_and_resumed_idempotently",
+            "mission::store::tests::failed_task_is_not_resurrected_as_ready",
+            "mission::store::tests::follow_up_tasks_cannot_add_unapproved_absolute_paths",
+            "mission::store::tests::follow_up_tasks_cannot_write_outside_confirmed_scope",
+            "mission::store::tests::follow_up_validation_requires_confirmed_scope",
+            "mission::store::tests::generated_plan_reassignment_rehashes_and_follow_up_keeps_selected_expert",
+            "mission::store::tests::handoff_is_idempotent_and_requires_the_exact_workflow_pin",
+            "mission::store::tests::implementation_cannot_pass_without_independent_verification",
+            "mission::store::tests::independently_verified_repair_unblocks_the_original_dependency",
+            "mission::store::tests::legacy_database_without_idempotency_column_reopens_and_migrates",
+            "mission::store::tests::mission_feedback_concurrent_replay_records_once",
+            "mission::store::tests::mission_feedback_context_limits_recent_count_and_serialized_text",
+            "mission::store::tests::mission_feedback_context_matches_repair_ancestors_across_pages_and_isolates_other_targets_and_plans",
+            "mission::store::tests::mission_feedback_is_append_only_idempotent_and_preserves_running_authority",
+            "mission::store::tests::mission_feedback_rejects_stale_unknown_canceled_terminal_and_unconfirmed_without_events",
+            "mission::store::tests::mission_feedback_request_conflicts_compare_all_fields_and_survive_reopen",
+            "mission::store::tests::parent_directory_segments_are_rejected",
+            "mission::store::tests::pause_resume_and_cancel_survive_reopen_without_reauthorizing_work",
+            "mission::store::tests::plan_change_invalidates_previous_confirmation",
+            "mission::store::tests::proactive_budget_extension_preserves_runtime_blocks_and_rejects_inflight_work",
+            "mission::store::tests::recheck_preserves_failures_requires_baseline_and_is_idempotent",
+            "mission::store::tests::repair_budget_counts_follow_up_tasks",
+            "mission::store::tests::resuming_manually_paused_over_budget_mission_records_exhaustion_and_allows_extension",
+            "mission::store::tests::review_rework_covers_historical_repairs_but_requires_downstream_revision_order",
+            "mission::store::tests::runtime_full_access_requires_plan_confirmation_and_persists_recovery_choice",
+            "mission::store::tests::runtime_recovery_preserves_ready_task_and_is_bound_to_current_plan",
+            "mission::store::tests::runtime_recovery_respects_cancellation_and_expired_budget",
+            "mission::store::tests::selected_task_requires_selected_dependency",
+            "mission::store::tests::snapshot_global_sequence_gaps_from_other_missions_are_complete",
+            "mission::store::tests::snapshot_pagination_keeps_delivery_cursor_lossless_after_10000_events",
+            "mission::store::tests::source_retry_uses_first_dispatch_and_keeps_baseline_after_10000_events",
+            "mission::store::tests::token_budget_fails_closed_without_usage_evidence",
+            "mission::store::tests::token_budget_uses_actual_usage_and_stops_before_next_dispatch",
+            "mission::store::tests::unconfirmed_mission_never_exposes_ready_tasks",
+            "mission::store::tests::unknown_usage_can_be_reconciled_without_losing_history_or_double_counting",
+            "mission::store::tests::usage_recording_is_idempotent_per_run",
+            "mission::store::tests::verification_rejects_stale_implementation_run",
+            "mission::store::tests::verification_rejects_unadmitted_run",
+            "mission::store::tests::workspace_claim_is_idempotent_persistent_and_exclusive"
+          ],
+          "assertion_lines": []
+        },
+        {
+          "name": "supervisor",
+          "command": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\himind-lifecycle-tests.exe app::mission_supervisor::tests:: --nocapture --test-threads=1",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-supervisor-1794648961641688200.log",
+          "sha256": "334ac062231fb21652a87a4c75f1104b0cbb8f067ac51eb8f34603def34193d1",
+          "rust_summaries": [
+            [
+              "ok",
+              "7",
+              "0",
+              "0",
+              "0"
+            ]
+          ],
+          "observed_tests": [
+            "app::mission_supervisor::tests::executor_budget_awaiting_verification_preserves_admitted_boundary",
+            "app::mission_supervisor::tests::executor_budget_pending_resume_requires_current_confirmation_and_claim",
+            "app::mission_supervisor::tests::executor_recovery_projection_store_supervisor_and_negative_boundaries",
+            "app::mission_supervisor::tests::host_follow_up_is_bounded_and_not_retried_after_failure",
+            "app::mission_supervisor::tests::one_broken_mission_does_not_stop_the_scan_and_is_recorded",
+            "app::mission_supervisor::tests::only_confirmed_active_missions_with_work_are_dispatchable",
+            "app::mission_supervisor::tests::supervisor_control_events_survive_pages_and_store_reopen"
+          ],
+          "assertion_lines": []
+        },
+        {
+          "name": "budget-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs budget",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-budget-browser-1794649082775983600.log",
+          "sha256": "76bc8fac444cac08e4fecd353a5d772aa4cba3637d4e579d571a4d07dd105b21",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS budget_exhausted followed by task_progress: same DTO across list/inbox/detail",
+            "PASS real SQLite increase, lost response, dialog reopen, identical request key, once-only extension, later pause preserved",
+            "PASS same idempotency key with different parameters rejected without mutation",
+            "PASS sufficient budget does not bypass environment",
+            "PASS manual pause is optional user choice, excluded from inbox",
+            "PASS dispatched verification is not fabricated live work",
+            "PASS coordination and feedback/retry labels do not invent a worker or require user action",
+            "PASS partial delivery exposes implementation/check/review with separate run/id/time and missing bodies",
+            "PASS 320/390px, long paths, ordinary 640px layout; all 200% zoom user_deferred, dark preference, reduced motion",
+            "PASS truthful live feedback and no infinite animation under reduced motion",
+            "PASS failed verification and overall completion retain evidence entries",
+            "PASS mismatched snapshot disables restore and budget submission"
+          ]
+        },
+        {
+          "name": "mission-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-mission-browser-1794648983648899600.log",
+          "sha256": "6f070fe592f7ee02107814f7704cbd053b498daf9e72052ed854bc26a7ad2106",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS native budget modal keyboard/focus return/background isolation",
+            "PASS manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+            "PASS partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+            "PASS late older poll cannot overwrite newer associated detail snapshot",
+            "PASS recovery:legacy-owned list/inbox/detail/task row/CTA contract",
+            "PASS recovery:producer-action list/inbox/detail/task row/CTA contract",
+            "PASS recovery:no-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:missing-attempt list/inbox/detail/task row/CTA contract",
+            "PASS recovery:foreign-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-plan list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-confirmation list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-cursor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-contract list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-actor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-reason list/inbox/detail/task row/CTA contract",
+            "PASS recovery:environment list/inbox/detail/task row/CTA contract",
+            "PASS recovery:budget list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause-pending list/inbox/detail/task row/CTA contract",
+            "PASS recovery:running-worker list/inbox/detail/task row/CTA contract",
+            "PASS active -> waiting: list/inbox/detail/task/owner/next action/CTA agree, current step may finish, no duplicate start, ended activity clears busy",
+            "PASS foreign/missing/mismatched/unknown live-run associations remain conservative; no recovery permissions invented",
+            "PASS checks_completed before reviewer: preparation/pause/execution expose real command, task/implementation/candidate/event time; later verdict updates separately and failure history remains",
+            "PASS missing/unknown/mismatched/ambiguous candidates and empty checks never substitute current evidence; raw history stays reachable",
+            "PASS a verdict from another candidate cannot sign current checks; it remains accessible in history",
+            "PASS native slash/backslash/extended roots in all six directions: actual DOM commands/0/1/-1/task/run/candidate/time, separate verdict updates, failed history and no duplicate CTA",
+            "PASS native foreign/ambiguous path forms and POSIX case refuse; raw candidate/digest/mission/task/implementation/verification/plan guards preserved",
+            "PASS missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+          ]
+        },
+        {
+          "name": "executor",
+          "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-product-1794649092042206400.log",
+          "sha256": "c150cbec2701227f00cdb98cc3ff8e41d685acef19806e4f21b9fe5473b4adfb",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "# tests 468",
+            "# pass 468",
+            "# fail 0"
+          ]
+        }
+      ],
+      "source_hashes": {
+        "src/mission/store.rs": "b94ffd22f96bf6cb08986866782c5754f14dbc1b5aec4dc82cda2008740ac3bf",
+        "src/mission/budget_remediation_tests.rs": "6ab3226fa6b51a4bd5eb86c7d4dddaaca239e4307a6327a0431e24973e4adcb1",
+        "src/app/mission_commands.rs": "3c799fdd0d5677b82ab23138e312f46eb71bbb5f7cc691d6437c0ddc16e70ab9",
+        "src/app/mission_supervisor.rs": "132485524689020e5e4713104547f79d205707893a70a8b5de2fd5c5ef0636d2",
+        "frontend/src/pages/missionView.ts": "4de094aa3016bcb50b2b347e70da79b7906de36182d0c22ee74fde8f3101548d",
+        "frontend/src/pages/missionSnapshot.ts": "bb518d7c132d2a915ecb2048b6157b2a1170ffe8d4157f9f4ec65047b645c9b4",
+        "frontend/src/pages/missionBudgetRequest.ts": "003fdc51332354acffc4b0d8572ca638f060ff7de8669f24b5a8c1b85e879898"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ],
+      "fixture_interpretation": {
+        "F04": "Store replay是只读快照重取/重复乱序cursor查询；不宣称重放写入命令。",
+        "F05": "原manual_pause拒绝预期与execution-contract保留主动增额冲突，按后者接受；其余旧计划/确认/未知关联/active拒绝。",
+        "F06": "真实SQLite Immediate事务锁和channel屏障，Running行是竞争夹具；另有AwaitingVerification边界回归。",
+        "F09": "旧后端的停止交接是条件兼容路径；当前Store显式resume失败后复核增额，普通进展不会遮挡耗尽；组件missing/foreign/unknown边界拒绝。未运行旧后端安装包。"
+      }
+    },
+    {
+      "id": "B09",
+      "title": "部分完成证据与三类核验结论同位展示",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/MissionEvidence.tsx",
+        "frontend/src/pages/missionView.ts",
+        "frontend/src/pages/MissionTeamPanel.tsx"
+      ],
+      "summary": "概览和任务行分别展示实现/必需检查/独立验收；绑定任务、distinct run、计划、候选前后边界和工作区。原生扩展路径仅规范明确拼写，候选身份字段仍精确匹配；歧义/外根不串用。",
+      "source_evidence": [
+        "frontend/src/pages/MissionEvidence.tsx:10",
+        "frontend/src/pages/MissionEvidence.tsx:41",
+        "frontend/src/pages/MissionEvidence.tsx:75",
+        "frontend/src/pages/MissionEvidence.tsx:109"
+      ],
+      "test_scenarios_reviewed": [
+        "paused verification_checks_completed without verdict",
+        "Windows slash/backslash/native extended root and foreign/ambiguous negatives",
+        "QA-LEGACY-01 real component recovery"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "部分完成、核验失败、全部完成均从概览和子任务行看到已有证据",
+        "实现提交、必需检查、独立核验分列实际run/id/时间；缺测试正文写未提供，不写0次通过",
+        "复制路径保留全值，打开仅用已有安全动作；重核、重做、续跑解释重复范围"
+      ],
+      "review_evidence": "实际React DOM核对暂停时checks_completed先于独立结论、6方向Windows根拼写、外根/歧义/旧候选/空checks负例及10005事件分页；退出码0/1/-1为传输样本，不能当该浏览器真实宿主执行。QA11正式宿主事件另核。",
+      "checks": [
+        {
+          "name": "mission-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-mission-browser-1794648983648899600.log",
+          "sha256": "6f070fe592f7ee02107814f7704cbd053b498daf9e72052ed854bc26a7ad2106",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS native budget modal keyboard/focus return/background isolation",
+            "PASS manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+            "PASS partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+            "PASS late older poll cannot overwrite newer associated detail snapshot",
+            "PASS recovery:legacy-owned list/inbox/detail/task row/CTA contract",
+            "PASS recovery:producer-action list/inbox/detail/task row/CTA contract",
+            "PASS recovery:no-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:missing-attempt list/inbox/detail/task row/CTA contract",
+            "PASS recovery:foreign-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-plan list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-confirmation list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-cursor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-contract list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-actor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-reason list/inbox/detail/task row/CTA contract",
+            "PASS recovery:environment list/inbox/detail/task row/CTA contract",
+            "PASS recovery:budget list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause-pending list/inbox/detail/task row/CTA contract",
+            "PASS recovery:running-worker list/inbox/detail/task row/CTA contract",
+            "PASS active -> waiting: list/inbox/detail/task/owner/next action/CTA agree, current step may finish, no duplicate start, ended activity clears busy",
+            "PASS foreign/missing/mismatched/unknown live-run associations remain conservative; no recovery permissions invented",
+            "PASS checks_completed before reviewer: preparation/pause/execution expose real command, task/implementation/candidate/event time; later verdict updates separately and failure history remains",
+            "PASS missing/unknown/mismatched/ambiguous candidates and empty checks never substitute current evidence; raw history stays reachable",
+            "PASS a verdict from another candidate cannot sign current checks; it remains accessible in history",
+            "PASS native slash/backslash/extended roots in all six directions: actual DOM commands/0/1/-1/task/run/candidate/time, separate verdict updates, failed history and no duplicate CTA",
+            "PASS native foreign/ambiguous path forms and POSIX case refuse; raw candidate/digest/mission/task/implementation/verification/plan guards preserved",
+            "PASS missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+          ]
+        },
+        {
+          "name": "legacy",
+          "command": "node frontend/scripts/remediation/qa-legacy-browser.mjs",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-legacy-1794649057510677700.log",
+          "sha256": "a7d95da0115e122f3689c07f58d11a91549e8028bfea98970d27de3ec0b756d9",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+            "PASS partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+            "PASS late older poll cannot overwrite newer associated detail snapshot",
+            "PASS missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+          ]
+        },
+        {
+          "name": "executor",
+          "command": "python scripts/remediation/executor-lifecycle-repair-checks.py",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-product-1794649092042206400.log",
+          "sha256": "c150cbec2701227f00cdb98cc3ff8e41d685acef19806e4f21b9fe5473b4adfb",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "# tests 468",
+            "# pass 468",
+            "# fail 0"
+          ]
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/MissionEvidence.tsx": "bed0005926e3e5f7d3770a20994f92c9da568c1681ff1ebb1a16327af31e640f",
+        "frontend/src/pages/missionView.ts": "4de094aa3016bcb50b2b347e70da79b7906de36182d0c22ee74fde8f3101548d",
+        "frontend/src/pages/MissionTeamPanel.tsx": "36e22f92e51f0b6e4ec8ef7ed89909bf2bbee9554b8c56856b6807cceb325ed7"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B10",
+      "title": "服务表单复用统一原生模态",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/AiProvidersPanel.tsx",
+        "frontend/src/components/ModalSurface.tsx"
+      ],
+      "summary": "复用原生dialog ModalSurface，局部Tab循环与top-layer背景隔离；切步标题聚焦，保存busy禁重入，嵌套Esc和触发器焦点返回。",
+      "source_evidence": [
+        "frontend/src/components/ModalSurface.tsx:19",
+        "frontend/src/pages/AiProvidersPanel.tsx:836",
+        "frontend/scripts/remediation/service-ui-browser.mjs:85"
+      ],
+      "test_scenarios_reviewed": [
+        "native nested modal focus/esc/restore",
+        "save busy double-submit guard"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "删除表单document级Tab循环，复用ModalSurface；新增→Tab/Shift+Tab→内层冲突→取消→Esc仅最上层可交互",
+        "关闭回触发器，切步聚焦标题；讲述人/NVDA不能浏览背景；保存忙态不重复提交"
+      ],
+      "review_evidence": "实际原生dialog、嵌套Tab/Esc、触发器返回、背景隔离和保存busy禁重复均由原浏览器断言和当前ModalSurface实现对应。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        },
+        {
+          "name": "mission-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-mission-browser-1794648983648899600.log",
+          "sha256": "6f070fe592f7ee02107814f7704cbd053b498daf9e72052ed854bc26a7ad2106",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS native budget modal keyboard/focus return/background isolation",
+            "PASS manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+            "PASS partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+            "PASS late older poll cannot overwrite newer associated detail snapshot",
+            "PASS recovery:legacy-owned list/inbox/detail/task row/CTA contract",
+            "PASS recovery:producer-action list/inbox/detail/task row/CTA contract",
+            "PASS recovery:no-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:missing-attempt list/inbox/detail/task row/CTA contract",
+            "PASS recovery:foreign-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-plan list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-confirmation list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-cursor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-contract list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-actor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-reason list/inbox/detail/task row/CTA contract",
+            "PASS recovery:environment list/inbox/detail/task row/CTA contract",
+            "PASS recovery:budget list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause-pending list/inbox/detail/task row/CTA contract",
+            "PASS recovery:running-worker list/inbox/detail/task row/CTA contract",
+            "PASS active -> waiting: list/inbox/detail/task/owner/next action/CTA agree, current step may finish, no duplicate start, ended activity clears busy",
+            "PASS foreign/missing/mismatched/unknown live-run associations remain conservative; no recovery permissions invented",
+            "PASS checks_completed before reviewer: preparation/pause/execution expose real command, task/implementation/candidate/event time; later verdict updates separately and failure history remains",
+            "PASS missing/unknown/mismatched/ambiguous candidates and empty checks never substitute current evidence; raw history stays reachable",
+            "PASS a verdict from another candidate cannot sign current checks; it remains accessible in history",
+            "PASS native slash/backslash/extended roots in all six directions: actual DOM commands/0/1/-1/task/run/candidate/time, separate verdict updates, failed history and no duplicate CTA",
+            "PASS native foreign/ambiguous path forms and POSIX case refuse; raw candidate/digest/mission/task/implementation/verification/plan guards preserved",
+            "PASS missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+          ]
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/AiProvidersPanel.tsx": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e",
+        "frontend/src/components/ModalSurface.tsx": "89952e480723081870aa5e469483c55fe73161c9069b6413751d9d43933ac28a"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B11",
+      "title": "预设选择语义与跨步字段错误定位",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/AiProvidersPanel.tsx"
+      ],
+      "summary": "分类aria-pressed、预设原生radio、步骤aria-current；错误摘要锚点和字段aria-invalid/describedby，回正确步骤并保留非密钥输入。",
+      "source_evidence": [
+        "frontend/src/pages/AiProvidersPanel.tsx:488",
+        "frontend/src/pages/AiProvidersPanel.tsx:846",
+        "frontend/src/pages/AiProvidersPanel.tsx:850",
+        "frontend/src/pages/AiProvidersPanel.tsx:875"
+      ],
+      "test_scenarios_reviewed": [
+        "required-field error links",
+        "radio keyboard and pressed/current",
+        "cross-step validation retains non-secret inputs"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "分类aria-pressed、预设原生radio、步骤aria-current，AX读出实际所选；键盘可改变选择",
+        "逐个必填缺失：摘要链接定位字段、aria-invalid/describedby读出要求；末步早期错误回正确步骤并保留非密钥输入"
+      ],
+      "review_evidence": "原生radio/pressed/current、错误摘要链接及跨步定位保留非密钥字段；晚到服务错误回早步及单次保存有独立扩展断言。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/AiProvidersPanel.tsx": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B12",
+      "title": "运行环境唯一tabpanel所有权",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/AiConnectionsPage.tsx",
+        "frontend/src/pages/AcpProfilesPanel.tsx"
+      ],
+      "summary": "父页唯一拥有ai-panel-acp，子页普通容器；五页签aria-controls目标唯一，方向键/Home/End更新选中与焦点。",
+      "source_evidence": [
+        "frontend/src/pages/AiConnectionsPage.tsx:152",
+        "frontend/src/pages/AiConnectionsPage.tsx:186",
+        "frontend/src/pages/AcpProfilesPanel.tsx"
+      ],
+      "test_scenarios_reviewed": [
+        "five deep links and keyboard tabs",
+        "single visible runtime tabpanel"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "ai-panel-acp数量恰为1，父页持有tabpanel，子页普通容器",
+        "五页签aria-controls均唯一有效，方向键/Home/End焦点与选择一致，AX仅一个运行环境面板"
+      ],
+      "review_evidence": "父页唯一tabpanel，五页签aria-controls唯一，方向键/Home/End的选中和焦点由真实浏览器核对。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/AiConnectionsPage.tsx": "ec04c7d7e3396b92fa0f0436d2f1111f47763983528feaea9f88fff6c63754ea",
+        "frontend/src/pages/AcpProfilesPanel.tsx": "e427ecea603a0ac83cc376bb85a90543c8c733afcafa1ac6ae298131aa15acc9"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    },
+    {
+      "id": "B13",
+      "title": "本地令牌、窄容器验证与目录降级六态",
+      "candidate_files_reviewed": [
+        "frontend/src/pages/ServiceUi.css",
+        "frontend/styles.css",
+        "frontend/src/pages/AiProvidersPanel.tsx"
+      ],
+      "summary": "局部12/13/14px令牌、窄容器布局、长文本换行；健康目录失败保留配置和成功快照时间，六态文字及重试；普通busy/status/alert和reduced-motion保留。",
+      "source_evidence": [
+        "frontend/src/pages/ServiceUi.css:1",
+        "frontend/src/pages/AiProvidersPanel.tsx:253",
+        "frontend/src/pages/AiProvidersPanel.tsx:764",
+        "frontend/scripts/remediation/mission-ui-retained-browser.mjs:26"
+      ],
+      "test_scenarios_reviewed": [
+        "320/390/480/620/880 widths",
+        "120-character URL and 50 percent expanded copy",
+        "composited contrast 4.5:1 and focus 3:1, 24px targets",
+        "catalog loading/error/denied/partial/ready and empty states"
+      ],
+      "passed": true,
+      "review_state": "independently_reviewed_predeployment_delivery_evidence",
+      "implemented_by": "existing_upstream_producers; no reviewer implementation",
+      "acceptance": [
+        "事实行/备用模型使用12px meta、名称13px、局部标题14px，不留9.5/10/11px裸字号；实测正文4.5:1、非文本/焦点3:1并记录合成色",
+        "内容宽320/390/480/620/880、200%、120字符URL及50%文案膨胀测边界遮挡；若复现挤压，服务<480动作换行、表单<440单列；未复现则附记录不宣称缺陷",
+        "仅健康目录失败不清配置列表，显示未知及旧快照时间，可局部重试；加载aria-busy、初始空/筛选空、错误、部分可用、成功、无权限均有文字与下一步",
+        "键盘/读屏检查status与alert，减少动效不位移缩放；命中区建议32px且核查24px最低及例外"
+      ],
+      "review_evidence": "原测量320/390/480/620/880及296容器、120字符URL/50%扩写、12/13/14px、六态/快照时间、reduced-motion；抽样文字最低5.4417、焦点8.5142、必要控件边界3.6579、命中区最低28px。非整站AA认证。",
+      "checks": [
+        {
+          "name": "service-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs service",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-service-browser-1794648971735854500.log",
+          "sha256": "bf691a7b278bffbf89d43bee297a2a228d98cc86e161ad905111408df906e505",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": []
+        },
+        {
+          "name": "budget-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-retained-browser.mjs budget",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-budget-browser-1794649082775983600.log",
+          "sha256": "76bc8fac444cac08e4fecd353a5d772aa4cba3637d4e579d571a4d07dd105b21",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS budget_exhausted followed by task_progress: same DTO across list/inbox/detail",
+            "PASS real SQLite increase, lost response, dialog reopen, identical request key, once-only extension, later pause preserved",
+            "PASS same idempotency key with different parameters rejected without mutation",
+            "PASS sufficient budget does not bypass environment",
+            "PASS manual pause is optional user choice, excluded from inbox",
+            "PASS dispatched verification is not fabricated live work",
+            "PASS coordination and feedback/retry labels do not invent a worker or require user action",
+            "PASS partial delivery exposes implementation/check/review with separate run/id/time and missing bodies",
+            "PASS 320/390px, long paths, ordinary 640px layout; all 200% zoom user_deferred, dark preference, reduced motion",
+            "PASS truthful live feedback and no infinite animation under reduced motion",
+            "PASS failed verification and overall completion retain evidence entries",
+            "PASS mismatched snapshot disables restore and budget submission"
+          ]
+        },
+        {
+          "name": "mission-browser",
+          "command": "node frontend/scripts/remediation/mission-ui-clock-evidence-browser.mjs",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-mission-browser-1794648983648899600.log",
+          "sha256": "6f070fe592f7ee02107814f7704cbd053b498daf9e72052ed854bc26a7ad2106",
+          "rust_summaries": [],
+          "observed_tests": [],
+          "assertion_lines": [
+            "PASS native budget modal keyboard/focus return/background isolation",
+            "PASS manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+            "PASS terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+            "PASS partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+            "PASS actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+            "PASS late older poll cannot overwrite newer associated detail snapshot",
+            "PASS recovery:legacy-owned list/inbox/detail/task row/CTA contract",
+            "PASS recovery:producer-action list/inbox/detail/task row/CTA contract",
+            "PASS recovery:no-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:missing-attempt list/inbox/detail/task row/CTA contract",
+            "PASS recovery:foreign-claim list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-plan list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-confirmation list/inbox/detail/task row/CTA contract",
+            "PASS recovery:mismatched-cursor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-contract list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-actor list/inbox/detail/task row/CTA contract",
+            "PASS recovery:unknown-reason list/inbox/detail/task row/CTA contract",
+            "PASS recovery:environment list/inbox/detail/task row/CTA contract",
+            "PASS recovery:budget list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause list/inbox/detail/task row/CTA contract",
+            "PASS recovery:manual-pause-pending list/inbox/detail/task row/CTA contract",
+            "PASS recovery:running-worker list/inbox/detail/task row/CTA contract",
+            "PASS active -> waiting: list/inbox/detail/task/owner/next action/CTA agree, current step may finish, no duplicate start, ended activity clears busy",
+            "PASS foreign/missing/mismatched/unknown live-run associations remain conservative; no recovery permissions invented",
+            "PASS checks_completed before reviewer: preparation/pause/execution expose real command, task/implementation/candidate/event time; later verdict updates separately and failure history remains",
+            "PASS missing/unknown/mismatched/ambiguous candidates and empty checks never substitute current evidence; raw history stays reachable",
+            "PASS a verdict from another candidate cannot sign current checks; it remains accessible in history",
+            "PASS native slash/backslash/extended roots in all six directions: actual DOM commands/0/1/-1/task/run/candidate/time, separate verdict updates, failed history and no duplicate CTA",
+            "PASS native foreign/ambiguous path forms and POSIX case refuse; raw candidate/digest/mission/task/implementation/verification/plan guards preserved",
+            "PASS missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+          ]
+        }
+      ],
+      "source_hashes": {
+        "frontend/src/pages/ServiceUi.css": "d0de5033a8a39fb5d464bce55f4578b696c8af24b5b3dcebb9573b10aa50d814",
+        "frontend/styles.css": "ff83485216a5d257d616c88d634bc26de255b493cd777a28c23ae7574b427c71",
+        "frontend/src/pages/AiProvidersPanel.tsx": "687dc54b532c29a1150087c88701872e4ee0c6832aac7fedf10f07023fa1f33e"
+      },
+      "limitations": [
+        "副本是supervisor传递的原始QA执行证据；本reviewer仅独立读码/读记录/核hash。",
+        "安装态、最终源集成及部署后验收由supervisor后续执行，不是本阶段已通过事实。"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "command": "python -B \"G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\review_verify.py\"",
+      "argv": [
+        "python",
+        "-B",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\review_verify.py"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 1703,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\review_verify.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\review_verify.stderr.log"
+      ],
+      "stdout_sha256": "05b81cc7bc21d630da918bae03c839f3ef3f7ccb0b3794a0f8a78f638788129c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "classification": "reviewer_current_read_only_document_code_evidence_check_not_QA_repetition"
+    },
+    {
+      "command": "python -B \"G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\coverage_verify.py\"",
+      "argv": [
+        "python",
+        "-B",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\coverage_verify.py"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 1859,
+      "evidence": [
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\coverage_verify.stdout.log",
+        "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\coverage_verify.stderr.log"
+      ],
+      "stdout_sha256": "a3351e62364ba5226472bbfd80a691ae8cdeecb344bcb17e47be2566ef65ebfb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "classification": "reviewer_current_read_only_document_code_evidence_check_not_QA_repetition"
+    }
+  ],
+  "required_checks": [
+    "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+    "python -c \"import json; p=json.load(open('reports/final/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','implemented_backlog_ids','changed_files','checks','limitations']); cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); fs=p['changed_files']; assert isinstance(fs,list) and fs; assert all(isinstance(f,str) and '..' not in f.split('/') and (f=='docs/mixed-remediation-delivery.md' or f.startswith('reports/final/')) for f in fs); assert not p.get('blocking_findings')\""
+  ],
+  "required_check_receipt": "reports/final/required-checks.json",
+  "blocking_findings": [],
+  "producer_task_ids": [],
+  "review_workflow": {
+    "plan": "scope/fixed binding and inputs read; no external skill loaded",
+    "execute": "independent source/document/log/payload/hash review; no producer or QA repetition",
+    "verify": "read-only verifier commands succeeded; final original required commands executed separately on sealed report",
+    "deliver": "readiness recommendation to supervisor, no self-declared Mission acceptance"
+  },
+  "evidence_handoff": {
+    "root": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424",
+    "ready": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\READY.json",
+      "sha256": "a2b6389794cd8ae2981df4eac3121c7bafbd6a2dda14ca3134dd644759638c3f"
+    },
+    "manifest": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\manifest.json",
+      "sha256": "b811f782f6b87cadc45484da2b1593e7cc5e5b00e941f6dce656e1749758457a"
+    },
+    "bundle_seal": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\bundle-seal.json",
+      "sha256": "7d810be85e01d3b4bfda52938c1cb28efd7072d2e7c2cbceb5a653bebba35a65"
+    },
+    "classification": "supervisor-transferred byte-preserving evidence, not this reviewer execution",
+    "files_verified": 394,
+    "mapped_records_read": 385,
+    "source_resolution": "manifest source_absolute_path -> relative_copy only; original external references never opened",
+    "history_archived_before_overwrite": [
+      {
+        "path": "reports/final/audit-after.json",
+        "copy": "review-evidence/history/reports/final/audit-after.json",
+        "sha256": "68bdda01dc97df08e0160913639b11c9f37c615fbd1b623fbb5c5c91171631ce",
+        "bytes": 1115276
+      },
+      {
+        "path": "reports/final/audit-before.json",
+        "copy": "review-evidence/history/reports/final/audit-before.json",
+        "sha256": "4f81c7fb6dd4124dd18b7fa4dba8b5f8a359c44e4d3258d36160cfb5a116c0f1",
+        "bytes": 1115245
+      },
+      {
+        "path": "reports/final/final-validation.json",
+        "copy": "review-evidence/history/reports/final/final-validation.json",
+        "sha256": "ac66a58bf89ac1bf095a1e6cfdf8f11d35aa64a810d309197160b84b66585ec7",
+        "bytes": 2886
+      },
+      {
+        "path": "reports/final/required-check.json",
+        "copy": "review-evidence/history/reports/final/required-check.json",
+        "sha256": "4d36da998f2f1721572ee36be6604e3d596a205c10bd1504d572b12b2925b6f5",
+        "bytes": 913
+      },
+      {
+        "path": "reports/final/result.json",
+        "copy": "review-evidence/history/reports/final/result.json",
+        "sha256": "30533e30e9c42e9005e827a26eab6adcb15990441f75a1dde0500157e6b91a7d",
+        "bytes": 62743
+      },
+      {
+        "path": "reports/final/retained-evidence-audit.json",
+        "copy": "review-evidence/history/reports/final/retained-evidence-audit.json",
+        "sha256": "26750c02f76b005aae39e9bd20024eccc9f94d4e92b079484b49faf87c9434a2",
+        "bytes": 18236
+      },
+      {
+        "path": "reports/final/review-checks.json",
+        "copy": "review-evidence/history/reports/final/review-checks.json",
+        "sha256": "aae2fd4d5caaab7e9a963ebd5dacd7f6030d6d79a1203ada07bf570220a6da88",
+        "bytes": 2159
+      },
+      {
+        "path": "docs/mixed-remediation-delivery.md",
+        "copy": "review-evidence/history/docs/mixed-remediation-delivery.md",
+        "sha256": "adf606dfac31e4e287dee8bc34cf16ec417ebf1f6c667c7d7c12f9a1c0c1512a",
+        "bytes": 6542
+      }
+    ],
+    "review_evidence": "reports/final/review-evidence.json"
+  },
+  "baseline_review": {
+    "total": 663,
+    "manifest_sha256": "b19505f763d23bdc3f0a5a9a23ef3f90a3d5926af36768a8479152cecba4f686",
+    "counts": {
+      "unchanged": 508,
+      "changed": 51,
+      "not_read_outside_task_scope": 104
+    },
+    "index": "reports/final/difference-index.json",
+    "prestart_files": [
+      {
+        "path": "src/workflow/mod.rs",
+        "before": "1430d31d452733e2c0091d660bf5ab0b80f5234a5e23de97454f03b0678cf45d",
+        "after": "2e7b19a76e1d5109a696b6294803355c06f4c163aa598330d832e137c2edaa93",
+        "current": "73f6dedeefe7fe3f8eea21e85abab708daff9361ada33e0db6322f19520f234a",
+        "status": "prestart_plus_later_changes_not_exclusive_attribution"
+      },
+      {
+        "path": "src/workflow/runtime.rs",
+        "before": "906759560c6cbebe0dc50cca06cd92157a8ba56318962b2180f78fcf075a75a5",
+        "after": "f7eed24fb61c24e2d3242e782fb8525c61e3b96dd5b07b93e8de8964f7d03d8d",
+        "current": "9ecab89014207b95cff77daa0c7a514d2b089a5df682388fc91ac15d0614318e",
+        "status": "prestart_plus_later_changes_not_exclusive_attribution"
+      },
+      {
+        "path": "src/workflow/preflight.rs",
+        "before": "77fbbefa89691af95e0bca913ad87509731fa30d32b96bad55651d22152d703d",
+        "after": "dd9e672d12222eb9c68b10836106db955bcc0201b4f89eef7af206f85ac9a13d",
+        "current": "dd9e672d12222eb9c68b10836106db955bcc0201b4f89eef7af206f85ac9a13d",
+        "status": "prestart_bytes_unchanged"
+      },
+      {
+        "path": "src/mission/store.rs",
+        "before": "2f1193a3a1c6e3fc4cdd18c9dd8fe4a88310bd4110c22277f3574d36bffe713d",
+        "after": "feb1bddd1e7575a73e7a243c18b949cd35068785912c95c4ab1fe3f6c37b17f6",
+        "current": "b94ffd22f96bf6cb08986866782c5754f14dbc1b5aec4dc82cda2008740ac3bf",
+        "status": "prestart_plus_later_changes_not_exclusive_attribution"
+      },
+      {
+        "path": "src/app/mission_dispatch.rs",
+        "before": "b27c9e112afa549ce51b354a072a075775d9e7a0a9c42c2eb14e81e2b9f4552d",
+        "after": "3eb07ac62384bb51f8a95aef5724459fbe6a674359a060ddc4237134491d9a43",
+        "current": "5dca7e42d8c8c8b261069eb9dba5b042bf54e4ddf54af044051d6bcf1b0ead1b",
+        "status": "prestart_plus_later_changes_not_exclusive_attribution"
+      },
+      {
+        "path": "src/app/runtime_workspace.rs",
+        "before": "676a453fdf11ee6dccadc488cbb78e72631a336f9be4254d8f29a00bbc925b2a",
+        "after": "7a03fe958eeb4829a661b5f96feda211e6c92665a0ddb62c77b7dd28a0f532a5",
+        "current": "7a03fe958eeb4829a661b5f96feda211e6c92665a0ddb62c77b7dd28a0f532a5",
+        "status": "prestart_bytes_unchanged"
+      },
+      {
+        "path": "frontend/src/pages/RuntimeWorkspaceDialog.tsx",
+        "before": "37fd9cc8336eef935b9b314567a19470a21dbdbf870a7070aa5e94170dd21b55",
+        "after": "2ef47c4ed678f7c351f381a8093910f3ecd3319a0634e4dcbbdcad17431d707a",
+        "current": "2ef47c4ed678f7c351f381a8093910f3ecd3319a0634e4dcbbdcad17431d707a",
+        "status": "prestart_bytes_unchanged"
+      }
+    ],
+    "attribution": "51 baseline differences and new paths include prior/concurrent/prestart work, not this reviewer achievement; original baseline content unavailable so this is byte-hash index, not invented full textual diff.",
+    "main_repository": "not opened or written; later integration belongs to supervisor"
+  },
+  "current_qa": {
+    "task_id": "repair-independent-qa-user-scope-11",
+    "report": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\sources\\biz\\reports\\qa\\result.json",
+      "sha256": "15b7778a1b5c397189e7967704ebab3581dc24e2c1e71d27afd87083038535f0"
+    },
+    "report_current_bytes_match": true,
+    "frozen": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\sources\\qa11\\independent-qa\\frozen.json",
+      "sha256": "3f24600d0466ab7a8b81c2497e746fc014ebb9a3baacd3a511256ed88e07ea42"
+    },
+    "prepared": {
+      "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\sources\\qa11\\executor-lifecycle-repair\\prepared.json",
+      "sha256": "0fa01215e75a360a72e8a6faffef7eba6f7497e3dd78db7de0b792875a2e098b"
+    },
+    "report_candidate": "b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61",
+    "current_prepared_candidate": "b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61",
+    "earlier_receipt_candidate": "05d459e18449e08b5a9c902a7d07dd0892b0fba8ec028d8bf72cb2137fad7273",
+    "host_candidate": "56e619a672764191d1af239b09818ed115837585cfb6d480b30e90e30f7d8d24",
+    "candidate_algorithms": {
+      "report_prepared": "SHA256 json.dumps(identity_without_candidate_id,sort_keys=True); includes retained file/toolchain/env/signing/build fields; recomputed without executing toolchain",
+      "host": "mission_candidate.v1 scoped_files_sha256; content tree and path/type status digests plus canonical workspace; src/mission/candidate.rs:58–104; retained event value, not recomputed or equated with report id",
+      "helper_artifact": "separate scoped helper output candidate, with source_candidate_id provenance; not report or host candidate"
+    },
+    "current_authorized_source_counts": {
+      "matched": 521,
+      "not_read_outside_task_scope": 37
+    },
+    "original_QA_logs": 19,
+    "backend_observed_counts": {
+      "config": 49,
+      "gateway": 80,
+      "budget": 13,
+      "mission": 56,
+      "supervisor": 7,
+      "handoff": 3,
+      "usage": 6,
+      "total": 214
+    },
+    "executor_prior_actual_executions": 468,
+    "executor_unique_test_ids": 463,
+    "worker_original_final_replay": [
+      {
+        "command": "npm --prefix frontend run build",
+        "exit_code": 0,
+        "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-1-1794649221261051500.log",
+        "sha256": "6e678e064c37a58ebe46a3af2e5ecb1c00075de64b6de811fdadec8cc6415446"
+      },
+      {
+        "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+        "exit_code": 0,
+        "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-2-1794649223690112000.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "command": "python scripts/remediation/independent-qa-current-candidate.py",
+        "exit_code": 0,
+        "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-3-1794649224384484200.log",
+        "sha256": "b1cfa7707982511d4c282913743329b576d6078642e5efaee0918d3b64afda92"
+      },
+      {
+        "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','status','backlog','implemented_backlog_ids','changed_files','checks','limitations','blocking_findings','producer_task_ids']); assert p['status']=='pass' and p['passed'] is True; assert not p['blocking_findings']; cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run build','python scripts/remediation/independent-qa-current-candidate.py']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); fs=p['changed_files']; roots=['reports/qa','frontend/scripts/remediation','scripts/remediation']; assert isinstance(fs,list); assert all(isinstance(f,str) and '..' not in f.split('/') and any(f.startswith(r+'/') for r in roots) for f in fs)\"",
+        "exit_code": 0,
+        "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-4-1794649260244463700.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "formal_host_events": [
+      {
+        "event_id": "mission_1794473598404_ffe1e069:1063",
+        "event_type": "verification_checks_completed",
+        "payload_json_sha256": "f106ec21961796592a49c65f76d1a6af73317df591cb1d9becd5a06cd91b70a0",
+        "implementation_run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-independent-qa-user-scope-11",
+        "verification_run_id": null,
+        "passed": null,
+        "checks": [
+          {
+            "command": "npm --prefix frontend run build",
+            "exit_code": 0,
+            "output_sha256": "3b5a365d6a756ce6168f9f62be42347b957b1f0771326eeca07579ad6c15563e",
+            "test_summary": "",
+            "elapsed_ms": 11740,
+            "error": ""
+          },
+          {
+            "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+            "exit_code": 0,
+            "output_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "test_summary": "",
+            "elapsed_ms": 11011,
+            "error": ""
+          },
+          {
+            "command": "python scripts/remediation/independent-qa-current-candidate.py",
+            "exit_code": 0,
+            "output_sha256": "5ed83af8e29265daf58186dc1414dfc763fd35ba1b8fd2f1b9db325626ca35a9",
+            "test_summary": "# tests 468\n# pass 468\n# fail 0",
+            "elapsed_ms": 43741,
+            "error": ""
+          },
+          {
+            "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','status','backlog','implemented_backlog_ids','changed_files','checks','limitations','blocking_findings','producer_task_ids']); assert p['status']=='pass' and p['passed'] is True; assert not p['blocking_findings']; cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run build','python scripts/remediation/independent-qa-current-candidate.py']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); fs=p['changed_files']; roots=['reports/qa','frontend/scripts/remediation','scripts/remediation']; assert isinstance(fs,list); assert all(isinstance(f,str) and '..' not in f.split('/') and any(f.startswith(r+'/') for r in roots) for f in fs)\"",
+            "exit_code": 0,
+            "output_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "test_summary": "",
+            "elapsed_ms": 10189,
+            "error": ""
+          }
+        ],
+        "copy": "upstream-evidence-v1/sources/control/qa11-native-acceptance-raw-event-observation-v1.json",
+        "sha256": "3ec79d8e348ea39c246b1fb21d49a785d9995346902e74fa1d421c24754e4d25",
+        "host_candidate": {
+          "schema_version": "mission_candidate.v1",
+          "identity_kind": "scoped_files_sha256",
+          "workspace_root": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+          "candidate_id": "56e619a672764191d1af239b09818ed115837585cfb6d480b30e90e30f7d8d24",
+          "commit_sha": "not-applicable",
+          "tree_digest": "f4077178137935016964f346ea6c8787489c0deafe00fe2146950ad9b4e088e8",
+          "status_digest": "bc061c39445d0ad3b134efe7c3bd81411aca822cf9701f6dc0c552c269f7406a"
+        }
+      },
+      {
+        "event_id": "mission_1794473598404_ffe1e069:1066",
+        "event_type": "host_verification_checked",
+        "payload_json_sha256": "d28515c8bd393b9173c99626183f1da134322dbc7164801e9caf7cf17a56c6f0",
+        "implementation_run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-independent-qa-user-scope-11",
+        "verification_run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-independent-qa-user-scope-11_verify",
+        "passed": true,
+        "checks": [
+          {
+            "command": "npm --prefix frontend run build",
+            "exit_code": 0,
+            "output_sha256": "3b5a365d6a756ce6168f9f62be42347b957b1f0771326eeca07579ad6c15563e",
+            "test_summary": "",
+            "elapsed_ms": 11740,
+            "error": ""
+          },
+          {
+            "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+            "exit_code": 0,
+            "output_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "test_summary": "",
+            "elapsed_ms": 11011,
+            "error": ""
+          },
+          {
+            "command": "python scripts/remediation/independent-qa-current-candidate.py",
+            "exit_code": 0,
+            "output_sha256": "5ed83af8e29265daf58186dc1414dfc763fd35ba1b8fd2f1b9db325626ca35a9",
+            "test_summary": "# tests 468\n# pass 468\n# fail 0",
+            "elapsed_ms": 43741,
+            "error": ""
+          },
+          {
+            "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','status','backlog','implemented_backlog_ids','changed_files','checks','limitations','blocking_findings','producer_task_ids']); assert p['status']=='pass' and p['passed'] is True; assert not p['blocking_findings']; cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run build','python scripts/remediation/independent-qa-current-candidate.py']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); fs=p['changed_files']; roots=['reports/qa','frontend/scripts/remediation','scripts/remediation']; assert isinstance(fs,list); assert all(isinstance(f,str) and '..' not in f.split('/') and any(f.startswith(r+'/') for r in roots) for f in fs)\"",
+            "exit_code": 0,
+            "output_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "test_summary": "",
+            "elapsed_ms": 10189,
+            "error": ""
+          }
+        ],
+        "copy": "upstream-evidence-v1/sources/control/qa11-native-acceptance-raw-event-observation-v1.json",
+        "sha256": "3ec79d8e348ea39c246b1fb21d49a785d9995346902e74fa1d421c24754e4d25",
+        "host_candidate": {
+          "schema_version": "mission_candidate.v1",
+          "identity_kind": "scoped_files_sha256",
+          "workspace_root": "\\\\?\\C:\\Users\\Administrator\\.codex\\worktrees\\mixed-executor-remediation\\himind-agent",
+          "candidate_id": "56e619a672764191d1af239b09818ed115837585cfb6d480b30e90e30f7d8d24",
+          "commit_sha": "not-applicable",
+          "tree_digest": "f4077178137935016964f346ea6c8787489c0deafe00fe2146950ad9b4e088e8",
+          "status_digest": "bc061c39445d0ad3b134efe7c3bd81411aca822cf9701f6dc0c552c269f7406a"
+        },
+        "protected_matches": true,
+        "protected_baseline_count": 2536,
+        "reviewer_output_keys": [
+          "schema_version",
+          "provider",
+          "workspace",
+          "summary",
+          "model",
+          "service_source",
+          "endpoint",
+          "passed",
+          "verified_task_ids",
+          "plan_sha256",
+          "candidate",
+          "checks",
+          "reasons"
+        ],
+        "formal_reviewer_summary": {
+          "passed": true,
+          "verified_task_ids": [
+            "repair-independent-qa-user-scope-11"
+          ],
+          "plan_sha256": "dc01c3a6c167714fdf0a5365189946531b1eb61586601296e5984939cec98a34",
+          "candidate": {
+            "candidate_id": "56e619a672764191d1af239b09818ed115837585cfb6d480b30e90e30f7d8d24",
+            "commit_sha": "not-applicable",
+            "tree_digest": "f4077178137935016964f346ea6c8787489c0deafe00fe2146950ad9b4e088e8",
+            "status_digest": "bc061c39445d0ad3b134efe7c3bd81411aca822cf9701f6dc0c552c269f7406a"
+          },
+          "checks": [
+            {
+              "command": "npm --prefix frontend run build",
+              "exit_code": 0,
+              "detail": "source=host; output_sha256=3b5a365d6a756ce6168f9f62be42347b957b1f0771326eeca07579ad6c15563e; host_check_boundary.matches=true，检查前后候选身份一致。"
+            },
+            {
+              "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+              "exit_code": 0,
+              "detail": "source=host; output_sha256=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b; 独立审阅报告保留B01-B13、F01-F10及明确的用户排除项，历史1051失败与1053宿主转录分别记录。"
+            },
+            {
+              "command": "python scripts/remediation/independent-qa-current-candidate.py",
+              "exit_code": 0,
+              "detail": "source=host; output_sha256=5ed83af8e29265daf58186dc1414dfc763fd35ba1b8fd2f1b9db325626ca35a9; test_summary=# tests 468 / # pass 468 / # fail 0。只读审阅独立入口、来源绑定及正负回归、冻结身份校验、当前产品回归实现和本任务资源中引用的准备及浏览器日志；未重跑检查。历史host与当前worker证据分离，缺失哈希、命令错配、旧任务及来源伪标有拒绝保护。"
+            },
+            {
+              "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','status','backlog','implemented_backlog_ids','changed_files','checks','limitations','blocking_findings','producer_task_ids']); assert p['status']=='pass' and p['passed'] is True; assert not p['blocking_findings']; cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run build','python scripts/remediation/independent-qa-current-candidate.py']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); fs=p['changed_files']; roots=['reports/qa','frontend/scripts/remediation','scripts/remediation']; assert isinstance(fs,list); assert all(isinstance(f,str) and '..' not in f.split('/') and any(f.startswith(r+'/') for r in roots) for f in fs)\"",
+              "exit_code": 0,
+              "detail": "source=host; output_sha256=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b; protected_file_check.matches=true，宿主执行前基线与当前2536个受保护文件清单一致，新增、删除、修改均为0。审阅的交付改动位于授权QA路径；正式VERIFY、最终审查、部署和安装后验收未被预先声明完成。"
+            }
+          ],
+          "reasons": []
+        }
+      },
+      {
+        "event_id": "mission_1794473598404_ffe1e069:1067",
+        "event_type": "task_completed",
+        "payload_json_sha256": "1ccd2dd2335cee57aff22ce71d09aff70a6910058c936df1249561705349ae71",
+        "implementation_run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-independent-qa-user-scope-11",
+        "verification_run_id": "workflow_run_mission_mission_1794473598404_ffe1e069_repair-independent-qa-user-scope-11_verify",
+        "passed": true,
+        "checks": null,
+        "copy": "upstream-evidence-v1/sources/control/qa11-native-acceptance-raw-event-observation-v1.json",
+        "sha256": "3ec79d8e348ea39c246b1fb21d49a785d9995346902e74fa1d421c24754e4d25"
+      }
+    ],
+    "formal_status": "QA11 independently accepted1066,completed1067; task completion alone not used",
+    "outer_host_stdout_stderr_available": false,
+    "prepared_passed_false_explanation": "preparation intentionally initializes passed=False at executor-lifecycle-repair-checks.py:335; not a product verdict"
+  },
+  "fixture_matrix": [
+    {
+      "id": "F01",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f01_progress_does_not_hide_exhaustion_and_extension_never_dispatches"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F02",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f02_extension_preserves_environment_block_and_existing_authorized_resolution"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F03",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f03_dropped_response_concurrent_same_key_restart_and_pause_return_current_state"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F04",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f04_restart_and_repeated_out_of_order_cursor_reads_do_not_reapply_events"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F05",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f05_stale_missing_mismatched_confirmation_and_active_reject_but_manual_pause_accepts"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "F05 proactive manual-pause extension retained by execution contract"
+    },
+    {
+      "id": "F06",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f06_running_present_rejects_then_explicit_retry_rechecks_all_gates",
+        "mission::store::budget_remediation_tests::f06_sqlite_transaction_barrier_rechecks_running_before_any_budget_write"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F07",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f07_every_remaining_limit_and_untrusted_cost_reject_without_mutation"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F08",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f08_parameter_validation_and_overflow_leave_all_persisted_state_unchanged"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F09",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f09_legacy_explicit_resume_diagnostic_then_explicit_extension_no_automatic_action",
+        "mission::store::budget_remediation_tests::f09_unsafe_legacy_diagnosis_is_read_only_and_extension_rechecks_inflight_and_cost"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    },
+    {
+      "id": "F10",
+      "passed": true,
+      "tests": [
+        "mission::store::budget_remediation_tests::f10_new_consumption_exhausts_again_and_old_plan_events_do_not_complete_or_activate"
+      ],
+      "evidence": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\9debfdb381fde87bc7651300cffee4afe5c789464ba400e26afe32edc36e4afb\\executor-lifecycle-repair\\qa11-budget-1794648953323865900.log",
+      "classification": "actual isolated SQLite Store tests; not installed API",
+      "current_vs_target": "original retained Store cases"
+    }
+  ],
+  "excluded_by_user": {
+    "screen_reader_specific": {
+      "status": "excluded_by_user",
+      "passed": null,
+      "blocking": false,
+      "future_obligation": false
+    },
+    "all_200_percent_zoom": {
+      "status": "excluded_by_user",
+      "passed": null,
+      "blocking": false,
+      "future_obligation": false
+    }
+  },
+  "exclusion_authority": "Explicit current task scope plus authorized906/1044 human decision, not untrusted feedback paths. Frozen old user_deferred wording stays history, no future obligation.",
+  "ordinary_UI_coverage": {
+    "service": {
+      "copy": "upstream-evidence-v1/sources/qa11/b-yyFY1j/browser-assertions.json",
+      "sha256": "1eeca84daa0de395d7c879044ccabd41740acecaa70394e98b06bb3890affdb0"
+    },
+    "checks": [
+      "five deep links and keyboard tabs",
+      "native nested modal focus/esc/restore",
+      "required-field error links",
+      "radio keyboard and pressed/current",
+      "save busy double-submit guard",
+      "health failure isolated from configuration",
+      "empty and filtered empty",
+      "extended-assertions.json"
+    ],
+    "extended_checks": [
+      "five-tab-all-arrows-home-end-unique-acp-and-default-scope",
+      "full-list-chat-and-media-only-survives-catalog-failure-and-local-retry",
+      "narrow-summary-readable-width-and-stacked-action-independent-of-shell-container",
+      "late-server-error-summary-to-early-field-retains-nonsecret-data-and-retry",
+      "form-copy-50-percent-at-five-widths",
+      "computed-font-tokens",
+      "form-text-control-boundaries-and-hit-targets",
+      "light-reduced-motion-local-light-theme",
+      "dark-reduced-motion-local-light-theme"
+    ],
+    "widths": [
+      320,
+      390,
+      480,
+      620,
+      880
+    ],
+    "outside_elements": 0,
+    "minimum_sampled_text_ratio": 5.4417198605453,
+    "focus_ratio": 8.514150884045685,
+    "minimum_sampled_target": 28,
+    "minimum_required_boundary_ratio": 3.6578580398507534,
+    "records": [
+      {
+        "assertions": [
+          "native budget modal keyboard/focus return/background isolation",
+          "manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+          "partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+          "late older poll cannot overwrite newer associated detail snapshot",
+          "recovery:legacy-owned list/inbox/detail/task row/CTA contract",
+          "recovery:producer-action list/inbox/detail/task row/CTA contract",
+          "recovery:no-claim list/inbox/detail/task row/CTA contract",
+          "recovery:missing-attempt list/inbox/detail/task row/CTA contract",
+          "recovery:foreign-claim list/inbox/detail/task row/CTA contract",
+          "recovery:mismatched-plan list/inbox/detail/task row/CTA contract",
+          "recovery:mismatched-confirmation list/inbox/detail/task row/CTA contract",
+          "recovery:mismatched-cursor list/inbox/detail/task row/CTA contract",
+          "recovery:unknown-contract list/inbox/detail/task row/CTA contract",
+          "recovery:unknown-actor list/inbox/detail/task row/CTA contract",
+          "recovery:unknown-reason list/inbox/detail/task row/CTA contract",
+          "recovery:environment list/inbox/detail/task row/CTA contract",
+          "recovery:budget list/inbox/detail/task row/CTA contract",
+          "recovery:manual-pause list/inbox/detail/task row/CTA contract",
+          "recovery:manual-pause-pending list/inbox/detail/task row/CTA contract",
+          "recovery:running-worker list/inbox/detail/task row/CTA contract",
+          "active -> waiting: list/inbox/detail/task/owner/next action/CTA agree, current step may finish, no duplicate start, ended activity clears busy",
+          "foreign/missing/mismatched/unknown live-run associations remain conservative; no recovery permissions invented",
+          "checks_completed before reviewer: preparation/pause/execution expose real command, task/implementation/candidate/event time; later verdict updates separately and failure history remains",
+          "missing/unknown/mismatched/ambiguous candidates and empty checks never substitute current evidence; raw history stays reachable",
+          "a verdict from another candidate cannot sign current checks; it remains accessible in history",
+          "native slash/backslash/extended roots in all six directions: actual DOM commands/0/1/-1/task/run/candidate/time, separate verdict updates, failed history and no duplicate CTA",
+          "native foreign/ambiguous path forms and POSIX case refuse; raw candidate/digest/mission/task/implementation/verification/plan guards preserved",
+          "missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+        ],
+        "classification": "real Chromium/Edge + production React component + fake browser clock; transport DTO contract fixtures, no actual Store or independent expert execution",
+        "unverified_historical_wording": [
+          "production/Tauri/MCP/backend transactions",
+          "real expert verdicts",
+          "true dark palette (existing light tokens retained)",
+          "complete accessibility conformance"
+        ],
+        "copy": "upstream-evidence-v1/sources/qa11/c-T3AlE0/browser-result.json",
+        "sha256": "1aad5bf832fbf4b6444c9257cefa32e085d380212873b77b2e1102f50036a7f1"
+      },
+      {
+        "assertions": [
+          "manual_pause: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "environment_blocked: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "budget_exhausted: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "system_verification: actual active→waiting component, continued clock, exact/over boundary and allowed dialog reopen",
+          "terminal has no invented freeze endpoint; explicit cumulative-time disclosure",
+          "partial: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "rejected: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "completed: overview + row entries, exact task/run/id/time/body association, retry/repair failure history, missing records",
+          "actual detail loads 10005 events across two pages/global gaps, retains all unique rows, no-new poll does not reset",
+          "late older poll cannot overwrite newer associated detail snapshot",
+          "missing plan association fails closed; loading/empty/error/partial/success/denied rendered"
+        ],
+        "classification": "real Chromium/Edge + production React component + fake browser clock; transport DTO contract fixtures, no actual Store or independent expert execution",
+        "unverified_historical_wording": [
+          "production/Tauri/MCP/backend transactions",
+          "real expert verdicts",
+          "native browser chrome zoom",
+          "true dark palette (existing light tokens retained)",
+          "screen reader and complete accessibility conformance"
+        ],
+        "copy": "upstream-evidence-v1/sources/qa11/c-nBomy9/browser-result.json",
+        "sha256": "edb83cb7b4e46c3b55c014e936b3a072dcc9ca46c4ea3f34754fd03e9fdb403f"
+      },
+      {
+        "assertions": [
+          "budget_exhausted followed by task_progress: same DTO across list/inbox/detail",
+          "real SQLite increase, lost response, dialog reopen, identical request key, once-only extension, later pause preserved",
+          "same idempotency key with different parameters rejected without mutation",
+          "sufficient budget does not bypass environment",
+          "manual pause is optional user choice, excluded from inbox",
+          "dispatched verification is not fabricated live work",
+          "coordination and feedback/retry labels do not invent a worker or require user action",
+          "partial delivery exposes implementation/check/review with separate run/id/time and missing bodies",
+          "320/390px, long paths, ordinary 640px layout; all 200% zoom user_deferred, dark preference, reduced motion",
+          "truthful live feedback and no infinite animation under reduced motion",
+          "failed verification and overall completion retain evidence entries",
+          "mismatched snapshot disables restore and budget submission"
+        ],
+        "classification": {
+          "budget": "real browser + actual unchanged SQLite Store via isolated JSON transport",
+          "verification": "contract state seed through store API; not a real expert review",
+          "errorAndPermission": "transport contract fixtures",
+          "dark": "system dark preference tested; product uses existing light tokens"
+        },
+        "unverified_historical_wording": null,
+        "copy": "upstream-evidence-v1/sources/qa11/b-FYDdun/browser-result.json",
+        "sha256": "41b31051a03b7ea2ab6137e65be5b6b4205c3072cc27943dbbb78b22dd8b0d70"
+      }
+    ]
+  },
+  "cross_executor": {
+    "native": {
+      "codex_receipt": {
+        "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/result.json",
+        "sha256": "fbe3d4a06b7d4f0711791160a1e7c0348afa8c5fb66f27f1329369ddec60ee74"
+      },
+      "himind_receipt": {
+        "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/real-himind.json",
+        "sha256": "43e899f714b864db0619058c99aee219dbff247f989ee7e90603965c23beacf4"
+      },
+      "chain": [
+        "baseline",
+        "himind-first",
+        "codex-launch",
+        "himind-second",
+        "codex-resume"
+      ],
+      "artifacts": {
+        "baseline": {
+          "value": 40,
+          "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/baseline.json",
+          "sha256": "f163384aa0b4fe3febed47e25e99f90b26ea0498f8bfb82ec2ce9a23e4a0c54d"
+        },
+        "himind-first": {
+          "value": 41,
+          "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/himind-first.json",
+          "sha256": "2466781dc1b9d84cef54267dc8e62217962255dbcd63cf92912c90d4e759cddf"
+        },
+        "codex-launch": {
+          "value": 42,
+          "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/codex-launch.json",
+          "sha256": "59263e2580ff36d3f1a6a1cb22c2069c6c73a625e906441988ed025dc2e917c0"
+        },
+        "himind-second": {
+          "value": 43,
+          "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/himind-second.json",
+          "sha256": "f12c4c1cf016e11ece9d12b40ca9fb9bcbb0a79d1d9a1fae0c86ba7d393b60b9"
+        },
+        "codex-resume": {
+          "value": 44,
+          "copy": "upstream-evidence-v1/sources/qa11/executor/live-codex-62b16a2bf61e9e68/codex-resume.json",
+          "sha256": "7f7a6e73c1ed7dc4f844b9d431a19e3ba77648a3668dc2f538310af0bf79a871"
+        }
+      },
+      "envelopes": [
+        {
+          "producer": "himind-first",
+          "run": "helper-himind-first-35720f671fd91527",
+          "source_executor": "himind.builtin",
+          "actual_model": [
+            "himind:lucen:gpt-6.1-sol"
+          ],
+          "receiver_executor": "personal.codex",
+          "artifact_hashes": [
+            {
+              "path": "himind-first.json",
+              "sha256": "2466781dc1b9d84cef54267dc8e62217962255dbcd63cf92912c90d4e759cddf",
+              "size_bytes": 82
+            }
+          ],
+          "permission_mode": "full_access",
+          "authority": "provenance_only_no_path_grant"
+        },
+        {
+          "producer": "codex-launch",
+          "run": "helper-codex-launch-67888839565a723f",
+          "source_executor": "personal.codex",
+          "actual_model": [],
+          "receiver_executor": "himind.builtin",
+          "artifact_hashes": [
+            {
+              "path": "codex-launch.json",
+              "sha256": "59263e2580ff36d3f1a6a1cb22c2069c6c73a625e906441988ed025dc2e917c0",
+              "size_bytes": 69
+            }
+          ],
+          "permission_mode": "full_access",
+          "authority": "provenance_only_no_path_grant"
+        },
+        {
+          "producer": "himind-second",
+          "run": "helper-himind-second-141ca6c34ce6bc10",
+          "source_executor": "himind.builtin",
+          "actual_model": [
+            "himind:lucen:gpt-6.1-sol"
+          ],
+          "receiver_executor": "personal.codex",
+          "artifact_hashes": [
+            {
+              "path": "himind-second.json",
+              "sha256": "f12c4c1cf016e11ece9d12b40ca9fb9bcbb0a79d1d9a1fae0c86ba7d393b60b9",
+              "size_bytes": 82
+            }
+          ],
+          "permission_mode": "full_access",
+          "authority": "provenance_only_no_path_grant"
+        }
+      ],
+      "codex_session": "01a1d966-41ec-73d3-abde-0ebd7c579615",
+      "launch_usage": {
+        "schema_version": "codex_usage_receipt.v1",
+        "run_id": "helper-codex-launch-67888839565a723f",
+        "provider_session_id": "01a1d966-41ec-73d3-abde-0ebd7c579615",
+        "counter_scope": "provider_session_cumulative",
+        "provider_raw": {
+          "input_tokens": 76064,
+          "output_tokens": 1036,
+          "cached_input_tokens": 52685,
+          "reasoning_output_tokens": 445
+        },
+        "baseline": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cached_input_tokens": 0,
+          "reasoning_output_tokens": 0
+        },
+        "run_increment": {
+          "input_tokens": 76064,
+          "output_tokens": 1036,
+          "cached_input_tokens": 52685,
+          "reasoning_output_tokens": 445
+        },
+        "increment_status": "known",
+        "cost": null,
+        "cost_status": "unknown",
+        "cached_reasoning_semantics": "subsets_not_additional_tokens"
+      },
+      "resume_usage": {
+        "schema_version": "codex_usage_receipt.v1",
+        "run_id": "helper-codex-resume-e6b47f64b20efff1",
+        "provider_session_id": "01a1d966-41ec-73d3-abde-0ebd7c579615",
+        "counter_scope": "provider_session_cumulative",
+        "provider_raw": {
+          "input_tokens": 162199,
+          "output_tokens": 1639,
+          "cached_input_tokens": 109032,
+          "reasoning_output_tokens": 445
+        },
+        "baseline": {
+          "input_tokens": 76064,
+          "output_tokens": 1036,
+          "cached_input_tokens": 52685,
+          "reasoning_output_tokens": 445
+        },
+        "run_increment": {
+          "input_tokens": 86135,
+          "output_tokens": 603,
+          "cached_input_tokens": 56347,
+          "reasoning_output_tokens": 0
+        },
+        "increment_status": "known",
+        "cost": null,
+        "cost_status": "unknown",
+        "cached_reasoning_semantics": "subsets_not_additional_tokens"
+      },
+      "himind_stages": [
+        {
+          "classification": "host_delegated_worker_invocation/current_candidate_test_binary_calling_product_runtime_api",
+          "candidate_id": "b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61",
+          "task_id": "himind-first",
+          "run_id": "helper-himind-first-35720f671fd91527",
+          "depends_on_artifact": "baseline.json",
+          "input_sha256": "f163384aa0b4fe3febed47e25e99f90b26ea0498f8bfb82ec2ce9a23e4a0c54d",
+          "output_artifact": "himind-first.json",
+          "output_sha256": "2466781dc1b9d84cef54267dc8e62217962255dbcd63cf92912c90d4e759cddf",
+          "read_scope": [
+            "baseline.json"
+          ],
+          "write_scope": [
+            "himind-first.json"
+          ],
+          "artifact_delivery": "native_host_embeds_only_scoped_dependency_in_no_tools_prompt",
+          "service_id": "lucen",
+          "model": "himind:lucen:gpt-6.1-sol",
+          "provider": "himind.builtin",
+          "tool_policy": "none",
+          "endpoint_provenance": "ephemeral_loopback_gateway_only_not_upstream_endpoint",
+          "endpoint": "http://localhost",
+          "usage_status": "reported_runtime_projection",
+          "usage": {
+            "input_tokens": 525,
+            "output_tokens": 35,
+            "estimated_cost": 0.0,
+            "currency": "",
+            "billing_owner": "local"
+          },
+          "usage_source": "runtime_session_projection_not_raw_upstream_billing",
+          "upstream_cost": null,
+          "upstream_billing_owner": null,
+          "configuration_sha256": {
+            "ai-services.json": "f38788c014109f127e82bf222b61877c71226628752a0a84db916943c5a3d0c3",
+            "ai-service-selection.json": "c6bde8156c11607d6034584f1c5dabc22e6a0764d0f218c801de485af52fadfd"
+          },
+          "runtime_sha256": {
+            "node.exe": "a926552584d75ed132d1dd571259262263b3e5b203ea02b5d2933acdbdb1d1e2",
+            "runtime.json": "97165785b7419c65f399f2aead8a41e0e8786176fe9b8bfce610db1a4d924d1a",
+            "node_modules/@deepseek-ai/dsh/lib/bin.js": "b6640801a5a65aae9f53ca21bcce3b2ea28bd9e9554c939c1ff7c4448d91fa18",
+            "entry": "ad95c68ecd42b79ed5cf78fec7147d20d78c21b482fa7fd09a0a1d34167c8d55"
+          },
+          "exit_code": 0,
+          "deadline_seconds": 90,
+          "canceled": false,
+          "elapsed_ms": 10844,
+          "runtime_operational_writes": "production Agent locks/bootstrap/cache/accounting/logs allowed; generated receipts/sessions in task resource",
+          "passed": true,
+          "mission_pipeline_acceptance": false
+        },
+        {
+          "classification": "host_delegated_worker_invocation/current_candidate_test_binary_calling_product_runtime_api",
+          "candidate_id": "b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61",
+          "task_id": "himind-second",
+          "run_id": "helper-himind-second-141ca6c34ce6bc10",
+          "depends_on_artifact": "codex-launch.json",
+          "input_sha256": "59263e2580ff36d3f1a6a1cb22c2069c6c73a625e906441988ed025dc2e917c0",
+          "output_artifact": "himind-second.json",
+          "output_sha256": "f12c4c1cf016e11ece9d12b40ca9fb9bcbb0a79d1d9a1fae0c86ba7d393b60b9",
+          "read_scope": [
+            "codex-launch.json"
+          ],
+          "write_scope": [
+            "himind-second.json"
+          ],
+          "artifact_delivery": "native_host_embeds_only_scoped_dependency_in_no_tools_prompt",
+          "service_id": "lucen",
+          "model": "himind:lucen:gpt-6.1-sol",
+          "provider": "himind.builtin",
+          "tool_policy": "none",
+          "endpoint_provenance": "ephemeral_loopback_gateway_only_not_upstream_endpoint",
+          "endpoint": "http://localhost",
+          "usage_status": "reported_runtime_projection",
+          "usage": {
+            "input_tokens": 2274,
+            "output_tokens": 35,
+            "estimated_cost": 0.0,
+            "currency": "",
+            "billing_owner": "local"
+          },
+          "usage_source": "runtime_session_projection_not_raw_upstream_billing",
+          "upstream_cost": null,
+          "upstream_billing_owner": null,
+          "configuration_sha256": {
+            "ai-services.json": "f38788c014109f127e82bf222b61877c71226628752a0a84db916943c5a3d0c3",
+            "ai-service-selection.json": "c6bde8156c11607d6034584f1c5dabc22e6a0764d0f218c801de485af52fadfd"
+          },
+          "runtime_sha256": {
+            "node.exe": "a926552584d75ed132d1dd571259262263b3e5b203ea02b5d2933acdbdb1d1e2",
+            "runtime.json": "97165785b7419c65f399f2aead8a41e0e8786176fe9b8bfce610db1a4d924d1a",
+            "node_modules/@deepseek-ai/dsh/lib/bin.js": "b6640801a5a65aae9f53ca21bcce3b2ea28bd9e9554c939c1ff7c4448d91fa18",
+            "entry": "ad95c68ecd42b79ed5cf78fec7147d20d78c21b482fa7fd09a0a1d34167c8d55"
+          },
+          "exit_code": 0,
+          "deadline_seconds": 90,
+          "canceled": false,
+          "elapsed_ms": 10880,
+          "runtime_operational_writes": "production Agent locks/bootstrap/cache/accounting/logs allowed; generated receipts/sessions in task resource",
+          "passed": true,
+          "mission_pipeline_acceptance": false
+        }
+      ],
+      "limits": [
+        "Structured product-runtime session/usage receipts; original outer host stdout/stderr not reconstructed.",
+        "HiMind cost/currency and upstream billing unknown; no inference from default zero.",
+        "Host artifact checks on four-hop helper are not full installed Mission or expert acceptance."
+      ]
+    },
+    "product_lifecycle_tests": [
+      "app::mission_dispatch::tests::executor_bidirectional_handoff_binds_run_hash_scope_permission_and_model_source",
+      "app::mission_dispatch::tests::executor_prestart_claim_reconcile_is_narrow_and_preserves_failed_history",
+      "app::mission_dispatch::tests::mission_canceled_terminal_runner_error_finalizes_exact_attempt",
+      "app::mission_dispatch::tests::mission_runtime_local_run_cancel_reaps_cli_tree_and_finishes_attempt",
+      "app::mission_dispatch::tests::mission_runtime_pause_and_other_run_cancel_allow_negative_final",
+      "app::mission_dispatch::tests::verification_provider_boundaries_preserve_read_only_risk_and_task_scope",
+      "app::mission_dispatch::tests::verification_read_only_required_check_still_completes",
+      "app::mission_supervisor::tests::executor_recovery_projection_store_supervisor_and_negative_boundaries",
+      "mission::executor_handoff::tests::handoff_paths_require_both_scopes_and_never_follow_absolute_evidence",
+      "mission::store::budget_remediation_tests::b05_currency_buckets_unknown_cost_and_run_usage_are_restart_idempotent",
+      "mission::store::budget_remediation_tests::f03_dropped_response_concurrent_same_key_restart_and_pause_return_current_state",
+      "mission::store::budget_remediation_tests::f04_restart_and_repeated_out_of_order_cursor_reads_do_not_reapply_events",
+      "mission::store::budget_remediation_tests::f09_unsafe_legacy_diagnosis_is_read_only_and_extension_rechecks_inflight_and_cost",
+      "mission::store::tests::executor_handoff_native_multihop_both_directions_preserves_failed_parents",
+      "mission::store::tests::executor_recovery_projection_missing_claim_fails_closed_before_legacy_restore",
+      "mission::store::tests::handoff_is_idempotent_and_requires_the_exact_workflow_pin",
+      "mission::store::tests::independently_verified_repair_unblocks_the_original_dependency",
+      "mission::store::tests::mission_feedback_context_matches_repair_ancestors_across_pages_and_isolates_other_targets_and_plans",
+      "mission::store::tests::mission_feedback_rejects_stale_unknown_canceled_terminal_and_unconfirmed_without_events",
+      "mission::store::tests::pause_resume_and_cancel_survive_reopen_without_reauthorizing_work",
+      "mission::store::tests::repair_budget_counts_follow_up_tasks",
+      "mission::store::tests::review_rework_covers_historical_repairs_but_requires_downstream_revision_order",
+      "mission::store::tests::runtime_full_access_requires_plan_confirmation_and_persists_recovery_choice",
+      "mission::store::tests::runtime_recovery_preserves_ready_task_and_is_bound_to_current_plan",
+      "mission::store::tests::runtime_recovery_respects_cancellation_and_expired_budget",
+      "runtime::acp::tests::handshake_without_model_option_yields_none",
+      "runtime::acp::tests::permission_policy_allows_once_only_when_explicit",
+      "runtime::acp::tests::permission_policy_cancels_without_a_matching_option",
+      "runtime::acp::tests::permission_policy_denies_by_default",
+      "runtime::acp::tests::picks_the_model_config_option_by_category",
+      "runtime::codex::tests::executor_agent_run_managed_claim_caller_receipt_recovery_preserves_failure",
+      "runtime::codex::tests::executor_agent_run_receipt_crash_restart_and_concurrent_recovery_are_once",
+      "runtime::codex::tests::executor_codex_selection_restart_stale_schema_and_incompatible_fallback",
+      "runtime::codex_usage::tests::usage_abandoned_turn_invalidates_baseline_after_restart",
+      "runtime::codex_usage::tests::usage_process_restart_preserves_baseline_and_immutable_receipt",
+      "runtime::deepseek_harness::headless_input_tests::headless_stdin_unread_large_request_remains_cancelable",
+      "runtime::deepseek_harness::tests::customized_dsh_model_settings_are_preserved",
+      "runtime::deepseek_harness::tests::local_gateway_overlay_pins_the_requested_model_alias",
+      "runtime::deepseek_harness::tests::managed_profile_preserves_user_selected_himind_model_after_runtime_update",
+      "runtime::deepseek_harness::tests::managed_web_profile_disables_dsh_browser_handoff",
+      "runtime::deepseek_harness::tests::mission_methods_overlay_keeps_assigned_model_shell_files_and_mcp",
+      "runtime::deepseek_harness::tests::no_tools_overlay_disables_every_model_facing_tool_row",
+      "runtime::deepseek_harness::tests::profile_migration_removes_agent_model_rows_even_with_js_tags",
+      "runtime::deepseek_harness::tests::read_only_overlay_preserves_file_readers_and_removes_escalating_tools",
+      "runtime::deepseek_harness::tests::requested_model_is_pinned_into_the_overlay",
+      "runtime::deepseek_harness::tests::unavailable_requested_model_fails_closed_and_lists_alternatives",
+      "runtime::deepseek_harness::tests::yaml_scalar_quotes_model_and_url",
+      "runtime::executor_live_handoff::executor_live_helper_accepted_scope_baseline_and_checks_are_bound",
+      "runtime::owned_tree::tests::ownership_transport_immediate_root_exit_cancel_timeout_and_shutdown",
+      "runtime::process::tests::process_cancellation_terminates_the_child",
+      "runtime::tests::executor_agent_result_and_runtime_facts_survive_ledger_restart",
+      "workflow::preflight::tests::codex_full_access_preflight_requires_ready_provider_and_still_rejects_files_only",
+      "workflow::preflight::tests::files_only_preflight_checks_inherited_role_provider_and_builtin_availability",
+      "workflow::runner::tests::executor_cancel_rebuild_preserves_comparable_cost_and_unknown_currency",
+      "workflow::runner::tests::executor_fail_when_paid_usage_survives_both_branches_and_manual_cancel",
+      "workflow::runner::tests::executor_late_ordinary_usage_after_completed_cancel_projects_once",
+      "workflow::runner::tests::executor_ordinary_publish_snapshot_event_cancel_barrier_is_atomic",
+      "workflow::runner::tests::executor_terminal_cancel_is_transactional_noop_for_stale_and_current_callers",
+      "workflow::runner::tests::executor_usage_replay_retry_restart_and_unknown_currency",
+      "workflow::runner::tests::executor_workflow_cancel_ack_projection_survives_process_death_and_reconciles_legacy_overwrite",
+      "workflow::runner::tests::executor_workflow_receipt_commit_crash_recovers_once_after_restart",
+      "workflow::runner::tests::runner_preserves_cancellation_that_arrives_during_a_step",
+      "workflow::runner::tests::runner_records_the_model_each_step_actually_used",
+      "workflow::runtime::tests::acp_model_alias_is_split_and_provider_matched",
+      "workflow::runtime::tests::cli_model_alias_is_forwarded_to_the_matching_cli",
+      "workflow::runtime::tests::codex_cli_cancel_after_recoverable_notification_remains_canceled",
+      "workflow::runtime::tests::codex_cli_cancel_wins_over_emitted_final_and_exit",
+      "workflow::runtime::tests::codex_workflow_access_preserves_read_only_verification_and_explicit_full_access",
+      "workflow::runtime::tests::executor_discovery_cancel_and_timeout_do_not_launch_exec",
+      "workflow::runtime::tests::executor_workflow_large_input_no_reader_cancel_timeout_and_output_first",
+      "workflow::runtime::tests::files_only_policy_cannot_escalate_read_or_use_external_providers",
+      "workflow::runtime::tests::full_access_requires_explicit_mode_and_preserves_read_and_files_only_limits",
+      "workflow::runtime::tests::model_namespace_must_match_the_runtime",
+      "workflow::runtime::tests::only_read_only_risk_steps_request_read_only_access",
+      "workflow::tests::declaring_model_requires_an_explicit_provider",
+      "workflow::tests::model_alias_requires_a_namespace_prefix",
+      "workflow::tests::model_override_follows_the_declared_provider_namespace",
+      "workflow::tests::provider_and_model_overrides_apply_to_every_delegate_branch",
+      "workflow::tests::rejects_model_fallbacks_across_namespaces",
+      "workflow::tests::rejects_role_with_invalid_model_alias",
+      "workflow::tests::rejects_runtime_step_with_invalid_model_alias"
+    ],
+    "classification": "actual helper / isolated product contract regressions / real component browser / QA11 host formal acceptance / later installed checks are distinct",
+    "installed_acceptance_passed": false
+  },
+  "source_code_review": {
+    "security": [
+      "src/mission/executor_handoff.rs:49–69 verifies accepted leaf/run/plan/check bindings; 103–115 intersects producer write/receiver read/confirmation and hashes bytes; 170–179 rejects absolute/parent/escaped artifacts.",
+      "src/workflow/runtime.rs:416–438 enforces model namespace; 449–479 retains read_only/files_only against explicit full_access; no model/service switch performed.",
+      "src/app/mission_dispatch.rs:1072–1078 and1764 tests preserve selected permissions and read-only verification.",
+      "src/app/inference_gateway.rs:3806 body withheld,4659 safe error boundary; loopback assertions use fictional keys only."
+    ],
+    "compatibility": {
+      "rust_dependencies": "Cargo.toml/Cargo.lock/build.rs/tauri.conf.json与663baseline相同",
+      "frontend": "package.json和lock均变化；当前runtime/development依赖与lock根一致，Playwright为devDependency。没有baseline原文，未伪称精确版本增删审计。",
+      "budgets": "保留主动增额、原request字段和Result入口；新增DTO默认反序列化，旧/缺关联不给新资格；成本未知fail-closed。",
+      "release_build": "普通无SERVICE_UI_RUNTIME_ROOT构建仍输出frontend/dist；显式资源根构建隔离到该根；本轮没有执行部署构建。",
+      "signing": "测试构建公钥不能代替部署官方信任根；控制端部署前重新固定有效配置、签名公钥、Runtime bundle。"
+    },
+    "dependencies": {
+      "cargo_same_as_663_baseline": true,
+      "frontend_package_lock_roots_match": true,
+      "exact_dependency_before_after_text_not_available": true
+    },
+    "scope": "No upstream code/source input/main repository edits, commit/push, host termination, deployment, skill loading or agent scheduling. Only own generated root and listed final deliverables written."
+  },
+  "historical_facts_preserved": {
+    "classification": "supplied historical observations, not this worker",
+    "997": {
+      "host": [
+        0,
+        0,
+        1,
+        -1
+      ],
+      "worker_claim": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "fourth": "not executed; check time budget exhausted"
+    },
+    "native956_and_965": [
+      0,
+      1,
+      2,
+      1
+    ],
+    "first_round": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "979": "candidate and 2532 protected files unchanged; not source drift",
+    "988": "specific identity difference unknown",
+    "909": "missing preparation diagnostic reconstruction is not raw stdout",
+    "upstream_502": "request_id=req_himind_1a1d877b882_9a; not proof of gateway defect",
+    "QA2": "original JSON failure preserved in prior reports",
+    "QA7": "paused/canceled, not accepted",
+    "QA8": "failed C: 16GiB preflight",
+    "QA9": "failed controlled stop; no product pass",
+    "981": "historical record retained without invented cause",
+    "1051": {
+      "event_id": "mission_1794473598404_ffe1e069:1051",
+      "task_id": "repair-independent-qa-user-scope-10",
+      "status": "failed",
+      "protected_differences": {
+        "count": 0
+      }
+    },
+    "1053": {
+      "event_id": "mission_1794473598404_ffe1e069:1053",
+      "classification": "historical_host_observation_transcript",
+      "raw_output_available": false,
+      "not_current_worker": true,
+      "does_not_rewrite_1051": true
+    },
+    "1083": {
+      "event_id": "mission_1794473598404_ffe1e069:1083",
+      "classification": "explicit_host_observation_in_authorized_task_input_not_copied_raw_stream",
+      "exit_code": 1,
+      "elapsed_ms": 131,
+      "output_sha256": "9199219cd3421e40d8943e174ed06ecaaffebd1826d97a16247cf3bc14c422b2",
+      "test_summary": "",
+      "numeric_TAP_total": null,
+      "cause_observed_in_prior_report": "passed=false because FREV-E01 evidence was not available within that task scope; first required command asserts passed is True. Second original command would also reject nonempty blocking_findings; no second event outcome invented."
+    },
+    "FREV-E01": {
+      "prior_finding": {
+        "id": "FREV-E01",
+        "severity": "blocking",
+        "kind": "evidence_unavailable_within_authorized_scope",
+        "summary": "不能仅凭QA11 passed:true认定当前独立验收和最终原命令复跑成立。",
+        "evidence": [
+          "reports/qa/current-candidate-delivery.json 明确要求检查 final-required-checks.json，任一失败覆盖就绪建议；该文件未交付到本轮授权根。",
+          "reports/qa/result.json 的19项当前检查原始日志均指向另一QA任务G盘资源根，报告只有引用和摘要；本轮未越界读取。",
+          "当前可读报告没有QA11的host_verification_checked/task_completed事件及implementation/verification run/candidate绑定；历史1053仅是QA10的转录，不能替代。",
+          "QA11 candidate_id=b6d56e1a1249865d414f179589d69a8b5b1fcd80fb99a84929770d27ba615e61；没有获准冻结identity逐文件清单，无法对本轮源码逐hash绑定。"
+        ],
+        "required_change": "控制端提供现有不可变证据的获准副本、原路径到副本映射及hash：QA11 frozen.json、identity/prepared摘要、final-required-checks.json、19项raw logs和浏览器断言/测量、native mixed helper及宿主接受事件。只补证据，不自动重开生产者、不重跑付费调用。",
+        "producer_task_ids": [
+          "repair-independent-qa-user-scope-11"
+        ],
+        "does_not_require_final_review_host_VERIFY_or_deployment_results": true
+      },
+      "prior_result": {
+        "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\review-evidence\\history\\reports\\final\\result.json",
+        "sha256": "30533e30e9c42e9005e827a26eab6adcb15990441f75a1dde0500157e6b91a7d"
+      },
+      "status": "resolved_by_new_evidence_review",
+      "original_failure_preserved": true,
+      "resolution": [
+        "READY task/mission, manifest seal and 394 file hashes verified within own resource.",
+        "19 original QA log command/argv/hash/exit bindings and actual assertion rows read; worker final original 4-check replay read.",
+        "Original persisted payload_json bytes for native1063/1066/1067 hash-bound and read; host checks0/0/0/0, distinct formal verifier and protected comparison accepted.",
+        "Frozen report/prepared identity recomputed from retained fields; 521 CURRENT authorized source bytes match, 37 excluded from direct read; no source drift among authorized entries."
+      ],
+      "not_a_producer_rerun": true
+    },
+    "repair-final-review-readiness-1": {
+      "status": "supervisor_canceled",
+      "classification": "task contract supplied history; no original event row supplied in this bundle",
+      "accepted": false,
+      "not_reopened": true
+    },
+    "QA11_first_final_replay": {
+      "outcomes": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "failure_log": {
+        "path": "G:\\HiMindAgentRuntime\\mission-checks\\8c95301f5b185f762422242e91f45e20f29b1e2a1532ad88fafdee4b07a5917c\\30145b19287bd923170c2174da9278df8a7e3dd944a942d9a741d56b26c26424\\upstream-evidence-v1\\sources\\qa11\\executor-lifecycle-repair\\qa11-final-required-3-1794649165213305800.log",
+        "sha256": "9573ec1cd6e51b060989d7df465cba61bdaecab04b7117d644b6ac987eac63b9"
+      },
+      "actual_output": "{\"passed\": false, \"error\": \"\"}",
+      "cause_level": "copied delivery summary attributes missing passed metadata on successful staged receipt; not inferred from empty error alone",
+      "subsequent_four_original_replays": [
+        {
+          "command": "npm --prefix frontend run build",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-1-1794649221261051500.log",
+          "sha256": "6e678e064c37a58ebe46a3af2e5ecb1c00075de64b6de811fdadec8cc6415446"
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert p.get('passed') is True; assert len(p.get('backlog',[]))==13\"",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-2-1794649223690112000.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "command": "python scripts/remediation/independent-qa-current-candidate.py",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-3-1794649224384484200.log",
+          "sha256": "b1cfa7707982511d4c282913743329b576d6078642e5efaee0918d3b64afda92"
+        },
+        {
+          "command": "python -c \"import json; p=json.load(open('reports/qa/result.json',encoding='utf-8')); assert all(k in p for k in ['passed','status','backlog','implemented_backlog_ids','changed_files','checks','limitations','blocking_findings','producer_task_ids']); assert p['status']=='pass' and p['passed'] is True; assert not p['blocking_findings']; cs=p['checks']; assert isinstance(cs,list) and cs; assert all(isinstance(c,dict) and c.get('command') and type(c.get('exit_code')) is int and c.get('evidence') for c in cs); expected=['npm --prefix frontend run build','python scripts/remediation/independent-qa-current-candidate.py']; assert all(any(c['command']==cmd and c['exit_code']==0 for c in cs) for cmd in expected); fs=p['changed_files']; roots=['reports/qa','frontend/scripts/remediation','scripts/remediation']; assert isinstance(fs,list); assert all(isinstance(f,str) and '..' not in f.split('/') and any(f.startswith(r+'/') for r in roots) for f in fs)\"",
+          "exit_code": 0,
+          "copy": "upstream-evidence-v1/sources/qa11/executor-lifecycle-repair/qa11-final-required-4-1794649260244463700.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "old_failure_not_rewritten": true
+    }
+  },
+  "limitations": [
+    "521 frozen source entries independently match CURRENT authorized BIZ bytes; 37 frozen entries and 104/663 baseline entries are outside read_paths and were not opened. Supervisor558/558 observation is separate supplied evidence, not own full-tree read.",
+    "QA11 native outer host stdout/stderr are not available as original streams. Persisted payload_json is retained and hash-bound; output hashes/test_summary are host records, never reconstructed raw streams.",
+    "Native four-hop is actual product runtime helper with scoped host artifact delivery, not full installed scheduler/Mission acceptance. Cancel/repair/failure/restart coverage combines actual subprocess tests, injected fixtures, ledger/store reopen and component contracts; no blanket OS-restart or mature production claim.",
+    "HiMind tokens are runtime session projections; upstream invoice/cost/currency unknown. Codex personal_cli_config exact model is not independently named by receipt; actual_model=[] is retained, no substitution inferred. Codex cost unknown; default numeric0 is not evidence of free usage.",
+    "Browser production components are real Chrome/Edge rendering; service API/fake clock/state/verification bodies include fixtures. Budget browser separately calls actual isolated Store. No installed Tauri or complete accessibility/true dark palette certification.",
+    "F05 uses authorized preservation of proactive increase; F09 does not execute an old backend binary. F01–F10 Store evidence and modern component/handler boundaries are stated at their actual level.",
+    "Original task10 full17-item acceptance wording is absent from QA11 supplied record; current explicit task contract/backlog and inherited applicable coverage reviewed. This does not waive unknown original text or invalidate separately accepted QA11; supervisor retains the original plan for later integration.",
+    "Remote Dashboard HTTP400/dead_letter remains supplied observed limitation; no remote deploy/requeue/delete or remediation performed.",
+    "Producer report retains four high npm advisories and chunk-size warning as observed history; no new network audit or dependency upgrade here. Current package and lock root dependencies match; Cargo dependency/config bytes match663 baseline.",
+    "No final source integration, deploy-local, installed health/Mission/UI/budget verification or this task formal VERIFY executed. These are later supervisor phases, not passed facts or circular prerequisites for this review."
+  ],
+  "deployment": {
+    "executed": false,
+    "authorized_actor": "supervisor_only",
+    "checklist_released": true,
+    "later_gates_passed": false,
+    "preconditions": [
+      "宿主另行正式VERIFY本次交付；最终源码集成核对差异索引和并行改动，保留7文件前置权限修复及主动预算扩展。",
+      "固定最终源码/依赖lock/构建环境/生产公钥/Runtime bundle版本与hash；普通release产出frontend/dist，不能安装测试公钥/测试helper；生成构建单独记录最终候选。",
+      "控制端在获准部署窗口验证磁盘容量及可恢复的整套旧exe/Runtime/前端资源/同版本目录路由与数据备份，记录版本hash；生产密钥保持原安全存储且不写报告。",
+      "评估既有依赖advisory观察和回滚兼容；停止派发并确认进程/写租约收敛仅由supervisor后续执行；本reviewer不操作。"
+    ],
+    "postdeployment_acceptance": [
+      "核对安装exe、Runtime、前端版本/hash与最终候选；system health、服务端口、网关实际请求/安全code和request_id、用量完整性；确认日志无凭据。",
+      "已安装UI：五深链、普通键盘/Tab/ShiftTab/HomeEnd、焦点陷阱与返回、嵌套Esc/背景隔离、保存busy单次提交、错误字段定位、六态/最近快照/对比度、320/390及窄容器长路径。",
+      "已安装混合Mission：HiMind及personal Codex分别实际执行，两方向manifest/hash交接、明确模型来源/权限边界、同session增量usage、未知成本保守阻断。",
+      "已安装取消确认进程树退出后才释放claim；暂停/恢复计划确认与原尝试绑定、失败祖先/repair_of及返工次数、distinct implementation/verification证据。",
+      "已安装预算：budget_exhausted后progress仍可显式足额增额；丢响应同键一次扩展/异参拒绝；Running/AwaitingVerification/环境/旧计划/未知成本守门；恢复再耗尽及列表/待办/详情一致。",
+      "读屏专项及所有200%缩放明确排除，无待办或后续义务；不部署远程Dashboard，不重排dead_letter。"
+    ],
+    "rollback_plan_released": true,
+    "rollback": [
+      "触发条件：安装hash不符、health/关键网关异常、数据无法解析、取消后仍写、预算或权限扩大；由supervisor停止新派发并保留现场事件/usage/失败日志。",
+      "确认工作进程已停止和写租约可回收后，从已验证备份恢复成套旧exe+Runtime+前端资源；不得混装新旧签名/协议。配置目录与路由必须同版本成对恢复，数据采用已验证兼容快照；禁止单文件随意降级。",
+      "恢复后重核版本hash、health、配置可解析和原任务状态/限额/确认；不删除新失败事件、不清成本、不伪造完成/自动重放工具。若数据兼容性不明，保持停止交接，不执行破坏性回退。",
+      "保留新旧完整快照及回滚操作/exit/hash，问题修复由协调方创建对应生产任务及依赖复核。"
+    ]
+  },
+  "next_steps": [
+    "将本次交付及最终原检查回执送宿主；宿主另行启动正式VERIFY，不自行调用。",
+    "后续由supervisor完成最终源码集成、并行改动保护、deploy-local与安装态健康/混合Mission/UI/预算检查及必要回滚。",
+    "保留FREV-E01原失败、1083退出1、readiness1取消及其余失败祖先，不自动重开已完成QA11或执行远端Dashboard操作。"
+  ]
+}
