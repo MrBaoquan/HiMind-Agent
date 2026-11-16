@@ -65,6 +65,7 @@ const INCLUDED_DIRS: &[(&str, &str)] = &[
 /// 明确不进包的顶层目录。写在这里的每一条都会出现在导出报告的跳过列表里，
 /// 所以"包里有什么"不需要靠猜。
 const EXCLUDED_DIRS: &[(&str, &str)] = &[
+    ("cache", "可重新生成的执行器与运行时缓存"),
     ("plugins", "拓展内容，重装后重新安装"),
     ("skills", "技能内容，重装后重新安装"),
     ("workflows", "工作流内容，重装后重新安装"),
@@ -220,6 +221,9 @@ fn classify_path(rel: &Path) -> Option<Decision> {
     });
     let first = segments.next()?;
     let top = classify_top_level(&first, true)?;
+    if matches!(top, Decision::Skip(_)) {
+        return Some(top);
+    }
     for segment in segments {
         if segment.eq_ignore_ascii_case(&first) {
             continue;

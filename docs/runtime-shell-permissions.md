@@ -16,8 +16,8 @@ UI 与 MCP 共享 MissionStore 和宿主实现，不通过操作 UI 或改数据
 |---|---|
 | 创建任务 `workspace.permission_mode` | `workspace_write` 或 `full_access`；随任务计划确认后生效 |
 | `mission.permission.set` | 仅允许执行前修改；更新计划摘要并使旧确认失效 |
-| `runtime.workspace.check` | 只检查，不修改权限；返回当前目录诊断及指纹 |
-| `runtime.workspace.resolve`，`action=full_access` | 经宿主用户授权后切换本任务权限并恢复；无需 ACL 指纹或修复 |
+| `workspace.runtime.check` | 只检查，不修改权限；返回当前目录诊断及指纹 |
+| `workspace.runtime.resolve`，`action=full_access` | 经宿主用户授权后切换本任务权限并恢复；无需 ACL 指纹或修复 |
 | 同能力 `repair` / `retry` | 高级隔离选项；按最新指纹补充最小权限或重新验证 |
 | 同能力 `files_only` | 禁用专家命令工具与间接命令工具，仍保留宿主必需检查 |
 

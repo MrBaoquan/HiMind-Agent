@@ -78,7 +78,9 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
                 | "mission.handoff.create"
                 | "mission.assignment.apply"
                 | "mission.plan.confirm"
+                | "mission.follow-up.add"
                 | "mission.follow_up.add"
+                | "mission.task.cancel-pending"
                 | "mission.task.cancel_pending"
                 | "mission.budget.extend"
                 | "mission.verification.retry"
@@ -132,11 +134,17 @@ pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value)
         return mission_plan_confirmation_target(input)
             .unwrap_or_else(|_| "计划确认信息无效或超出显示限制".to_string());
     }
-    if capability_id == "mission.follow_up.add" {
+    if matches!(
+        capability_id,
+        "mission.follow-up.add" | "mission.follow_up.add"
+    ) {
         return mission_follow_up_add_target(input)
             .unwrap_or_else(|_| "跟进请求无效或超出审批显示限制".to_string());
     }
-    if capability_id == "mission.task.cancel_pending" {
+    if matches!(
+        capability_id,
+        "mission.task.cancel-pending" | "mission.task.cancel_pending"
+    ) {
         return mission_pending_repair_cancellation_target(input)
             .unwrap_or_else(|_| "撤销请求无效或超出审批显示限制".to_string());
     }
@@ -190,7 +198,10 @@ pub(crate) fn mission_plan_confirmation_target(
     input: &serde_json::Value,
 ) -> Result<String, String> {
     let field = |name: &str| {
-        input.get(name).cloned().ok_or_else(|| format!("missing {name}"))
+        input
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("missing {name}"))
     };
     let details = serde_json::json!({
         "mission_id": field("mission_id")?,
@@ -213,12 +224,18 @@ const FOLLOW_UP_REVIEW_TARGET_BYTES: usize = super::manager::MAX_APPROVAL_TEXT_B
 const FOLLOW_UP_INLINE_REVIEW_BYTES: usize = FOLLOW_UP_REVIEW_TARGET_BYTES - 2 * 1024;
 
 pub(crate) fn mission_follow_up_add_target(input: &serde_json::Value) -> Result<String, String> {
-    mission_follow_up_target_with_root(input, &crate::store::paths::agent_home().join("mission-follow-up-reviews"))
+    mission_follow_up_target_with_root(
+        input,
+        &crate::store::paths::agent_home().join("mission-follow-up-reviews"),
+    )
 }
 
-fn mission_follow_up_target_with_root(input: &serde_json::Value, review_root: &std::path::Path) -> Result<String, String> {
-    let request: crate::mission::follow_up::MissionFollowUpAdd = serde_json::from_value(input.clone())
-        .map_err(|error| error.to_string())?;
+fn mission_follow_up_target_with_root(
+    input: &serde_json::Value,
+    review_root: &std::path::Path,
+) -> Result<String, String> {
+    let request: crate::mission::follow_up::MissionFollowUpAdd =
+        serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
     request.validate().map_err(|error| error.to_string())?;
     // Match the unchanged Grant args_digest exactly, including every objective,
     // path, check, criterion, dependency, reason and complete read extension
@@ -234,8 +251,11 @@ fn mission_follow_up_target_with_root(input: &serde_json::Value, review_root: &s
     let inline = serde_json::to_string(&serde_json::json!({
         "review_mode":"inline_full_request", "payload_sha256":digest,
         "binding":binding, "scope_policy":scope_policy, "request":input,
-    })).map_err(|error| error.to_string())?;
-    if inline.len() <= FOLLOW_UP_INLINE_REVIEW_BYTES { return Ok(inline); }
+    }))
+    .map_err(|error| error.to_string())?;
+    if inline.len() <= FOLLOW_UP_INLINE_REVIEW_BYTES {
+        return Ok(inline);
+    }
 
     // A review receipt is application state, not a Mission task or a path grant.
     // The path is host-chosen and content-addressed, and its bytes must match the
@@ -287,10 +307,13 @@ fn mission_follow_up_target_with_root(input: &serde_json::Value, review_root: &s
     let _lock = crate::store::atomic_file::lock(&review_path).map_err(|error| error.to_string())?;
     if review_path.exists() {
         if std::fs::read(&review_path).map_err(|error| error.to_string())? != payload {
-            return Err("follow-up review receipt content does not match the exact request".to_string());
+            return Err(
+                "follow-up review receipt content does not match the exact request".to_string(),
+            );
         }
     } else {
-        crate::store::atomic_file::atomic_write(&review_path, &payload).map_err(|error| error.to_string())?;
+        crate::store::atomic_file::atomic_write(&review_path, &payload)
+            .map_err(|error| error.to_string())?;
     }
     Ok(target)
 }
@@ -307,46 +330,69 @@ fn reject_review_link(path: &std::path::Path) -> Result<(), String> {
         use std::os::windows::fs::MetadataExt;
         linked || metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
     };
-    if linked { return Err("follow-up review storage must not use links or reparse points".to_string()); }
+    if linked {
+        return Err("follow-up review storage must not use links or reparse points".to_string());
+    }
     Ok(())
 }
 
 /// Read only a hash-addressed native follow-up receipt. Callers cannot pass a
 /// path; its exact bytes and typed contract must both match the approval hash.
 pub(crate) fn read_mission_follow_up_review(digest: &str) -> Result<serde_json::Value, String> {
-    read_follow_up_review_at(digest, &crate::store::paths::agent_home().join("mission-follow-up-reviews"))
+    read_follow_up_review_at(
+        digest,
+        &crate::store::paths::agent_home().join("mission-follow-up-reviews"),
+    )
 }
 
-fn read_follow_up_review_at(digest: &str, root: &std::path::Path) -> Result<serde_json::Value, String> {
+fn read_follow_up_review_at(
+    digest: &str,
+    root: &std::path::Path,
+) -> Result<serde_json::Value, String> {
     use std::io::Read;
-    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
         return Err("任务说明摘要无效".to_string());
     }
     let path = root.join(format!("{digest}.json"));
     reject_review_link(root)?;
     reject_review_link(&path)?;
     let file = std::fs::File::open(path).map_err(|_| "完整任务说明暂不可读，请重试".to_string())?;
-    let metadata = file.metadata().map_err(|_| "无法核对任务说明".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "无法核对任务说明".to_string())?;
     if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
         return Err("任务说明格式或长度无效".to_string());
     }
     let mut bytes = Vec::new();
-    file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+    file.take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| "完整任务说明读取失败".to_string())?;
     if bytes.len() > 4 * 1024 * 1024 || format!("{:x}", Sha256::digest(&bytes)) != digest {
         return Err("任务说明与审批摘要不一致".to_string());
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "任务说明格式无效".to_string())?;
-    let request: crate::mission::follow_up::MissionFollowUpAdd = serde_json::from_value(value.clone())
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "任务说明格式无效".to_string())?;
+    let request: crate::mission::follow_up::MissionFollowUpAdd =
+        serde_json::from_value(value.clone()).map_err(|_| "任务说明契约无效".to_string())?;
+    request
+        .validate()
         .map_err(|_| "任务说明契约无效".to_string())?;
-    request.validate().map_err(|_| "任务说明契约无效".to_string())?;
     Ok(serde_json::json!({"payload_sha256":digest,"request":value}))
 }
 
 pub(crate) fn mission_budget_extension_target(input: &serde_json::Value) -> Result<String, String> {
-    let mission_id = input.get("mission_id").and_then(serde_json::Value::as_str)
+    let mission_id = input
+        .get("mission_id")
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "missing mission_id".to_string())?;
-    let request = input.get("input").cloned().ok_or_else(|| "missing input".to_string())?;
+    let request = input
+        .get("input")
+        .cloned()
+        .ok_or_else(|| "missing input".to_string())?;
     let details = serde_json::json!({ "mission_id": mission_id, "budget_increase": request });
     let text = serde_json::to_string_pretty(&details).map_err(|error| error.to_string())?;
     if text.len() > 4_000 {
@@ -387,7 +433,9 @@ mod tests {
     fn mission_follow_up_review_supports_real_ten_kib_payload_inline_without_truncation() {
         let mut input = follow_up_review_input();
         input["tasks"][0]["objective"] = serde_json::json!("x".repeat(5_000));
-        let paths = (0..16).map(|i| format!("src/{i}/{}", "p".repeat(150))).collect::<Vec<_>>();
+        let paths = (0..16)
+            .map(|i| format!("src/{i}/{}", "p".repeat(150)))
+            .collect::<Vec<_>>();
         input["tasks"][0]["read_paths"] = serde_json::json!(paths);
         input["tasks"][0]["write_paths"] = serde_json::json!(paths);
         input["tasks"][0]["required_checks"] = serde_json::json!(vec!["cargo test"; 32]);
@@ -400,7 +448,7 @@ mod tests {
         assert_eq!(review["request"], input);
         assert_eq!(review["payload_sha256"], args_digest(&input).unwrap());
         assert!(!root.exists());
-        let description = format!("能力：mission.follow_up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
+        let description = format!("能力：mission.follow-up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
         assert!(description.len() <= super::super::manager::MAX_APPROVAL_TEXT_BYTES);
     }
 
@@ -408,8 +456,8 @@ mod tests {
     fn mission_follow_up_review_keeps_full_large_objective_paths_checks_and_criteria() {
         let mut input = follow_up_review_input();
         input["tasks"][0]["objective"] = serde_json::json!("界".repeat(8_000));
-        input["tasks"][0]["acceptance_criteria"] = serde_json::json!(vec!["界".repeat(2_000);32]);
-        input["tasks"][0]["required_checks"] = serde_json::json!(vec!["cargo test";32]);
+        input["tasks"][0]["acceptance_criteria"] = serde_json::json!(vec!["界".repeat(2_000); 32]);
+        input["tasks"][0]["required_checks"] = serde_json::json!(vec!["cargo test"; 32]);
         let root = follow_up_review_root();
         let target = mission_follow_up_target_with_root(&input, &root).unwrap();
         let review: serde_json::Value = serde_json::from_str(&target).unwrap();
@@ -418,10 +466,19 @@ mod tests {
         assert_eq!(review["payload_sha256"], args_digest(&input).unwrap());
         let file = std::path::PathBuf::from(review["review"]["path"].as_str().unwrap());
         assert_eq!(file.parent(), Some(root.as_path()));
-        assert_eq!(file.file_name().unwrap().to_str().unwrap(), format!("{}.json", args_digest(&input).unwrap()));
+        assert_eq!(
+            file.file_name().unwrap().to_str().unwrap(),
+            format!("{}.json", args_digest(&input).unwrap())
+        );
         let bytes = std::fs::read(&file).unwrap();
-        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), args_digest(&input).unwrap());
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), input);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            args_digest(&input).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            input
+        );
         let full = read_follow_up_review_at(&args_digest(&input).unwrap(), &root).unwrap();
         assert_eq!(full["request"], input);
         assert_eq!(full["payload_sha256"], args_digest(&input).unwrap());
@@ -429,15 +486,24 @@ mod tests {
             assert!(read_follow_up_review_at(&invalid, &root).is_err());
         }
         let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-        assert_eq!(mission_follow_up_target_with_root(&input, &root).unwrap(), target);
-        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
-        let mut changed = input.clone(); changed["tasks"][0]["objective"] = serde_json::json!("异".repeat(8_000));
+        assert_eq!(
+            mission_follow_up_target_with_root(&input, &root).unwrap(),
+            target
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            modified
+        );
+        let mut changed = input.clone();
+        changed["tasks"][0]["objective"] = serde_json::json!("异".repeat(8_000));
         let changed_target = mission_follow_up_target_with_root(&changed, &root).unwrap();
         assert_ne!(changed_target, target);
         // Only this unit test's isolated review directory is modified.
         std::fs::write(&file, b"tampered").unwrap();
         assert!(read_follow_up_review_at(&args_digest(&input).unwrap(), &root).is_err());
-        assert!(mission_follow_up_target_with_root(&input, &root).unwrap_err().contains("does not match"));
+        assert!(mission_follow_up_target_with_root(&input, &root)
+            .unwrap_err()
+            .contains("does not match"));
         assert_eq!(std::fs::read(&file).unwrap(), b"tampered");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -446,14 +512,16 @@ mod tests {
     fn mission_follow_up_review_manifest_fits_actual_approval_limit_at_maximum_task_count() {
         let mut input = follow_up_review_input();
         let template = input["tasks"][0].clone();
-        input["tasks"] = serde_json::json!((0..8).map(|i| {
-            let mut t = template.clone();
-            t["id"] = serde_json::json!(format!("repair-{i}-{}", "x".repeat(150)));
-            t["repair_of"] = serde_json::json!(format!("parent-{i}-{}", "x".repeat(150)));
-            t["title"] = serde_json::json!("界".repeat(240));
-            t["objective"] = serde_json::json!("界".repeat(8_000));
-            t
-        }).collect::<Vec<_>>());
+        input["tasks"] = serde_json::json!((0..8)
+            .map(|i| {
+                let mut t = template.clone();
+                t["id"] = serde_json::json!(format!("repair-{i}-{}", "x".repeat(150)));
+                t["repair_of"] = serde_json::json!(format!("parent-{i}-{}", "x".repeat(150)));
+                t["title"] = serde_json::json!("界".repeat(240));
+                t["objective"] = serde_json::json!("界".repeat(8_000));
+                t
+            })
+            .collect::<Vec<_>>());
         let root = follow_up_review_root();
         let target = mission_follow_up_target_with_root(&input, &root).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&target).unwrap();
@@ -466,11 +534,10 @@ mod tests {
             assert_eq!(manifest["tasks"][i]["field_counts"]["required_checks"], 1);
             assert_eq!(manifest["full_fields_in_review"], true);
         }
-        let description = format!("能力：mission.follow_up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
+        let description = format!("能力：mission.follow-up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
         assert!(description.len() <= super::super::manager::MAX_APPROVAL_TEXT_BYTES);
         std::fs::remove_dir_all(root).unwrap();
     }
-
 
     #[test]
     fn mission_follow_up_read_extension_approval_binds_every_field_inline_and_in_full_review() {
@@ -479,31 +546,59 @@ mod tests {
             input["tasks"][0]["read_paths"] = serde_json::json!(["src", "contracts"]);
             input["read_scope_extension"] = serde_json::json!({"paths":["contracts"],
                 "authorized_by":"user:existing-explicit-permission", "reason":"Independent review compilation inputs"});
-            if large { input["tasks"][0]["objective"] = serde_json::json!("界".repeat(8_000)); }
+            if large {
+                input["tasks"][0]["objective"] = serde_json::json!("界".repeat(8_000));
+            }
             let root = follow_up_review_root();
             let target = mission_follow_up_target_with_root(&input, &root).unwrap();
             let review: serde_json::Value = serde_json::from_str(&target).unwrap();
             assert_eq!(review["payload_sha256"], args_digest(&input).unwrap());
-            assert!(review["scope_policy"].as_str().unwrap().contains("read-only"));
+            assert!(review["scope_policy"]
+                .as_str()
+                .unwrap()
+                .contains("read-only"));
             if large {
                 assert_eq!(review["read_scope_extension"]["access"], "read_only");
-                assert_eq!(review["read_scope_extension"]["authorized_by"], input["read_scope_extension"]["authorized_by"]);
-                assert_eq!(review["read_scope_extension"]["sha256"], args_digest(&input["read_scope_extension"]).unwrap());
-                assert_eq!(read_follow_up_review_at(&args_digest(&input).unwrap(), &root).unwrap()["request"], input);
+                assert_eq!(
+                    review["read_scope_extension"]["authorized_by"],
+                    input["read_scope_extension"]["authorized_by"]
+                );
+                assert_eq!(
+                    review["read_scope_extension"]["sha256"],
+                    args_digest(&input["read_scope_extension"]).unwrap()
+                );
+                assert_eq!(
+                    read_follow_up_review_at(&args_digest(&input).unwrap(), &root).unwrap()
+                        ["request"],
+                    input
+                );
             } else {
                 assert_eq!(review["request"], input);
                 assert!(!root.exists());
             }
             for field in ["paths", "authorized_by", "reason"] {
                 let mut changed = input.clone();
-                if field == "paths" { changed["read_scope_extension"][field] = serde_json::json!(["workflows"]); }
-                else { changed["read_scope_extension"][field] = serde_json::json!("different explicit authorization"); }
-                assert_ne!(args_digest(&changed).unwrap(), args_digest(&input).unwrap(), "{field}");
-                assert_ne!(mission_follow_up_target_with_root(&changed, &root).unwrap(), target, "{field}");
+                if field == "paths" {
+                    changed["read_scope_extension"][field] = serde_json::json!(["workflows"]);
+                } else {
+                    changed["read_scope_extension"][field] =
+                        serde_json::json!("different explicit authorization");
+                }
+                assert_ne!(
+                    args_digest(&changed).unwrap(),
+                    args_digest(&input).unwrap(),
+                    "{field}"
+                );
+                assert_ne!(
+                    mission_follow_up_target_with_root(&changed, &root).unwrap(),
+                    target,
+                    "{field}"
+                );
             }
             if large {
                 let path = root.join(format!("{}.json", args_digest(&input).unwrap()));
-                let mut tampered = input.clone(); tampered["read_scope_extension"]["authorized_by"] = serde_json::json!("spoofed");
+                let mut tampered = input.clone();
+                tampered["read_scope_extension"]["authorized_by"] = serde_json::json!("spoofed");
                 std::fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
                 assert!(read_follow_up_review_at(&args_digest(&input).unwrap(), &root).is_err());
                 assert!(mission_follow_up_target_with_root(&input, &root).is_err());
@@ -515,29 +610,44 @@ mod tests {
     #[test]
     fn mission_follow_up_read_extension_large_manifest_fits_with_maximum_batch_and_authorization() {
         let mut input = follow_up_review_input();
-        let paths = (0..128).map(|i| format!("inputs/{i}/{}", "界".repeat(990))).collect::<Vec<_>>();
+        let paths = (0..128)
+            .map(|i| format!("inputs/{i}/{}", "界".repeat(990)))
+            .collect::<Vec<_>>();
         input["read_scope_extension"] = serde_json::json!({"paths":paths,
             "authorized_by":"界".repeat(160), "reason":"界".repeat(2000)});
         let template = input["tasks"][0].clone();
-        input["tasks"] = serde_json::json!((0..8).map(|i| {
-            let mut task = template.clone();
-            task["id"] = serde_json::json!(format!("repair-{i}-{}", "x".repeat(150)));
-            task["repair_of"] = serde_json::json!(format!("parent-{i}-{}", "x".repeat(150)));
-            task["title"] = serde_json::json!("界".repeat(240));
-            task["objective"] = serde_json::json!("界".repeat(8000));
-            if i == 0 { task["read_paths"] = serde_json::json!(paths); }
-            task
-        }).collect::<Vec<_>>());
+        input["tasks"] = serde_json::json!((0..8)
+            .map(|i| {
+                let mut task = template.clone();
+                task["id"] = serde_json::json!(format!("repair-{i}-{}", "x".repeat(150)));
+                task["repair_of"] = serde_json::json!(format!("parent-{i}-{}", "x".repeat(150)));
+                task["title"] = serde_json::json!("界".repeat(240));
+                task["objective"] = serde_json::json!("界".repeat(8000));
+                if i == 0 {
+                    task["read_paths"] = serde_json::json!(paths);
+                }
+                task
+            })
+            .collect::<Vec<_>>());
         let root = follow_up_review_root();
         let target = mission_follow_up_target_with_root(&input, &root).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&target).unwrap();
         assert_eq!(manifest["read_scope_extension"]["access"], "read_only");
         assert_eq!(manifest["read_scope_extension"]["paths_count"], 128);
-        assert_eq!(manifest["read_scope_extension"]["review_json_pointer"], "/read_scope_extension");
+        assert_eq!(
+            manifest["read_scope_extension"]["review_json_pointer"],
+            "/read_scope_extension"
+        );
         assert_eq!(manifest["read_scope_extension"]["reason_characters"], 2000);
-        assert_eq!(manifest["read_scope_extension"]["sha256"], args_digest(&input["read_scope_extension"]).unwrap());
-        assert_eq!(read_follow_up_review_at(&args_digest(&input).unwrap(), &root).unwrap()["request"], input);
-        let description = format!("能力：mission.follow_up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
+        assert_eq!(
+            manifest["read_scope_extension"]["sha256"],
+            args_digest(&input["read_scope_extension"]).unwrap()
+        );
+        assert_eq!(
+            read_follow_up_review_at(&args_digest(&input).unwrap(), &root).unwrap()["request"],
+            input
+        );
+        let description = format!("能力：mission.follow-up.add\n风险等级：R3\n目标：{target}\n来源：dashboard_worker\n\n拒绝、超时或 Agent 中断都会阻止实际执行。");
         assert!(target.len() <= FOLLOW_UP_REVIEW_TARGET_BYTES);
         assert!(description.len() <= super::super::manager::MAX_APPROVAL_TEXT_BYTES);
         std::fs::remove_dir_all(root).unwrap();
@@ -546,19 +656,28 @@ mod tests {
     #[test]
     fn mission_follow_up_policy_requires_r3_and_displays_the_exact_request() {
         for declared in ["R1", "read_only", "local_write"] {
-            assert_eq!(effective_risk_level("mission.follow_up.add", declared), "R3");
+            assert_eq!(
+                effective_risk_level("mission.follow-up.add", declared),
+                "R3"
+            );
         }
-        assert!(!is_local_ai_configuration_capability("mission.follow_up.add"));
-        assert!(destructive_request_type("mission.follow_up.add").is_none());
+        assert!(!is_local_ai_configuration_capability(
+            "mission.follow-up.add"
+        ));
+        assert!(destructive_request_type("mission.follow-up.add").is_none());
         let input = serde_json::json!({"schema_version":"mission.follow_up.add.v1","mission_id":"mission_test",
             "expected_plan_sha256":"a".repeat(64),"reason":"Explicit user correction",
             "tasks":[{"id":"repair-6","title":"Correct delivery","objective":"Consume authorized runtime resources",
                 "repair_of":"repair-5","depends_on":[],"read_paths":["src"],"write_paths":["src"],
                 "acceptance_criteria":["Real delivery passes"],"required_checks":["cargo test"]}]});
         let target = mission_follow_up_add_target(&input).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&target).unwrap()["request"], input);
-        assert_eq!(target_description("mission.follow_up.add", &input), target);
-        let mut changed = input.clone(); changed["tasks"][0]["objective"] = serde_json::json!("A precise different objective");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&target).unwrap()["request"],
+            input
+        );
+        assert_eq!(target_description("mission.follow-up.add", &input), target);
+        let mut changed = input.clone();
+        changed["tasks"][0]["objective"] = serde_json::json!("A precise different objective");
         assert_ne!(args_digest(&input).unwrap(), args_digest(&changed).unwrap());
         assert!(target.len() < FOLLOW_UP_INLINE_REVIEW_BYTES);
     }
@@ -569,7 +688,8 @@ mod tests {
         let target = mission_budget_extension_target(&serde_json::json!({
             "mission_id": "mission_test",
             "input": {"additional_tokens": 1000, "unlimited_tokens": false}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(target.contains("mission_test"));
         assert!(target.contains("1000"));
     }
@@ -577,19 +697,33 @@ mod tests {
     #[test]
     fn pending_repair_cancellation_requires_r3_and_exact_validated_target() {
         for declared in ["R1", "read_only", "local_write"] {
-            assert_eq!(effective_risk_level("mission.task.cancel_pending", declared), "R3");
+            assert_eq!(
+                effective_risk_level("mission.task.cancel-pending", declared),
+                "R3"
+            );
         }
         let input = serde_json::json!({"schema_version":"mission.task.cancel_pending.v1",
             "mission_id":"mission_test", "expected_plan_sha256":"a".repeat(64),
             "task_id":"obsolete-repair", "request_id":"human-scope-1", "reason":"用户调整当前验收范围"});
         let target = mission_pending_repair_cancellation_target(&input).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&target).unwrap(), input);
-        assert_eq!(target_description("mission.task.cancel_pending", &input), target);
-        let mut invalid = input.clone(); invalid["execution"] = serde_json::json!("override");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&target).unwrap(),
+            input
+        );
+        assert_eq!(
+            target_description("mission.task.cancel-pending", &input),
+            target
+        );
+        let mut invalid = input.clone();
+        invalid["execution"] = serde_json::json!("override");
         assert!(mission_pending_repair_cancellation_target(&invalid).is_err());
-        let mut changed = input.clone(); changed["task_id"] = serde_json::json!("different-repair");
+        let mut changed = input.clone();
+        changed["task_id"] = serde_json::json!("different-repair");
         assert_ne!(args_digest(&input).unwrap(), args_digest(&changed).unwrap());
-        assert_ne!(target, mission_pending_repair_cancellation_target(&changed).unwrap());
+        assert_ne!(
+            target,
+            mission_pending_repair_cancellation_target(&changed).unwrap()
+        );
     }
 
     #[test]
@@ -627,7 +761,10 @@ mod tests {
             effective_risk_level("extension.review.decide", "admin_action"),
             "R3"
         );
-        assert_eq!(effective_risk_level("mission.plan.confirm", "local_write"), "R3");
+        assert_eq!(
+            effective_risk_level("mission.plan.confirm", "local_write"),
+            "R3"
+        );
     }
 
     #[test]
@@ -704,8 +841,18 @@ mod tests {
             "approved_absolute_write_paths":[]
         });
         let target = target_description("mission.plan.confirm", &input);
-        for value in ["mission-test", "plan_sha256", "selected_task_ids", "src/attention.mjs", "REVIEW.md", "approved_absolute_write_paths"] {
-            assert!(target.contains(value), "approval summary omitted {value}: {target}");
+        for value in [
+            "mission-test",
+            "plan_sha256",
+            "selected_task_ids",
+            "src/attention.mjs",
+            "REVIEW.md",
+            "approved_absolute_write_paths",
+        ] {
+            assert!(
+                target.contains(value),
+                "approval summary omitted {value}: {target}"
+            );
         }
     }
 

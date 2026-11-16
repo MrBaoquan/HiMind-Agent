@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$Version,
@@ -9,6 +10,8 @@ param(
     [string]$ExtensionPublicKeyPath,
     [string]$ExtensionSigningKeyId,
     [string]$RuntimeReleaseDirectory,
+    [string]$ArtifactManifest,
+    [string]$BuildRoot,
     [string]$WindowsCodeSigningCertificateThumbprint,
     [string]$WindowsTimestampUrl = "http://timestamp.sectigo.com",
     [string]$ReleaseNotes = "",
@@ -108,6 +111,27 @@ if ($Prerelease) {
     throw "当前 Independent 更新 provider 只消费 stable latest Release，不支持 prerelease。"
 }
 
+if ($ArtifactManifest) {
+    . (Join-Path $PSScriptRoot 'build-support.ps1')
+    . (Join-Path $PSScriptRoot 'runtime-bundle.ps1')
+    $ArtifactManifest = Assert-BuildPath $ArtifactManifest
+    if (-not $BuildRoot) { $BuildRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ArtifactManifest)) }
+    $managedBuildRoot = Get-BuildRoot $BuildRoot -ReadOnly
+    [void](Assert-BuildPath $ArtifactManifest -Within (Join-Path $managedBuildRoot 'artifacts'))
+    $frozenBuild = Read-BuildManifest $ArtifactManifest -RequireVerification
+    if ($frozenBuild.version -ne $Version -or $frozenBuild.configuration -ne 'release' -or $frozenBuild.channel -ne 'release') {
+        throw 'Release publishing requires a matching verified release-channel manifest.'
+    }
+    if (-not $RuntimeReleaseDirectory) { $RuntimeReleaseDirectory = $frozenBuild.runtime.directory }
+    $runtimeInfo = Resolve-RuntimeReleaseDirectory $RuntimeReleaseDirectory -RequireExactPackage
+    if (-not $frozenBuild.runtime -or $frozenBuild.runtime.manifest_sha256 -ne (Get-BuildFileHash $runtimeInfo.ManifestPath) -or
+        $frozenBuild.runtime.package_sha256 -ne $runtimeInfo.Manifest.sha256 -or
+        $frozenBuild.runtime.signature_sha256 -ne (Get-BuildFileHash (Join-Path $runtimeInfo.Directory "$($runtimeInfo.PackageName).signature.json"))) {
+        throw 'Release Runtime identity differs from verified build manifest.'
+    }
+    $RuntimeReleaseDirectory = $runtimeInfo.Directory
+}
+
 $OutputRoot = if ([IO.Path]::IsPathRooted($OutputDirectory)) {
     [IO.Path]::GetFullPath($OutputDirectory)
 } else {
@@ -173,6 +197,8 @@ try {
         [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_KEY_ID", $ExtensionSigningKeyId, "Process")
     }
     $packageArgs = @{ Version = $Version; OutputDirectory = $OutputRoot; Configuration = "release"; RuntimeReleaseDirectory = $RuntimeReleaseDirectory }
+    if ($ArtifactManifest) { $packageArgs.ArtifactManifest = $ArtifactManifest }
+    if ($BuildRoot) { $packageArgs.BuildRoot = $BuildRoot }
     if ($WindowsCodeSigningCertificateThumbprint) {
         $packageArgs.WindowsCodeSigningCertificateThumbprint = $WindowsCodeSigningCertificateThumbprint
     }

@@ -90,6 +90,15 @@ foreach ($file in Get-ChildItem -LiteralPath $SourceRoot -Recurse -Filter *.rs -
         for ($scan = $index; $scan -ge 0; $scan--) {
             if ($lines[$scan] -match $FunctionPattern) { $start = $scan; break }
         }
+        # Rust also removes standalone #[test] functions from normal builds,
+        # including functions in an external #[path = "..."] test module.
+        $isTest = $false
+        for ($scan = $start - 1; $scan -ge 0; $scan--) {
+            if ([string]::IsNullOrWhiteSpace($lines[$scan])) { continue }
+            if ($lines[$scan] -notmatch '^\s*#\[') { break }
+            if ($lines[$scan] -match '^\s*#\[test\]\s*$') { $isTest = $true; break }
+        }
+        if ($isTest) { continue }
         $end = $limit - 1
         for ($scan = $index + 1; $scan -lt $limit; $scan++) {
             if ($lines[$scan] -match $FunctionPattern) { $end = $scan - 1; break }

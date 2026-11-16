@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$Version,
@@ -11,13 +12,19 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipDependencyInstall,
     [switch]$SkipTests,
-    [string]$RuntimeReleaseDirectory
+    [string]$RuntimeReleaseDirectory,
+    [string]$ArtifactManifest,
+    [string]$BuildRoot
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 . (Join-Path $PSScriptRoot "runtime-bundle.ps1")
+. (Join-Path $PSScriptRoot "build-pipeline.ps1")
+$packageLock = $null
+$BuildManifest = $null
+try {
 
 $CargoText = [IO.File]::ReadAllText((Join-Path $Root "Cargo.toml"))
 $PackageVersion = [regex]::Match($CargoText, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -29,9 +36,34 @@ if ($PackageVersion -ne $Version) {
     throw "Requested version $Version does not match Cargo.toml version $PackageVersion."
 }
 
-if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration -RuntimeReleaseDirectory $RuntimeReleaseDirectory -SkipDependencyInstall:$SkipDependencyInstall -SkipTests:$SkipTests
-    if ($LASTEXITCODE -ne 0) { throw "Agent build failed." }
+$requireBuildVerification = $true
+if (-not $ArtifactManifest -and -not $SkipBuild) {
+    $built = Invoke-AgentBuildPipeline -Repository $Root -Mode candidate -Build -BuildChannel release -BuildRoot $BuildRoot `
+        -Configuration $Configuration -RuntimeReleaseDirectory $RuntimeReleaseDirectory -SkipDependencyInstall:$SkipDependencyInstall -SkipTests:$SkipTests
+    $ArtifactManifest = $built.manifest
+    # Keep the existing explicit development skips, but never treat their
+    # output as a verified candidate for manifest reuse or local deployment.
+    $requireBuildVerification = $built.full_tests
+}
+if ($ArtifactManifest) {
+    $ArtifactManifest = Assert-BuildPath $ArtifactManifest
+    if (-not $BuildRoot) { $BuildRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ArtifactManifest)) }
+    $managedRoot = Get-BuildRoot $BuildRoot -ReadOnly
+    [void](Assert-BuildPath $ArtifactManifest -Within (Join-Path $managedRoot 'artifacts'))
+    $packageLock = Enter-BuildLock $managedRoot
+    $BuildManifest = Read-BuildManifest $ArtifactManifest -RequireVerification:$requireBuildVerification
+    if ($BuildManifest.version -ne $Version -or $BuildManifest.configuration -ne $Configuration) { throw 'Artifact version/configuration does not match requested package' }
+    $BinaryRoot = Split-Path -Parent $ArtifactManifest
+    if (-not $RuntimeReleaseDirectory -and $BuildManifest.runtime) { $RuntimeReleaseDirectory = $BuildManifest.runtime.directory }
+    $runtimeInfo = Resolve-RuntimeReleaseDirectory $RuntimeReleaseDirectory -RequireExactPackage
+    if (-not $BuildManifest.runtime -or $BuildManifest.runtime.manifest_sha256 -ne (Get-BuildFileHash $runtimeInfo.ManifestPath) -or
+        $BuildManifest.runtime.package_sha256 -ne $runtimeInfo.Manifest.sha256 -or
+        $BuildManifest.runtime.signature_sha256 -ne (Get-BuildFileHash (Join-Path $runtimeInfo.Directory "$($runtimeInfo.PackageName).signature.json"))) { throw 'Package Runtime identity differs from build manifest' }
+    $BundledRuntime = $runtimeInfo.Directory
+} else {
+    # Compatibility for explicitly skipped legacy manual builds only.
+    $BinaryRoot = Join-Path $Root "target\$Configuration"
+    $BundledRuntime = if ($RuntimeReleaseDirectory) { $RuntimeReleaseDirectory } else { Join-Path $BinaryRoot 'resources/runtime' }
 }
 
 $OutputRoot = if ([IO.Path]::IsPathRooted($OutputDirectory)) {
@@ -46,7 +78,6 @@ if (Test-Path -LiteralPath $ReleaseDirectory) {
 New-Item -ItemType Directory -Path $ReleaseDirectory | Out-Null
 Set-Content -LiteralPath (Join-Path $ReleaseDirectory "himind-agent.version") -Value $Version -Encoding ASCII
 
-$BinaryRoot = Join-Path $Root "target\$Configuration"
 foreach ($Name in @("himind-agent.exe", "himind-agent-launcher.exe", "himind-agent-updater.exe", "himind-agent-mcp.exe")) {
     $Source = Join-Path $BinaryRoot $Name
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Built binary is missing: $Source" }
@@ -119,14 +150,13 @@ $VSCodeArtifact = Join-Path $ReleaseDirectory "resources\vscode\himind-ai.vsix"
 & (Join-Path $PSScriptRoot "build-vscode-extension.ps1") -OutputPath $VSCodeArtifact -SkipDependencyInstall:$SkipDependencyInstall | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "VS Code integration package build failed." }
 
-$BundledRuntime = Join-Path $Root "target\$Configuration\resources\runtime"
 if (-not (Test-Path -LiteralPath (Join-Path $BundledRuntime "himind-runtime-release.json") -PathType Leaf)) {
-    throw "Bundled Runtime is missing from target\$Configuration\resources\runtime. Run build.ps1 with a signed Runtime release or pass -RuntimeReleaseDirectory."
+    throw "Bundled Runtime is missing: $BundledRuntime"
 }
 Copy-RuntimeBundle -RuntimeReleaseDirectory $BundledRuntime -DestinationDirectory (Join-Path $ReleaseDirectory "resources\runtime") | Out-Null
 
 $TrackedStatus = @(& git status --porcelain=v1 --untracked-files=normal)
-$Commit = (& git rev-parse HEAD).Trim()
+$Commit = if ($BuildManifest) { $BuildManifest.commit } else { (& git rev-parse HEAD).Trim() }
 $Files = @(Get-ChildItem -LiteralPath $ReleaseDirectory -File -Recurse | Sort-Object FullName | ForEach-Object {
     [pscustomobject]@{
         path = $_.FullName.Substring($ReleaseDirectory.Length).TrimStart('\').Replace('\', '/')
@@ -139,7 +169,11 @@ $Manifest = [ordered]@{
     product = "himind-agent"
     version = $Version
     source_commit = $Commit
-    source_dirty = ($TrackedStatus.Count -gt 0)
+    # Older frozen manifests do not record dirty status. Do not label a reused
+    # artifact with the current checkout's status; its content hash is exact.
+    source_dirty = $(if ($BuildManifest) { $null } else { $TrackedStatus.Count -gt 0 })
+    source_hash = $(if ($BuildManifest) { $BuildManifest.source_hash } else { $null })
+    build_manifest_sha256 = $(if ($BuildManifest) { Get-BuildFileHash $ArtifactManifest } else { $null })
     authenticode_signed = [bool]$Thumbprint
     default_mode = "independent"
     protocol = "himind-agent.business-integration"
@@ -205,3 +239,5 @@ finally {
     update_archive = $UpdateArchivePath
     update_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $UpdateArchivePath).Hash.ToLowerInvariant()
 } | ConvertTo-Json
+}
+finally { if ($packageLock) { $packageLock.Dispose() } }
