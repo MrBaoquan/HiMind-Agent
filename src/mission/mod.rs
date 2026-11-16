@@ -189,6 +189,7 @@ pub(crate) const PLAN_FORMAT_CONTRACT: &str = concat!(
     r#""task_resources":{"fix-1":["build:shared-target","port:8080","database:test"]}。"#,
     "共享资源冲突由宿主排他调度，不伪造产物依赖；同文件读写范围仍须如实申报。scheduling 不得包含客户端声称的隔离工作区路径。",
     "每个 tasks 元素仅允许 id、title、objective、depends_on、read_paths、write_paths、acceptance_criteria、required_checks、execution、repair_of。角色及绑定只能位于 execution 对象：executor、model、role_id、service_id、expert；expert 仅允许 expert_id、expert_version、expert_digest。禁止在任务顶层重复 role_id、executor、model、service_id 或 expert。不得用 service 替代 service_id。按原任务固定绑定原样填写 execution，不得为满足格式改动范围、检查、依赖或授权。",
+    "独立复核由宿主为交付派生单独运行，不添加 verification 字段；用户对复核职责的描述不是新增协议字段。budget 仅使用 max_rounds、max_minutes、max_repair_attempts、max_total_tokens、max_cost；不限 token 或金额使用对应字段 null，不使用 max_tokens。",
 );
 
 #[cfg(test)]
