@@ -628,7 +628,9 @@ mod tests {
         }
         let evidence=json!({"classification":"real_personal_codex_model_launch_resume_shell",
             "version":version.trim(),"launch":first,"resume":second,
-            "launch_args":invocation.args,"resume_args":resumed.args,
+            // Evidence consumers compare argv with the observed Unicode command line.
+            "launch_args":invocation.args.iter().map(|arg|arg.to_str().expect("live Codex argv must be Unicode")).collect::<Vec<_>>(),
+            "resume_args":resumed.args.iter().map(|arg|arg.to_str().expect("live Codex argv must be Unicode")).collect::<Vec<_>>(),
             "permission":"danger-full-access","model_source":"personal_cli_config","host_verify_invoked":false});
         fs::write(root.join("result.json"),serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         println!("real Codex launch/resume shell result: {}",root.join("result.json").display());
