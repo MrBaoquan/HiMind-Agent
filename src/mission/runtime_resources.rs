@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+const RESOURCE_PATH_HASH_LEN: usize = 24;
+
 #[derive(Debug)]
 pub(crate) struct CheckRuntimeResources {
     root: PathBuf,
@@ -62,11 +64,16 @@ impl CheckRuntimeResources {
         let base = resolve_future_directory(&ordinary_absolute(base)?, &mut guards)?;
         let mission_hash = format!("{:x}", Sha256::digest(mission_id.as_bytes()));
         let task_hash = format!("{:x}", Sha256::digest(task_id.as_bytes()));
-        let legacy_root = base.join(&mission_hash).join(&task_hash);
-        // Check the future path before creating anything, including a base
-        // that has not been created yet. Existing ancestors may not redirect.
-        let legacy_root = resolve_future_directory(&legacy_root, &mut guards)?;
-        ensure_separate(&legacy_root, &workspace)?;
+        let short_mission = &mission_hash[..RESOURCE_PATH_HASH_LEN];
+        let short_task = &task_hash[..RESOURCE_PATH_HASH_LEN];
+        let short_legacy_root = base.join(short_mission).join(short_task);
+        let legacy_legacy_root = base.join(&mission_hash).join(&task_hash);
+        // Check both layouts before creating anything. Existing full-hash
+        // roots remain pinned; new roots use shorter selectors for Windows tools.
+        let short_legacy_root = resolve_future_directory(&short_legacy_root, &mut guards)?;
+        let legacy_legacy_root = resolve_future_directory(&legacy_legacy_root, &mut guards)?;
+        ensure_separate(&short_legacy_root, &workspace)?;
+        ensure_separate(&legacy_legacy_root, &workspace)?;
         let allocations = base.join(".allocations-v1");
         ensure_separate(&allocations, &workspace)?;
         let _lock = storage_lock(&allocations)?;
@@ -76,8 +83,19 @@ impl CheckRuntimeResources {
             None => None,
         };
         if let Some(preferred) = &preferred { reject_control_base(preferred, &allocations)?; }
-        let record_path = allocations.join(&mission_hash).join(format!("{task_hash}.json"));
-        let existing = read_control_json::<StorageAllocation>(&record_path, &mut guards)?;
+        let short_record_path = allocations.join(short_mission).join(format!("{short_task}.json"));
+        let legacy_record_path = allocations.join(&mission_hash).join(format!("{task_hash}.json"));
+        let short_record = read_control_json::<StorageAllocation>(&short_record_path, &mut guards)?;
+        let legacy_record = read_control_json::<StorageAllocation>(&legacy_record_path, &mut guards)?;
+        if short_record.is_some() && legacy_record.is_some() {
+            return Err("duplicate runtime allocation records for one task".into());
+        }
+        let (record_path, existing) = match (short_record, legacy_record) {
+            (Some(record), None) => (short_record_path, Some(record)),
+            (None, Some(record)) => (legacy_record_path, Some(record)),
+            (None, None) => (short_record_path, None),
+            (Some(_), Some(_)) => unreachable!(),
+        };
         let other_roots = registered_task_roots(&base, &allocations, &mission_hash, &task_hash, &mut guards)?;
         let (root, allocation) = if let Some((record, file)) = existing {
             if record.version != 1 || record.mission_hash != mission_hash
@@ -88,8 +106,10 @@ impl CheckRuntimeResources {
             let pinned_base = resolve_future_directory(&ordinary_absolute(&record.base)?, &mut guards)?;
             validate_local_disk(&pinned_base)?;
             let root = resolve_future_directory(&ordinary_absolute(&record.root)?, &mut guards)?;
+            let expected_short_root = pinned_base.join(short_mission).join(short_task);
+            let expected_legacy_root = pinned_base.join(&mission_hash).join(&task_hash);
             if pinned_base != record.base || root != record.root
-                || root != pinned_base.join(&mission_hash).join(&task_hash)
+                || root != expected_short_root && root != expected_legacy_root
             {
                 return Err("runtime storage allocation path mismatch".into());
             }
@@ -97,9 +117,24 @@ impl CheckRuntimeResources {
             (root, None)
         } else {
             // An existing legacy root always wins, even after policy changes.
-            let legacy_exists = directory_exists(&legacy_root)?;
+            let legacy_exists = directory_exists(&legacy_legacy_root)?;
+            let short_exists = directory_exists(&short_legacy_root)?;
+            if !legacy_exists && short_exists {
+                return Err("unregistered shortened runtime resource directory".into());
+            }
             let selected_base = if legacy_exists { base.clone() } else { preferred.unwrap_or(base.clone()) };
-            let root = resolve_future_directory(&selected_base.join(&mission_hash).join(&task_hash), &mut guards)?;
+            let selected_short_root = resolve_future_directory(
+                &selected_base.join(short_mission).join(short_task), &mut guards,
+            )?;
+            let selected_legacy_root = resolve_future_directory(
+                &selected_base.join(&mission_hash).join(&task_hash), &mut guards,
+            )?;
+            if !legacy_exists && (directory_exists(&selected_short_root)?
+                || directory_exists(&selected_legacy_root)?)
+            {
+                return Err("unregistered runtime resource directory in selected storage".into());
+            }
+            let root = if legacy_exists { legacy_legacy_root.clone() } else { selected_short_root };
             ensure_separate(&root, &workspace)?;
             ensure_separate(&root, &allocations)?;
             for other in &other_roots { ensure_separate(&root, other)?; }
@@ -315,7 +350,8 @@ fn registered_task_roots(
     default_base: &Path, allocations: &Path, mission: &str, task: &str,
     guards: &mut Vec<fs::File>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let is_hash = |name: &str| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_hash = |name: &str| matches!(name.len(), RESOURCE_PATH_HASH_LEN | 64)
+        && name.bytes().all(|b| b.is_ascii_hexdigit());
     let mut roots = std::collections::BTreeSet::new();
     let mut count = 0usize;
     for folder in fs::read_dir(allocations)? {
@@ -345,15 +381,25 @@ fn registered_task_roots(
                 .ok_or("unexpected host allocation record")?;
             let (record, _file) = read_control_json::<StorageAllocation>(&entry.path(), guards)?
                 .ok_or("runtime allocation disappeared")?;
-            if record.version != 1 || record.mission_hash != name || record.task_hash != task_hash {
+            if record.version != 1 || !record.mission_hash.starts_with(&name)
+                || !record.task_hash.starts_with(task_hash)
+                || record.mission_hash.len() != 64 || record.task_hash.len() != 64
+                || name.len() == 64 && record.mission_hash != name
+                || task_hash.len() == 64 && record.task_hash != task_hash
+            {
                 return Err("runtime allocation registry identity mismatch".into());
             }
             let base = resolve_future_directory(&ordinary_absolute(&record.base)?, guards)?;
             let root = resolve_future_directory(&ordinary_absolute(&record.root)?, guards)?;
-            if base != record.base || root != record.root || root != base.join(&name).join(task_hash) {
+            let short_root = base.join(&record.mission_hash[..RESOURCE_PATH_HASH_LEN])
+                .join(&record.task_hash[..RESOURCE_PATH_HASH_LEN]);
+            let legacy_root = base.join(&record.mission_hash).join(&record.task_hash);
+            if base != record.base || root != record.root
+                || root != short_root && root != legacy_root
+            {
                 return Err("runtime allocation registry path mismatch".into());
             }
-            if name != mission || task_hash != task { roots.insert(root); }
+            if record.mission_hash != mission || record.task_hash != task { roots.insert(root); }
         }
     }
     // Legacy tasks have not necessarily been opened since allocation pinning
@@ -361,7 +407,8 @@ fn registered_task_roots(
     for folder in fs::read_dir(default_base)? {
         let folder = folder?;
         let name = folder.file_name().to_str().ok_or("invalid legacy name")?.to_owned();
-        if !is_hash(&name) { continue; }
+        // Shortened roots are trusted only through their full-hash pins above.
+        if name.len() != 64 || !is_hash(&name) { continue; }
         guards.extend(checked_directory_chain(&folder.path(), false)?);
         for entry in fs::read_dir(folder.path())? {
             let entry = entry?;
@@ -851,9 +898,11 @@ mod tests {
             &fixture.workspace, mission, task, &fixture.cache,
         ).unwrap();
         let root = first.root.clone();
-        assert_eq!(root.parent().unwrap().file_name().unwrap().to_str().unwrap().len(), 64);
-        assert_eq!(root.file_name().unwrap().to_str().unwrap().len(), 64);
+        assert_eq!(root.parent().unwrap().file_name().unwrap().to_str().unwrap().len(), RESOURCE_PATH_HASH_LEN);
+        assert_eq!(root.file_name().unwrap().to_str().unwrap().len(), RESOURCE_PATH_HASH_LEN);
         assert!(root.file_name().unwrap().to_str().unwrap().bytes().all(|b| b.is_ascii_hexdigit()));
+        let typical_node_temp = root.join("tmp").join("node-test-temporary-directory-name");
+        assert!(typical_node_temp.to_string_lossy().len() < 240, "{}", typical_node_temp.display());
         assert!(!root.starts_with(&fixture.workspace));
         assert!(!fixture.workspace.starts_with(&root));
         assert!(root.is_absolute());
@@ -885,6 +934,64 @@ mod tests {
     }
 
     #[test]
+    fn shortened_task_resources_fit_windows_temp_paths_and_read_legacy_allocations() {
+        let fixture = Fixture::new();
+        let mission = "a mission with a deliberately long identity";
+        let task = "a task identity that produces a long runtime path";
+        let first = CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache).unwrap();
+        let current_root = first.root.clone();
+        let mission_hash = format!("{:x}", Sha256::digest(mission.as_bytes()));
+        let task_hash = format!("{:x}", Sha256::digest(task.as_bytes()));
+        let allocations = fixture.cache.join(".allocations-v1");
+        let short_record = allocations.join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+            .join(format!("{}.json", &task_hash[..RESOURCE_PATH_HASH_LEN]));
+        let legacy_record = allocations.join(&mission_hash).join(format!("{task_hash}.json"));
+        let legacy_root = fixture.cache.join(&mission_hash).join(&task_hash);
+        let mut record: StorageAllocation = serde_json::from_slice(&fs::read(&short_record).unwrap()).unwrap();
+        drop(first);
+        fs::remove_dir_all(&current_root).unwrap();
+        fs::remove_file(&short_record).unwrap();
+        fs::create_dir_all(legacy_root.join("tmp")).unwrap();
+        fs::create_dir_all(legacy_root.join("npm-cache")).unwrap();
+        record.root = canonical_directory(&legacy_root).unwrap();
+        checked_directory_chain(legacy_record.parent().unwrap(), true).unwrap();
+        atomic_control_json(&legacy_record, &record, false).unwrap();
+
+        let reopened = CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache).unwrap();
+        assert_eq!(reopened.root, legacy_root);
+        assert!(!short_record.exists());
+    }
+
+    #[test]
+    fn adopted_full_hash_root_reopens_from_a_short_allocation_record() {
+        let fixture = Fixture::new();
+        let mission = "legacy mission requiring path compatibility";
+        let task = "legacy task requiring path compatibility";
+        let mission_hash = format!("{:x}", Sha256::digest(mission.as_bytes()));
+        let task_hash = format!("{:x}", Sha256::digest(task.as_bytes()));
+        let legacy_root = fixture.cache.join(&mission_hash).join(&task_hash);
+        fs::create_dir_all(legacy_root.join("tmp")).unwrap();
+        fs::create_dir_all(legacy_root.join("npm-cache")).unwrap();
+        fs::write(legacy_root.join("retained.txt"), "legacy evidence").unwrap();
+
+        let first = CheckRuntimeResources::prepare_at(
+            &fixture.workspace, mission, task, &fixture.cache,
+        ).unwrap();
+        assert_eq!(first.root, legacy_root);
+        let short_record = fixture.cache.join(".allocations-v1")
+            .join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+            .join(format!("{}.json", &task_hash[..RESOURCE_PATH_HASH_LEN]));
+        assert!(short_record.is_file());
+        drop(first);
+
+        let reopened = CheckRuntimeResources::prepare_at(
+            &fixture.workspace, mission, task, &fixture.cache,
+        ).unwrap();
+        assert_eq!(reopened.root, legacy_root);
+        assert_eq!(fs::read_to_string(legacy_root.join("retained.txt")).unwrap(), "legacy evidence");
+    }
+
+    #[test]
     fn invalid_roots_and_workspace_overlap_are_rejected_before_creation() {
         let fixture = Fixture::new();
         let file = fixture.root.join("file");
@@ -894,9 +1001,10 @@ mod tests {
             assert!(CheckRuntimeResources::prepare_at(&fixture.workspace, "m", "t", &base).is_err());
         }
         assert!(!internal.exists());
-        let task_root = fixture.cache
-            .join(format!("{:x}", Sha256::digest(b"m")))
-            .join(format!("{:x}", Sha256::digest(b"t")));
+        let mission_hash = format!("{:x}", Sha256::digest(b"m"));
+        let task_hash = format!("{:x}", Sha256::digest(b"t"));
+        let task_root = fixture.cache.join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+            .join(&task_hash[..RESOURCE_PATH_HASH_LEN]);
         let nested_workspace = task_root.join("nested-workspace");
         fs::create_dir_all(&nested_workspace).unwrap();
         for workspace in [&task_root, &nested_workspace, &fixture.root.join("missing")] {

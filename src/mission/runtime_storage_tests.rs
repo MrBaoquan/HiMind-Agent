@@ -103,9 +103,11 @@ fn allocation_is_bound_to_workspace_and_corruption_cannot_redirect_it() {
     assert!(CheckRuntimeResources::prepare_in(&other, "mission", "task",
         &home.join("cache/mission-checks"), Some(&home.join("mission-runtime-storage.json"))).is_err());
     drop(resources);
+    let mission_hash = format!("{:x}", Sha256::digest(b"mission"));
+    let task_hash = format!("{:x}", Sha256::digest(b"task"));
     let record = home.join("cache/mission-checks/.allocations-v1")
-        .join(format!("{:x}", Sha256::digest(b"mission")))
-        .join(format!("{:x}.json", Sha256::digest(b"task")));
+        .join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+        .join(format!("{}.json", &task_hash[..RESOURCE_PATH_HASH_LEN]));
     let mut value: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
     value["root"] = json!(other);
     fs::write(&record, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -159,8 +161,9 @@ fn interrupted_publication_preserves_temp_without_blocking_other_tasks() {
     let (fixture, home, alternate) = setup();
     configure_storage_in(&home, &alternate).unwrap();
     let first = prepare(&fixture, &home, "first").unwrap();
+    let mission_hash = format!("{:x}", Sha256::digest(b"mission"));
     let folder = home.join("cache/mission-checks/.allocations-v1")
-        .join(format!("{:x}", Sha256::digest(b"mission")));
+        .join(&mission_hash[..RESOURCE_PATH_HASH_LEN]);
     let temp = folder.join(".storage-123-0123456789abcdef.tmp");
     fs::write(&temp, "interrupted JSON bytes").unwrap();
     let second = prepare(&fixture, &home, "second").unwrap();
