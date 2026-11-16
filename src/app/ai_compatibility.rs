@@ -405,6 +405,16 @@ impl CapabilityMatrixV1 {
             .iter()
             .filter(|provider| provider.id != UNKNOWN_PROVIDER_ID)
             .filter(|provider| provider.protocols.contains(protocol))
+            // This evidence covers the exact HTTPS endpoint, not lookalike hosts
+            // or paths that merely share the /v1 prefix. Keep legacy profiles'
+            // matching unchanged while bounding this new provider fingerprint.
+            .filter(|provider| {
+                provider.id != "xixiapi_responses"
+                    || (parsed.scheme() == "https"
+                        && parsed.port_or_known_default() == Some(443)
+                        && host == "xixiapi.io"
+                        && (path == "/v1" || path.starts_with("/v1/")))
+            })
             .filter_map(|provider| {
                 provider_match_score(provider, &host, path).map(|score| (score, provider))
             })
@@ -903,7 +913,7 @@ fn builtin_providers() -> Vec<ProviderCapability> {
     let s = CapabilitySupport::Supported;
     let u = CapabilitySupport::Unsupported;
     let x = CapabilitySupport::Unknown;
-    vec![
+    let mut providers = vec![
         provider(
             "anthropic_native",
             "Anthropic Messages native",
@@ -1092,7 +1102,27 @@ fn builtin_providers() -> Vec<ProviderCapability> {
             supports_1m: CapabilitySupport::Unknown,
             unknown_policy: FailureMode::StructuredDiagnostic,
         },
-    ]
+    ];
+    // Direct 2026-11-16 Lucen gpt-6.1-sol probe: matched text call/result
+    // history returned its sentinel without another call and fully completed.
+    // Evidence: synthetic-probe-v4/review.json, SHA256
+    // d80dc9b9981b81842759ac805d9ac006b9b4dc771171bed48539b43564cb5ee7.
+    // Inherit every other limited capability; this proves no additional media,
+    // namespace, web-search, tool-choice mode or sampling support.
+    let mut xixiapi = providers
+        .iter()
+        .find(|provider| provider.id == "openai_responses_limited")
+        .expect("builtin matrix must contain the limited Responses provider")
+        .clone();
+    xixiapi.id = "xixiapi_responses".to_string();
+    xixiapi.display_name = "XixiAPI Responses".to_string();
+    xixiapi.fingerprint = ProviderFingerprint {
+        host_suffixes: vec!["xixiapi.io".to_string()],
+        path_prefixes: vec!["/v1".to_string()],
+    };
+    xixiapi.function_call_history = CapabilitySupport::Supported;
+    providers.push(xixiapi);
+    providers
 }
 
 fn agent_plan_rule(model: &str, image: CapabilitySupport) -> ModelCapabilityRule {
@@ -1915,6 +1945,7 @@ mod tests {
             "vectide_anthropic",
             "opencode_zen_responses",
             "opencode_zen_chat",
+            "xixiapi_responses",
             "openai_responses_limited",
             "volcengine_agent_plan",
             UNKNOWN_PROVIDER_ID,
@@ -1927,6 +1958,116 @@ mod tests {
         let encoded = serde_json::to_vec(&matrix).unwrap();
         let decoded: CapabilityMatrixV1 = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, matrix);
+    }
+
+    #[test]
+    fn xixiapi_responses_fingerprint_is_bounded() {
+        let matrix = CapabilityMatrixV1::builtin();
+        for endpoint in [
+            "https://xixiapi.io/v1",
+            "https://xixiapi.io/v1/",
+            "https://XIXIAPI.IO:443/v1/responses",
+        ] {
+            assert_eq!(
+                matrix
+                    .resolve_provider(endpoint, &AIServiceProtocol::OpenaiResponses)
+                    .id,
+                "xixiapi_responses",
+                "missing proved endpoint {endpoint}"
+            );
+        }
+        for endpoint in [
+            "https://notxixiapi.io/v1",
+            "https://xixiapi.io.evil.invalid/v1",
+            "https://api.xixiapi.io/v1",
+            "https://xixiapi.io/",
+            "https://xixiapi.io/other",
+            "https://xixiapi.io/v10",
+            "https://xixiapi.io/v1-other",
+            "http://xixiapi.io/v1",
+            "https://xixiapi.io:8443/v1",
+            "https://unproved.example/v1",
+        ] {
+            let provider = matrix.resolve_provider(endpoint, &AIServiceProtocol::OpenaiResponses);
+            assert_eq!(provider.id, "openai_responses_limited", "{endpoint}");
+            assert!(!provider.function_call_history.is_supported(), "{endpoint}");
+        }
+        for (protocol, expected) in [
+            (AIServiceProtocol::OpenaiChat, "openai_chat_compatible"),
+            (AIServiceProtocol::Anthropic, "anthropic_native"),
+        ] {
+            assert_eq!(
+                matrix
+                    .resolve_provider("https://xixiapi.io/v1", &protocol)
+                    .id,
+                expected
+            );
+        }
+
+        let provider = matrix.provider("xixiapi_responses").unwrap();
+        let mut expected = matrix.provider("openai_responses_limited").unwrap().clone();
+        expected.id = provider.id.clone();
+        expected.display_name = provider.display_name.clone();
+        expected.fingerprint = provider.fingerprint.clone();
+        expected.function_call_history = CapabilitySupport::Supported;
+        assert_eq!(provider, &expected, "no other capability may be inferred");
+    }
+
+    #[test]
+    fn xixiapi_responses_preserves_call_ids_arguments_and_results() {
+        let matrix = CapabilityMatrixV1::builtin();
+        let provider =
+            matrix.resolve_provider("https://xixiapi.io/v1", &AIServiceProtocol::OpenaiResponses);
+        let client = matrix.client("opencode").unwrap();
+        let request = serde_json::json!({
+            "model": "gpt-6.1-sol",
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "tools": [{"type": "function", "name": "read_sentinel"}],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Use the existing results."}]},
+                {"type": "function_call", "name": "read_sentinel", "arguments": "{\"path\":\"first\"}", "call_id": "call_first"},
+                {"type": "function_call", "name": "read_sentinel", "arguments": "{\"path\":\"second\"}", "call_id": "call_second"},
+                {"type": "function_call_output", "call_id": "call_first", "output": "FIRST_SENTINEL"},
+                {"type": "function_call_output", "call_id": "call_second", "output": "SECOND_SENTINEL"}
+            ]
+        });
+        let normalized = normalize_provider_request(
+            &AIServiceProtocol::OpenaiResponses,
+            request.clone(),
+            client,
+            provider,
+            None,
+        )
+        .unwrap();
+        assert_eq!(normalized.request, request);
+        assert!(normalized.changes.is_empty());
+
+        let generic = matrix.resolve_provider(
+            "https://unproved.example/v1",
+            &AIServiceProtocol::OpenaiResponses,
+        );
+        let fallback = normalize_provider_request(
+            &AIServiceProtocol::OpenaiResponses,
+            request,
+            client,
+            generic,
+            None,
+        )
+        .unwrap();
+        assert!(fallback.request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] == "message"));
+        assert!(fallback.changes.iter().any(|change| {
+            change.feature == "function_call_history"
+                && change.action == NormalizationAction::Degrade
+        }));
+        let transcript = fallback.request.to_string();
+        assert!(transcript.contains("FIRST_SENTINEL"));
+        assert!(transcript.contains("SECOND_SENTINEL"));
     }
 
     #[test]

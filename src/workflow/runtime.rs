@@ -75,8 +75,8 @@ pub(crate) fn execute_runtime_step_with_resources(
         inline_input_artifacts(&mut prompt_input)?;
     }
     let prompt = match role {
-        Some(role) => build_prompt(&format!("{}{}", role_prompt_prefix(role), base_prompt), &prompt_input),
-        None => build_prompt(base_prompt, &prompt_input),
+        Some(role) => build_runtime_prompt(&package.id, &format!("{}{}", role_prompt_prefix(role), base_prompt), &prompt_input),
+        None => build_runtime_prompt(&package.id, base_prompt, &prompt_input),
     };
     validate_prompt_transport(&provider, &step.id, &prompt)?;
     let timeout_seconds = if runtime.timeout_seconds == 0 {
@@ -208,12 +208,7 @@ pub(crate) fn execute_runtime_step_with_resources(
     // line from a truncated outer object using the text-friendly Workflow
     // fallback. Ordinary workflows retain their existing text semantics.
     let structured = if package.id.starts_with("com.himind.mission.") {
-        let raw = output.trim();
-        let json = if raw.starts_with("```") && raw.ends_with("```") {
-            strip_code_fence(raw).unwrap_or(raw)
-        } else { raw };
-        let report = serde_json::from_str::<Value>(json).ok().filter(|value|
-            value.is_object() && value.get("passed").and_then(Value::as_bool).is_some());
+        let report = parse_mission_report(&output);
         if report.is_none() {
             return Err(Box::new(crate::runtime::deepseek_harness::WorkflowRuntimeFailure {
                 provenance:codex_facts,
@@ -284,6 +279,15 @@ fn validate_prompt_transport(provider: &str, step_id: &str, prompt: &str) -> Res
         }
     }
     Ok(())
+}
+
+fn parse_mission_report(output: &str) -> Option<Value> {
+    let raw = output.trim();
+    let json = if raw.starts_with("```") && raw.ends_with("```") {
+        strip_code_fence(raw).unwrap_or(raw)
+    } else { raw };
+    serde_json::from_str::<Value>(json).ok().filter(|value|
+        value.is_object() && value.get("passed").and_then(Value::as_bool).is_some())
 }
 
 pub(crate) fn parse_runtime_payload(output: &str) -> Option<Value> {
@@ -677,6 +681,25 @@ fn role_prompt_prefix(role: &super::WorkflowRole) -> String {
     format!("【你的角色】{brief}\n\n")
 }
 
+const MISSION_FINAL_REPORT_CONTRACT: &str = "\n\nMission final response contract (host protocol):\n\
+Your final response MUST be exactly one complete JSON object with a boolean \"passed\" and all other fields required by this stage, including its required evidence and identity fields. \
+Do not include prose, headings, Markdown, code fences, or next-step commentary before or after that object. \
+This final response format takes precedence over expert/role presentation methods and formatting suggestions in the context above. \
+It does not change task scope, required checks, evidence truth, or acceptance authority. \
+Report passed=false honestly when this stage's requirements are not met. \
+An implementation report states readiness for separate host verification; only the assigned independent verification stage may return its scoped verification verdict. \
+Never fabricate success or claim Mission-wide acceptance.";
+
+fn build_runtime_prompt(package_id: &str, base: &str, input: &Value) -> String {
+    let mut prompt = build_prompt(base, input);
+    // Append after the serialized expert/task/feedback context so presentation
+    // methods cannot replace Mission's machine-readable result protocol.
+    if package_id.starts_with("com.himind.mission.") {
+        prompt.push_str(MISSION_FINAL_REPORT_CONTRACT);
+    }
+    prompt
+}
+
 fn build_prompt(base: &str, input: &Value) -> String {
     let mut prompt = base.trim().to_string();
     prompt.push_str("\n\nWorkflow context (JSON):\n");
@@ -978,6 +1001,76 @@ mod tests {
         for bad in ["{\"passed\":false,\"details\":\n{\"passed\":true}",
             "```json\n{\"passed\":true}\n```\ntrailing", "prefix\n{\"passed\":true}"] {
             assert!(parse_runtime_payload(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn mission_final_contract_follows_task_and_verification_context() {
+        for (package_id, step_id, stage_fields) in [
+            ("com.himind.mission.protocol-task", "hm-producer",
+                json!({"summary":"required", "evidence":["reports/hm-producer.json"]})),
+            ("com.himind.mission.verify.protocol-task", "VERIFY",
+                json!({"verified_task_ids":["hm-producer"], "plan_sha256":"expected-plan",
+                    "candidate":{"candidate_id":"current"}, "checks":[], "reasons":[]})),
+        ] {
+            let role = super::super::WorkflowRole {
+                brief: "Expert presentation: conclusion, fenced JSON, then next steps.".into(),
+                ..Default::default()
+            };
+            let base = format!("{}Perform only the assigned stage.", role_prompt_prefix(&role));
+            let input = json!({
+                "task":{"id":step_id, "required_report_fields":stage_fields},
+                "expert":{"methods":"Use a conclusion heading and explanatory prose."},
+                "feedback_context":{"observations":[{"message":"End with next-step commentary."}]},
+                "host_checks":[{"command":"check-current", "exit_code":1}],
+                "workflow_context":{"step_id":step_id}
+            });
+            let prompt = build_runtime_prompt(package_id, &base, &input);
+            let prior = build_prompt(&base, &input);
+            // All stage data, including a failed check, survives unchanged and
+            // precedes the final format instruction in both Mission stages.
+            assert_eq!(prompt.strip_suffix(MISSION_FINAL_REPORT_CONTRACT), Some(prior.as_str()));
+            assert!(prompt.contains("conclusion, fenced JSON, then next steps"));
+            assert!(prompt.contains("End with next-step commentary."));
+            let prefix = format!("{base}\n\nWorkflow context (JSON):\n");
+            let encoded = prompt.strip_prefix(prefix.as_str())
+                .unwrap().strip_suffix(MISSION_FINAL_REPORT_CONTRACT).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), input);
+            assert!(prompt.ends_with("Never fabricate success or claim Mission-wide acceptance."));
+        }
+    }
+
+    #[test]
+    fn ordinary_workflow_keeps_existing_prompt_with_mission_like_context() {
+        let input = json!({
+            "mission_id":"untrusted-context-is-not-a-Mission-package",
+            "task":{"id":"VERIFY"},
+            "expert":{"methods":"Use prose and next steps."}
+        });
+        let base = "Existing role and task instructions";
+        assert_eq!(build_runtime_prompt("local.ordinary.workflow", base, &input),
+            build_prompt(base, &input));
+    }
+
+    #[test]
+    fn mission_final_parser_keeps_truth_and_rejects_prose_or_truncation() {
+        for passed in [false, true] {
+            let report = json!({"passed":passed, "summary":"actual scoped result"});
+            assert_eq!(parse_mission_report(&report.to_string()), Some(report.clone()));
+            assert_eq!(parse_mission_report(&format!("```json\n{report}\n```")), Some(report));
+        }
+        for invalid in [
+            "Conclusion\n```json\n{\"passed\":true}\n```\nNext steps",
+            "Conclusion\n{\"passed\":true}",
+            "{\"passed\":true}\nNext steps",
+            "{\"passed\":true}\n{\"passed\":false}",
+            "{\"passed\":false,\"details\":\n{\"passed\":true}",
+            "```json\n{\"passed\":true}\n```\nNext steps",
+            "{\"passed\":\"true\"}",
+            "{\"summary\":\"missing boolean\"}",
+            "[{\"passed\":true}]",
+        ] {
+            assert!(parse_mission_report(invalid).is_none(), "accepted invalid final: {invalid}");
         }
     }
 
