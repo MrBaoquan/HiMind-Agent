@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>图片与语音服务选择示例</title>
+<style>
+  body { font: 15px/1.6 system-ui; margin: 32px auto; padding: 0 24px; max-width: 840px; color: #182535; background: #f7f9fc; }
+  section { background: white; padding: 24px; margin: 20px 0; border: 1px solid #dbe3ef; border-radius: 12px; }
+  fieldset { border: 0; padding: 0; } legend, h1 { font-weight: 650; }
+  label { display: block; margin: 12px 0; } select, textarea { display: block; width: 100%; padding: 9px; box-sizing: border-box; }
+  button { padding: 8px 12px; margin: 4px 8px 4px 0; cursor: pointer; } textarea { min-height: 80px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; } [role=status] { color: #475b76; }
+</style>
+<h1>选择本次使用的 AI 服务</h1>
+<p>项目与插件默认选择保存在本插件中。每次执行由 Agent 读取凭据并调用服务。</p>
+<section><h2>图片生成</h2><div id="image-picker"></div><label>画面描述<textarea id="prompt">一座清晨的山间小屋</textarea></label><button id="image-run" disabled>生成图片</button><pre id="image-result"></pre></section>
+<section><h2>语音合成</h2><div id="audio-picker"></div><label>配音文字<textarea id="text">你好，欢迎使用 HiMind。</textarea></label><p id="voice-note">更换服务或模型后，请重新选择该服务的音色。</p><button id="audio-run" disabled>使用服务默认音色生成</button><pre id="audio-result"></pre></section>
+<script type="module">
+  // Put this page in a plugin view. SDK files are embedded in Agent; no CDN or extra package is needed.
+  const parts = location.pathname.split('/').filter(Boolean);
+  const sdk = new URL(`/${parts.slice(0, 2).join('/')}/_himind/ai-v1/`, location.href);
+  const { createAiClient, viewTransport } = await import(new URL('client.mjs', sdk));
+  const { mountServiceSelector } = await import(new URL('service-selector.mjs', sdk));
+  // Use your own stable plugin/project identifiers. Project identity comes from your plugin state.
+  const client = createAiClient({ invoke: viewTransport(), pluginId: parts[0], projectId: 'example-project' });
+  for (const [kind, capability, field] of [['image', 'media.image.generate', 'prompt'], ['audio', 'media.audio.speech', 'text']]) {
+    const run = document.querySelector(`#${kind}-run`);
+    const result = document.querySelector(`#${kind}-result`);
+    let selected;
+    let busy = false;
+    mountServiceSelector(document.querySelector(`#${kind}-picker`), {
+      client, capability, filters: { execution_mode: 'sync' },
+      onChange(state) { selected = state; run.disabled = busy || !state.ready; },
+    });
+    run.addEventListener('click', async () => {
+      if (!selected?.ready || busy) return;
+      busy = true; run.disabled = true; result.textContent = '正在执行…';
+      try {
+        const output = await client.execute(capability, { [field]: document.getElementById(field).value }, selected.value);
+        result.textContent = JSON.stringify({ actual: output.actual, fallback_used: output.fallback_used, artifacts: output.artifacts, usage: output.usage }, null, 2);
+      } catch (error) { result.textContent = error.message; }
+      finally { busy = false; run.disabled = !selected?.ready; }
+    });
+  }
+</script>
+</html>

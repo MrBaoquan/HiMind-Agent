@@ -54,6 +54,8 @@ struct BatchJob {
     #[serde(default)]
     budget_tokens: u64,
     #[serde(default)]
+    pinned_model: String,
+    #[serde(default)]
     used_tokens: u64,
     created_at: u64,
     updated_at: u64,
@@ -147,6 +149,30 @@ fn string_field(input: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn pin_target(input: &Value) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let plan = crate::store::ai_services::capability_selection_plan(crate::store::ai_services::CAP_VISION, input)?;
+    let selected = &plan["selected"];
+    if selected["eligible"] != true { return Err("批量任务的服务或模型当前不可执行".into()); }
+    let pinned_service = format!("custom:{}", selected["service_id"].as_str().ok_or("缺少服务")?);
+    let pinned_model = selected["model"].as_str().ok_or("缺少模型")?.to_string();
+    Ok((pinned_service, pinned_model))
+}
+
+fn resume_config(job: &BatchJob, input: &Value) -> Result<Value, Box<dyn std::error::Error>> {
+    if job.service.is_empty() || job.pinned_model.is_empty() {
+        return Err("旧批量作业未保存固定模型；请显式重新创建任务并确认服务模型".into());
+    }
+    Ok(json!({
+        "profile": job.profile,
+        "service": job.service,
+        "model": job.pinned_model,
+        "fallback": "none",
+        "max_edge": input.get("max_edge").cloned().unwrap_or(json!(512)),
+        "max_output_tokens": input.get("max_output_tokens").cloned().unwrap_or(json!(200)),
+        "budget_tokens": job.budget_tokens,
+    }))
+}
+
 pub(crate) fn start(input: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     let raw_items = input
         .get("items")
@@ -195,6 +221,7 @@ pub(crate) fn start(input: &Value) -> Result<Value, Box<dyn std::error::Error>> 
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, 3) as u32)
         .unwrap_or(2);
+    let (pinned_service, pinned_model) = pin_target(input)?;
     let now = now_seconds();
     let id = format!("vision-{now}-{:08x}", rand::random::<u32>());
     let job = BatchJob {
@@ -204,7 +231,8 @@ pub(crate) fn start(input: &Value) -> Result<Value, Box<dyn std::error::Error>> 
         done: 0,
         failed: 0,
         profile: profile.clone(),
-        service: string_field(input, "service").unwrap_or_default(),
+        service: pinned_service.clone(),
+        pinned_model: pinned_model.clone(),
         budget_tokens,
         used_tokens: 0,
         created_at: now,
@@ -218,7 +246,11 @@ pub(crate) fn start(input: &Value) -> Result<Value, Box<dyn std::error::Error>> 
     if let Ok(job) = shared.lock() {
         persist(&job);
     }
-    let config = input.clone();
+    let mut config = input.clone();
+    config.as_object_mut().unwrap().remove("selection");
+    config["service"] = json!(pinned_service);
+    config["model"] = json!(pinned_model);
+    config["fallback"] = json!("none");
     let job_id = id.clone();
     thread::spawn(move || run_job(job_id, shared, config, concurrency, attempts));
     Ok(json!({ "job_id": id, "status": "running", "total": raw_items.len() }))
@@ -480,6 +512,7 @@ pub(crate) fn resume(input: &Value) -> Result<Value, Box<dyn std::error::Error>>
             json!({ "job_id": job.id, "status": job.status, "resumed": false, "pending": 0 }),
         );
     }
+    let config = resume_config(&job, input)?;
     for item in job.items.iter_mut() {
         if item.status == "running" {
             item.status = "pending".to_string();
@@ -488,13 +521,6 @@ pub(crate) fn resume(input: &Value) -> Result<Value, Box<dyn std::error::Error>>
     job.status = "running".to_string();
     job.updated_at = now_seconds();
     persist(&job);
-    let config = json!({
-        "profile": job.profile,
-        "service": job.service,
-        "max_edge": input.get("max_edge").cloned().unwrap_or(json!(512)),
-        "max_output_tokens": input.get("max_output_tokens").cloned().unwrap_or(json!(200)),
-        "budget_tokens": job.budget_tokens,
-    });
     let attempts = input
         .get("attempts")
         .and_then(Value::as_u64)
@@ -566,4 +592,34 @@ pub(crate) fn list() -> Result<Value, Box<dyn std::error::Error>> {
     });
     summaries.truncate(50);
     Ok(json!({ "jobs": summaries }))
+}
+
+#[cfg(test)]
+mod plugin_ai_tests {
+    use super::*;
+    #[test]
+    fn batch_model_pin_survives_serialization_and_default_changes() {
+        use crate::store::ai_services as ai;
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!("himind-plugin-ai-batch-{}", std::process::id()));
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        ai::upsert(ai::CustomAIServiceInput { id:"vision".into(),display_name:"测试视觉".into(),base_url:"http://127.0.0.1:9/v1".into(),protocol:ai::AIServiceProtocol::OpenaiChat,model:"first".into(),models:vec!["first".into(),"second".into()],image_model:String::new(),image_adapter:String::new(),media:Default::default(),api_key:"test-only".into(),endpoints:vec![] }).unwrap();
+        ai::set_capability_routes(ai::CAP_VISION, vec![ai::CapabilityRouteEntry::new("vision", "second")]).unwrap();
+        let (service, model) = pin_target(&json!({})).unwrap();
+        let job = BatchJob { id:"test".into(),status:"interrupted".into(),total:0,done:0,failed:0,profile:"full".into(),service,pinned_model:model,budget_tokens:0,used_tokens:0,created_at:0,updated_at:0,items:vec![] };
+        let restored: BatchJob = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        ai::set_capability_routes(ai::CAP_VISION, vec![ai::CapabilityRouteEntry::new("vision", "first")]).unwrap();
+        assert_eq!(pin_target(&json!({})).unwrap().1, "first");
+        let config = resume_config(&restored, &json!({})).unwrap();
+        assert_eq!(config["service"], "custom:vision");
+        assert_eq!(config["model"], "second");
+        assert_eq!(config["fallback"], "none");
+        let mut legacy = serde_json::to_value(&restored).unwrap();
+        legacy.as_object_mut().unwrap().remove("pinned_model");
+        let legacy: BatchJob = serde_json::from_value(legacy).unwrap();
+        assert!(resume_config(&legacy, &json!({})).is_err());
+        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

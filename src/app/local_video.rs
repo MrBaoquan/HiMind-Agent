@@ -524,6 +524,8 @@ fn wan_api_root(base_url: &str) -> Result<String, Box<dyn Error>> {
     let root = base
         .strip_suffix("/compatible-mode/v1")
         .or_else(|| base.strip_suffix("/api/v1"))
+        // OpenAI-compatible service roots may have a normalized /v1 suffix.
+        .or_else(|| base.strip_suffix("/v1"))
         .unwrap_or(base);
     Ok(root.trim_end_matches('/').to_string())
 }
@@ -669,6 +671,7 @@ fn tasks_url(base_url: &str) -> Result<String, Box<dyn Error>> {
     let root = if base.ends_with("/api/plan/v3") || base.ends_with("/api/v3") {
         base.to_string()
     } else {
+        let base = base.strip_suffix("/v1").unwrap_or(base);
         format!("{base}/api/v3")
     };
     Ok(format!("{root}/contents/generations/tasks"))
@@ -1176,5 +1179,15 @@ mod tests {
             tasks_url("https://ark.cn-beijing.volces.com").unwrap(),
             "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
         );
+        assert_eq!(
+            tasks_url("https://ark.cn-beijing.volces.com/v1").unwrap(),
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+        );
+        for suffix in ["", "/v1", "/api/v1", "/compatible-mode/v1"] {
+            assert_eq!(
+                wan_api_root(&format!("https://dashscope.aliyuncs.com{suffix}")).unwrap(),
+                "https://dashscope.aliyuncs.com"
+            );
+        }
     }
 }

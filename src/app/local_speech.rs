@@ -631,7 +631,11 @@ fn is_loopback_url(base_url: &str) -> bool {
 }
 
 fn fish_model_endpoint(base_url: &str) -> String {
-    format!("{}/model", base_url.trim().trim_end_matches('/'))
+    // Service storage normalizes a bare OpenAI-compatible endpoint to /v1.
+    // Fish voice catalogs live at /model, while synthesis/ASR live under /v1.
+    let base = base_url.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/model")
 }
 
 fn fish_asr_endpoint(base_url: &str) -> String {

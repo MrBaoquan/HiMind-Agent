@@ -41,6 +41,10 @@ pub(crate) fn read_image(input: &Value) -> Result<Value, Box<dyn Error>> {
 }
 
 pub(crate) fn describe(input: &Value) -> Result<Value, Box<dyn Error>> {
+    crate::app::ai_capability_bus::execute_media(CAP_VISION, input)
+}
+
+pub(crate) fn describe_attempt(input: &Value) -> Result<Value, Box<dyn Error>> {
     let path = string_field(input, "path").unwrap_or_default();
     let image_input = string_field(input, "image");
     if path.is_empty() && image_input.is_none() {
@@ -49,37 +53,10 @@ pub(crate) fn describe(input: &Value) -> Result<Value, Box<dyn Error>> {
     let profile = string_field(input, "profile").unwrap_or_else(|| "full".to_string());
     let prompt = string_field(input, "prompt").unwrap_or_else(|| default_prompt(&profile));
     let requested_service = string_field(input, "service").unwrap_or_default();
-    // 服务归属 Agent：调用方不指定时，按「vision.describe」能力绑定路由，
-    // 没有绑定才退回到当前激活服务。`service` 参数仅为旧调用方保留，新调用方不应传。
-    let mut resolved_by = "binding";
-    let (service, api_key) = if let Some(id) = requested_service.strip_prefix("custom:") {
-        resolved_by = "request";
-        ai_services::load_secret(id.trim())?
-    } else if requested_service.is_empty() {
-        let bound = ai_services::configured_capability_service(CAP_VISION)?;
-        match bound {
-            Some(id) => ai_services::load_secret(&id)?,
-            None => {
-                resolved_by = "active";
-                ai_services::active_service_with_secret()?.ok_or("没有激活的 AI 服务")?
-            }
-        }
-    } else {
-        return Err("service 必须是 custom:<id>，留空由 Agent 按能力绑定选择".into());
-    };
-    // 模型解析顺序必须与路由计划一致（ADR 0023 第七条）：
-    // 显式传入 → `vision.describe` 的媒体绑定 → 服务对话模型。
-    // 计划里 `capability_models(CAP_VISION)` 用的也是这个顺序，三处同源。
-    let model = string_field(input, "model")
-        .or_else(|| {
-            ai_services::capability_models(&service, CAP_VISION)
-                .into_iter()
-                .next()
-        })
-        .unwrap_or_else(|| service.model.clone());
-    if model.trim().is_empty() {
-        return Err("当前 AI 服务没有可用模型".into());
-    }
+    let id = requested_service.strip_prefix("custom:").ok_or("视觉执行尝试必须指定服务")?;
+    let (service, api_key) = ai_services::load_secret(id)?;
+    let model = string_field(input, "model").ok_or("视觉执行尝试必须指定模型")?;
+    let resolved_by = "route_plan";
     let max_edge = input
         .get("max_edge")
         .and_then(Value::as_u64)
