@@ -18,6 +18,20 @@ $unowned = Join-Path $fixture 'unowned'
 [IO.File]::WriteAllText((Join-Path $unowned 'keep.txt'),'user file')
 Assert-Rejected { Get-BuildRoot $unowned } 'Adopted a nonempty unowned directory'
 $results.Add('unowned-root-rejected')
+$machine = Get-BuildMachineReport (Split-Path -Parent $PSScriptRoot) $fixture
+Assert-Check ($machine.host.architecture -eq 'X64' -and $machine.build_root -eq [IO.Path]::GetFullPath($fixture)) 'Machine report omitted normalized host/build root identity'
+$results.Add('machine-report-includes-portable-host-and-root-identity')
+$fixtureRuntimeManifest = Join-Path $fixture 'repository\resources\runtime\himind-runtime-release.json'
+[IO.Directory]::CreateDirectory((Split-Path -Parent $fixtureRuntimeManifest)) | Out-Null
+Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'resources\runtime\himind-runtime-release.json') -Destination $fixtureRuntimeManifest
+. (Join-Path $PSScriptRoot 'runtime-bundle.ps1')
+$Root = Join-Path $fixture 'repository'
+$RepoManifestPath = $fixtureRuntimeManifest
+$wrongRuntimeRejected = $false
+try { Resolve-RuntimeReleaseDirectory -RequestedDirectory (Join-Path $fixture 'missing-runtime') | Out-Null }
+catch { $wrongRuntimeRejected = $_.Exception.Message -like '*No signed Runtime release*' }
+Assert-Check $wrongRuntimeRejected 'Explicit Runtime path silently fell back to a machine-specific package'
+$results.Add('explicit-runtime-path-never-falls-back-to-machine-local-runtime')
 Assert-Rejected { Assert-BuildPath (Join-Path $fixture '..\outside') -Within $fixture } 'Path escape accepted'
 $results.Add('path-escape-rejected')
 $root = Get-BuildRoot (Join-Path $fixture 'managed')

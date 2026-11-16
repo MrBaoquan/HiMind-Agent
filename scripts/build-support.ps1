@@ -134,6 +134,115 @@ function Get-BuildRoot {
     return $root
 }
 
+function Get-BuildMachineReport {
+    param([Parameter(Mandatory)][string]$Repository, [Parameter(Mandatory)][string]$BuildRoot)
+    $issues = [Collections.Generic.List[string]]::new()
+    if (-not $IsWindows) { $issues.Add('The Agent build pipeline currently supports Windows hosts only.') }
+    if ($PSVersionTable.PSVersion -lt [version]'7.0') { $issues.Add('Install PowerShell 7 or newer (pwsh).') }
+    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
+        $issues.Add('The supported build host is Windows x64.')
+    }
+
+    $tools = [ordered]@{}
+    foreach ($name in @('git','rustc','rustfmt','cargo','node','npm.cmd')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) { $issues.Add("Required command not found on PATH: $name") }
+        else { $tools[$name] = $command.Source }
+    }
+    if ($tools.Contains('rustc')) {
+        $rustIdentity = @(& rustc -vV 2>&1) -join "`n"
+        if ($LASTEXITCODE -or $rustIdentity -notmatch '(?m)^host: x86_64-pc-windows-msvc$') {
+            $issues.Add('rustc must target x86_64-pc-windows-msvc; install/select the Windows MSVC Rust toolchain.')
+        }
+    }
+    if ($tools.Contains('node')) {
+        $nodeVersion = @(& node --version 2>&1) -join ''
+        if ($LASTEXITCODE -or $nodeVersion -notmatch '^v?(\d+)\.(\d+)\.(\d+)') {
+            $issues.Add('Node.js version could not be read.')
+        }
+        elseif ([version]("$($Matches[1]).$($Matches[2]).$($Matches[3])") -lt [version]'22.6.0') {
+            $issues.Add("Node.js 22.6 or newer is required; found $nodeVersion.")
+        }
+    }
+    if ($tools.Contains('npm.cmd')) {
+        $npmVersion = @(& npm.cmd --version 2>&1) -join ''
+        if ($LASTEXITCODE -or $npmVersion -notmatch '^(\d+)\.') { $issues.Add('npm version could not be read.') }
+        elseif ([int]$Matches[1] -lt 9) { $issues.Add("npm 9 or newer is required for package-lock v3; found $npmVersion.") }
+    }
+
+    $programRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique
+    $vswhere = @($programRoots | ForEach-Object { Join-Path $_ 'Microsoft Visual Studio\Installer\vswhere.exe' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
+    $visualStudio = $null
+    if ($vswhere.Count) {
+        $visualStudio = @(& $vswhere[0] -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Where-Object { $_ } | Select-Object -First 1) | Select-Object -First 1
+    }
+    if (-not $visualStudio -and -not ($env:VCINSTALLDIR -and (Get-Command cl.exe -ErrorAction SilentlyContinue))) {
+        $issues.Add('Install Visual Studio Build Tools with the C++ x64/x86 tools workload.')
+    }
+
+    $sdkRoots = [Collections.Generic.List[string]]::new()
+    foreach ($programRoot in $programRoots) {
+        $candidate = Join-Path $programRoot 'Windows Kits\10\Include'
+        if (Test-Path -LiteralPath $candidate -PathType Container) { $sdkRoots.Add($candidate) }
+    }
+    foreach ($registryPath in @('HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+        try {
+            $registryRoot = (Get-ItemProperty -LiteralPath $registryPath -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+            $candidate = Join-Path $registryRoot 'Include'
+            if ((Test-Path -LiteralPath $candidate -PathType Container) -and -not $sdkRoots.Contains($candidate)) { $sdkRoots.Add($candidate) }
+        } catch { }
+    }
+    if (-not $sdkRoots.Count) { $issues.Add('Install a Windows 10/11 SDK through Visual Studio Installer.') }
+
+    $absoluteRoot = Assert-BuildPath $BuildRoot
+    try {
+        $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($absoluteRoot))
+        if ($drive.DriveType -ne [IO.DriveType]::Fixed) { $issues.Add("Build root must be on a local fixed disk: $absoluteRoot") }
+        $freeBytes = $drive.AvailableFreeSpace
+        if ($freeBytes -lt 8GB) { $issues.Add("Build root needs at least 8 GiB free before verification: $absoluteRoot") }
+    } catch {
+        $freeBytes = 0L
+        $issues.Add("Cannot query local free space for build root: $absoluteRoot")
+    }
+
+    $toolVersions = [ordered]@{}
+    $versionCommands = @(
+        @{name='git'; executable='git'; arguments=@('--version')},
+        @{name='rustc'; executable='rustc'; arguments=@('-V')},
+        @{name='rustfmt'; executable='rustfmt'; arguments=@('--version')},
+        @{name='cargo'; executable='cargo'; arguments=@('-V')},
+        @{name='node'; executable='node'; arguments=@('--version')},
+        @{name='npm.cmd'; executable='npm.cmd'; arguments=@('--version')}
+    )
+    foreach ($entry in $versionCommands) {
+        if ($tools.Contains($entry.name)) {
+            $toolVersions[$entry.name] = @(& $entry.executable @($entry.arguments) 2>&1) -join ''
+        }
+    }
+
+    return [pscustomobject]@{
+        ready = ($issues.Count -eq 0)
+        host = [ordered]@{ os = [Environment]::OSVersion.VersionString; architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString(); powershell = $PSVersionTable.PSVersion.ToString() }
+        repository = [IO.Path]::GetFullPath($Repository)
+        build_root = $absoluteRoot
+        free_bytes = $freeBytes
+        tools = $tools
+        tool_versions = $toolVersions
+        visual_studio = $visualStudio
+        windows_sdk_roots = $sdkRoots.ToArray()
+        issues = $issues.ToArray()
+    }
+}
+
+function Assert-BuildMachineReady {
+    param([Parameter(Mandatory)][string]$Repository, [Parameter(Mandatory)][string]$BuildRoot)
+    $report = Get-BuildMachineReport $Repository $BuildRoot
+    if (-not $report.ready) { throw "Build machine is not ready:`n - $($report.issues -join "`n - ")`nRun scripts/check-build-machine.ps1 after installing/configuring the missing prerequisites." }
+    return $report
+}
+
 function Enter-BuildLock {
     param([string]$Root, [string]$Name = 'operation')
     $directory = Assert-BuildPath (Join-Path $Root 'locks') -Within $Root

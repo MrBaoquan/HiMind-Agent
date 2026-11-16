@@ -14,6 +14,19 @@ function Invoke-AgentBuildPipeline {
     $Repository = Assert-BuildPath $Repository
     $storageRoot = Get-BuildRoot $BuildRoot -ReadOnly:($Explain -or $DryRun)
     $slot = if ($Mode -eq 'quick') { 'dev' } else { 'verify' }
+    $machine = $null
+    $runtime = $null
+    if (-not ($Explain -or $DryRun)) {
+        $machine = Assert-BuildMachineReady $Repository $storageRoot
+        if ($Build -and -not $SkipRuntimeBundle) {
+            . (Join-Path $PSScriptRoot 'runtime-bundle.ps1')
+            $Root = $Repository
+            $runtimeInfo = Resolve-RuntimeReleaseDirectory $RuntimeReleaseDirectory -RequireExactPackage
+            $runtime = [ordered]@{ directory=$runtimeInfo.Directory; manifest_sha256=Get-BuildFileHash $runtimeInfo.ManifestPath;
+                package=$runtimeInfo.PackageName; package_sha256=$runtimeInfo.Manifest.sha256;
+                signature_sha256=Get-BuildFileHash (Join-Path $runtimeInfo.Directory "$($runtimeInfo.PackageName).signature.json") }
+        }
+    }
     $source = Get-BuildSource $Repository
     $previousSource = Join-Path $storageRoot "state\source-$slot.json"
     $oldFiles = @{}
@@ -39,7 +52,7 @@ function Invoke-AgentBuildPipeline {
     $context = [pscustomobject]@{ root = $storageRoot; evidence = Join-Path $storageRoot "evidence\$run"; steps = [Collections.Generic.List[object]]::new() }
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $result = [ordered]@{ schema = 'himind.verification.v1'; result = 'FAILED'; mode = $Mode; source_hash = $source.hash;
-        build_input_hash = ''; full_tests = $false; manifest = $null; steps = @(); duration_ms = 0; slot = $slot; capacity = @() }
+        build_input_hash = ''; full_tests = $false; manifest = $null; steps = @(); duration_ms = 0; slot = $slot; capacity = @(); machine = $machine }
     try {
         $result.capacity = @(Assert-BuildCapacity @(@{Path=$storageRoot; Bytes=6GB}, @{Path=$Repository; Bytes=512MB}))
         $toolchainEnvironment = Initialize-BuildToolchain
@@ -122,16 +135,6 @@ function Invoke-AgentBuildPipeline {
             Invoke-BuildStep $context 'integration-tests' $integrationIdentity {
                 Invoke-BuildCommand 'npm.cmd' @('test') $integration (Join-Path $context.evidence 'integration-tests.log')
             }
-        }
-        $runtime = $null
-        if ($Build -and -not $SkipRuntimeBundle) {
-            . (Join-Path $PSScriptRoot 'runtime-bundle.ps1')
-            # runtime-bundle uses Root for its repository manifest.
-            $Root = $Repository
-            $runtimeInfo = Resolve-RuntimeReleaseDirectory $RuntimeReleaseDirectory -RequireExactPackage
-            $runtime = [ordered]@{ directory=$runtimeInfo.Directory; manifest_sha256=Get-BuildFileHash $runtimeInfo.ManifestPath;
-                package=$runtimeInfo.PackageName; package_sha256=$runtimeInfo.Manifest.sha256;
-                signature_sha256=Get-BuildFileHash (Join-Path $runtimeInfo.Directory "$($runtimeInfo.PackageName).signature.json") }
         }
         $buildIdentity = [ordered]@{ source=$source.hash; rust=$rustIdentity; frontend=Get-BuildHash (Get-BuildTree $distDirectory);
             configuration=$Configuration; binaries=@('himind-agent','himind-agent-launcher','himind-agent-updater'); mcp=@{binary='himind-agent-mcp'; features=@('mcp-console')}; runtime=$runtime }

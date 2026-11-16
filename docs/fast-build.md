@@ -1,32 +1,44 @@
 # 本地快速构建与空间管理
 
-需要 PowerShell 7、Cargo/MSVC、Node/npm。延续现有工具，不需要 sccache。
-推荐将专用 Git worktree 和构建根放在空间较大的卷；不同任务不共享可变源码、frontend/dist 或 node_modules。
+支持 Windows x64 开发机。需要 PowerShell 7、Git、Rust MSVC、Visual Studio C++ x64/x86 工具、Windows 10/11 SDK、Node.js 22.6+ 和 npm 9+；不需要 sccache。工具版本差异会使本机验证收据失效并重新执行相关步骤。
+每台机器把专用 Git worktree 和构建根放在本地空间充足的固定磁盘；不要在网络盘、云同步目录或多机共享目录中使用可变构建根。不同 worktree 不共享可变源码、`frontend/dist` 或 `node_modules`。
 
 ```powershell
-$env:HIMIND_BUILD_ROOT = 'G:/HiMindAgentBuilds/shared-v1'
+# 按这台机器的盘符和可用空间设置；也可以完全使用默认的 LOCALAPPDATA 路径。
+$env:HIMIND_BUILD_ROOT = 'D:/HiMindAgentBuilds/shared-v1'
+# 每台机器分别配置已签名 Runtime 与官方公钥路径，不复制私钥。
+$env:HIMIND_RUNTIME_RELEASE_DIRECTORY = 'D:/HiMindRuntime/release-matching-repository-manifest'
+$env:HIMIND_SIGNING_PUBLIC_KEY_PATH = "$env:LOCALAPPDATA/HiMindAgent/trusted-keys/himind-production-2026.pem"
+$env:HIMIND_SIGNING_KEY_ID = 'himind-production-2026'
+$env:HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH = "$env:LOCALAPPDATA/HiMindAgent/trusted-keys/himind-extension-production-2026.pem"
+$env:HIMIND_EXTENSION_SIGNING_KEY_ID = 'himind-extension-production-2026'
+# 在开始较长的构建前确认这台机器的依赖与目标架构。
+pwsh -File scripts/check-build-machine.ps1 -BuildRoot $env:HIMIND_BUILD_ROOT
 # 只解释影响范围，不安装依赖、不编译。
 pwsh -File scripts/verify.ps1 -Mode quick -Explain
 # 日常检查，Cargo 原生增量；每次检查 dist/依赖内容，调用 Cargo 检查缺失输出。
 pwsh -File scripts/verify.ps1 -Mode quick
 # 完整功能验证并冻结四个可安装 EXE。先配置公钥环境变量，见下文。
-pwsh -File scripts/build.ps1 -RuntimeReleaseDirectory '<已签名 Runtime 目录>'
+pwsh -File scripts/build.ps1
 # 使用同一 verified manifest 打包；打包不会再次编译 Agent。
 pwsh -File scripts/package.ps1 -ArtifactManifest '<build-manifest.verified-*.json>' -BuildRoot $env:HIMIND_BUILD_ROOT
 # 直接安装返回的 verified manifest；不调用 Cargo/rustc/npm。
-pwsh -File scripts/deploy-local.ps1 -ArtifactManifest '<build-manifest.verified-*.json>' -RuntimeReleaseDirectory '<已签名 Runtime 目录>'
+pwsh -File scripts/deploy-local.ps1 -ArtifactManifest '<build-manifest.verified-*.json>'
 # 显示可回收项；Apply 才删除。预算按实际项目大小调整。
 pwsh -File scripts/build-cache.ps1 -TargetBudgetBytes 40GB
 pwsh -File scripts/build-cache.ps1 -TargetBudgetBytes 40GB -Apply
 ```
 
-构建根也可用各入口的 `-BuildRoot` 指定；不指定时使用 LOCALAPPDATA/HiMindAgentBuilds/shared-v1。
+构建根也可用各入口的 `-BuildRoot` 指定；不指定时使用 `%LOCALAPPDATA%/HiMindAgentBuilds/shared-v1`。`-RuntimeReleaseDirectory` 可覆盖 Runtime 环境变量。相对路径按当前 repository 解析，跨机器建议用绝对路径。
 脚本只接管带自己 ownership 标记的目录，拒绝已有非空陌生目录。
 根下只有 dev/verify 两个固定 target 槽；共享写锁覆盖依赖、编译、验证和制品冻结，冲突时直接说明并退出。
 quick 使用开发增量，candidate 关闭增量并固定较小调试符号；release 保留 Cargo 默认优化配置。
 构建环境仅在当前进程作用域内设置并恢复，Cargo 下载和 npm 缓存、临时文件归该根所有。
 固定 Cargo home 不复制用户全局凭据；私有依赖需在该环境中另行配置。
 `-UseSccache` 可选，缺失时正常降级，缓存上限 10G。
+机器预检会在安装依赖或编译之前检查 Windows x64、PowerShell、Git、Rust host target/format、Node/npm、Visual Studio C++ 工具、Windows SDK 和构建卷空间；完整候选还会先核对精确签名 Runtime，缺项时打印安装/配置提示并停止。
+
+构建根、Cargo/npm 缓存、验证收据、证据和 verified manifest 是本机数据。身份包含 repository、工具链和 Runtime 位置；不要在开发机间复制或合并 `HIMIND_BUILD_ROOT`。每台机器独立运行 candidate 验证和构建；要传给另一台机器的是最终 package/installer，而不是带有绝对证据路径的 verified manifest。Git 分支和源码可通过团队正常 Git 流程同步。公钥可单独分发，签名私钥只留在受控签名环境。
 
 构建签名环境变量：HIMIND_SIGNING_PUBLIC_KEY_PATH、HIMIND_SIGNING_KEY_ID、HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH、HIMIND_EXTENSION_SIGNING_KEY_ID。
 本地安装默认读取 AgentHome/trusted-keys 下的官方公钥；公钥内容必须与产物记录匹配。
@@ -52,7 +64,7 @@ GitHub 发布脚本可用 -ArtifactManifest/-BuildRoot 消费 release-channel ve
 Plan/Apply 使用同一写锁，并检查遗留原生进程、路径归属和目录链接；不涉及源码、生产目录或别的项目。
 回滚代码：还原本分支构建脚本和 build.rs；旧候选/备份不受缓存清理影响。无需变更全局工具配置。
 
-可重复检查：check-build-support.ps1、check-build-pipeline.ps1、check-build-cache.ps1、check-deploy-local.ps1。
+可重复检查：check-build-machine.ps1、check-build-support.ps1、check-build-pipeline.ps1、check-build-cache.ps1、check-deploy-local.ps1。
 前三者接受 FixtureRoot，建议也放 G 盘。pipeline 检查使用真实小型 Rust/npm 工程，不能代替实际 Agent 安装验证。
 本机实测结果与来源见本任务 .himind/long-tasks/20261116-fast-build-storage-optimization；不把小工程耗时当成 Agent 性能。
 

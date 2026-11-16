@@ -8,7 +8,7 @@ try {
 . (Join-Path $PSScriptRoot 'build-pipeline.ps1')
 if (-not $FixtureRoot) { $FixtureRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\build-pipeline-tests' }
 $fixture = Assert-BuildPath (Join-Path $FixtureRoot ([Guid]::NewGuid().ToString('N'))) -Within $FixtureRoot
-$repository = Join-Path $fixture 'source with spaces'
+$repository = Join-Path $fixture 'source with spaces 源码'
 $storage = Join-Path $fixture 'managed'
 foreach ($path in @('src','frontend','icons','integrations\vscode-himind-ai')) { [IO.Directory]::CreateDirectory((Join-Path $repository $path)) | Out-Null }
 function Write-Fixture([string]$Relative, [string]$Text) { [IO.File]::WriteAllText((Join-Path $repository $Relative), ($Text.TrimEnd() + "`n"), [Text.UTF8Encoding]::new($false)) }
@@ -76,6 +76,7 @@ if ($LASTEXITCODE) { throw 'Fixture Git initialization failed' }
 $checks = [Collections.Generic.List[string]]::new()
 $cold = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
 Assert-Pipeline ($cold.result -eq 'PASS' -and $cold.full_tests) 'Cold fixture failed'
+Assert-Pipeline ($cold.machine.ready -and $cold.machine.tool_versions.node -and $cold.machine.tool_versions.rustc) 'Candidate omitted its successful machine/toolchain compatibility report'
 [void](Read-BuildManifest $cold.manifest -RequireVerification)
 $checks.Add('actual-rust-npm-cold-candidate')
 $hot = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
