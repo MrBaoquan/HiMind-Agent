@@ -39,6 +39,7 @@ fn prompt(task: &crate::mission::MissionTaskSpec) -> String {
 
 fn role_from_binding(role_id: &str, binding: &ExecutionBinding) -> WorkflowRole {
     WorkflowRole {
+        optional: false,
         label: role_id.to_string(),
         brief: format!("承担 {role_id} 职责；只执行计划内任务，不扩大范围。"),
         runtime_provider: binding.executor.clone(),
@@ -180,7 +181,7 @@ mod tests {
             repair_of: String::new(),
         };
         MissionView {
-            schema_version: "mission.v1".to_string(), mission_id: "mission_secret".to_string(), title: "Secret title".to_string(),
+            scheduling: None, schema_version: "mission.v1".to_string(), mission_id: "mission_secret".to_string(), title: "Secret title".to_string(),
             objective: "Secret objective".to_string(), status: MissionStatus::Completed,
             workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/secret/workspace".to_string(), read_scope: vec!["secret".to_string()], write_scope: vec!["secret".to_string()] },
             acceptance_criteria: vec!["tests pass".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),

@@ -240,7 +240,7 @@ mod tests {
             }, repair_of: String::new(),
         };
         MissionView {
-            schema_version: "mission.v1".to_string(), mission_id: id.to_string(), title: "Task".to_string(),
+            scheduling: None, schema_version: "mission.v1".to_string(), mission_id: id.to_string(), title: "Task".to_string(),
             objective: String::new(), status,
             workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
             acceptance_criteria: vec!["ok".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),
@@ -268,7 +268,7 @@ mod tests {
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
-            summary: "test".to_string(),
+            scheduling: None, summary: "test".to_string(),
             tasks: vec![mission("unused", MissionStatus::Active, TaskStatus::Ready, true).tasks[0].spec.clone()],
             required_acceptance: vec!["ok".to_string()],
             budget: MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None, currency: None },
@@ -315,7 +315,7 @@ mod tests {
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
-            summary: "repairable".to_string(),
+            scheduling: None, summary: "repairable".to_string(),
             tasks: vec![mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks[0].spec.clone()],
             required_acceptance: vec!["ok".to_string()],
             budget: MissionBudget { max_rounds: 3, max_minutes: 10, max_repair_attempts: 1, max_total_tokens: None, max_cost: None, currency: None },
@@ -431,7 +431,7 @@ mod tests {
             }).unwrap();
             let first = mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks.remove(0).spec;
             let mut next = first.clone(); next.id = "next".into(); next.depends_on = vec!["task".into()];
-            let proposal = MissionPlanProposal { summary: "boundary fixture".into(), tasks: vec![first, next],
+            let proposal = MissionPlanProposal { scheduling: None, summary: "boundary fixture".into(), tasks: vec![first, next],
                 required_acceptance: vec!["independent check".into()],
                 budget: MissionBudget { max_rounds: 10, max_minutes: 60, max_repair_attempts: 2, max_total_tokens: Some(100), max_cost: None, currency: None } };
             let planned = store.propose_plan(&created.mission_id, &proposal).unwrap();
@@ -609,7 +609,7 @@ mod tests {
             let first = mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks.remove(0).spec;
             let mut next = first.clone(); next.id = "next".into(); next.depends_on = vec!["task".into()];
             let planned = store.propose_plan(&created.mission_id, &MissionPlanProposal {
-                summary: "recovery boundary".into(), tasks: vec![first, next], required_acceptance: vec!["separate review".into()],
+                scheduling: None, summary: "recovery boundary".into(), tasks: vec![first, next], required_acceptance: vec!["separate review".into()],
                 budget: MissionBudget { max_rounds: 100, max_minutes: 60, max_repair_attempts: 2,
                     max_total_tokens: Some(100), max_cost: None, currency: None },
             }).unwrap();

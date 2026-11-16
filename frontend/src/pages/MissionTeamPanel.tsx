@@ -9,18 +9,20 @@ import { ENDED_STATUSES, executionTodoId, missionTodo, clientLabel, activityStat
 import { taskStatusLabel } from './taskView';
 import { MissionEvidence, MissionTaskEvidence } from './MissionEvidence';
 import { MissionBudgetSummary } from './MissionBudgetSummary';
+import { MissionExecutionOverview, executionEventLabel as eventLabel } from './MissionExecutionOverview';
 import { readMissionSnapshot } from './missionSnapshot';
 import { pendingBudgetRequest, retainBudgetRequest, clearBudgetRequest } from './missionBudgetRequest';
 import { RuntimeWorkspaceDialog } from './RuntimeWorkspaceDialog';
 import { CollaborationDialog } from './CollaborationDialog';
-import { assignmentProblem, bindExpert, changeExecutor, changeService, expertKey, serviceOptions } from './missionAssignment';
+import { assignmentProblem, bindExpert, changeExecutor, changeService, expertKey, hasMissingTaskAssignment, initialAssignmentRoles, initialTaskRoles, recommendedRole, serviceOptions } from './missionAssignment';
 import {
-  eventLabel,
   canRetryWaitingVerification,
   legacyBudgetExtensionAction,
   legacyVerificationOverrideForTask,
   missionNextAction,
+  missionRunningTasks,
   missionRunningVerifications,
+  missionTaskExecutionLabel,
   missionWait,
   missionResponsibility,
   missionResumeAction,
@@ -34,7 +36,6 @@ import {
   missionStalled,
   taskFailureReason,
   MISSION_STAGE_LABELS,
-  MISSION_TASK_STATUS_LABELS,
   progressDisclosure,
   taskTitle,
 } from './missionView';
@@ -65,34 +66,46 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
   const [title, setTitle] = useState('');
   const [objective, setObjective] = useState('');
   const [root, setRoot] = useState('');
-  const [writeScope, setWriteScope] = useState('');
+  const [writeScope, setWriteScope] = useState('.');
   const [permissionMode, setPermissionMode] = useState<'workspace_write' | 'full_access'>('workspace_write');
   const [acceptance, setAcceptance] = useState('');
   const [workflows, setWorkflows] = useState<WorkflowCenterItem[]>([]);
   const [workflowId, setWorkflowId] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [workflowError, setWorkflowError] = useState('');
+  const [workflowLoading, setWorkflowLoading] = useState(false);
   const requestId = useRef(`agent-ui:${crypto.randomUUID()}`);
   useEffect(() => {
-    void agentApi.workflowCenter().then(snapshot => setWorkflows(snapshot.workflows.filter(item => item.enabled && !item.development && (Object.keys(item.package.roles || {}).length > 0 || item.package.steps.some(step => step.role_id?.trim())))))
-      .catch(cause => setError(formatError(cause, '协作工作流读取失败')));
-  }, []);
+    if (!advancedOpen) return;
+    let active = true;
+    setWorkflowLoading(true); setWorkflowError('');
+    void agentApi.workflowCenter().then(snapshot => {
+      if (active) setWorkflows(snapshot.workflows.filter(item => item.enabled && !item.development && (Object.keys(item.package.roles || {}).length > 0 || item.package.steps.some(step => step.role_id?.trim()))));
+    }).catch(cause => { if (active) setWorkflowError(formatError(cause, '固定工作流读取失败，可继续自动组队')); })
+      .finally(() => { if (active) setWorkflowLoading(false); });
+    return () => { active = false; };
+  }, [advancedOpen]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   async function submit() {
-    if (busy) return;
+    if (busy || !objective.trim() || !root.trim()) return;
     setBusy(true);
     setError('');
     try {
       const selected = workflows.find(item => item.package.id === workflowId);
-      if (!selected) throw new Error('请选择已安装的协作工作流');
-      onCreated(await agentApi.createMissionHandoff({
+      if (workflowId && !selected) throw new Error('所选固定工作流不可用，请重新选择或使用自动组队');
+      const input = {
         idempotency_key: requestId.current, source_client: 'agent-ui', source_reference: requestId.current,
-        title: title.trim(), objective: objective.trim(),
+        title: title.trim() || Array.from(objective.trim().split('\n')[0]).slice(0, 120).join(''), objective: objective.trim(),
         workspace: { root: root.trim(), permission_mode: permissionMode, read_scope: ['.'], write_scope: writeScope.split(/[,\n]/).map(value => value.trim()).filter(Boolean) },
         acceptance_criteria: acceptance.split('\n').map(value => value.trim()).filter(Boolean),
+      };
+      onCreated(await (selected ? agentApi.createMissionHandoff({
+        ...input,
         workflow: { workflow_id: selected.package.id, workflow_version: selected.package.version, workflow_sha256: selected.package_digest, entrypoint: selected.package.default_entrypoint || '' },
         plan_mode: 'generated',
-      }));
+      }) : agentApi.createMissionIntent(input)));
     } catch (cause) {
       setError(formatError(cause, '协作任务创建失败'));
     } finally {
@@ -105,18 +118,23 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
       <section className="collaboration-create-dialog">
         <header><div><span>新建协作任务</span><h2 id="mission-create-title">创建协作任务</h2></div><button type="button" className="btn" onClick={onClose}>关闭</button></header>
         <div className="collaboration-create-fields">
-          <label><span>协作工作流 *</span><select value={workflowId} onChange={event => setWorkflowId(event.target.value)}><option value="">请选择已安装工作流</option>{workflows.map(item => <option key={item.package.id} value={item.package.id}>{item.package.name} · {item.package.version}</option>)}</select></label>
-          {!workflows.length ? <p className="muted">请先在“我的能力”安装协作工作流。</p> : null}
-          <label><span>任务标题 *</span><input value={title} onChange={event => setTitle(event.target.value)} placeholder="例如：修复设置页焦点丢失" /></label>
-          <label><span>目标</span><textarea value={objective} onChange={event => setObjective(event.target.value)} placeholder="完成后应该看到什么结果？" /></label>
-          <label><span>工作区根目录 *</span><input value={root} onChange={event => setRoot(event.target.value)} placeholder="项目的本地绝对路径" /></label>
+          <label><span>需求描述 *</span><textarea required value={objective} onChange={event => setObjective(event.target.value)} placeholder="描述要完成的工作、预期结果和约束" /></label>
+          <p className="muted">默认根据需求自动组队，创建后可调整专家、执行器、服务与模型。</p>
+          <label><span>任务标题（可选）</span><input value={title} onChange={event => setTitle(event.target.value)} placeholder="留空时使用需求首行" /></label>
+          <label><span>工作区根目录 *</span><input required value={root} onChange={event => setRoot(event.target.value)} placeholder="项目的本地绝对路径" /></label>
           <label><span>执行权限</span><select value={permissionMode} onChange={event => setPermissionMode(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label>
+          <small>默认可在工作区内修改；可在进阶选项缩小范围。最终计划会列出具体修改路径，确认后才执行。</small>
           <small>{permissionMode === 'full_access' ? <>确认计划后，HiMind AI 或 ACP 按当前用户权限运行。<br />ACP 请求自动批准；不会自动提权为管理员。</> : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身访问控制。'}</small>
-          <label><span>允许修改的范围 *</span><textarea value={writeScope} onChange={event => setWriteScope(event.target.value)} placeholder="例如：frontend/src，行或逗号分隔" /></label>
           <label><span>完成标准</span><textarea value={acceptance} onChange={event => setAcceptance(event.target.value)} placeholder="每行一条可验证标准" /></label>
+          <details onToggle={event => setAdvancedOpen(event.currentTarget.open)}>
+            <summary>进阶选项：固定工作流与修改范围</summary>
+            <label><span>固定工作流（可选）</span><select value={workflowId} onChange={event => setWorkflowId(event.target.value)}><option value="">自动组队（推荐）</option>{workflows.map(item => <option key={item.package.id} value={item.package.id}>{item.package.name} · {item.package.version}</option>)}</select></label>
+            {workflowLoading ? <small>正在读取固定工作流</small> : workflowError ? <p className="muted" role="status">{workflowError}</p> : !workflows.length ? <small>暂无已安装的协作工作流，可继续自动组队。</small> : null}
+            <label><span>允许修改的范围（可选）</span><textarea value={writeScope} onChange={event => setWriteScope(event.target.value)} placeholder="例如：frontend/src，行或逗号分隔；后续确认计划时核对" /></label>
+          </details>
         </div>
         {error ? <p className="error" role="alert">{error}</p> : null}
-        <footer><small>创建后选择专家，再确认计划。</small><button type="button" className="btn btn-primary" disabled={busy || !workflowId || !title.trim() || !root.trim()} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '创建中' : '创建任务'}</button></footer>
+        <footer><small>创建草案不会启动执行；随后调整指派、确认计划与权限。</small><button type="button" className="btn btn-primary" disabled={busy || !objective.trim() || !root.trim()} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <Plus size={14} />}{busy ? '创建中' : '创建草案'}</button></footer>
       </section>
     </CollaborationDialog>
   );
@@ -225,6 +243,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   if (!mission) return <section className="mission-detail"><button type="button" className="btn" onClick={onBack}>返回我的任务</button>{error ? <p className="error" role="alert">{error}</p> : <div className="collaboration-task-loading"><BusyIndicator size={18} />正在读取任务详情</div>}</section>;
   const stage = missionStage(mission);
   const progress = missionProgress(mission);
+  const runningTasks = missionRunningTasks(mission, relatedActivities);
   const flow = missionFlow(mission);
   const verificationExplanation = missionVerificationExplanation(mission, events, relatedActivities);
   const currentFlowIndex = flow.findIndex(step => step.state === 'current');
@@ -233,7 +252,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const verificationRunLive = runningVerifications.length > 0;
   const verificationStarted = progress.awaitingVerification > 0 && progress.startedVerification > 0;
   const verificationQueued = mission.status === 'active' && progress.awaitingVerification > 0 && !verificationStarted;
-  const liveWork = verificationRunLive || (mission.status === 'active' && (progress.running > 0 || planning || confirming || dispatching));
+  const liveWork = runningTasks.length > 0 || verificationRunLive;
   const detailStatusLabel = missionStatusLabel(mission, events, relatedActivities);
   const runtimeBlocked = missionRuntimeBlocked(mission, events);
   const wait = missionWait(mission);
@@ -367,7 +386,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
     <section className="mission-detail" data-mission-id={mission.mission_id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, relatedActivities)}>
       <div className="mission-detail-head"><button type="button" className="btn" onClick={onBack}>返回我的任务</button><span className={'collaboration-task-status status-'+mission.status}>{detailStatusLabel}</span></div>
       <header className="mission-detail-hero"><div><span className="collaboration-task-kicker"><ShieldCheck size={15}/>协作任务</span><h2>{mission.title}</h2><p>{mission.objective || '尚未填写目标说明'}</p></div>
-        {progress.total ? <div className="mission-detail-progress"><strong>{progress.done}/{progress.total}</strong><span>原始交付已通过验收</span><div className="task-center-progress"><span style={{width:Math.round(progress.done/progress.total*100)+'%'}}/></div><small>{progress.running} 执行中 · {progress.awaitingVerification} 项结果待核验</small></div> : <span className="muted">未记录执行进度</span>}
+        {progress.total ? <div className="mission-detail-progress"><strong>{progress.done}/{progress.total}</strong><span>原始交付已通过验收</span><div className="task-center-progress"><span style={{width:Math.round(progress.done/progress.total*100)+'%'}}/></div><small>{runningTasks.length} 项任务同时执行 · {progress.running} 项已派发占用 · {progress.awaitingVerification} 项结果待核验</small></div> : <span className="muted">未记录执行进度</span>}
       </header>
       {!['failed', 'canceled'].includes(mission.status) ? <nav className={`mission-stage-rail${liveWork ? ' is-live' : ''}`} aria-label="协作任务进度">
         {flow.map((step, index) => <div key={step.label} className={`is-${step.state}${step.state === 'current' && currentStageIsVerification && !verificationStarted ? ' is-attention' : ''}${step.state === 'current' && liveWork ? ' is-running' : ''}`} aria-current={step.state === 'current' ? 'step' : undefined}>
@@ -384,6 +403,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         : ['draft','planned'].includes(mission.status) ? <button className="btn btn-primary" disabled={planning} onClick={()=>void generatePlan()}>{planning?'生成中':'生成执行计划'}</button>
         : mission.status==='awaiting_confirmation' ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>审查计划与访问范围</button>
         : (verificationRunLive || mission.status==='active') && progress.awaitingVerification > 0 ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>查看验收详情</button>
+        : mission.status==='active' && progress.running > 0 ? <button className="btn" onClick={()=>setTab('overview')}>查看执行现场</button>
         : missionStalled(mission) ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>查看失败原因</button>
         : runtimeBlocked ? <button className="btn btn-primary" onClick={()=>setRuntimeWorkspaceOpen(true)}>处理命令环境</button>
         : legacyRetry ? <button className="btn btn-primary" disabled={Boolean(rechecking)} onClick={()=>void recheckTask(legacyRetry.task.spec.id, legacyRetry.task.verification_run_id, legacyRetry.override)}>{rechecking === legacyRetry.task.spec.id ? '提交中' : '确认覆盖并重试核验'}</button>
@@ -402,10 +422,11 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       {userRuns.length ? <section className="mission-detail-panel"><h3>需要你处理的执行事项</h3>{userRuns.map(item=><div className="task-related-execution" key={item.id} data-todo-id={executionTodoId(item.workflow_run_id || item.id, item.current_step_id || '', item.pause_kind || '')}><span>{taskTitle(mission,item.mission_task_id||'') || item.title} · {activityStatusLabel(item)}</span>{onOpenWorkflowRun&&item.workflow_run_id?<button className="btn btn-primary" onClick={()=>onOpenWorkflowRun(item.workflow_run_id!)}>处理执行事项</button>:null}</div>)}</section>:null}
       <div className="mission-detail-tabs segmented-control" role="tablist" aria-label="任务详情内容">{([{id:'overview',label:'概览'},{id:'plan',label:'执行计划'},{id:'experts',label:'协作专家'},{id:'activity',label:'活动记录'}] as const).map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} className={tab===item.id?'active':''} onClick={()=>setTab(item.id)}>{item.label}</button>)}</div>
       {tab==='overview'?<div role="tabpanel" aria-label="概览">
+        <MissionExecutionOverview mission={mission} events={events} activities={relatedActivities}/>
         <MissionEvidence mission={mission} events={events}/>
         <MissionBudgetSummary mission={mission} events={events} historyComplete={historyComplete} now={now}/>
         <section className="mission-detail-panel"><h3>完成标准</h3>{mission.acceptance_criteria.length?<ul>{mission.acceptance_criteria.map((value,index)=><li key={index}>{value}</li>)}</ul>:<p className="muted">尚未填写完成标准。</p>}{mission.required_acceptance.length?<><h4>必须通过的验收</h4><ul>{mission.required_acceptance.map((value,index)=><li key={index}>{value}</li>)}</ul></>:null}</section>
-        <section className="mission-detail-panel"><h3>计划摘要</h3><p>{mission.plan_summary || '尚未生成执行计划。'}</p>{progress.total?<p>{progress.done}/{progress.total} 项已通过验收 · {progress.running} 项执行中 · {progress.awaitingVerification} 项验收未完成</p>:null}<button className="btn" onClick={()=>setTab('plan')}>查看执行计划</button></section>
+        <section className="mission-detail-panel"><h3>计划摘要</h3><p>{mission.plan_summary || '尚未生成执行计划。'}</p>{progress.total?<p>{progress.done}/{progress.total} 项已通过验收 · {runningTasks.length} 项执行中 · {progress.running} 项已派发占用 · {progress.awaitingVerification} 项验收未完成</p>:null}<button className="btn" onClick={()=>setTab('plan')}>查看执行计划</button></section>
         {mission.handoff?.context_summary?<section className="mission-detail-panel"><h3>来源上下文</h3><p>{mission.handoff.context_summary}</p></section>:null}
         {mission.status==='completed'?<details className="mission-optional-export"><summary>将本次协作方式保存为工作流</summary><CollaborationWorkflowExportPanel mission={mission}/></details>:null}
       </div>:null}
@@ -465,7 +486,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
                 const retryAvailable = canRetryWaitingVerification(mission, events, task);
                 return (
                   <div className={`mission-task-row task-${task.status}`} key={task.spec.id} data-mission-task-id={task.spec.id}>
-                    <span className="mission-task-status">{verificationStatus || MISSION_TASK_STATUS_LABELS[task.status]}</span>
+                    <span className="mission-task-status">{verificationStatus || missionTaskExecutionLabel(mission, task, relatedActivities)}</span>
                     <div>
                       <strong>{task.spec.title}</strong>
                       <small>{task.spec.execution.role_id || '未指派专家'} · {task.spec.execution.executor}{task.spec.execution.model ? ` · ${task.spec.execution.model}` : ''}</small>
@@ -498,7 +519,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         </div>
       ) : null}
 
-        {mission.status === 'active' && !verificationRunLive && mission.tasks.some(task => task.status === 'ready') ? <button type="button" className="btn btn-primary" disabled={dispatching} onClick={() => void dispatchNext()}>{dispatching ? <BusyIndicator size={14} /> : <Plus size={14} />}{dispatching ? '执行中' : '继续执行下一项'}</button> : null}
+        {mission.status === 'active' && !verificationRunLive && mission.tasks.some(task => task.status === 'ready') ? <button type="button" className="btn btn-primary" disabled={dispatching} onClick={() => void dispatchNext()}>{dispatching && liveWork ? <BusyIndicator size={14} /> : <Plus size={14} />}{dispatching ? '提交派发中' : mission.scheduling ? '检查可派发任务' : '继续执行下一项'}</button> : null}
         {relatedActivities.length ? <section className="mission-detail-panel"><h3>执行尝试与重试</h3><p className="muted">子任务及其验收执行归属于本任务，不另计顶层任务。</p>{relatedActivities.map(item=><div className="task-related-execution" key={item.id}><div><strong>{taskTitle(mission,item.mission_task_id||'') || item.title}</strong><small>{item.parent_kind==='retry'?'重试':item.parent_kind==='delegate'?'委派':'执行尝试'} · {activityStatusLabel(item)||taskStatusLabel(item.status)}</small><code>{item.workflow_run_id||item.id}</code></div>{onOpenWorkflowRun&&item.workflow_run_id?<button className="btn" onClick={()=>onOpenWorkflowRun(item.workflow_run_id!)}>查看执行</button>:null}</div>)}</section>:null}
       </div>:null}
       {tab==='experts'?<div role="tabpanel" aria-label="协作专家">
@@ -630,59 +651,60 @@ function CollaborationAssignmentDialog({ mission, onClose, onAssigned }: { missi
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [recommended, setRecommended] = useState(true);
+  const inactiveRoles = useRef(new Map<string, MissionRoleAssignment>());
 
   useEffect(() => {
     let active = true;
     void agentApi.missionAssignmentOptions(mission.mission_id).then(next => {
       if (!active) return;
       setOptions(next);
-      setRoles(next.roles.map(role => {
-        const existing = mission.assignment?.roles.find(value => value.role_id === role.role_id);
-        if (existing) return { ...existing, label: role.label };
-        const executor = next.executors.find(value => value.executor === role.recommended_executor);
-        const recommendedModel = executor?.models.find(value => value.alias === role.recommended_model && value.service_id === role.recommended_service_id);
-        return {
-          role_id: role.role_id,
-          label: role.label,
-          expert: null,
-          executor: role.recommended_executor,
-          service_id: recommendedModel?.service_id || '',
-          model: recommendedModel?.alias || '',
-        };
-      }));
-      const fallback = next.roles.find(role => role.availability === 'available')?.role_id || next.roles[0]?.role_id || '';
-      setTaskRoles(Object.fromEntries(mission.proposed_tasks.map(task => [task.id, task.execution.role_id || fallback])));
+      const initial = initialAssignmentRoles(mission, next);
+      setRoles(initial);
+      setTaskRoles(initialTaskRoles(mission, initial));
+      setRecommended(mission.assignment?.recommended ?? true);
+      inactiveRoles.current.clear();
     }).catch(cause => setError(formatError(cause, '指派选项读取失败')));
     return () => { active = false; };
   }, [mission.mission_id]);
 
   function useRecommended() {
     if (!options) return;
-    setRecommended(true);
-    setRoles(current => options.roles.map(option => {
-      const previous = current.find(role => role.role_id === option.role_id);
-      const executor = options.executors.find(value => value.executor === option.recommended_executor);
-      const recommendedModel = executor?.models.find(value => value.alias === option.recommended_model && value.service_id === option.recommended_service_id);
-      return {
-        ...(previous || { role_id: option.role_id, label: option.label, expert: null }),
-        label: option.label,
-        executor: option.recommended_executor,
-        service_id: recommendedModel?.service_id || '',
-        model: recommendedModel?.alias || '',
-      };
+    setRecommended(roles.every(role => {
+      const pin = options.roles.find(option => option.role_id === role.role_id)?.recommended_expert;
+      return !!pin && role.expert?.expert_id === pin.expert_id && role.expert?.expert_version === pin.expert_version && role.expert?.expert_digest === pin.expert_digest;
     }));
+    setRoles(current => current.map(role => {
+      const option = options.roles.find(value => value.role_id === role.role_id);
+      if (!option) return role;
+      const defaults = recommendedRole(option, options);
+      return { ...role, executor: defaults.executor, service_id: defaults.service_id, model: defaults.model };
+    }));
+  }
+
+  function toggleRole(roleId: string) {
+    const option = options?.roles.find(value => value.role_id === roleId);
+    if (!options || !option?.optional) return;
+    setRecommended(false);
+    const existing = roles.find(role => role.role_id === roleId);
+    if (existing) {
+      inactiveRoles.current.set(roleId, existing);
+      setRoles(current => current.filter(role => role.role_id !== roleId));
+    } else {
+      const restored = inactiveRoles.current.get(roleId) || recommendedRole(option, options);
+      setRoles(current => [...current, restored]);
+    }
   }
 
   async function submit() {
     if (!options || busy) return;
     const problems = roles.map(role => assignmentProblem(role, options)).filter(Boolean);
-    const missingTaskRole = mission.proposed_tasks.some(task => !taskRoles[task.id]);
+    const missingTaskRole = hasMissingTaskAssignment(mission, taskRoles, roles);
     if (problems.length) {
       setError(problems[0]);
       return;
     }
     if (missingTaskRole) {
-      setError('请为每项计划任务选择承担专家');
+      setError('请为每项计划任务选择已启用且有指派的职责');
       return;
     }
     setBusy(true); setError('');
@@ -698,37 +720,39 @@ function CollaborationAssignmentDialog({ mission, onClose, onAssigned }: { missi
   }
 
   const problems = options ? roles.map(role => ({ roleId: role.role_id, message: assignmentProblem(role, options) })).filter(item => item.message) : [];
-  const missingTaskRole = mission.proposed_tasks.some(task => !taskRoles[task.id]);
+  const missingTaskRole = hasMissingTaskAssignment(mission, taskRoles, roles);
 
   return (
     <CollaborationDialog titleId="mission-assignment-title" onClose={onClose}>
       <section className="collaboration-create-dialog collaboration-assignment-dialog" aria-labelledby="mission-assignment-title">
         <header>
-          <div><span>固定工作流中的职责槽位</span><h2 id="mission-assignment-title">选择协作专家</h2><small>{options ? `${options.workflow_id}@${options.workflow_version}` : '正在读取固定工作流'}</small></div>
+          <div><span>需求对应的协作职责</span><h2 id="mission-assignment-title">选择协作专家</h2><small>{options ? `${options.workflow_id}@${options.workflow_version}` : '正在读取职责与推荐'}</small></div>
           <button type="button" className="btn" onClick={onClose}>关闭</button>
         </header>
-        <p>选择各职责的专家和执行配置；随后单独确认计划与路径授权。</p>
+        <p>核对推荐专家和执行配置，可按需启停可选职责；应用指派后，单独确认计划与路径授权。</p>
+        {options?.recommendation_warnings?.length ? <div role="status"><strong>推荐说明与局限</strong><ul>{options.recommendation_warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div> : null}
         {error ? <p className="error" role="alert">{error}</p> : null}
         {options ? <div className="collaboration-assignment-list">{options.roles.map(option => {
-          const value = roles.find(role => role.role_id === option.role_id);
-          if (!value) return null;
+          const assigned = roles.find(role => role.role_id === option.role_id);
+          const enabled = !!assigned;
+          const value = assigned || inactiveRoles.current.get(option.role_id) || recommendedRole(option, options);
           const selectedExpert = value.expert ? options.experts.find(expert => expert.id === value.expert?.expert_id && expert.version === value.expert?.expert_version && expert.digest === value.expert?.expert_digest) : undefined;
           const selectedExpertKey = value.expert ? `${value.expert.expert_id}@${value.expert.expert_version}:${value.expert.expert_digest}` : '';
           const selectedExecutor = options.executors.find(executor => executor.executor === value.executor);
           const services = serviceOptions(selectedExecutor);
           const models = (selectedExecutor?.models || []).filter(model => model.service_id === value.service_id);
-          const problem = assignmentProblem(value, options);
+          const problem = enabled ? assignmentProblem(value, options) : '';
           return <article className="collaboration-assignment-role" key={option.role_id}>
-            <div className="collaboration-assignment-role-heading"><strong>{option.label || option.role_id}</strong><small>{option.brief || option.role_id}</small><em className={`collaboration-assignment-availability is-${option.availability}`}>{option.availability === 'available' ? '推荐配置可用' : option.unavailable_reason || '推荐配置不可用，可更换执行器'}</em>{problem ? <em className="collaboration-assignment-problem" role="status">{problem}</em> : null}</div>
-            <label><span>专家 *</span><select aria-label={`${option.label || option.role_id}专家`} value={selectedExpertKey} onChange={event => { setRecommended(false); const expert = options.experts.find(item => expertKey(item) === event.target.value); setRoles(current => current.map(role => role.role_id === option.role_id ? bindExpert(role, expert) : role)); }}><option value="">请选择已安装专家</option>{options.experts.map(expert => <option key={expertKey(expert)} value={expertKey(expert)}>{expert.name} · {expert.version}</option>)}</select><small>{selectedExpert ? `摘要 ${selectedExpert.digest.slice(0, 12)}…` : '提交前必须选择专家版本'}</small></label>
-            <label><span>执行器 *</span><select aria-label={`${option.label || option.role_id}执行器`} value={value.executor} onChange={event => { const executor = options.executors.find(item => item.executor === event.target.value); if (!executor) return; setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? changeExecutor(role, executor) : role)); }}><option value="">请选择宿主执行器</option>{options.executors.map(executor => <option key={executor.executor} value={executor.executor} disabled={!executor.available}>{executor.label}{executor.available ? '' : ` · ${executor.reason || '不可用'}`}</option>)}</select></label>
-            <label><span>服务 *</span><select aria-label={`${option.label || option.role_id}服务`} value={value.service_id} disabled={!selectedExecutor || selectedExecutor.models.length === 0} onChange={event => { setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? changeService(role, selectedExecutor, event.target.value) : role)); }}><option value="">{services.length ? '请选择服务' : '由执行器自身配置'}</option>{services.map(service => <option key={service.id} value={service.id}>{service.label || service.id}</option>)}</select></label>
-            <label><span>模型 *</span><select aria-label={`${option.label || option.role_id}模型`} value={value.model} disabled={!selectedExecutor || selectedExecutor.models.length === 0 || !value.service_id} onChange={event => { setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? { ...role, model: event.target.value } : role)); }}><option value="">{models.length ? '请选择模型' : '由执行器自身配置'}</option>{models.map(model => <option key={model.alias} value={model.alias}>{model.label || model.alias}</option>)}</select></label>
+            <div className="collaboration-assignment-role-heading"><strong>{option.label || option.role_id}{option.optional ? '（可选）' : ''}</strong><small>{option.brief || option.role_id}</small>{option.recommendation_reason ? <small>推荐理由：{option.recommendation_reason}</small> : <small>暂无专家推荐，请手动选择。</small>}<em className={`collaboration-assignment-availability is-${option.availability}`}>{option.availability === 'available' ? '执行配置可用' : option.unavailable_reason || '推荐配置不可用，可更换执行器'}</em>{option.optional ? <button type="button" className="btn" role="switch" aria-label={`${option.label || option.role_id}职责`} aria-checked={enabled} onClick={() => toggleRole(option.role_id)}>{enabled ? '已启用' : '未启用'}</button> : null}{problem ? <em className="collaboration-assignment-problem" role="status">{problem}</em> : null}</div>
+            <label><span>专家 *</span><select aria-label={`${option.label || option.role_id}专家`} value={selectedExpertKey} disabled={!enabled} onChange={event => { setRecommended(false); const expert = options.experts.find(item => expertKey(item) === event.target.value); setRoles(current => current.map(role => role.role_id === option.role_id ? bindExpert(role, expert) : role)); }}><option value="">请选择已安装专家</option>{value.expert && !selectedExpert ? <option value={selectedExpertKey} disabled>所选专家已不在目录，请重新选择</option> : null}{options.experts.map(expert => <option key={expertKey(expert)} value={expertKey(expert)}>{expert.name} · {expert.version}</option>)}</select><small>{selectedExpert ? `摘要 ${selectedExpert.digest.slice(0, 12)}…` : enabled ? '提交前必须选择专家版本' : '启用此职责后可选择专家'}</small></label>
+            <label><span>执行器 *</span><select aria-label={`${option.label || option.role_id}执行器`} value={value.executor} disabled={!enabled} onChange={event => { const executor = options.executors.find(item => item.executor === event.target.value); if (!executor) return; setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? changeExecutor(role, executor) : role)); }}><option value="">请选择宿主执行器</option>{options.executors.map(executor => <option key={executor.executor} value={executor.executor} disabled={!executor.available}>{executor.label}{executor.available ? '' : ` · ${executor.reason || '不可用'}`}</option>)}</select></label>
+            <label><span>服务 *</span><select aria-label={`${option.label || option.role_id}服务`} value={value.service_id} disabled={!enabled || !selectedExecutor || selectedExecutor.models.length === 0} onChange={event => { setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? changeService(role, selectedExecutor, event.target.value) : role)); }}><option value="">{services.length ? '请选择服务' : '由执行器自身配置'}</option>{services.map(service => <option key={service.id} value={service.id}>{service.label || service.id}</option>)}</select></label>
+            <label><span>模型 *</span><select aria-label={`${option.label || option.role_id}模型`} value={value.model} disabled={!enabled || !selectedExecutor || selectedExecutor.models.length === 0 || !value.service_id} onChange={event => { setRecommended(false); setRoles(current => current.map(role => role.role_id === option.role_id ? { ...role, model: event.target.value } : role)); }}><option value="">{models.length ? '请选择模型' : '由执行器自身配置'}</option>{models.map(model => <option key={model.alias} value={model.alias}>{model.label || model.alias}</option>)}</select></label>
           </article>;
         })}</div> : <div className="collaboration-task-loading"><BusyIndicator size={16} />正在读取职责目录</div>}
-        {mission.proposed_tasks.length ? <div className="collaboration-task-role-map"><strong>任务与职责映射 *</strong>{mission.proposed_tasks.map(task => <label key={task.id}><span>{task.title}</span><select aria-label={`${task.title}承担专家`} value={taskRoles[task.id] || ''} onChange={event => { setRecommended(false); setTaskRoles(current => ({ ...current, [task.id]: event.target.value })); }}><option value="">请选择承担专家</option>{options?.roles.map(role => <option key={role.role_id} value={role.role_id}>{role.label || role.role_id}</option>)}</select></label>)}</div> : null}
-        {missingTaskRole ? <p className="error" role="status">请为每项计划任务选择承担专家。</p> : null}
-        <footer className="collaboration-assignment-actions"><small>专家版本与摘要随指派固定，内容变更需重新指派。</small><button type="button" className="btn" disabled={!options || busy} onClick={useRecommended}>使用推荐服务与模型</button><button type="button" className="btn btn-primary" disabled={!options || busy || roles.length === 0 || problems.length > 0 || missingTaskRole} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <ShieldCheck size={14} />}{busy ? '应用中' : '应用角色指派'}</button></footer>
+        {mission.proposed_tasks.length ? <div className="collaboration-task-role-map"><strong>任务与职责映射 *</strong>{mission.proposed_tasks.map(task => <label key={task.id}><span>{task.title}</span><select aria-label={`${task.title}承担专家`} value={taskRoles[task.id] || ''} onChange={event => { setRecommended(false); setTaskRoles(current => ({ ...current, [task.id]: event.target.value })); }}><option value="">请选择承担专家</option>{taskRoles[task.id] && !roles.some(role => role.role_id === taskRoles[task.id]) ? <option value={taskRoles[task.id]} disabled>原职责未启用，请重新选择</option> : null}{roles.map(role => <option key={role.role_id} value={role.role_id}>{role.label || role.role_id}</option>)}</select></label>)}</div> : null}
+        {missingTaskRole ? <p className="error" role="status">请为每项计划任务选择已启用且有指派的职责。</p> : null}
+        <footer className="collaboration-assignment-actions"><small>推荐按钮仅填入配置，不会启动；专家版本与摘要随指派固定。</small><button type="button" className="btn" disabled={!options || busy} onClick={useRecommended}>使用推荐服务与模型</button><button type="button" className="btn btn-primary" disabled={!options || busy || roles.length === 0 || problems.length > 0 || missingTaskRole} onClick={() => void submit()}>{busy ? <BusyIndicator size={14} /> : <ShieldCheck size={14} />}{busy ? '应用中' : '应用角色指派'}</button></footer>
       </section>
     </CollaborationDialog>
   );

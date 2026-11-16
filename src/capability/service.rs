@@ -98,10 +98,12 @@ enum CapabilityHandler {
     EngineeringWorkspaceLeaseList,
     EngineeringHandoffCreate,
     MissionHandoffCreate,
+    MissionIntentCreate,
     MissionGet,
     MissionEventsList,
     MissionAssignmentOptions,
     MissionAssignmentApply,
+    MissionPlanGenerate,
     MissionPlanConfirm,
     MissionFollowUpAdd,
     MissionPendingRepairCancel,
@@ -1956,6 +1958,14 @@ impl CapabilityGateway {
                 CapabilityHandler::MissionHandoffCreate,
             ),
             registration(
+                "mission.intent.create",
+                "按需求创建专家团队任务",
+                "提供需求、工作区和访问意图，按真实专家目录生成版本化团队工作流与待指派草案。重试同一幂等键保留原绑定；不会确认计划、批准权限或启动执行。固定工作流交接仍可使用 mission.handoff.create。",
+                "local_write",
+                crate::mission::entry::input_schema(),
+                CapabilityHandler::MissionIntentCreate,
+            ),
+            registration(
                 "mission.get",
                 "读取协作任务",
                 "读取 Mission 当前状态、计划摘要、角色指派和任务视图；不返回凭据或原始私密对话。",
@@ -2048,6 +2058,17 @@ impl CapabilityGateway {
                     "required":["mission_id","input"],"additionalProperties":false
                 }),
                 CapabilityHandler::MissionAssignmentApply,
+            ),
+            registration(
+                "mission.plan.generate",
+                "生成协作任务计划草案",
+                "按当前已指派团队生成任务依赖、范围、预算和并发策略供审查；与 Agent 界面共用应用服务，不确认计划、不授权或启动。expected_plan_revision 防止用旧草案覆盖新版本。",
+                "local_write",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1},
+                    "expected_plan_revision":{"type":"integer","minimum":0}
+                },"required":["mission_id","expected_plan_revision"],"additionalProperties":false}),
+                CapabilityHandler::MissionPlanGenerate,
             ),
             registration(
                 "mission.plan.confirm",
@@ -4262,6 +4283,13 @@ impl CapabilityGateway {
                 value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
                 Ok(value)
             }
+            CapabilityHandler::MissionIntentCreate => {
+                let request: crate::mission::entry::MissionIntentInput = serde_json::from_value(input)?;
+                let mission = crate::mission::entry::create(&request)?;
+                let mut value = serde_json::to_value(&mission)?;
+                value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
+                Ok(value)
+            }
             CapabilityHandler::MissionGet => {
                 let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
                     .filter(|value| !value.is_empty()).ok_or("mission.get requires mission_id")?;
@@ -4300,6 +4328,12 @@ impl CapabilityGateway {
                     input.get("input").cloned().ok_or("mission.assignment.apply requires input")?
                 )?;
                 Ok(serde_json::to_value(crate::mission::MissionStore::open_default()?.assign_roles(mission_id, &request)?)?)
+            }
+            CapabilityHandler::MissionPlanGenerate => {
+                let mission_id=input["mission_id"].as_str().ok_or("mission_id is required")?;
+                let revision=input["expected_plan_revision"].as_u64().ok_or("expected_plan_revision is required")?;
+                Ok(serde_json::to_value(crate::app::mission_commands::generate_mission_plan_sync(&self.options,mission_id,Some(revision))
+                    .map_err(std::io::Error::other)?)?)
             }
             CapabilityHandler::MissionPlanConfirm => {
                 let mission_id = input.get("mission_id").and_then(Value::as_str).map(str::trim)
@@ -10130,6 +10164,20 @@ mod tests {
             } else {
                 assert_eq!(descriptor.input_schema["properties"]["input"]["properties"]["target_task_ids"]["uniqueItems"], true);
             }
+        }
+    }
+
+    #[test]
+    fn mission_plan_generation_mcp_requires_current_revision_and_never_accepts_grants() {
+        let gateway = CapabilityGateway::new(Options::from_env(), Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry=gateway.build_registry_scoped(false).unwrap();
+        let registration=registry.get("mission.plan.generate").unwrap();
+        assert!(matches!(registration.handler,CapabilityHandler::MissionPlanGenerate));
+        let schema=&registration.descriptor.input_schema;
+        validate_capability_input_schema(schema,&json!({"mission_id":"mission_test","expected_plan_revision":0})).unwrap();
+        for invalid in [json!({"mission_id":"mission_test"}),json!({"mission_id":"mission_test","expected_plan_revision":-1}),
+            json!({"mission_id":"mission_test","expected_plan_revision":0,"confirmed_by":"model","approved_paths":["."]})] {
+            assert!(validate_capability_input_schema(schema,&invalid).is_err());
         }
     }
 

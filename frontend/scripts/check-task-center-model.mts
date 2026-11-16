@@ -211,3 +211,50 @@ assert.equal(canRetryWaitingVerification(retryMission,ownedEvents.map(event=>eve
  ? {...event,payload:{...event.payload,automatic_pause:false}} : event),retryTask),false);
 assert.equal(canRetryWaitingVerification({...retryMission,tasks:[retryTask,{...retryTask,spec:{...retryTask.spec,id:'child',repair_of:'repair-3'}}]},retryEvents,retryTask),false);
 console.log('Explicit same-delivery Waiting retry/manual pause guards passed');
+
+// P4: Store Running is occupancy, not proof that the current LocalRun is live.
+import {missionRunningTasks, missionTaskActivity, missionTaskExecutionLabel, missionSchedulingWait, missionRunningVerifications} from '../src/pages/missionView.ts';
+const executing = mission('active', {tasks:[{...rootTask('work','running'),spec:{id:'work',title:'实现任务',depends_on:[],execution:{executor:'personal.codex',role_id:'implementer'}}}]});
+const currentRun = run('work-run',{mission_id:'m1',mission_task_id:'work'});
+assert.equal(missionProgress(executing).running,1);
+assert.equal(missionRunningTasks(executing).length,0);
+assert.equal(missionTaskExecutionLabel(executing,executing.tasks[0]),'已派发，等待运行状态');
+assert.equal(missionStatusLabel(executing),'已派发，等待运行状态');
+assert.match(missionNextAction(executing),/已派发.*等待执行器运行状态/);
+assert.match(missionResponsibility(executing),/已派发.*等待执行器运行状态/);
+assert.equal(missionRunningTasks(executing,[currentRun]).length,1);
+assert.equal(missionStatusLabel(executing,[],[currentRun]),'专家执行中');
+for(const patch of [{mission_id:'foreign'},{mission_task_id:'foreign'},{workflow_run_id:'old-attempt'},{mission_id:undefined},{mission_task_id:undefined}]) {
+ const stale={...currentRun,...patch};
+ assert.equal(missionTaskActivity(executing,executing.tasks[0],[stale]),undefined);
+ assert.equal(missionRunningTasks(executing,[stale]).length,0);
+}
+for(const status of ['queued','waiting','succeeded','failed']) {
+ const activity={...currentRun,status};
+ assert.equal(missionRunningTasks(executing,[activity]).length,0);
+ assert.equal(missionTaskExecutionLabel(executing,executing.tasks[0],[activity]),status==='waiting'?'执行等待中':'已派发，等待运行状态');
+ assert.equal(missionStatusLabel(executing,[],[activity]),status==='waiting'?'执行等待中':'已派发，等待运行状态');
+}
+for(const status of ['completed','failed','canceled','awaiting_confirmation']) assert.equal(missionRunningTasks({...executing,status} as MissionView,[currentRun]).length,0);
+for(const status of ['completed','awaiting_verification','ready']) assert.equal(missionRunningTasks({...executing,tasks:[{...executing.tasks[0],status}]} as MissionView,[currentRun]).length,0);
+assert.equal(missionRunningTasks({...executing,tasks:[{...executing.tasks[0],attempt_run_id:''}]},[currentRun]).length,0);
+assert.equal(missionRunningTasks({...executing,status:'waiting'},[currentRun]).length,1,'An explicitly live in-flight attempt may finish while later dispatch is paused.');
+const reviewActivity=run(legacy.tasks[0].verification_run_id,{mission_id:'m1',mission_task_id:'pending'});
+assert.equal(missionRunningVerifications(legacy,[reviewActivity]).length,1);
+assert.equal(missionRunningVerifications(legacy,[{...reviewActivity,workflow_run_id:legacy.tasks[0].attempt_run_id}]).length,0);
+assert.equal(missionRunningVerifications({...legacy,effective_wait:null},[reviewActivity]).length,0,'Independent review keeps its exact wait/plan gate.');
+
+const schedulingEvent=(sequence:number,event_type:string,reason:unknown,extra={})=>({mission_id:'m1',sequence,event_type,
+ payload:{plan_sha256:'hash',scheduling:{waiting:reason?[{task_id:'work',reason}]:[]}},...extra}) as Parameters<typeof missionSchedulingWait>[2][number];
+const admitted=schedulingEvent(1,'parallel_wave_admitted',{code:'max_active_tasks',limit:3});
+const resourceWait=schedulingEvent(2,'parallel_wave_waiting',{code:'resource_busy',holder_task_id:'work',conflict:{name:'build'}});
+assert.equal(missionSchedulingWait(executing,'work',[resourceWait,admitted]),'等待 实现任务 释放资源 · build');
+assert.equal(eventLabel(resourceWait),'调度等待依赖、名额或资源释放');
+assert.equal(missionSchedulingWait(executing,'work',[resourceWait,schedulingEvent(3,'parallel_wave_admitted',null)]),'','A later admission clears older waits.');
+assert.equal(missionSchedulingWait(executing,'work',[admitted,{...resourceWait,mission_id:'other'}]),'等待并发名额（上限 3）');
+assert.equal(missionSchedulingWait(executing,'work',[admitted,{...resourceWait,payload:{...resourceWait.payload,plan_sha256:'old'}}]),'等待并发名额（上限 3）');
+for(const [reason,expected] of [
+ [{code:'dependencies_not_verified',task_ids:['work']},'等待依赖通过验收：实现任务'],
+ [{code:'executor_capacity',executor:'personal.codex',limit:1},'等待 personal.codex 的执行名额（上限 1）'],
+] as const) assert.equal(missionSchedulingWait(executing,'work',[schedulingEvent(1,'parallel_wave_waiting',reason)]),expected);
+console.log('P4 runtime-live checks passed: exact ownership/attempt, queued/waiting/missing, occupancy, terminal guards, independent review gate, scheduling waits');

@@ -48,7 +48,7 @@ impl WorkflowStepExecutor for RuntimeStepExecutor<'_> {
         } else { implementation_prompt_input(input) };
         // Re-derive trusted host resources; never interpret an arbitrary path in
         // business input as permission to write outside the candidate.
-        let resources = if input.get("host_runtime_resources").is_some() { Some(crate::mission::CheckRuntimeResources::prepare(
+        let resources = if input.get("host_runtime_resources").is_some() { Some(implementation_resources(
             Path::new(&step.runtime.as_ref().ok_or("Mission runtime is missing")?.workspace_path),
             input.get("mission_id").and_then(Value::as_str).ok_or("Mission id is missing")?,
             input.get("task_id").and_then(Value::as_str).ok_or("Mission task id is missing")?,
@@ -178,6 +178,19 @@ pub(crate) async fn dispatch_next_mission_task(
 
 pub(crate) fn control_mission(mission_id: &str, action: &str) -> Result<crate::mission::MissionView, Box<dyn Error>> {
     let store = MissionStore::open_default()?;
+    // Requeue only while no wave can execute or reconcile the same attempts.
+    // This is preparation, never a second path around Mission dispatch.
+    let _resume_lock = if action == "resume" {
+        let current = store.get(mission_id)?;
+        let root = crate::store::paths::agent_home().join("mission-dispatch-locks");
+        std::fs::create_dir_all(&root)?;
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(root.join(format!("{}.lock", current.mission_id)))?;
+        if !file.try_lock_exclusive()? {
+            return Err("当前派发批次尚未收尾，请在当前步骤结束后重试恢复；未改变任务状态".into());
+        }
+        Some(file)
+    } else { None };
     if action == "resume" {
         let current = store.get(mission_id)?;
         for task in current.tasks.iter().filter(|task| task.status == crate::mission::TaskStatus::Failed) {
@@ -191,6 +204,24 @@ pub(crate) fn control_mission(mission_id: &str, action: &str) -> Result<crate::m
         }
     }
     let mission = store.control(mission_id, action)?;
+    if action == "resume" {
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+        let runner = WorkflowRunner::open_default()?;
+        for task in mission.tasks.iter().filter(|task| matches!(task.status,
+            crate::mission::TaskStatus::Running | crate::mission::TaskStatus::AwaitingVerification)) {
+            for id in [&task.attempt_run_id, &task.verification_run_id] {
+                if id.is_empty() { continue; }
+                if let Some(run) = ledger.get_run(id)?.filter(|run|
+                    run.status == crate::agent_core_contracts::LocalRunStatus::Waiting && run.pause_kind.is_user_pause()) {
+                    let requeued = runner.resume_from_pause(run)?;
+                    if requeued.status != crate::agent_core_contracts::LocalRunStatus::Queued { continue; }
+                    store.append_event(mission_id, "mission_attempt_requeued", &task.spec.id,
+                        "已将用户暂停的执行尝试重新入队，等待 Mission 调度器核对后继续",
+                        json!({"run_id":id,"source":"mission.control resume"}))?;
+                }
+            }
+        }
+    }
     if action == "cancel" {
         let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
         let runner = WorkflowRunner::open_default()?;
@@ -255,6 +286,9 @@ pub(crate) fn dispatch_next(
     reconcile_prestart_workspace_claim(&store,mission_id,&crate::store::local_runs::LocalRunLedger::open_default()?)?;
     // Drops before dispatch_lock: a canceled worker releases its claim only after Runtime exits.
     let _cancel_cleanup = CanceledClaimCleanup { store: store.clone(), mission_id: mission_id.to_string() };
+    if mission.scheduling.is_some() {
+        return dispatch_parallel_wave(&store, options, &mission);
+    }
     if let Some(pending) = store.next_verification_task(mission_id)? {
         return run_verification(&store, options, &mission, &pending);
     }
@@ -264,13 +298,33 @@ pub(crate) fn dispatch_next(
     let Some(task) = store.next_ready_task(mission_id)? else {
         return Ok(json!({"dispatched": false, "reason": "no ready task"}));
     };
+    dispatch_task(&store, options, &mission, &task, None)
+}
+
+fn dispatch_task(store: &MissionStore, options: &Options, mission: &crate::mission::MissionView,
+    task: &MissionTaskSpec, isolation: Option<&crate::mission::isolation::TaskIsolation>,
+) -> Result<Value, Box<dyn Error>> {
+    dispatch_task_with_executor(store, options, mission, task, isolation, None)
+}
+
+fn dispatch_task_with_executor(store: &MissionStore, options: &Options, mission: &crate::mission::MissionView,
+    task: &MissionTaskSpec, isolation: Option<&crate::mission::isolation::TaskIsolation>,
+    executor: Option<&dyn WorkflowStepExecutor>,
+) -> Result<Value, Box<dyn Error>> {
+    let mission_id = &mission.mission_id;
     if let Some((owner_mission, owner_task, _)) = store.workspace_claim(&mission.workspace.root)? {
+        if mission.scheduling.is_none() || owner_mission != *mission_id {
         let reason = format!("workspace has an active mission attempt: {owner_mission}/{owner_task}");
         return defer_dispatch(&store, mission_id, &task.id, &reason, json!({
             "owner_mission_id": owner_mission,
             "owner_task_id": owner_task,
         }));
+        }
     }
+    let source_mission = mission;
+    let mut worker_mission = mission.clone();
+    if let Some(isolation) = isolation { worker_mission.workspace.root = isolation.isolated_root().to_string_lossy().into_owned(); }
+    let mission = &worker_mission;
     validate_execution_binding(&task)?;
     if let Some(blocked) = prepare_task_environment(&store, &mission, &task)? { return Ok(blocked); }
     let package = mission_task_package(&store, &mission, &task)?;
@@ -278,10 +332,13 @@ pub(crate) fn dispatch_next(
     let request_id = format!("mission_{}_{}", mission.mission_id, task.id);
     let expected_run_id = format!("workflow_run_{request_id}");
     let input = implementation_input(&store, &mission, &task)?;
-    if let Err(error) = store.begin_task_attempt(mission_id, &task.id, &expected_run_id) {
+    if let Err(error) = store.begin_task_attempt_in_workspace(mission_id, &task.id, &expected_run_id, Some(&mission.workspace.root)) {
         return defer_dispatch(&store, mission_id, &task.id, &error.to_string(), json!({}));
     }
-    let baseline = match crate::mission::protected_files(Path::new(&mission.workspace.root), &task) {
+    let mut protection_task = task.clone();
+    let peer_writes = if isolation.is_some() { source_mission.tasks.iter().flat_map(|peer| peer.spec.write_paths.clone()).collect::<Vec<_>>() } else { Vec::new() };
+    protection_task.write_paths.extend(peer_writes.clone());
+    let baseline = match crate::mission::protected_files(Path::new(&source_mission.workspace.root), &protection_task) {
         Ok(files) => files,
         Err(error) => {
             store.complete_task_attempt(mission_id, &task.id, &expected_run_id, false,
@@ -290,7 +347,7 @@ pub(crate) fn dispatch_next(
         }
     };
     store.append_event(mission_id, "task_baseline_captured", &task.id, "系统已记录执行前只读文件基线",
-        json!({"protected_baseline": {"provenance": "host_before_execution", "files": baseline},
+        json!({"protected_baseline": {"provenance": "host_before_execution", "files": baseline, "excluded_peer_write_paths": peer_writes},
             "implementation_run_id": expected_run_id, "plan_sha256": mission.plan_sha256}))?;
     let run = match runner.start("local-agent", &package, &request_id, &input) {
         Ok(run) => run,
@@ -306,7 +363,132 @@ pub(crate) fn dispatch_next(
         let _ = crate::store::local_runs::LocalRunLedger::open_default()?.mark_run_failed(&run.run_id, &reason);
         return defer_dispatch(&store, mission_id, &task.id, &reason, json!({"run_id": run.run_id}));
     }
-    execute_implementation_attempt(&store, options, &mission, &task, &package, &input, &runner, run)
+    let host_executor=mission_executor(options,mission);
+    execute_implementation_attempt_with_executor(&store, &mission, &task, &package, &input, &runner, run,
+        executor.unwrap_or(&host_executor))
+}
+
+/// One host owns a Mission wave under the existing OS dispatch lock. Each
+/// attempt still uses the normal WorkflowRunner, ledger and atomic admission.
+fn dispatch_parallel_wave(store: &MissionStore, options: &Options, mission: &crate::mission::MissionView) -> Result<Value, Box<dyn Error>> {
+    dispatch_parallel_wave_with_executor(store, options, mission, None)
+}
+
+fn dispatch_parallel_wave_with_executor(store: &MissionStore, options: &Options, mission: &crate::mission::MissionView,
+    executor: Option<&(dyn WorkflowStepExecutor + Sync)>,
+) -> Result<Value, Box<dyn Error>> {
+    use crate::mission::{TaskStatus, parallel::{TaskResourceClaims, TaskWorkspace}, isolation::Preparation};
+    let mut results = Vec::new();
+    let running = mission.tasks.iter().filter(|task| task.status == TaskStatus::Running).cloned().collect::<Vec<_>>();
+    if !running.is_empty() {
+        results.extend(std::thread::scope(|scope| {
+            let workers = running.iter().map(|pending| scope.spawn(move || {
+                let mut worker = mission.clone();
+                let root = store.attempt_workspace(&pending.attempt_run_id).map_err(|error| error.to_string())?
+                    .ok_or("并行尝试缺少持久化执行工作区，已停止自动恢复以避免在错误目录重复执行")?;
+                worker.workspace.root = root;
+                resume_or_reconcile_attempt(store, options, &worker, pending).map_err(|error| error.to_string())
+            })).collect::<Vec<_>>();
+            workers.into_iter().map(|worker| worker.join().unwrap_or_else(|_| Err("Mission recovery worker panicked".into()))).collect::<Vec<_>>()
+        }));
+    }
+    let current = store.get(&mission.mission_id)?;
+    if current.status != crate::mission::MissionStatus::Active { return wave_result(store, &current, results); }
+    let mission = &current;
+    // Freeze the integrated candidate while checks/review run. A subsequent
+    // wave starts only after these verifications have persisted their outcomes.
+    let reviewing = mission.tasks.iter().filter(|task| task.status == TaskStatus::AwaitingVerification).cloned().collect::<Vec<_>>();
+    if !reviewing.is_empty() {
+        for pending in reviewing.iter() {
+            let current = store.get(&mission.mission_id)?;
+            if current.status != crate::mission::MissionStatus::Active { break; }
+            if shared_writer_in_progress(store, &current)? { break; }
+            results.push(match executor {
+                Some(executor) => run_verification_with_executor(store, &current, pending, executor),
+                None => run_verification(store, options, &current, pending),
+            }.map_err(|error| error.to_string()));
+        }
+    }
+    let current = store.get(&mission.mission_id)?;
+    if current.status != crate::mission::MissionStatus::Active { return wave_result(store, &current, results); }
+    // A prepared reviewer may be waiting on a client. Preserve its frozen
+    // source candidate; a waiting isolated implementation alone does not stop
+    // independent review or admission into a remaining worker slot.
+    if current.tasks.iter().any(|task| task.status == TaskStatus::AwaitingVerification) {
+        return wave_result(store, &current, results);
+    }
+    let mission = &current;
+    let limit = crate::mission::effective_parallel_limit(mission);
+    let mut prepared = std::collections::BTreeMap::new();
+    let mut isolations = std::collections::BTreeMap::new();
+    let mut fallback_reasons = Vec::new();
+    for task in mission.tasks.iter().filter(|task| task.status == TaskStatus::Ready).take(limit.max(1)) {
+        if limit == 1 || task.spec.write_paths.is_empty() { continue; }
+        if task.spec.read_paths.iter().chain(&task.spec.write_paths).any(|path| Path::new(path).is_absolute()) {
+            fallback_reasons.push(json!({"task_id":task.spec.id,"reason":"绝对路径任务保留原授权并串行执行，当前隔离仅支持工作区相对路径"}));
+            continue;
+        }
+        let run_id = format!("workflow_run_mission_{}_{}", mission.mission_id, task.spec.id);
+        match crate::mission::isolation::prepare(Path::new(&mission.workspace.root), &crate::store::paths::agent_home().join("mission-isolation"),
+            &mission.mission_id, &task.spec.id, &run_id)? {
+            Preparation::Ready(isolation) => {
+                prepared.insert(task.spec.id.clone(), TaskResourceClaims {workspace:TaskWorkspace::Isolated {root:isolation.isolated_root().to_string_lossy().into_owned()},..Default::default()});
+                isolations.insert(task.spec.id.clone(), isolation);
+            }
+            Preparation::Unsupported {reason} => fallback_reasons.push(json!({"task_id":task.spec.id,"reason":reason})),
+        }
+    }
+    let decision = match store.ready_task_batch(&mission.mission_id, &prepared) {
+        Ok(decision) => decision,
+        Err(error) => {
+            if let Some(reason) = store.budget_exhaustion_reason(mission)? { store.record_budget_exhausted(&mission.mission_id, &reason)?; }
+            return Ok(json!({"dispatched":false,"reason":error.to_string()}));
+        }
+    };
+    if decision.admitted_task_ids.is_empty() {
+        if !decision.waiting.is_empty() { store.record_scheduling_wait(&mission.mission_id, &decision)?; }
+        let mut result = wave_result(store, mission, results)?;
+        result["scheduling"] = serde_json::to_value(decision)?;
+        return Ok(result);
+    }
+    store.append_event(&mission.mission_id,"parallel_wave_admitted","",
+        &format!("准备推进 {} 项独立工作，并发上限 {limit}",decision.admitted_task_ids.len()),
+        json!({"plan_sha256":mission.plan_sha256,"limit":limit,"scheduling":decision,"serial_fallbacks":fallback_reasons,
+            "budget_serial":limit==1 && mission.scheduling.as_ref().is_some_and(|policy| policy.max_active_tasks>1)}))?;
+    results.extend(run_parallel_workers(&decision.admitted_task_ids, &|id| {
+        let task = &mission.tasks.iter().find(|task| task.spec.id == id).expect("admitted task exists").spec;
+        dispatch_task_with_executor(store,options,mission,task,isolations.get(id),executor.map(|executor|executor as &dyn WorkflowStepExecutor)).map_err(|error| error.to_string())
+    }));
+    wave_result(store, mission, results)
+}
+
+fn shared_writer_in_progress(store: &MissionStore, mission: &crate::mission::MissionView) -> Result<bool, Box<dyn Error>> {
+    for task in mission.tasks.iter().filter(|task| task.status == crate::mission::TaskStatus::Running && !task.spec.write_paths.is_empty()) {
+        let root = store.attempt_workspace(&task.attempt_run_id)?.ok_or("running task has no execution workspace")?;
+        if Path::new(&root).canonicalize()? == Path::new(&mission.workspace.root).canonicalize()? { return Ok(true); }
+    }
+    Ok(false)
+}
+
+fn candidate_integration_lock(mission_id: &str) -> Result<std::fs::File, Box<dyn Error>> {
+    let root = crate::store::paths::agent_home().join("mission-dispatch-locks");
+    std::fs::create_dir_all(&root)?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(root.join(format!("{mission_id}.integration.lock")))?;
+    fs4::fs_std::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn run_parallel_workers(ids: &[String], worker: &(impl Fn(&str)->Result<Value,String> + Sync)) -> Vec<Result<Value,String>> {
+    std::thread::scope(|scope| {
+        let workers=ids.iter().map(|id| scope.spawn(move || worker(id))).collect::<Vec<_>>();
+        workers.into_iter().map(|worker| worker.join().unwrap_or_else(|_| Err("Mission worker panicked".into()))).collect()
+    })
+}
+
+fn wave_result(store: &MissionStore, mission: &crate::mission::MissionView, results: Vec<Result<Value,String>>) -> Result<Value,Box<dyn Error>> {
+    let outcomes = results.into_iter().map(|result| match result {Ok(value)=>value,Err(error)=>json!({"dispatched":false,"error":error})}).collect::<Vec<_>>();
+    Ok(json!({"dispatched":outcomes.iter().any(|value| value["dispatched"]==true),"parallel":true,"outcomes":outcomes,"mission":store.get(&mission.mission_id)?}))
 }
 
 fn prepare_task_environment(store: &MissionStore, mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<Option<Value>, Box<dyn Error>> {
@@ -358,18 +540,19 @@ fn mission_step_timeout(mission:&crate::mission::MissionView)->u64 {
 // LocalRun remains owned by its ordinary reconciliation path.
 fn reconcile_prestart_workspace_claim(store:&MissionStore,mission_id:&str,
     ledger:&crate::store::local_runs::LocalRunLedger)->Result<bool,Box<dyn Error>> {
-    let mission=store.get(mission_id)?;
-    let Some((owner,task_id,run_id))=store.workspace_claim(&mission.workspace.root)? else {return Ok(false);};
-    if owner!=mission_id {return Ok(false);}
-    let latest=store.get(mission_id)?;
-    let Some(task)=latest.tasks.iter().find(|t|t.spec.id==task_id) else {return Ok(false);};
-    if task.status!=crate::mission::TaskStatus::Failed || task.attempt_run_id!=run_id
-        || !task.verification_run_id.is_empty() {return Ok(false);}
-    if ledger.get_run(&run_id)?.is_some() {return Ok(false);}
-    store.complete_task_attempt(mission_id,&task_id,&run_id,false,&[],"prestart claim reconciliation")?;
-    store.append_event(mission_id,"prestart_workspace_claim_reconciled",&task_id,
-        "已释放创建 LocalRun 前失败的原工作区占用",json!({"run_id":run_id,"reason_code":"local_run_absent"}))?;
-    Ok(true)
+    let mut reconciled=false;
+    for (task_id,run_id) in store.mission_workspace_claims(mission_id)? {
+        let latest=store.get(mission_id)?;
+        let Some(task)=latest.tasks.iter().find(|t|t.spec.id==task_id) else {continue;};
+        if task.status!=crate::mission::TaskStatus::Failed || task.attempt_run_id!=run_id
+            || !task.verification_run_id.is_empty() {continue;}
+        if ledger.get_run(&run_id)?.is_some() {continue;}
+        store.complete_task_attempt(mission_id,&task_id,&run_id,false,&[],"prestart claim reconciliation")?;
+        store.append_event(mission_id,"prestart_workspace_claim_reconciled",&task_id,
+            "已释放创建 LocalRun 前失败的原工作区占用",json!({"run_id":run_id,"reason_code":"local_run_absent"}))?;
+        reconciled=true;
+    }
+    Ok(reconciled)
 }
 
 fn mission_should_stop(id: &str, _original: &crate::mission::MissionView) -> bool {
@@ -383,7 +566,7 @@ fn mission_executor<'a>(options: &'a Options, mission: &crate::mission::MissionV
 }
 
 fn implementation_input(store: &MissionStore, mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<Value, Box<dyn Error>> {
-    let resources = crate::mission::CheckRuntimeResources::prepare(
+    let resources = implementation_resources(
         Path::new(&mission.workspace.root), &mission.mission_id, &task.id)?;
     Ok(json!({
         "workspace_root": mission.workspace.root,
@@ -401,6 +584,14 @@ fn implementation_input(store: &MissionStore, mission: &crate::mission::MissionV
     }))
 }
 
+fn implementation_resources(workspace:&Path,mission_id:&str,task_id:&str)
+    ->Result<crate::mission::CheckRuntimeResources,Box<dyn Error>> {
+    let source=MissionStore::open_default()?.get(mission_id)?;
+    if workspace.canonicalize()? != Path::new(&source.workspace.root).canonicalize()? {
+        crate::mission::CheckRuntimeResources::prepare_isolated(workspace,mission_id,task_id)
+    } else {crate::mission::CheckRuntimeResources::prepare(workspace,mission_id,task_id)}
+}
+
 fn execute_implementation_attempt(
     store: &MissionStore,
     options: &Options,
@@ -411,6 +602,15 @@ fn execute_implementation_attempt(
     runner: &WorkflowRunner,
     run: crate::agent_core_contracts::LocalRun,
 ) -> Result<Value, Box<dyn Error>> {
+    let executor=mission_executor(options,mission);
+    execute_implementation_attempt_with_executor(store,mission,task,package,input,runner,run,&executor)
+}
+
+fn execute_implementation_attempt_with_executor(
+    store: &MissionStore, mission: &crate::mission::MissionView, task: &MissionTaskSpec,
+    package: &WorkflowPackage, input: &Value, runner: &WorkflowRunner,
+    run: crate::agent_core_contracts::LocalRun, executor: &dyn WorkflowStepExecutor,
+) -> Result<Value, Box<dyn Error>> {
     let task_id = task.id.clone();
     if matches!(run.status, crate::agent_core_contracts::LocalRunStatus::Running | crate::agent_core_contracts::LocalRunStatus::Waiting) {
         let reason = "the bound LocalRun is already active or waiting; it was not started again";
@@ -419,9 +619,8 @@ fn execute_implementation_attempt(
             "run_status": run.status,
         }));
     }
-    let executor = mission_executor(options, mission);
     let run_id = run.run_id.clone();
-    let outcome = match runner.run_ready(package, run, input, &executor) {
+    let outcome = match runner.run_ready(package, run, input, executor) {
         Ok(outcome) => outcome,
         Err(error) => {
             if error.to_string().contains("leased by another process") {
@@ -469,6 +668,11 @@ fn execute_implementation_attempt(
     let has_required_checks = !task.required_checks.is_empty();
     let has_acceptance = !task.acceptance_criteria.is_empty();
     let updated = if run_succeeded && has_required_checks && has_acceptance {
+        if !integrate_task_candidate(store, mission, task, &outcome.run.run_id)? {
+            return defer_dispatch(store, &mission.mission_id, &task.id,
+                "实现已完成，等待当前候选核验结束后整合；保留原交付和资源占用",
+                json!({"run_id":outcome.run.run_id,"run_status":outcome.run.status,"integration_pending":true}));
+        }
         store.await_task_verification(
             &mission.mission_id,
             &task_id,
@@ -528,6 +732,11 @@ fn resume_or_reconcile_attempt(
         crate::agent_core_contracts::LocalRunStatus::Succeeded => {
             let has_checks = !task.required_checks.is_empty() && !task.acceptance_criteria.is_empty();
             let updated = if has_checks {
+                if !integrate_task_candidate(store, mission, task, run_id)? {
+                    return defer_dispatch(store, &mission.mission_id, &task.id,
+                        "实现已完成，等待当前候选核验结束后整合；保留原交付和资源占用",
+                        json!({"run_id":run_id,"run_status":run.status,"integration_pending":true}));
+                }
                 store.await_task_verification(&mission.mission_id, &task.id, run_id, "从持久化 LocalRun 恢复完成态")?
             } else {
                 store.complete_task_attempt(&mission.mission_id, &task.id, run_id, false,
@@ -547,6 +756,47 @@ fn resume_or_reconcile_attempt(
             Ok(json!({"dispatched": false, "recovered": true, "run_status": run.status, "mission": updated}))
         }
     }
+}
+
+fn integrate_task_candidate(store: &MissionStore, mission: &crate::mission::MissionView,
+    task: &MissionTaskSpec, run_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let source = store.get(&mission.mission_id)?;
+    let Some(execution_root) = store.attempt_workspace(run_id)? else { return Ok(true); };
+    if execution_root == source.workspace.root { return Ok(true); }
+    let _lock = candidate_integration_lock(&source.mission_id)?;
+    let source = store.get(&source.mission_id)?;
+    if source.status != crate::mission::MissionStatus::Active {
+        return Err("Mission paused or canceled before candidate integration; retained the same isolated delivery for reconciliation".into());
+    }
+    // A reviewer can outlive one dispatcher wave (waiting, queued after pause,
+    // or a terminal LocalRun not reconciled yet). The persisted preparation is
+    // the freeze, not this process's lock lifetime. Never mutate its candidate.
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    for pending in source.tasks.iter().filter(|pending| pending.status == crate::mission::TaskStatus::AwaitingVerification) {
+        let (suffix, _) = verification_host_evidence(store, &source.mission_id,
+            &pending.spec.id, &pending.attempt_run_id)?;
+        let expected = format!("workflow_run_mission_{}_{}_verify{suffix}", source.mission_id, pending.spec.id);
+        if ledger.get_run(&expected)?.is_some() { return Ok(false); }
+    }
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let crate::mission::isolation::Preparation::Ready(isolation) = crate::mission::isolation::prepare(
+            Path::new(&source.workspace.root), &crate::store::paths::agent_home().join("mission-isolation"),
+            &source.mission_id, &task.id, run_id)? else { return Err("bound task isolation is no longer available".into()); };
+        if isolation.isolated_root().canonicalize()? != Path::new(&execution_root).canonicalize()? {
+            return Err("persisted execution workspace does not match the host isolation receipt".into());
+        }
+        let integrated = isolation.integrate(&task.write_paths)?;
+        store.record_task_integration(&source.mission_id, &task.id, run_id, &serde_json::to_value(&integrated.receipt)?)?;
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        // Runtime has exited. A failed merge retains its worktree and receipt;
+        // it cannot be presented as a verified source delivery.
+        store.complete_task_attempt(&source.mission_id,&task.id,run_id,false,
+            &[format!("local-run:{run_id}")], &format!("交付整合失败：{error}"))?;
+    }
+    result.map(|()| true)
 }
 
 fn candidate_identity(mission: &crate::mission::MissionView, task: &MissionTaskSpec) -> Result<Value, Box<dyn Error>> {
@@ -655,6 +905,14 @@ fn run_verification_with_executor(
     executor: &dyn WorkflowStepExecutor,
 ) -> Result<Value, Box<dyn Error>> {
     let task = &pending.spec;
+    // Integration and review share the candidate freeze. Recheck ownership
+    // even for saved/queued verifier runs, before any required command runs.
+    let _candidate_lock = candidate_integration_lock(&mission.mission_id)?;
+    store.assert_verification_ownership(&mission.mission_id, &task.id, &pending.attempt_run_id)?;
+    if shared_writer_in_progress(store, &store.get(&mission.mission_id)?)? {
+        return defer_dispatch(store, &mission.mission_id, &task.id,
+            "等待共享工作区写入结束后再冻结交付并核验", json!({"reason_code":"shared_writer_active"}));
+    }
     let evidence_refs = vec![format!("local-run:{}", pending.attempt_run_id)];
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
     let implementation_run = ledger.get_run(&pending.attempt_run_id)?
@@ -670,6 +928,9 @@ fn run_verification_with_executor(
         .unwrap_or(Value::Null);
     let (suffix, protected_baseline) = verification_host_evidence(
         store, &mission.mission_id, &task.id, &pending.attempt_run_id)?;
+    let integration = store.task_integration(&mission.mission_id, &task.id, &pending.attempt_run_id)?;
+    let protection_task = crate::mission::baseline_protection_task(mission, task, &pending.attempt_run_id,
+        &protected_baseline, integration.as_ref())?;
     let expected_verification_id = format!("workflow_run_mission_{}_{}_verify{suffix}", mission.mission_id, task.id);
     let existing = ledger.get_run(&expected_verification_id)?;
     if let Some(current) = &existing {
@@ -714,7 +975,7 @@ fn run_verification_with_executor(
                 error: "必需检查改写交付候选；测试输出应写入范围外独立可清理的 cache/host-owned 目录，不能在验收中重写交付候选".into(),
             });
         }
-        let protected_current = crate::mission::protected_files(Path::new(&mission.workspace.root), task)?;
+        let protected_current = crate::mission::protected_files(Path::new(&mission.workspace.root), &protection_task)?;
         let protected_files_match = !protected_baseline.is_null() && protected_baseline["files"] == protected_current;
         let read_scope = verification_read_scope(task);
         let proposed_input = json!({
@@ -732,6 +993,7 @@ fn run_verification_with_executor(
             "implementation_status": implementation_run.status,
             "implementation_output": implementation_output,
             "implementation_evidence": implementation_evidence,
+            "integration_receipt": integration,
             "expected_plan_sha256": mission.plan_sha256,
             "feedback_context": store.feedback_context(&mission.mission_id, &mission.plan_sha256, &[task.id.clone()])?,
             // The reviewer inspects the actual post-check candidate, while the
@@ -773,7 +1035,7 @@ fn run_verification_with_executor(
     if run.run_id == pending.attempt_run_id {
         return Err("verification run must differ from implementation run".into());
     }
-    let protected_current = crate::mission::protected_files(Path::new(&mission.workspace.root), task)?;
+    let protected_current = crate::mission::protected_files(Path::new(&mission.workspace.root), &protection_task)?;
     let protected_files_match = !protected_baseline.is_null() && protected_baseline["files"] == protected_current;
     if store.get(&mission.mission_id)?.status != crate::mission::MissionStatus::Active {
         return Ok(json!({"dispatched":false,"reason":"Mission paused or canceled before independent verification"}));
@@ -1211,6 +1473,342 @@ fn verification_package(
 
 #[cfg(test)]
 mod tests {
+    fn retain_parallel_snapshot(store:&crate::mission::MissionStore,id:&str,name:&str) {
+        if let Some(root)=std::env::var_os("HIMIND_TEST_PARALLEL_EVIDENCE") {
+            let root=std::path::PathBuf::from(root);std::fs::create_dir_all(&root).unwrap();
+            let snapshot=store.snapshot(id,0).unwrap();
+            let ledger=crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+            // Bind actual ledger status to the Store's persisted run ids. Task
+            // admission itself is not proof that a runtime is currently busy.
+            let activities=snapshot.mission.tasks.iter().flat_map(|task| {
+                [&task.attempt_run_id,&task.verification_run_id].into_iter().filter_map(|run_id| {
+                    if run_id.is_empty(){return None;}
+                    let run=ledger.get_run(run_id).unwrap()?;
+                    Some(json!({"id":run.run_id,"source":"workflow","title":task.spec.title,
+                        "status":run.status,"progress":null,"created_at":run.created_at,"updated_at":run.updated_at,
+                        "mission_id":id,"mission_task_id":task.spec.id,"workflow_run_id":run.run_id,"pause_kind":run.pause_kind}))
+                }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+            std::fs::write(root.join(format!("{name}.json")),serde_json::to_vec_pretty(&json!({"snapshot":snapshot,"activities":activities,
+                "source":"deterministic fixture: actual Store snapshot and ledger statuses, not installed model execution"})).unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parallel_waiting_attempt_does_not_block_peer_review_or_ready_work() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock=crate::store::paths::test_env_lock();let env=Environment::new();
+        std::env::set_var("HIMIND_AGENT_HOME",env.root.join("host"));
+        let root=env.root.join("source");std::fs::create_dir(&root).unwrap();std::fs::write(root.join("read.txt"),"protected").unwrap();
+        let store=crate::mission::MissionStore::open_default().unwrap();
+        let created=store.create(&serde_json::from_value(json!({"title":"waiting peer fixture",
+            "workspace":{"root":root,"read_scope":["read.txt"],"write_scope":[]}})).unwrap()).unwrap();
+        let tasks=["waiting","delivered","ready"].iter().map(|id|json!({"id":id,"title":id,
+            "read_paths":["read.txt"],"write_paths":[],"acceptance_criteria":["input unchanged"],
+            "required_checks":["node -e \"process.exit(0)\""],"execution":{"executor":"personal.codex","role_id":"reviewer"}})).collect::<Vec<_>>();
+        let plan=serde_json::from_value(json!({"summary":"independent read tasks","tasks":tasks,"required_acceptance":[],
+            "scheduling":{"max_active_tasks":3},"budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}})).unwrap();
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        let mission=store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["waiting".into(),"delivered".into(),"ready".into()],&[],&[],&[],"fixture").unwrap();
+        let runner=crate::workflow::WorkflowRunner::open_default().unwrap();
+        let ledger=crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        for id in ["waiting","delivered"] {
+            let task=&mission.tasks.iter().find(|task|task.spec.id==id).unwrap().spec;
+            let package=super::task_package(&mission.mission_id,&mission.title,task,root.to_str().unwrap()).unwrap();
+            let mut run=runner.start("fixture",&package,&format!("waiting-test-{id}"),&json!({})).unwrap();
+            store.begin_task_attempt(&mission.mission_id,id,&run.run_id).unwrap();
+            let files=crate::mission::protected_files(&root,task).unwrap();
+            store.append_event(&mission.mission_id,"task_baseline_captured",id,"fixture",json!({
+                "implementation_run_id":run.run_id,"protected_baseline":{"files":files}})).unwrap();
+            run.status=if id=="waiting" {crate::agent_core_contracts::LocalRunStatus::Waiting}else{crate::agent_core_contracts::LocalRunStatus::Succeeded};
+            ledger.save_run(&run).unwrap();
+            if id=="delivered" {store.await_task_verification(&mission.mission_id,id,&run.run_id,"ready").unwrap();}
+        }
+        struct Probe(std::sync::atomic::AtomicUsize);
+        impl super::WorkflowStepExecutor for Probe {
+            fn execute(&self,package:&super::WorkflowPackage,step:&super::WorkflowStep,input:&serde_json::Value)
+                ->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                if input.get("host_checks").is_some() {super::WorkflowStepExecutor::execute(&BoundReview::default(),package,step,input)}
+                else {Ok(super::WorkflowStepExecution::output(json!({"passed":true})))}
+            }
+        }
+        let executor=Probe(std::sync::atomic::AtomicUsize::new(0));let options=crate::Options::from_env();
+        let current=store.get(&mission.mission_id).unwrap();
+        let result=super::dispatch_parallel_wave_with_executor(&store,&options,&current,Some(&executor)).unwrap();
+        let current=store.get(&mission.mission_id).unwrap();
+        assert_eq!(current.tasks.iter().find(|t|t.spec.id=="waiting").unwrap().status,crate::mission::TaskStatus::Running);
+        assert_eq!(current.tasks.iter().find(|t|t.spec.id=="delivered").unwrap().status,crate::mission::TaskStatus::Completed,"{result}");
+        assert_eq!(current.tasks.iter().find(|t|t.spec.id=="ready").unwrap().status,crate::mission::TaskStatus::AwaitingVerification,"{result}");
+        assert_eq!(executor.0.load(std::sync::atomic::Ordering::SeqCst),2);
+        retain_parallel_snapshot(&store,&mission.mission_id,"waiting-with-peer-delivery");
+        // A paused plan must stop before any required check or reviewer runs.
+        let ready=current.tasks.iter().find(|t|t.spec.id=="ready").unwrap();
+        store.control(&mission.mission_id,"pause").unwrap();
+        let before=store.snapshot(&mission.mission_id,0).unwrap();
+        assert!(super::run_verification_with_executor(&store,&current,ready,&executor).is_err());
+        assert_eq!(store.snapshot(&mission.mission_id,0).unwrap(),before);
+        assert_eq!(executor.0.load(std::sync::atomic::Ordering::SeqCst),2);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn parallel_isolated_dispatch_integrates_disjoint_changes_and_verifies_shared_candidate() {
+        use crate::runtime::process::codex_test_support::Environment;
+        use std::sync::{Condvar,Mutex};
+        let _lock=crate::store::paths::test_env_lock();let env=Environment::new();
+        let root=env.root.join("source");std::fs::create_dir(&root).unwrap();
+        std::env::set_var("HIMIND_AGENT_HOME",env.root.join("host"));
+        let git=|args:&[&str]| {let output=std::process::Command::new("git").current_dir(&root).args(args).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));};
+        git(&["init","--quiet"]);git(&["config","user.name","Fixture"]);git(&["config","user.email","fixture@example.invalid"]);
+        git(&["config","core.autocrlf","false"]);
+        std::fs::write(root.join("read.txt"),"immutable input\n").unwrap();
+        std::fs::write(root.join("a.txt"),"old a\n").unwrap();std::fs::write(root.join("b.txt"),"old b\n").unwrap();
+        git(&["add","."]);git(&["commit","--quiet","-m","baseline"]);
+        let store=crate::mission::MissionStore::open_default().unwrap();
+        let created=store.create(&serde_json::from_value(json!({"title":"isolated parallel integration",
+            "workspace":{"root":root,"read_scope":["."],"write_scope":["a.txt","b.txt"]}})).unwrap()).unwrap();
+        let tasks=["a","b"].iter().map(|id|json!({"id":id,"title":id,"read_paths":["."],"write_paths":[format!("{id}.txt")],
+            "acceptance_criteria":["only own delivery changed"],"required_checks":["node -e \"process.exit(0)\""],
+            "execution":{"executor":"personal.codex","role_id":"implementer"}})).collect::<Vec<_>>();
+        let plan=serde_json::from_value(json!({"summary":"independent writes","tasks":tasks,"required_acceptance":[],
+            "scheduling":{"max_active_tasks":2},"budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}})).unwrap();
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        let mission=store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["a".into(),"b".into()],
+            &["a.txt".into(),"b.txt".into()],&[],&[],"fixture").unwrap();
+        let storage=crate::store::paths::agent_home().join("mission-isolation");
+        let isolations=["a","b"].iter().map(|id| {
+            let run_id=format!("workflow_run_mission_{}_{}",mission.mission_id,id);
+            let crate::mission::isolation::Preparation::Ready(isolation)=crate::mission::isolation::prepare(&root,&storage,&mission.mission_id,id,&run_id).unwrap()
+                else {panic!("clean fixture should isolate")};(id.to_string(),isolation)
+        }).collect::<std::collections::BTreeMap<_,_>>();
+        let prepared=isolations.iter().map(|(id,isolation)|(id.clone(),crate::mission::parallel::TaskResourceClaims{
+            workspace:crate::mission::parallel::TaskWorkspace::Isolated{root:isolation.isolated_root().to_string_lossy().into_owned()},..Default::default()
+        })).collect();
+        let decision=store.ready_task_batch(&mission.mission_id,&prepared).unwrap();assert_eq!(decision.admitted_task_ids,["a","b"]);
+        struct Writer {gate:(Mutex<usize>,Condvar),source:std::path::PathBuf}
+        impl super::WorkflowStepExecutor for Writer {
+            fn execute(&self,_:&super::WorkflowPackage,_:&super::WorkflowStep,input:&serde_json::Value)
+                ->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                let root=std::path::Path::new(input["workspace_root"].as_str().unwrap());assert_ne!(root.canonicalize()?,self.source.canonicalize()?);
+                let (count,signal)=&self.gate;let mut count=count.lock().unwrap();*count+=1;signal.notify_all();
+                let (count,timeout)=signal.wait_timeout_while(count,std::time::Duration::from_secs(10),|count|*count<2).unwrap();
+                if timeout.timed_out() && *count<2 {return Err("isolated workers did not overlap".into());}drop(count);
+                let id=input["task_id"].as_str().unwrap();std::fs::write(root.join(format!("{id}.txt")),format!("new {id}\n"))?;
+                Ok(super::WorkflowStepExecution::output(json!({"passed":true})))
+            }
+        }
+        let writer=Writer{gate:(Mutex::new(0),Condvar::new()),source:root.clone()};let options=crate::Options::from_env();
+        let results=super::run_parallel_workers(&decision.admitted_task_ids,&|id| {
+            let task=&mission.tasks.iter().find(|task|task.spec.id==id).unwrap().spec;
+            super::dispatch_task_with_executor(&store,&options,&mission,task,isolations.get(id),Some(&writer)).map_err(|error|error.to_string())
+        });
+        assert!(results.iter().all(|result|result.as_ref().is_ok_and(|value|value["verification_pending"]==true)),"{results:?}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(),"new a\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(),"new b\n");
+        assert_eq!(std::fs::read_to_string(root.join("read.txt")).unwrap(),"immutable input\n");
+        retain_parallel_snapshot(&store,&mission.mission_id,"isolated-awaiting-review");
+        for id in ["a","b"] {
+            let current=store.get(&mission.mission_id).unwrap();let pending=current.tasks.iter().find(|task|task.spec.id==id).unwrap();
+            let result=super::run_verification_with_executor(&store,&current,pending,&BoundReview::default()).unwrap();
+            assert_eq!(result["passed"],true,"{result}");
+        }
+        assert_eq!(store.get(&mission.mission_id).unwrap().status,crate::mission::MissionStatus::Completed);
+        retain_parallel_snapshot(&store,&mission.mission_id,"isolated-completed");
+        let snapshot=store.snapshot(&mission.mission_id,0).unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event|event.event_type=="task_candidate_integrated").count(),2);
+        assert!(store.mission_workspace_claims(&mission.mission_id).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parallel_recovery_defers_integration_until_prepared_review_is_reconciled() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        let root = env.root.join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::env::set_var("HIMIND_AGENT_HOME", env.root.join("host"));
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git").current_dir(&root).args(args).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "core.autocrlf", "false"]);
+        for id in ["a", "b"] { std::fs::write(root.join(format!("{id}.txt")), format!("old {id}\n")).unwrap(); }
+        let marker = env.root.join("check-started");
+        std::fs::write(root.join("check.py"), format!(
+            "from pathlib import Path\nPath({:?}).touch()\n__import__('time').sleep(0.8)\n", marker.to_string_lossy())).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "baseline"]);
+        let store = crate::mission::MissionStore::open_default().unwrap();
+        let created = store.create(&serde_json::from_value(json!({"title":"persisted review freeze",
+            "workspace":{"root":root,"read_scope":["."],"write_scope":["a.txt","b.txt"]}})).unwrap()).unwrap();
+        let tasks = ["a", "b"].iter().map(|id| json!({"id":id,"title":id,
+            "read_paths":["."],"write_paths":[format!("{id}.txt")],
+            "acceptance_criteria":["own change integrated with immutable test input"],
+            "required_checks":if *id=="a" {vec!["python check.py"]} else {vec!["node -e \"process.exit(0)\""]},
+            "execution":{"executor":"personal.codex","role_id":"implementer"}})).collect::<Vec<_>>();
+        let plan = serde_json::from_value(json!({"summary":"cross-wave recovery","tasks":tasks,"required_acceptance":[],
+            "scheduling":{"max_active_tasks":2},"budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}})).unwrap();
+        let proposed = store.propose_plan(&created.mission_id, &plan).unwrap();
+        let mission = store.confirm_plan(&created.mission_id, &proposed.plan_sha256,
+            &["a".into(),"b".into()], &["a.txt".into(),"b.txt".into()], &[], &[], "fixture").unwrap();
+        let runner = crate::workflow::WorkflowRunner::open_default().unwrap();
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let storage = crate::store::paths::agent_home().join("mission-isolation");
+        // Persist both implementations before either delivery changes the source.
+        for id in ["a", "b"] {
+            let task = &mission.tasks.iter().find(|task|task.spec.id==id).unwrap().spec;
+            let run_id = format!("workflow_run_mission_{}_{}",mission.mission_id,id);
+            let crate::mission::isolation::Preparation::Ready(isolation) = crate::mission::isolation::prepare(
+                &root,&storage,&mission.mission_id,id,&run_id).unwrap() else {panic!("clean Git must isolate")};
+            let package = super::task_package(&mission.mission_id,&mission.title,task,isolation.isolated_root().to_str().unwrap()).unwrap();
+            let mut run = runner.start("fixture",&package,&format!("mission_{}_{}",mission.mission_id,id),&json!({})).unwrap();
+            assert_eq!(run.run_id,run_id);
+            store.begin_task_attempt_in_workspace(&mission.mission_id,id,&run_id,Some(isolation.isolated_root().to_str().unwrap())).unwrap();
+            let mut protection = task.clone();
+            protection.write_paths = vec!["a.txt".into(),"b.txt".into()];
+            store.append_event(&mission.mission_id,"task_baseline_captured",id,"host fixture baseline",json!({
+                "implementation_run_id":run_id,"protected_baseline":{"provenance":"host_before_execution","files":crate::mission::protected_files(&root,&protection).unwrap(),
+                "excluded_peer_write_paths":["a.txt","b.txt"]}})).unwrap();
+            std::fs::write(isolation.isolated_root().join(format!("{id}.txt")),format!("new {id}\n")).unwrap();
+            run.status = if id=="a" {crate::agent_core_contracts::LocalRunStatus::Succeeded} else {crate::agent_core_contracts::LocalRunStatus::Waiting};
+            ledger.save_run(&run).unwrap();
+        }
+        let options = crate::Options::from_env();
+        let current = store.get(&mission.mission_id).unwrap();
+        super::resume_or_reconcile_attempt(&store,&options,&current,&current.tasks[0]).unwrap();
+        let id = mission.mission_id.clone();
+        let control = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !marker.exists() {
+                assert!(start.elapsed()<std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            crate::mission::MissionStore::open_default().unwrap().control(&id,"pause").unwrap();
+        });
+        let current = store.get(&mission.mission_id).unwrap();
+        super::run_verification_with_executor(&store,&current,&current.tasks[0],&BoundReview::default()).unwrap();
+        control.join().unwrap();
+        let prepared_id = format!("workflow_run_mission_{}_a_verify",mission.mission_id);
+        assert_eq!(ledger.get_run(&prepared_id).unwrap().unwrap().status,crate::agent_core_contracts::LocalRunStatus::Queued);
+        assert!(store.get(&mission.mission_id).unwrap().tasks[0].verification_run_id.is_empty(),"freeze predates verifier admission");
+        store.control(&mission.mission_id,"resume").unwrap();
+        let mut delivered = ledger.get_run(&format!("workflow_run_mission_{}_b",mission.mission_id)).unwrap().unwrap();
+        delivered.status = crate::agent_core_contracts::LocalRunStatus::Succeeded;
+        ledger.save_run(&delivered).unwrap();
+        struct Review;
+        impl super::WorkflowStepExecutor for Review {
+            fn execute(&self,p:&super::WorkflowPackage,s:&super::WorkflowStep,i:&serde_json::Value)->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                super::WorkflowStepExecutor::execute(&BoundReview::default(),p,s,i)
+            }
+        }
+        let current = store.get(&mission.mission_id).unwrap();
+        let result = super::dispatch_parallel_wave_with_executor(&store,&options,&current,Some(&Review)).unwrap();
+        let current = store.get(&mission.mission_id).unwrap();
+        assert_eq!(current.tasks[0].status,crate::mission::TaskStatus::Completed,"{result}");
+        assert_eq!(current.tasks[1].status,crate::mission::TaskStatus::Running);
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(),"old b\n");
+        assert_eq!(store.mission_workspace_claims(&mission.mission_id).unwrap().len(),1);
+        assert_eq!(ledger.get_run(&delivered.run_id).unwrap().unwrap().status,crate::agent_core_contracts::LocalRunStatus::Succeeded);
+        let result = super::dispatch_parallel_wave_with_executor(&store,&options,&current,Some(&Review)).unwrap();
+        assert_eq!(store.get(&mission.mission_id).unwrap().status,crate::mission::MissionStatus::Completed,"{result}");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(),"new b\n");
+        assert!(store.mission_workspace_claims(&mission.mission_id).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parallel_workers_overlap_three_real_runners_and_gate_downstream_on_verified_results() {
+        use crate::runtime::process::codex_test_support::Environment;
+        use std::sync::{Condvar,Mutex};
+        use std::time::{Duration,Instant};
+        let _lock=crate::store::paths::test_env_lock();
+        let env=Environment::new();
+        std::env::set_var("HIMIND_AGENT_HOME",env.root.with_extension("parallel-host"));
+        std::fs::write(env.root.join("read.txt"),"immutable input").unwrap();
+        let store=crate::mission::MissionStore::open_default().unwrap();
+        let created=store.create(&serde_json::from_value(json!({"title":"parallel timing fixture",
+            "workspace":{"root":env.root,"read_scope":["read.txt"],"write_scope":[]}})).unwrap()).unwrap();
+        let tasks=["a","b","c","downstream"].iter().map(|id| json!({"id":id,"title":id,
+            "read_paths":["read.txt"],"write_paths":[],"depends_on":if *id=="downstream" {vec!["a","b","c"]}else{vec![]},
+            "acceptance_criteria":["immutable input remains unchanged"],"required_checks":["node -e \"process.exit(0)\""],
+            "execution":{"executor":"personal.codex","role_id":"reviewer"}})).collect::<Vec<_>>();
+        let plan=serde_json::from_value(json!({"summary":"three independent reviews then synthesis","tasks":tasks,
+            "required_acceptance":[],"scheduling":{"max_active_tasks":3},
+            "budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}})).unwrap();
+        let planned=store.propose_plan(&created.mission_id,&plan).unwrap();
+        let ids=["a","b","c","downstream"].map(String::from);
+        let mission=store.confirm_plan(&created.mission_id,&planned.plan_sha256,&ids,&[],&[],&[],"fixture").unwrap();
+        let decision=store.ready_task_batch(&mission.mission_id,&Default::default()).unwrap();
+        assert_eq!(decision.admitted_task_ids,["a","b","c"]);
+        struct Timed<'a> { gate:&'a (Mutex<usize>,Condvar), intervals:&'a Mutex<Vec<(String,Instant,Instant)>>,
+            store:&'a crate::mission::MissionStore, mission_id:&'a str, recorded:&'a std::sync::atomic::AtomicBool }
+        impl super::WorkflowStepExecutor for Timed<'_> {
+            fn execute(&self,_:&super::WorkflowPackage,step:&super::WorkflowStep,_:&serde_json::Value)
+                ->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                let started=Instant::now();
+                let (count,signal)=self.gate;let mut count=count.lock().unwrap();*count+=1;signal.notify_all();
+                let (count,timeout)=signal.wait_timeout_while(count,Duration::from_secs(10),|count|*count<3).unwrap();
+                if timeout.timed_out() && *count<3 {return Err("three execution intervals did not overlap".into());}
+                drop(count);
+                if !self.recorded.swap(true,std::sync::atomic::Ordering::SeqCst) {retain_parallel_snapshot(self.store,self.mission_id,"three-running");}
+                std::thread::sleep(Duration::from_millis(120));
+                self.intervals.lock().unwrap().push((step.id.clone(),started,Instant::now()));
+                Ok(super::WorkflowStepExecution::output(json!({"passed":true})))
+            }
+        }
+        let gate=(Mutex::new(0),Condvar::new());let intervals=Mutex::new(Vec::new());
+        let recorded=std::sync::atomic::AtomicBool::new(false);
+        let outcomes=super::run_parallel_workers(&decision.admitted_task_ids,&|id| {
+            (||->Result<serde_json::Value,Box<dyn std::error::Error>> {
+                let task=&mission.tasks.iter().find(|task|task.spec.id==id).unwrap().spec;
+                let package=super::task_package(&mission.mission_id,&mission.title,task,env.root.to_str().unwrap())?;
+                let runner=crate::workflow::WorkflowRunner::open_default()?;
+                let run=runner.start("fixture",&package,&format!("parallel-{id}"),&json!({}))?;
+                store.begin_task_attempt(&mission.mission_id,id,&run.run_id)?;
+                let files=crate::mission::protected_files(&env.root,task)?;
+                store.append_event(&mission.mission_id,"task_baseline_captured",id,"host timing fixture",
+                    json!({"implementation_run_id":run.run_id,"protected_baseline":{"provenance":"host_before_execution","files":files}}))?;
+                let outcome=runner.run_ready(&package,run,&json!({}),&Timed{gate:&gate,intervals:&intervals,
+                    store:&store,mission_id:&mission.mission_id,recorded:&recorded})?;
+                assert_eq!(outcome.run.status,crate::agent_core_contracts::LocalRunStatus::Succeeded);
+                store.await_task_verification(&mission.mission_id,id,&outcome.run.run_id,"fixture awaits real host checks")?;
+                Ok(json!({"dispatched":true,"run_id":outcome.run.run_id}))
+            })().map_err(|error|error.to_string())
+        });
+        assert!(outcomes.iter().all(Result::is_ok),"{outcomes:?}");
+        let times=intervals.lock().unwrap();assert_eq!(times.len(),3);
+        assert!(times.iter().map(|(_,start,_)|*start).max().unwrap()<times.iter().map(|(_,_,end)|*end).min().unwrap());
+        if let Some(root)=std::env::var_os("HIMIND_TEST_PARALLEL_EVIDENCE") {
+            let first=times.iter().map(|(_,start,_)|*start).min().unwrap();
+            std::fs::write(std::path::Path::new(&root).join("timing.json"),serde_json::to_vec_pretty(&json!({
+                "source":"deterministic integration fixture using real WorkflowRunner and ledger, not installed model execution",
+                "mission_id":mission.mission_id,"intervals":times.iter().map(|(id,start,end)|json!({"task_id":id,
+                    "start_ms":start.duration_since(first).as_millis(),"end_ms":end.duration_since(first).as_millis()})).collect::<Vec<_>>()
+            })).unwrap()).unwrap();
+        }
+        drop(times);
+        assert!(store.ready_task_batch(&mission.mission_id,&Default::default()).unwrap().admitted_task_ids.is_empty());
+        retain_parallel_snapshot(&store,&mission.mission_id,"three-awaiting-review");
+        for id in ["a","b","c"] {
+            let current=store.get(&mission.mission_id).unwrap();
+            let pending=current.tasks.iter().find(|task|task.spec.id==id).unwrap();
+            let result=super::run_verification_with_executor(&store,&current,pending,&BoundReview::default()).unwrap();
+            assert_eq!(result["passed"],true,"{result}");
+            if id!="c" {assert!(!store.ready_task_batch(&mission.mission_id,&Default::default()).unwrap().admitted_task_ids.contains(&"downstream".into()));}
+        }
+        assert_eq!(store.ready_task_batch(&mission.mission_id,&Default::default()).unwrap().admitted_task_ids,["downstream"]);
+        retain_parallel_snapshot(&store,&mission.mission_id,"downstream-ready");
+        let snapshot=store.snapshot(&mission.mission_id,0).unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event|event.event_type=="task_dispatched").count(),3);
+        assert_eq!(snapshot.events.iter().filter(|event|event.event_type=="host_verification_checked" && event.payload["passed"]==true).count(),3);
+    }
+
     #[test]
     fn implementation_prompt_deduplicates_without_feedback_and_preserves_constraints() {
         let original = serde_json::json!({
@@ -1522,6 +2120,61 @@ mod tests {
         let active = store.confirm_plan(&created.mission_id, &planned.plan_sha256, &["work".into()], &[], &[], &[], "fixture").unwrap();
         let package = super::task_package(&active.mission_id, &active.title, &task, root.to_str().unwrap()).unwrap();
         (store, active, task, package)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mission_control_resume_requeues_only_current_user_pauses_without_executing() {
+        use crate::agent_core_contracts::{LocalRunStatus, RunPauseKind};
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock = crate::store::paths::test_env_lock();
+        let env = Environment::new();
+        let (store, mission, task, package) = cli_mission(&env.root);
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let runner = crate::workflow::WorkflowRunner::open_default().unwrap();
+        let run = runner.start("fixture", &package, "paused-current", &json!({})).unwrap();
+        store.begin_task_attempt(&mission.mission_id, &task.id, &run.run_id).unwrap();
+        let paused = runner.pause(run).unwrap();
+        let unrelated = runner.start("fixture", &package, "paused-unbound", &json!({})).unwrap();
+        let unrelated = runner.pause(unrelated).unwrap();
+        store.control(&mission.mission_id, "pause").unwrap();
+        let root = crate::store::paths::agent_home().join("mission-dispatch-locks");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(root.join(format!("{}.lock", mission.mission_id))).unwrap();
+        fs4::fs_std::FileExt::lock_exclusive(&owner).unwrap();
+        assert!(super::control_mission(&mission.mission_id, "resume").is_err());
+        assert_eq!(store.get(&mission.mission_id).unwrap().status, crate::mission::MissionStatus::Waiting);
+        drop(owner);
+        for kind in [RunPauseKind::Approval, RunPauseKind::Feedback, RunPauseKind::External, RunPauseKind::User] {
+            let mut current = ledger.get_run(&paused.run_id).unwrap().unwrap();
+            current.status = LocalRunStatus::Waiting;
+            current.pause_kind = kind;
+            ledger.save_run(&current).unwrap();
+            super::control_mission(&mission.mission_id, "resume").unwrap();
+            let actual = ledger.get_run(&paused.run_id).unwrap().unwrap();
+            assert_eq!(actual.status, if kind == RunPauseKind::User {LocalRunStatus::Queued} else {LocalRunStatus::Waiting});
+            assert_eq!(actual.pause_kind, if kind == RunPauseKind::User {RunPauseKind::None} else {kind});
+            assert!(actual.steps.iter().all(|step| step.status != crate::agent_core_contracts::LocalStepStatus::Running));
+            store.control(&mission.mission_id, "pause").unwrap();
+        }
+        super::control_mission(&mission.mission_id, "resume").unwrap();
+        assert_eq!(ledger.get_run(&unrelated.run_id).unwrap().unwrap().status, LocalRunStatus::Waiting);
+        assert_eq!(store.snapshot(&mission.mission_id, 0).unwrap().events.iter()
+            .filter(|event| event.event_type == "mission_attempt_requeued").count(), 1);
+        // The same path recovers a user-paused independent verifier, retaining
+        // the implementation's claim and without invoking any model.
+        let mut delivered = ledger.get_run(&paused.run_id).unwrap().unwrap();
+        delivered.status = LocalRunStatus::Succeeded;
+        ledger.save_run(&delivered).unwrap();
+        store.await_task_verification(&mission.mission_id, &task.id, &paused.run_id, "delivered").unwrap();
+        let verifier = runner.start("fixture", &package, "paused-verifier", &json!({})).unwrap();
+        store.begin_verification_attempt(&mission.mission_id, &task.id, &verifier.run_id).unwrap();
+        let verifier = runner.pause(verifier).unwrap();
+        store.control(&mission.mission_id, "pause").unwrap();
+        super::control_mission(&mission.mission_id, "resume").unwrap();
+        assert_eq!(ledger.get_run(&verifier.run_id).unwrap().unwrap().status, LocalRunStatus::Queued);
+        assert_eq!(store.get(&mission.mission_id).unwrap().tasks[0].attempt_run_id, paused.run_id);
     }
 
     #[cfg(windows)]

@@ -1840,6 +1840,7 @@ fn main() {
         let package = role_package(&[(
             "software.reviewer",
             super::super::WorkflowRole {
+                optional: false,
                 label: "代码审查".to_string(),
                 brief: "只依据 diff 判断".to_string(),
                 runtime_provider: "himind.fixture".to_string(),

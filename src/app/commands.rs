@@ -8488,6 +8488,59 @@ fn decide_workflow_step(
     Ok(serde_json::to_value(run)?)
 }
 
+/// Generic Workflow clients never own Mission execution, including recovery.
+/// Read the immutable interaction and exact persisted run bindings before any
+/// package loading, feedback mutation, preflight or background acceptance.
+fn workflow_resume_interaction(
+    ledger: &crate::store::local_runs::LocalRunLedger,
+    run: &crate::agent_core_contracts::LocalRun,
+) -> Result<crate::agent_core_contracts::InteractionEnvelope, Box<dyn Error>> {
+    use rusqlite::OptionalExtension;
+
+    let interaction = ledger
+        .get_interaction(&run.interaction_id)?
+        .ok_or("workflow run interaction is missing")?;
+    let workflow_id = interaction.business_context.pointer("/workflow/id")
+        .and_then(Value::as_str).unwrap_or_default();
+    // Namespace identity also protects old/orphaned attempts after their claim
+    // or current task binding is gone. Caller-supplied mission_id alone is not
+    // ownership: ordinary workflows may carry similarly named business data.
+    let host_mission_package = workflow_id.starts_with("com.himind.mission.");
+    let binding = if host_mission_package {
+        None
+    } else {
+        // No Store lookup-by-run API exists. Keep this fallback read-only and
+        // unbounded so legacy bindings cannot escape through a paged UI list.
+        let path = crate::store::paths::agent_home().join("mission-runs.sqlite3");
+        if path.try_exists()? {
+            let connection = rusqlite::Connection::open_with_flags(
+                path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            connection.busy_timeout(Duration::from_secs(30))?;
+            connection.query_row(
+                "SELECT mission_id, task_id FROM mission_tasks
+                 WHERE attempt_run_id=?1 OR verification_run_id=?1
+                 UNION ALL SELECT mission_id, task_id FROM mission_workspace_claims
+                 WHERE run_id=?1 LIMIT 1",
+                [&run.run_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()?
+        } else { None }
+    };
+    if host_mission_package || binding.is_some() {
+        let (mission_id, task_id) = binding.unwrap_or_else(|| (
+            interaction.business_context.pointer("/input/mission_id")
+                .and_then(Value::as_str).unwrap_or_default().to_string(),
+            interaction.business_context.pointer("/input/task_id")
+                .and_then(Value::as_str).unwrap_or_default().to_string(),
+        ));
+        return Err(format!(
+            "Mission-owned LocalRun {} ({mission_id}/{task_id}) cannot execute through generic Workflow resume or feedback. 请在 Mission 页面继续，由 Mission 调度器检查状态、占用和授权后执行；暂停的 Mission 使用 mission.control resume，审查意见使用 mission.feedback.submit。",
+            run.run_id,
+        ).into());
+    }
+    Ok(interaction)
+}
+
 pub(crate) fn resume_workflow_with_gateway(
     gateway: CapabilityGateway,
     run_id: &str,
@@ -8497,9 +8550,7 @@ pub(crate) fn resume_workflow_with_gateway(
     let run = ledger
         .get_run(run_id)?
         .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
-    let interaction = ledger
-        .get_interaction(&run.interaction_id)?
-        .ok_or("workflow run interaction is missing")?;
+    let interaction = workflow_resume_interaction(&ledger, &run)?;
     let mut input = interaction
         .business_context
         .get("input")
@@ -8677,6 +8728,7 @@ pub(crate) fn schedule_resume_workflow_with_gateway(
     let run = ledger
         .get_run(run_id)?
         .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    workflow_resume_interaction(&ledger, &run)?;
     let thread_run_id = run_id.to_string();
     let thread_feedback = feedback.map(str::to_string);
     thread::Builder::new()
@@ -9901,6 +9953,180 @@ pub(crate) async fn validate_workspace_registry() -> Result<serde_json::Value, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WorkflowResumeHome {
+        root: PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl WorkflowResumeHome {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("workflow-resume-owner-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&root).unwrap();
+            let previous = std::env::var_os("HIMIND_AGENT_HOME");
+            std::env::set_var("HIMIND_AGENT_HOME", &root);
+            Self { root, previous }
+        }
+
+        fn gateway(&self) -> CapabilityGateway {
+            let mut options = Options::from_env();
+            options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())))
+        }
+    }
+
+    impl Drop for WorkflowResumeHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+                None => std::env::remove_var("HIMIND_AGENT_HOME"),
+            }
+        }
+    }
+
+    fn workflow_resume_package(id: &str) -> crate::workflow::WorkflowPackage {
+        serde_json::from_value(json!({
+            "schema_version":"workflow_package.v1", "id":id, "version":"1.0.0",
+            "name":"Resume owner fixture", "min_agent_version":"0.3.0",
+            "capabilities":["system.health"],
+            "steps":[{"id":"HEALTH", "title":"Health", "kind":"capability",
+                "capability_id":"system.health", "execution_mode":"sync", "risk_level":"read_only"}],
+            "ui":{"mode":"standard"}
+        })).unwrap()
+    }
+
+    fn install_workflow_resume_package(root: &Path, package: &crate::workflow::WorkflowPackage) -> crate::workflow::WorkflowPackage {
+        let source = root.join(&package.id);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("workflow.json"), serde_json::to_vec(package).unwrap()).unwrap();
+        crate::workflow::WorkflowStore::open_default().unwrap().install_from_directory(&source).unwrap().package
+    }
+
+    fn assert_workflow_resume_rejected(
+        gateway: &CapabilityGateway,
+        ledger: &crate::store::local_runs::LocalRunLedger,
+        run: &crate::agent_core_contracts::LocalRun,
+    ) {
+        let before_run = serde_json::to_value(ledger.get_run(&run.run_id).unwrap()).unwrap();
+        let before_events = serde_json::to_value(ledger.list_events(&run.run_id).unwrap()).unwrap();
+        let before_interaction = serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap();
+        for feedback in [None, Some("change scope and continue")] {
+            for scheduled in [false, true] {
+                let result = if scheduled {
+                    schedule_resume_workflow_with_gateway(gateway.clone(), &run.run_id, feedback)
+                } else {
+                    resume_workflow_with_gateway(gateway.clone(), &run.run_id, feedback)
+                };
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Mission-owned LocalRun"), "{error}");
+                assert!(error.contains("mission.control") && error.contains("mission.feedback.submit"), "{error}");
+            }
+        }
+        assert_eq!(serde_json::to_value(ledger.get_run(&run.run_id).unwrap()).unwrap(), before_run);
+        assert_eq!(serde_json::to_value(ledger.list_events(&run.run_id).unwrap()).unwrap(), before_events);
+        assert_eq!(serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap(), before_interaction);
+    }
+
+    #[test]
+    fn workflow_resume_rejects_mission_packages_even_without_current_claims() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = WorkflowResumeHome::new();
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let runner = crate::workflow::WorkflowRunner::with_ledger(ledger.clone());
+        let gateway = env.gateway();
+        // Opaque request ids and missing business input cannot turn a host
+        // implementation or saved verifier into an ordinary Workflow run.
+        for (index, id) in ["com.himind.mission.fixture", "com.himind.mission.verify.fixture"].iter().enumerate() {
+            // Install an executable package: rejection cannot be attributed to
+            // missing package metadata or an unavailable Runtime provider.
+            let package = install_workflow_resume_package(&env.root, &workflow_resume_package(id));
+            let input = if index == 0 {json!({"mission_id":"fixture", "task_id":"work"})} else {json!({})};
+            let run = runner.start("local-agent", &package, &format!("opaque-{index}"), &input).unwrap();
+            let paused = runner.pause(run).unwrap();
+            assert_workflow_resume_rejected(&gateway, &ledger, &paused);
+            // The safe user-pause operation only requeues. Generic execution
+            // must still be rejected afterwards, which reproduces the bypass.
+            let queued = resume_paused_workflow_run(paused.run_id.clone()).unwrap();
+            assert_eq!(queued["status"], "queued");
+            let run = ledger.get_run(&paused.run_id).unwrap().unwrap();
+            assert_workflow_resume_rejected(&gateway, &ledger, &run);
+            let canceled = runner.cancel(run, "fixture canceled").unwrap();
+            assert_workflow_resume_rejected(&gateway, &ledger, &canceled);
+        }
+        assert!(!env.root.join("mission-runs.sqlite3").exists());
+    }
+
+    #[test]
+    fn workflow_resume_rejects_exact_mission_bindings_with_legacy_package_identity() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = WorkflowResumeHome::new();
+        let store = crate::mission::MissionStore::open_default().unwrap();
+        let created = store.create(&serde_json::from_value(json!({"title":"Resume owner",
+            "workspace":{"root":env.root, "read_scope":["."], "write_scope":[]}})).unwrap()).unwrap();
+        let proposal = serde_json::from_value(json!({"summary":"Read-only task", "tasks":[{
+            "id":"work", "title":"Inspect", "read_paths":["."], "write_paths":[],
+            "acceptance_criteria":["evidence"], "required_checks":["node --test"],
+            "execution":{"executor":"himind.builtin", "role_id":"reviewer"}}],
+            "required_acceptance":[], "budget":{"max_rounds":8, "max_minutes":10, "max_repair_attempts":2}})).unwrap();
+        let planned = store.propose_plan(&created.mission_id, &proposal).unwrap();
+        let mission = store.confirm_plan(&created.mission_id, &planned.plan_sha256,
+            &["work".into()], &[], &[], &[], "fixture").unwrap();
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let runner = crate::workflow::WorkflowRunner::with_ledger(ledger.clone());
+        let package = workflow_resume_package("com.example.legacy-worker");
+        let gateway = env.gateway();
+        let implementation = runner.start("local-agent", &package, "opaque-implementation", &json!({})).unwrap();
+        store.begin_task_attempt(&mission.mission_id, "work", &implementation.run_id).unwrap();
+        let before = store.snapshot(&mission.mission_id, 0).unwrap();
+        assert_workflow_resume_rejected(&gateway, &ledger, &implementation);
+        assert_eq!(store.snapshot(&mission.mission_id, 0).unwrap(), before);
+        assert_eq!(store.attempt_workspace(&implementation.run_id).unwrap(), Some(mission.workspace.root.clone()));
+        store.await_task_verification(&mission.mission_id, "work", &implementation.run_id, "fixture").unwrap();
+        let verifier = runner.start("local-agent", &package, "opaque-verifier", &json!({})).unwrap();
+        store.begin_verification_attempt(&mission.mission_id, "work", &verifier.run_id).unwrap();
+        let before = store.snapshot(&mission.mission_id, 0).unwrap();
+        assert_workflow_resume_rejected(&gateway, &ledger, &verifier);
+        assert_eq!(store.snapshot(&mission.mission_id, 0).unwrap(), before);
+        assert_eq!(store.attempt_workspace(&implementation.run_id).unwrap(), Some(mission.workspace.root.clone()));
+
+        // A real Mission id in unrelated business data is insufficient to
+        // reserve this run. Preserve ordinary Workflow recovery semantics.
+        let ordinary = runner.start("local-agent", &package, "unrelated", &json!({
+            "mission_id":mission.mission_id, "task_id":"work"})).unwrap();
+        assert!(workflow_resume_interaction(&ledger, &ordinary).is_ok());
+    }
+
+    #[test]
+    fn workflow_resume_preserves_ordinary_execution_and_loop_feedback() {
+        let _lock = crate::store::paths::test_env_lock();
+        let env = WorkflowResumeHome::new();
+        let mut package = workflow_resume_package("com.example.resume-test");
+        // Its explicit empty properties also filter the workflow_context that
+        // preflight/runner inject even when the business input is empty.
+        let mut body = package.steps[0].clone();
+        body.capability_id = "schedule.list".into();
+        package.capabilities = vec![body.capability_id.clone()];
+        package.steps = serde_json::from_value(json!([{
+            "id":"REVIEW", "title":"Review loop", "kind":"loop", "risk_level":"read_only",
+            "execution_mode":"long_running", "loop":{"max_iterations":2, "pause_for_feedback":true,
+                "exit_when":{"operator":"equals", "path":"loops.REVIEW.iteration", "value":2},
+                "steps":[body]}
+        }])).unwrap();
+        let package = install_workflow_resume_package(&env.root, &package);
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
+        let runner = crate::workflow::WorkflowRunner::with_ledger(ledger.clone());
+        let input = json!({});
+        let run = runner.start("local-agent", &package, "ordinary-loop", &input).unwrap();
+        let gateway = env.gateway();
+        let waiting = resume_workflow_with_gateway(gateway.clone(), &run.run_id, None).unwrap();
+        assert_eq!(waiting["run"]["status"], "waiting");
+        let result = resume_workflow_with_gateway(gateway, &run.run_id, Some("continue ordinary loop")).unwrap();
+        assert_eq!(result["run"]["status"], "succeeded");
+        assert!(ledger.list_events(&run.run_id).unwrap().iter().any(|event|
+            event.event_type == crate::agent_core_contracts::RuntimeEventType::QuestionResolved
+                && event.payload["feedback"] == "continue ordinary loop"));
+        assert!(!env.root.join("mission-runs.sqlite3").exists());
+    }
 
     #[test]
     fn run_status_keys_stay_in_one_vocabulary() {

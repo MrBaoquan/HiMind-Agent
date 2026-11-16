@@ -34,6 +34,18 @@ impl CheckRuntimeResources {
         )
     }
 
+    /// An isolated implementation and its integrated-source review are distinct
+    /// workspace generations. Keep the existing source allocation pinned and
+    /// give the host-created execution workspace its own cache allocation.
+    pub(crate) fn prepare_isolated(workspace: &Path, mission_id: &str, task_id: &str) -> Result<Self, Box<dyn Error>> {
+        let workspace=canonical_directory(workspace)?;
+        let home=crate::store::paths::agent_home();
+        let key=format!("{:x}",Sha256::digest(workspace.to_string_lossy().as_bytes()));
+        Self::prepare_in(&workspace,mission_id,task_id,
+            &home.join("cache/mission-isolated-checks").join(&key[..16]),
+            None)
+    }
+
     fn prepare_in(
         workspace: &Path,
         mission_id: &str,

@@ -185,7 +185,9 @@ pub(crate) fn mission_assignment_options_sync(mission_id: &str) -> Result<Missio
         .iter()
         .find(|option| option.executor == "himind.builtin" && option.available)
         .or_else(|| allowed_executors.iter().find(|option| option.available));
-    let experts = crate::expert::list().map_err(|error| error.to_string())?;
+    let experts = crate::expert::list_versions().map_err(|error| error.to_string())?;
+    let recommendation = crate::mission::team::recommend_team(&mission.objective,
+        &crate::expert::list_team_candidates().map_err(|error| error.to_string())?);
     let role_definitions = mission_workflow_role_definitions(&package);
     let mut roles = role_definitions.into_iter().map(|(role_id, (label, brief, role_executor, role_model))| {
         let recommended_executor = if role_executor.trim().is_empty() {
@@ -213,6 +215,9 @@ pub(crate) fn mission_assignment_options_sync(mission_id: &str) -> Result<Missio
             None => ("unavailable".to_string(), format!("执行器未安装：{recommended_executor}")),
         };
         MissionRoleOption {
+            optional: package.roles.get(&role_id).is_some_and(|role| role.optional),
+            recommended_expert: recommendation.roles.iter().find(|item| item.role_id == role_id).map(|item| item.expert.clone()),
+            recommendation_reason: recommendation.roles.iter().find(|item| item.role_id == role_id).map(|item| item.reason.clone()).unwrap_or_default(),
             role_id, label, brief, recommended_executor,
             recommended_service_id, recommended_model, model_override_supported,
             availability, unavailable_reason,
@@ -220,9 +225,16 @@ pub(crate) fn mission_assignment_options_sync(mission_id: &str) -> Result<Missio
     }).collect::<Vec<_>>();
     roles.sort_by(|left, right| left.role_id.cmp(&right.role_id));
     Ok(MissionAssignmentOptions {
+        recommendation_warnings: recommendation.warnings,
         workflow_id: pin.workflow_id.clone(), workflow_version: pin.workflow_version.clone(),
         workflow_sha256: digest, roles, experts, executors: allowed_executors, source: "workflow".to_string(),
     })
+}
+
+#[tauri::command]
+pub(crate) async fn create_mission_intent(input: crate::mission::entry::MissionIntentInput) -> Result<MissionView, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::mission::entry::create(&input).map_err(|error| error.to_string()))
+        .await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -462,22 +474,52 @@ pub(crate) async fn generate_mission_plan(
     options: tauri::State<'_, crate::app::commands::AgentState>,
 ) -> Result<MissionView, String> {
     let options = options.options.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || generate_mission_plan_sync(&options, &mission_id, None))
+        .await.map_err(|error| error.to_string())?
+}
+
+pub(crate) fn generate_mission_plan_sync(options: &crate::Options, mission_id: &str, expected_revision: Option<u64>) -> Result<MissionView, String> {
+    generate_mission_plan_with(mission_id, expected_revision, |mission| {
+        // Prefer the team's explicitly chosen HiMind service for coordination.
+        // CLI-only teams retain the existing profile's planning service; this
+        // never changes their worker bindings or grants execution permission.
+        let model=mission.assignment.as_ref().and_then(|assignment|assignment.roles.iter()
+            .find(|role|role.executor=="himind.builtin" && !role.model.trim().is_empty())).map(|role|role.model.as_str());
+        let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home(
+            options, &mission.workspace.root, &crate::mission::plan_prompt(mission), 240, true,
+            &format!("mission-plan-{}-{}", mission_id, mission.plan_revision), "PLAN", model,
+            crate::runtime::deepseek_harness::WorkflowAccess::Read, &|| Ok(false),
+        ).map_err(|error| error.to_string())?;
+        Ok(outcome.text)
+    })
+}
+
+fn generate_mission_plan_with(mission_id: &str, expected_revision: Option<u64>, generate: impl FnOnce(&MissionView)->Result<String,String>) -> Result<MissionView, String> {
+    (|| -> Result<MissionView, Box<dyn std::error::Error>> {
+        use fs4::fs_std::FileExt;
+        crate::mission::require_id("mission_id", mission_id)?;
+        let lock_root=crate::store::paths::agent_home().join("mission-dispatch-locks");
+        fs::create_dir_all(&lock_root)?;
+        let lock=fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(lock_root.join(format!("{mission_id}.plan.lock")))?;
+        if !lock.try_lock_exclusive()? {return Err("该任务正在生成计划，请查询同一草案，不重复发起".into());}
         let store = MissionStore::open_default().map_err(|error| error.to_string())?;
         let mission = store.get(&mission_id).map_err(|error| error.to_string())?;
+        if expected_revision.is_some_and(|revision|revision!=mission.plan_revision) {return Err("计划版本已变化，请读取最新任务后重试".into());}
         if !matches!(mission.status, crate::mission::MissionStatus::Draft | crate::mission::MissionStatus::Planned | crate::mission::MissionStatus::AwaitingConfirmation) {
-            return Err("当前 Mission 状态不允许重新生成计划".to_string());
+            return Err("当前 Mission 状态不允许重新生成计划".into());
         }
-        let prompt = crate::mission::plan_prompt(&mission);
-        let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home(
-            &options, &mission.workspace.root, &prompt, 240, true,
-            &format!("mission-plan-{}", mission_id), "PLAN", None,
-            crate::runtime::deepseek_harness::WorkflowAccess::Read,
-            &|| Ok(false),
-        ).map_err(|error| error.to_string())?;
-        let proposal = parse_plan_json(&outcome.text)?;
-        store.propose_plan(&mission_id, &proposal).map_err(|error| error.to_string())
-    }).await.map_err(|error| error.to_string())?
+        let response=generate(&mission)?;
+        let current=store.get(mission_id)?;
+        if current.plan_revision!=mission.plan_revision || current.assignment!=mission.assignment || current.workspace!=mission.workspace {
+            return Err("生成期间计划、团队指派或访问意图已改变，未保存过时计划".into());
+        }
+        let mut proposal = parse_plan_json(&response)?;
+        // The generated proposal is reviewed with this scheduling intent in its
+        // hash. Imported old plans are never silently upgraded to concurrency.
+        proposal.scheduling.get_or_insert_with(Default::default);
+        store.propose_plan_for_snapshot(&mission, &proposal)
+    })().map_err(|error|error.to_string())
 }
 
 #[tauri::command]
@@ -646,6 +688,40 @@ fn follow_up_review_context(mission: &MissionView, target: &crate::mission::Miss
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_plan_generation_remains_unconfirmed_and_rejects_stale_or_concurrent_changes() {
+        let _lock=crate::store::paths::test_env_lock();
+        let env=crate::runtime::process::codex_test_support::Environment::new();
+        std::env::set_var("HIMIND_AGENT_HOME",env.root.join("host"));
+        let store=MissionStore::open_default().unwrap();
+        let create=||store.create(&serde_json::from_value(serde_json::json!({"title":"plan control fixture",
+            "workspace":{"root":env.root,"read_scope":["."],"write_scope":[]}})).unwrap()).unwrap();
+        let mission=create();
+        let response=serde_json::json!({"summary":"review","tasks":[{"id":"inspect","title":"Inspect",
+            "read_paths":["."],"write_paths":[],"acceptance_criteria":["evidence"],"required_checks":["node --test"],
+            "execution":{"executor":"personal.codex","role_id":"reviewer"}}],"required_acceptance":[],
+            "budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}}).to_string();
+        let planned=generate_mission_plan_with(&mission.mission_id,Some(0), |_|Ok(response.clone())).unwrap();
+        assert_eq!(planned.status,crate::mission::MissionStatus::AwaitingConfirmation);
+        assert!(planned.confirmation.is_none() && planned.tasks.is_empty());
+        assert_eq!(planned.scheduling.as_ref().unwrap().max_active_tasks,3);
+        assert!(generate_mission_plan_with(&mission.mission_id,Some(0), |_|panic!("stale request must not call the model")).is_err());
+        let next=create();let revision=next.plan_revision;
+        let error=generate_mission_plan_with(&next.mission_id,Some(revision), |_| {
+            store.control(&next.mission_id,"cancel").unwrap();Ok(response.clone())
+        }).unwrap_err();
+        assert!(error.contains("changed") || error.contains("改变"),"{error}");
+        assert_eq!(store.get(&next.mission_id).unwrap().status,crate::mission::MissionStatus::Canceled);
+        let third=create();
+        let result=generate_mission_plan_with(&third.mission_id,Some(0), |_| {
+            assert!(generate_mission_plan_with(&third.mission_id,Some(0), |_|panic!("duplicate call must not reach model")).is_err());
+            Ok(response)
+        }).unwrap();
+        assert_eq!(result.plan_revision,1);
+        assert!(generate_mission_plan_with("../outside",None, |_|panic!()).is_err());
+    }
 
     #[test]
     fn mission_feedback_follow_up_prompt_contains_only_bound_json_observations() {

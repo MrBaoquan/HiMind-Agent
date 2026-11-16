@@ -266,6 +266,31 @@ impl MissionStore {
         input: &MissionHandoffInput,
         workflows: &crate::workflow::WorkflowStore,
     ) -> Result<MissionView, Box<dyn Error>> {
+        self.create_handoff_with_fingerprint(input, workflows, None)
+    }
+
+    /// Intent entry fingerprints the user's request before deriving a team.
+    /// A retry retains its original pinned definition even if the catalog changes.
+    pub(crate) fn handoff_replay(&self, key: &str, fingerprint: &str) -> Result<Option<MissionView>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let existing = connection.query_row(
+            "SELECT mission_id, handoff_json FROM mission_runs WHERE idempotency_key = ?1",
+            params![key.trim()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()?;
+        match existing {
+            Some((id, raw)) => {
+                let handoff: MissionHandoff = serde_json::from_str(&raw)?;
+                if handoff.request_sha256 != fingerprint { return Err("idempotency key was already used by a different handoff request".into()); }
+                Ok(Some(self.get(&id)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn create_handoff_with_fingerprint(
+        &self, input: &MissionHandoffInput, workflows: &crate::workflow::WorkflowStore,
+        intent_fingerprint: Option<&str>,
+    ) -> Result<MissionView, Box<dyn Error>> {
         validate_handoff_input(input)?;
         // A handoff must name an exact installed artifact. The host, not the
         // source client, proves the version/digest relationship before storing it.
@@ -274,7 +299,10 @@ impl MissionStore {
             &input.workflow.workflow_version,
             &input.workflow.workflow_sha256,
         )?;
-        let request_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(input)?));
+        let request_sha256 = match intent_fingerprint {
+            Some(value) => { require_sha256(value)?; value.to_string() },
+            None => format!("{:x}", Sha256::digest(serde_json::to_vec(input)?)),
+        };
         let mission_id = new_mission_id();
         let now = now_stamp();
         let handoff = MissionHandoff {
@@ -386,7 +414,10 @@ impl MissionStore {
                 .map(str::to_string).collect::<BTreeSet<_>>()
         } else { package.roles.keys().cloned().collect::<BTreeSet<_>>() };
         let assigned_roles = input.roles.iter().map(|role| role.role_id.clone()).collect::<BTreeSet<_>>();
-        if assigned_roles != allowed_roles {
+        let required_roles = if package.roles.is_empty() { allowed_roles.clone() } else {
+            package.roles.iter().filter(|(_, role)| !role.optional).map(|(id, _)| id.clone()).collect::<BTreeSet<_>>()
+        };
+        if !assigned_roles.is_subset(&allowed_roles) || !required_roles.is_subset(&assigned_roles) {
             return Err("assignment must cover every role declared by the pinned workflow".into());
         }
         if input.roles.iter().any(|role| !package.accepts_provider(&role.executor)) {
@@ -800,12 +831,20 @@ impl MissionStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mission_id, task_id, run_id FROM mission_workspace_claims WHERE workspace_key = ?1",
+                "SELECT mission_id, task_id, run_id FROM mission_workspace_claims WHERE source_key = ?1 OR workspace_key = ?1 ORDER BY acquired_at, run_id LIMIT 1",
                 params![workspace_claim_key(workspace_root)],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Snapshot all owners; recovery must not stop at the first parallel claim.
+    pub(crate) fn mission_workspace_claims(&self, mission_id: &str) -> Result<Vec<(String,String)>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT task_id, run_id FROM mission_workspace_claims WHERE mission_id=?1 ORDER BY acquired_at, run_id")?;
+        let rows = statement.query_map([mission_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>,_>>()?)
     }
 
     pub(crate) fn propose_plan(
@@ -814,6 +853,11 @@ impl MissionStore {
         proposal: &MissionPlanProposal,
     ) -> Result<MissionView, Box<dyn Error>> {
         let mission = self.get(mission_id)?;
+        self.propose_plan_for_snapshot(&mission, proposal)
+    }
+
+    pub(crate) fn propose_plan_for_snapshot(&self, mission: &MissionView, proposal: &MissionPlanProposal) -> Result<MissionView, Box<dyn Error>> {
+        let mission_id = &mission.mission_id;
         validate_proposal(proposal)?;
         let assigned = if mission.workflow.is_some() {
             let assignment = mission.assignment.as_ref().ok_or("mission roles must be assigned before planning")?;
@@ -843,6 +887,12 @@ impl MissionStore {
         let now = now_stamp();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current=load_mission(&transaction,mission_id)?.ok_or("mission missing")?;
+        if current.plan_revision!=mission.plan_revision || current.plan_sha256!=mission.plan_sha256
+            || current.status!=mission.status || current.assignment!=mission.assignment || current.workspace!=mission.workspace
+            || current.confirmation!=mission.confirmation || current.tasks.iter().any(|task|matches!(task.status,TaskStatus::Running|TaskStatus::AwaitingVerification)) {
+            return Err("mission changed while preparing the plan; read the current revision before retrying".into());
+        }
         transaction.execute(
             "UPDATE mission_runs SET status = ?2, plan_revision = ?3,
                 plan_sha256 = ?4, plan_json = ?5, confirmation_json = NULL,
@@ -1727,6 +1777,18 @@ impl MissionStore {
         })
     }
 
+    pub(crate) fn record_scheduling_wait(&self, mission_id: &str, decision: &super::parallel::ReadySet) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission missing")?;
+        if mission.status != MissionStatus::Active { return Ok(()); }
+        let payload=serde_json::json!({"plan_sha256":mission.plan_sha256,"scheduling":decision});
+        let previous=decision_event(&tx,"mission_id=?1 AND event_type='parallel_wave_waiting'",[mission_id],true)?;
+        if previous.is_some_and(|event|event.payload==payload) {return Ok(());}
+        append_event_tx(&tx,mission_id,"parallel_wave_waiting","","等待依赖、执行名额或资源释放；未启动新的工作",payload,&now_stamp())?;
+        tx.commit()?;Ok(())
+    }
+
     /// Record one run's usage exactly once and return the accumulated mission
     /// usage. The event id is the LocalRun id, so retrying dispatch after a
     /// restart cannot double-charge a token or cost budget.
@@ -1825,6 +1887,12 @@ impl MissionStore {
         task_id: &str,
         run_id: &str,
     ) -> Result<MissionView, Box<dyn Error>> {
+        self.begin_task_attempt_in_workspace(mission_id, task_id, run_id, None)
+    }
+
+    pub(crate) fn begin_task_attempt_in_workspace(
+        &self, mission_id: &str, task_id: &str, run_id: &str, execution_root: Option<&str>,
+    ) -> Result<MissionView, Box<dyn Error>> {
         require_id("task_id", task_id)?;
         require_id("run_id", run_id)?;
         let mission = self.get(mission_id)?;
@@ -1850,8 +1918,8 @@ impl MissionStore {
         )?;
         if status == TaskStatus::Running.as_str() && bound_run == run_id {
             let claim: Option<(String, String, String)> = transaction.query_row(
-                "SELECT mission_id, task_id, run_id FROM mission_workspace_claims WHERE workspace_key = ?1",
-                params![workspace_key],
+                "SELECT mission_id, task_id, run_id FROM mission_workspace_claims WHERE run_id = ?1 AND (source_key = ?2 OR workspace_key = ?2)",
+                params![run_id, workspace_key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).optional()?;
             if claim.as_ref().is_some_and(|(claimed_mission, claimed_task, claimed_run)| {
@@ -1868,8 +1936,9 @@ impl MissionStore {
         let current = load_mission(&transaction, mission_id)?.ok_or("mission missing")?;
         if let Some(reason) = budget_exhaustion_reason_on(&transaction, &current)? { return Err(reason.into()); }
         let active_claim: Option<(String, String)> = transaction.query_row(
-            "SELECT mission_id, task_id FROM mission_workspace_claims WHERE workspace_key = ?1",
-            params![workspace_key],
+            "SELECT mission_id, task_id FROM mission_workspace_claims WHERE (source_key = ?1 OR workspace_key = ?1)
+                AND (?2 = 0 OR mission_id <> ?3) LIMIT 1",
+            params![workspace_key, current.scheduling.is_some() as i64, mission_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         if let Some((claimed_mission, claimed_task)) = active_claim {
@@ -1877,10 +1946,34 @@ impl MissionStore {
                 "workspace already has an active mission attempt: {claimed_mission}/{claimed_task}"
             ).into());
         }
+        if current.scheduling.is_some() {
+            if let Some((holder,name))=external_resource_conflict_on(&transaction,&current,task_id)? {
+                return Err(format!("named resource {name} is occupied by {holder}").into());
+            }
+            let mut claims = scheduling_claims_on(&transaction, &current)?;
+            if let Some(root) = execution_root.filter(|root| workspace_claim_key(root) != workspace_key) {
+                claims.entry(task_id.to_string()).or_default().workspace = super::parallel::TaskWorkspace::Isolated { root: root.to_string() };
+            }
+            let mut tasks = current.tasks.clone();
+            for task in &mut tasks {
+                if task.spec.id != task_id && matches!(task.status, TaskStatus::Ready | TaskStatus::Blocked) { task.status = TaskStatus::Proposed; }
+            }
+            let decision = super::parallel::ready_set(&tasks, &current.workspace.root, &claims,
+                super::parallel::ParallelPolicy { max_active_tasks: effective_parallel_limit(&current) })?;
+            if !decision.admitted_task_ids.iter().any(|id| id == task_id) { return Err(format!("task {task_id} is waiting for verified dependencies, capacity or resources: {:?}", decision.waiting).into()); }
+            let task = current.tasks.iter().find(|task| task.spec.id == task_id).ok_or("task missing")?;
+            let executor_limit = current.scheduling.as_ref().and_then(|policy| policy.executor_limits.get(&task.spec.execution.executor))
+                .copied().unwrap_or(effective_parallel_limit(&current));
+            if current.tasks.iter().filter(|other| super::parallel::holds_resources(other.status)
+                && other.spec.execution.executor == task.spec.execution.executor).count() >= executor_limit {
+                return Err("executor session capacity is currently occupied".into());
+            }
+        }
+        let claim_key = if current.scheduling.is_some() { format!("attempt:{run_id}") } else { workspace_key.clone() };
         transaction.execute(
-            "INSERT INTO mission_workspace_claims(workspace_key, mission_id, task_id, run_id, acquired_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![workspace_key, mission_id, task_id, run_id, now],
+            "INSERT INTO mission_workspace_claims(workspace_key, mission_id, task_id, run_id, acquired_at, source_key, execution_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![claim_key, mission_id, task_id, run_id, now, workspace_key, execution_root.unwrap_or(&current.workspace.root)],
         )?;
         let changed = transaction.execute(
             "UPDATE mission_tasks SET status = ?3, attempt_run_id = ?4, updated_at = ?5
@@ -2082,6 +2175,13 @@ impl MissionStore {
         if mission.tasks.iter().any(|child| child.spec.repair_of == task_id && child.status != TaskStatus::Canceled) {
             return Err("recheck the latest repair task instead of its ancestor".into());
         }
+        let source_key = workspace_claim_key(&mission.workspace.root);
+        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
+            WHERE source_key=?1 OR workspace_key=?1)", [&source_key], |row| row.get(0))?;
+        if occupied { return Err("workspace already has an active mission attempt; wait before rechecking".into()); }
+        if let Some((holder, name)) = external_resource_conflict_on(&tx, &mission, task_id)? {
+            return Err(format!("named resource {name} is occupied by {holder}").into());
+        }
         let (_, baseline_event) = verification_events_for_run(&tx, mission_id, task_id, &task.attempt_run_id)?;
         let prior_baseline = baseline_event.and_then(|event| event.payload.get("protected_baseline").cloned());
         let baseline = if let Some(baseline) = prior_baseline {
@@ -2104,13 +2204,20 @@ impl MissionStore {
             serde_json::json!({"provenance": "source_client_pre_run_attestation", "source": source,
                 "files": source.files, "imported_at": now_stamp()})
         };
-        let current = super::protected_files(std::path::Path::new(&mission.workspace.root), &task.spec)?;
+        let integration = decision_event(&tx,"mission_id=?1 AND task_id=?2 AND event_type='task_candidate_integrated'
+            AND json_extract(payload_json,'$.run_id')=?3",params![mission_id,task_id,task.attempt_run_id],true)?;
+        let protection_task = super::baseline_protection_task(&mission, &task.spec, &task.attempt_run_id,
+            &baseline, integration.as_ref().map(|event| &event.payload))?;
+        let current = super::protected_files(std::path::Path::new(&mission.workspace.root), &protection_task)?;
         if baseline["files"] != current {
             return Err("protected files differ from the baseline or the baseline does not cover the read-only scope".into());
         }
         let now = now_stamp();
-        tx.execute("INSERT INTO mission_workspace_claims (workspace_key, mission_id, task_id, run_id, acquired_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)", params![workspace_claim_key(&mission.workspace.root), mission_id, task_id, task.attempt_run_id, now])?;
+        let claim_key = if mission.scheduling.is_some() { format!("attempt:{}", task.attempt_run_id) } else { source_key.clone() };
+        // A recheck reads the integrated source candidate, never the original
+        // isolated implementation directory. Keep its source ownership explicit.
+        tx.execute("INSERT INTO mission_workspace_claims (workspace_key, mission_id, task_id, run_id, acquired_at, source_key, execution_root)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![claim_key, mission_id, task_id, task.attempt_run_id, now, source_key, mission.workspace.root])?;
         tx.execute("UPDATE mission_tasks SET status = 'awaiting_verification', verification_run_id = '',
             verification_passed = NULL, updated_at = ?3 WHERE mission_id = ?1 AND task_id = ?2", params![mission_id, task_id, now])?;
         tx.execute("UPDATE mission_runs SET status = 'active', updated_at = ?2 WHERE mission_id = ?1", params![mission_id, now])?;
@@ -2190,6 +2297,8 @@ impl MissionStore {
             params![mission_id, task_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
+        assert_verification_ownership_on(&transaction, &mission, task_id, &bound_run)?;
         if status == TaskStatus::AwaitingVerification.as_str() && bound_verification_run == run_id {
             transaction.commit()?;
             return self.get(mission_id);
@@ -2203,10 +2312,6 @@ impl MissionStore {
         if !bound_verification_run.trim().is_empty() {
             return Err(format!("task {task_id} already has verification run {bound_verification_run}").into());
         }
-        let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
-        if mission.status != MissionStatus::Active || !owned_pending_verification_on(&transaction, &mission)? {
-            return Err("verification admission requires an active confirmed plan and its current workspace claim".into());
-        }
         transaction.execute(
             "UPDATE mission_tasks SET verification_run_id = ?3, updated_at = ?4
              WHERE mission_id = ?1 AND task_id = ?2",
@@ -2219,6 +2324,16 @@ impl MissionStore {
         )?;
         transaction.commit()?;
         self.get(mission_id)
+    }
+
+    /// Checks before even observer checks touch the delivery candidate. The
+    /// same gate is repeated when admitting/replaying the reviewer and saving a
+    /// positive result; an old LocalRun id is not proof of current ownership.
+    pub(crate) fn assert_verification_ownership(&self, mission_id: &str, task_id: &str, implementation_run_id: &str)
+        -> Result<(), Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = load_mission(&connection, mission_id)?.ok_or("mission not found")?;
+        assert_verification_ownership_on(&connection, &mission, task_id, implementation_run_id)
     }
 
     pub(crate) fn record_verification_result(
@@ -2281,9 +2396,7 @@ impl MissionStore {
         }
         if passed {
             let mission = load_mission(&transaction, mission_id)?.ok_or("mission missing")?;
-            if mission.status != MissionStatus::Active || mission.confirmation.as_ref()
-                .is_none_or(|confirmation| confirmation.plan_sha256 != mission.plan_sha256)
-            { return Err("verification has no active confirmed plan".into()); }
+            assert_verification_ownership_on(&transaction, &mission, task_id, implementation_run_id)?;
             let evidence: Option<String> = transaction.query_row(
                 "SELECT payload_json FROM mission_events WHERE mission_id = ?1 AND task_id = ?2
                  AND event_type = 'host_verification_checked' ORDER BY sequence DESC LIMIT 1",
@@ -2462,6 +2575,85 @@ impl MissionStore {
             .map(|task| task.spec))
     }
 
+    pub(crate) fn ready_task_batch(&self, mission_id: &str,
+        prepared: &BTreeMap<String, super::parallel::TaskResourceClaims>,
+    ) -> Result<super::parallel::ReadySet, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = load_mission(&connection, mission_id)?.ok_or("mission missing")?;
+        if mission.status != MissionStatus::Active { return Err("mission must be active".into()); }
+        if let Some(reason) = budget_exhaustion_reason_on(&connection, &mission)? { return Err(reason.into()); }
+        let mut claims = scheduling_claims_on(&connection, &mission)?;
+        for (id, claim) in prepared {
+            // Host-created locations may supplement declarations, not replace
+            // named resources or an already active attempt's location.
+            if mission.tasks.iter().any(|task| task.spec.id == *id && !super::parallel::holds_resources(task.status)) {
+                claims.entry(id.clone()).or_default().workspace = claim.workspace.clone();
+            }
+        }
+        let mut tasks=mission.tasks.clone();let mut waiting=Vec::new();
+        for task in &mut tasks {
+            if task.status!=TaskStatus::Ready {continue;}
+            if let Some((holder,name))=external_resource_conflict_on(&connection,&mission,&task.spec.id)? {
+                task.status=TaskStatus::Proposed;
+                waiting.push(super::parallel::TaskWait{task_id:task.spec.id.clone(),reason:super::parallel::WaitReason::ResourceBusy{
+                    holder_task_id:holder,conflict:super::parallel::ResourceConflict::ExclusiveResource{name}}});
+            }
+        }
+        let mut decision = loop {
+            let decision=super::parallel::ready_set(&tasks, &mission.workspace.root, &claims,
+                super::parallel::ParallelPolicy { max_active_tasks: effective_parallel_limit(&mission) })?;
+            let mut counts=BTreeMap::<String,usize>::new();
+            for task in &mission.tasks {if super::parallel::holds_resources(task.status) {*counts.entry(task.spec.execution.executor.clone()).or_default()+=1;}}
+            let mut rejected=false;
+            for id in &decision.admitted_task_ids {
+                let task=tasks.iter_mut().find(|task|task.spec.id==*id).expect("admitted task");
+                let executor=&task.spec.execution.executor;
+                let limit=mission.scheduling.as_ref().and_then(|policy|policy.executor_limits.get(executor)).copied().unwrap_or(effective_parallel_limit(&mission));
+                let count=counts.entry(executor.clone()).or_default();
+                if *count>=limit {
+                    task.status=TaskStatus::Proposed;rejected=true;
+                    waiting.push(super::parallel::TaskWait{task_id:id.clone(),reason:super::parallel::WaitReason::ExecutorCapacity{executor:executor.clone(),limit}});
+                } else {*count+=1;}
+            }
+            if !rejected {break decision;}
+            // Fill slots left by a saturated executor with work for another
+            // executor, while recomputing all graph/resource conflicts.
+        };
+        decision.waiting.extend(waiting);
+        Ok(decision)
+    }
+
+    pub(crate) fn attempt_workspace(&self, run_id: &str) -> Result<Option<String>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        Ok(connection.query_row("SELECT execution_root FROM mission_workspace_claims WHERE run_id = ?1",
+            [run_id], |row| row.get::<_, String>(0)).optional()?.filter(|root| !root.is_empty()))
+    }
+
+    pub(crate) fn task_integration(&self, mission_id: &str, task_id: &str, run_id: &str) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let raw: Option<String> = connection.query_row("SELECT payload_json FROM mission_events WHERE mission_id=?1 AND task_id=?2
+            AND event_type='task_candidate_integrated' AND json_extract(payload_json,'$.run_id')=?3 ORDER BY sequence DESC LIMIT 1",
+            params![mission_id,task_id,run_id],|row| row.get(0)).optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into)).transpose()
+    }
+
+    pub(crate) fn record_task_integration(&self, mission_id: &str, task_id: &str, run_id: &str, receipt: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx.query_row("SELECT payload_json FROM mission_events WHERE mission_id=?1 AND task_id=?2
+            AND event_type='task_candidate_integrated' AND json_extract(payload_json,'$.run_id')=?3 ORDER BY sequence DESC LIMIT 1",
+            params![mission_id,task_id,run_id],|row| row.get(0)).optional()?;
+        if let Some(previous) = previous {
+            let previous: serde_json::Value = serde_json::from_str(&previous)?;
+            if previous["receipt"] != *receipt { return Err("integration run already recorded with a different receipt".into()); }
+        } else {
+            append_event_tx(&tx,mission_id,"task_candidate_integrated",task_id,"隔离交付已整合，等待对整合后的候选进行检查与复核",
+                serde_json::json!({"run_id":run_id,"receipt":receipt}),&now_stamp())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn running_task(&self, mission_id: &str) -> Result<Option<MissionTaskView>, Box<dyn Error>> {
         let mission = self.get(mission_id)?;
         if mission.status != MissionStatus::Active {
@@ -2480,20 +2672,90 @@ impl MissionStore {
     }
 }
 
+/// Until an executor can enforce a per-attempt token/cost reservation, finite
+/// financial budgets admit one attempt at a time. Late usage is never zero.
+pub(crate) fn effective_parallel_limit(mission: &MissionView) -> usize {
+    if mission.budget.as_ref().is_some_and(|budget| budget.max_total_tokens.is_some() || budget.max_cost.is_some()) { return 1; }
+    mission.scheduling.as_ref().map(|policy| policy.max_active_tasks).unwrap_or(1)
+}
+
+fn scheduling_claims_on(connection: &Connection, mission: &MissionView)
+    -> Result<BTreeMap<String, super::parallel::TaskResourceClaims>, Box<dyn Error>> {
+    let mut claims = BTreeMap::new();
+    if let Some(policy) = &mission.scheduling {
+        for (id, resources) in &policy.task_resources {
+            claims.insert(id.clone(), super::parallel::TaskResourceClaims {
+                exclusive_resources: resources.clone(), ..Default::default()
+            });
+        }
+    }
+    let mut statement = connection.prepare("SELECT task_id, execution_root FROM mission_workspace_claims WHERE mission_id = ?1")?;
+    let rows = statement.query_map([&mission.mission_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+    for row in rows {
+        let (id, root) = row?;
+        if !root.is_empty() && workspace_claim_key(&root) != workspace_claim_key(&mission.workspace.root) {
+            claims.entry(id).or_default().workspace = super::parallel::TaskWorkspace::Isolated { root };
+        }
+    }
+    Ok(claims)
+}
+
+/// Named resources such as ports/devices remain exclusive across workspaces
+/// and Missions, including canceled workers whose claims have not drained.
+fn external_resource_conflict_on(connection:&Connection,mission:&MissionView,task_id:&str)
+    ->Result<Option<(String,String)>,Box<dyn Error>> {
+    let Some(resources)=mission.scheduling.as_ref().and_then(|policy|policy.task_resources.get(task_id)).filter(|set|!set.is_empty()) else {return Ok(None);};
+    let mut statement=connection.prepare("SELECT claims.mission_id,claims.task_id,runs.plan_json FROM mission_workspace_claims AS claims
+        JOIN mission_runs AS runs ON runs.mission_id=claims.mission_id WHERE claims.mission_id<>?1 ORDER BY claims.acquired_at,claims.run_id")?;
+    let rows=statement.query_map([&mission.mission_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?;
+    for row in rows {
+        let (owner,task,plan)=row?;let plan:serde_json::Value=serde_json::from_str(&plan)?;
+        if let Some(names)=plan.pointer("/scheduling/task_resources").and_then(|values|values.get(&task)).and_then(serde_json::Value::as_array) {
+            if let Some(name)=names.iter().filter_map(serde_json::Value::as_str).find(|name|resources.contains(*name)) {
+                return Ok(Some((format!("{owner}/{task}"),name.to_string())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 // Narrow exception for an explicit resume only: it cannot admit an
 // implementation, replace a current worker, invent a claim or extend budget.
 fn owned_pending_verification_on(connection: &Connection, mission: &MissionView) -> Result<bool, Box<dyn Error>> {
     if mission.plan_sha256.is_empty()
         || mission.confirmation.as_ref().is_none_or(|c| c.plan_sha256 != mission.plan_sha256)
-        || mission.tasks.iter().any(|task| task.status == TaskStatus::Running) {
+        || (mission.scheduling.is_none() && mission.tasks.iter().any(|task| task.status == TaskStatus::Running)) {
         return Ok(false);
     }
-    let Some(task) = mission.tasks.iter().find(|task| task.status == TaskStatus::AwaitingVerification) else {return Ok(false);};
-    if task.attempt_run_id.is_empty() {return Ok(false);}
-    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
-        WHERE workspace_key=?1 AND mission_id=?2 AND task_id=?3 AND run_id=?4)",
-        params![workspace_claim_key(&mission.workspace.root), mission.mission_id, task.spec.id, task.attempt_run_id],
-        |row| row.get(0))?)
+    let mut found=false;
+    for task in mission.tasks.iter().filter(|task| super::parallel::holds_resources(task.status)) {
+        found |= task.status == TaskStatus::AwaitingVerification;
+        if task.attempt_run_id.is_empty() {return Ok(false);}
+        let owned: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
+            WHERE (workspace_key=?1 OR source_key=?1) AND mission_id=?2 AND task_id=?3 AND run_id=?4)",
+            params![workspace_claim_key(&mission.workspace.root), mission.mission_id, task.spec.id, task.attempt_run_id],
+            |row| row.get(0))?;
+        if !owned {return Ok(false);}
+    }
+    Ok(found)
+}
+
+fn assert_verification_ownership_on(connection: &Connection, mission: &MissionView, task_id: &str, run_id: &str)
+    -> Result<(), Box<dyn Error>> {
+    if mission.status != MissionStatus::Active
+        || !mission.tasks.iter().any(|task| task.spec.id == task_id && task.status == TaskStatus::AwaitingVerification
+            && task.attempt_run_id == run_id && !run_id.is_empty())
+        || !owned_pending_verification_on(connection, mission)? {
+        return Err("verification admission requires an active confirmed plan and its current workspace claim".into());
+    }
+    let foreign_owner: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
+        WHERE (source_key=?1 OR workspace_key=?1) AND mission_id<>?2)",
+        params![workspace_claim_key(&mission.workspace.root), mission.mission_id], |row| row.get(0))?;
+    if foreign_owner { return Err("verification workspace is owned by another Mission".into()); }
+    if let Some((holder, name)) = external_resource_conflict_on(connection, mission, task_id)? {
+        return Err(format!("named resource {name} is occupied by {holder}").into());
+    }
+    Ok(())
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
@@ -2548,6 +2810,19 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
             [],
         )?;
     }
+    // Additive migration: legacy workspace keys remain valid. Parallel attempts
+    // have individual keys while source_key keeps cross-Mission exclusion.
+    let claim_columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(mission_workspace_claims)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>,_>>()?;
+        rows
+    };
+    for name in ["source_key", "execution_root"] {
+        if !claim_columns.iter().any(|column| column == name) {
+            connection.execute(&format!("ALTER TABLE mission_workspace_claims ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"), [])?;
+        }
+    }
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_mission_claims_source ON mission_workspace_claims(source_key)", [])?;
     let mut columns = {
         let mut statement = connection.prepare("PRAGMA table_info(mission_runs)")?;
         let mut rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -2596,8 +2871,9 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
 
 fn restore_legacy_claim(connection:&Connection,workspace:&str,mission:&str,task:&str,run:&str,at:&str)
     ->rusqlite::Result<usize> {
-    connection.execute("INSERT OR IGNORE INTO mission_workspace_claims(workspace_key,mission_id,task_id,run_id,acquired_at)
-        SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(SELECT 1 FROM mission_tasks WHERE mission_id=?2 AND task_id=?3
+    connection.execute("INSERT OR IGNORE INTO mission_workspace_claims(workspace_key,mission_id,task_id,run_id,acquired_at,source_key)
+        SELECT ?1,?2,?3,?4,?5,?1 WHERE EXISTS(SELECT 1 FROM mission_runs WHERE mission_id=?2 AND json_extract(plan_json,'$.scheduling') IS NULL)
+        AND EXISTS(SELECT 1 FROM mission_tasks WHERE mission_id=?2 AND task_id=?3
         AND attempt_run_id=?4 AND status IN ('running','awaiting_verification'))",
         params![workspace_claim_key(workspace),mission,task,run,at])
 }
@@ -2745,7 +3021,7 @@ fn load_mission(connection: &Connection, mission_id: &str) -> Result<Option<Miss
     }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let usage = usage_from_events(connection, &id)?;
     let mut mission = MissionView {
-        schema_version: "mission.v1".to_string(), mission_id: id.clone(), title, objective,
+        scheduling: proposal.as_ref().and_then(|value| value.scheduling.clone()), schema_version: "mission.v1".to_string(), mission_id: id.clone(), title, objective,
         status: MissionStatus::parse(&status)?, workspace: serde_json::from_str(&workspace)?,
         acceptance_criteria: serde_json::from_str(&acceptance)?,
         plan_revision: revision.max(0) as u64, plan_sha256: hash,
@@ -4337,7 +4613,7 @@ mod tests {
         let mut verification = task("verify");
         verification.depends_on = vec!["fix".to_string()];
         MissionPlanProposal {
-            summary: "先修复再验证".to_string(),
+            scheduling: None, summary: "先修复再验证".to_string(),
             tasks: vec![task("fix"), verification],
             required_acceptance: vec!["全部检查通过".to_string()],
             budget: MissionBudget {
@@ -4720,6 +4996,42 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_admission_is_atomic_bounded_and_preserves_cross_mission_exclusion() {
+        let store=store("parallel-admission");
+        let mut input=create_input(); input.workspace.write_scope=vec!["frontend/src".into()];
+        let created=store.create(&input).unwrap();
+        let mut plan=proposal();
+        let original_hash=super::super::contract::plan_hash_for_workspace(&created.mission_id,&created.workspace,&created.acceptance_criteria,&plan).unwrap();
+        plan.scheduling=Some(super::super::parallel::MissionScheduling {max_active_tasks:2,..Default::default()});
+        plan.tasks.truncate(1);
+        plan.tasks[0].write_paths.clear();
+        let mut second=plan.tasks[0].clone();second.id="second".into();
+        let mut third=plan.tasks[0].clone();third.id="third".into();
+        let mut downstream=plan.tasks[0].clone();downstream.id="downstream".into();downstream.depends_on=vec!["fix".into()];
+        plan.tasks.extend([second,third,downstream]);
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        assert_ne!(proposed.plan_sha256,original_hash);
+        store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["fix".into(),"second".into(),"third".into(),"downstream".into()],&[],&[],&[],"test").unwrap();
+        store.begin_task_attempt(&created.mission_id,"fix","parallel-first").unwrap();
+        store.begin_task_attempt(&created.mission_id,"second","parallel-second").unwrap();
+        assert!(store.begin_task_attempt(&created.mission_id,"third","parallel-third").is_err());
+        assert!(store.begin_task_attempt(&created.mission_id,"downstream","parallel-dependent").is_err());
+        store.begin_task_attempt(&created.mission_id,"second","parallel-second").unwrap();
+        let reopened=MissionStore::new(store.path.clone());
+        assert_eq!(reopened.get(&created.mission_id).unwrap().tasks.iter().filter(|t| t.status==TaskStatus::Running).count(),2);
+        assert_eq!(reopened.attempt_workspace("parallel-first").unwrap(),Some(input.workspace.root.clone()));
+        let competing=store.create(&input).unwrap();
+        let p=store.propose_plan(&competing.mission_id,&plan).unwrap();
+        store.confirm_plan(&competing.mission_id,&p.plan_sha256,&["fix".into()],&[],&[],&[],"test").unwrap();
+        assert!(store.begin_task_attempt(&competing.mission_id,"fix","other-mission").unwrap_err().to_string().contains("workspace already"));
+        store.complete_task_attempt(&created.mission_id,"fix","parallel-first",false,&[],"fixture failure").unwrap();
+        store.begin_task_attempt(&created.mission_id,"third","parallel-third").unwrap();
+        assert!(store.begin_task_attempt(&created.mission_id,"downstream","parallel-dependent").is_err());
+        let claims=store.connection().unwrap().query_row("SELECT COUNT(*) FROM mission_workspace_claims WHERE mission_id=?1",[&created.mission_id],|row| row.get::<_,i64>(0)).unwrap();
+        assert_eq!(claims,2);
+    }
+
+    #[test]
     fn workspace_claim_is_idempotent_persistent_and_exclusive() {
         let root = std::env::temp_dir().join(format!(
             "himind-mission-reopen-{}-{}",
@@ -4770,6 +5082,116 @@ mod tests {
         assert_eq!(failed_events, 1);
         let second_claim = reopened.begin_task_attempt(&second.mission_id, "fix", "run-second").unwrap();
         assert_eq!(second_claim.tasks[0].status, TaskStatus::Running);
+    }
+
+    fn parallel_review_fixture(store: &MissionStore, root: &std::path::Path, resource: Option<&str>) -> MissionView {
+        fs::create_dir_all(root).unwrap();fs::write(root.join("read.txt"), "protected").unwrap();
+        let mut input=create_input();input.workspace.root=root.to_string_lossy().into_owned();
+        input.workspace.read_scope=vec!["read.txt".into()];input.workspace.write_scope.clear();
+        let created=store.create(&input).unwrap();let mut plan=proposal();plan.tasks.truncate(1);
+        plan.tasks[0].read_paths=vec!["read.txt".into()];plan.tasks[0].write_paths.clear();
+        let mut scheduling=super::super::parallel::MissionScheduling::default();
+        if let Some(name)=resource {scheduling.task_resources.insert("fix".into(),[name.to_string()].into());}
+        plan.scheduling=Some(scheduling);
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["fix".into()],&[],&[],&[],"fixture").unwrap()
+    }
+
+    #[test]
+    fn parallel_verification_replay_and_success_require_current_claim_and_active_plan() {
+        let store=store("parallel-review-ownership");let root=store.path.parent().unwrap().join("workspace");
+        let mission=parallel_review_fixture(&store,&root,None);let id=&mission.mission_id;
+        store.begin_task_attempt(id,"fix","impl").unwrap();store.await_task_verification(id,"fix","impl","ready").unwrap();
+        store.begin_verification_attempt(id,"fix","review").unwrap();
+        store.control(id,"pause").unwrap();
+        assert!(store.begin_verification_attempt(id,"fix","review").is_err());
+        store.control(id,"resume").unwrap();store.begin_verification_attempt(id,"fix","review").unwrap();
+        store.connection().unwrap().execute("DELETE FROM mission_workspace_claims WHERE run_id='impl'",[]).unwrap();
+        let before=store.snapshot(id,0).unwrap();
+        assert!(store.assert_verification_ownership(id,"fix","impl").is_err());
+        assert!(store.begin_verification_attempt(id,"fix","review").is_err());
+        assert!(store.record_verification_result(id,"fix","impl","review",true,&["review".into()],"").is_err());
+        assert_eq!(store.snapshot(id,0).unwrap(),before);
+        // Even a structurally valid stale claim cannot coexist with a new
+        // Mission's source ownership and authorize replay of the old reviewer.
+        let other=parallel_review_fixture(&store,&root,None);
+        store.begin_task_attempt(&other.mission_id,"fix","new-owner").unwrap();
+        store.connection().unwrap().execute("INSERT INTO mission_workspace_claims
+            (workspace_key,mission_id,task_id,run_id,acquired_at,source_key,execution_root) VALUES ('attempt:impl',?1,'fix','impl','',?2,?3)",
+            params![id,workspace_claim_key(&mission.workspace.root),mission.workspace.root]).unwrap();
+        assert!(store.begin_verification_attempt(id,"fix","review").unwrap_err().to_string().contains("another Mission"));
+    }
+
+    #[test]
+    fn parallel_review_retry_cannot_bypass_source_or_global_named_resource_claims() {
+        let store=store("parallel-review-retry-claims");let root=store.path.parent().unwrap().join("source");
+        let mission=parallel_review_fixture(&store,&root,Some("port:4321"));let id=&mission.mission_id;
+        store.begin_task_attempt(id,"fix","impl").unwrap();
+        let files=super::super::protected_files(&root,&mission.tasks[0].spec).unwrap();
+        store.append_event(id,"task_baseline_captured","fix","fixture",serde_json::json!({
+            "implementation_run_id":"impl","protected_baseline":{"files":files}})).unwrap();
+        store.await_task_verification(id,"fix","impl","ready").unwrap();store.begin_verification_attempt(id,"fix","review").unwrap();
+        store.record_verification_result(id,"fix","impl","review",false,&["review".into()],"negative").unwrap();
+        let request:MissionVerificationRetry=serde_json::from_value(serde_json::json!({"request_id":"retry",
+            "expected_plan_sha256":mission.plan_sha256,"expected_verification_run_id":"review"})).unwrap();
+        let other=parallel_review_fixture(&store,&root,None);store.begin_task_attempt(&other.mission_id,"fix","source-holder").unwrap();
+        assert!(store.retry_verification(id,"fix",&request).unwrap_err().to_string().contains("workspace already"));
+        store.complete_task_attempt(&other.mission_id,"fix","source-holder",false,&[],"done").unwrap();
+        let elsewhere=parallel_review_fixture(&store,&root.with_extension("elsewhere"),Some("port:4321"));
+        store.begin_task_attempt(&elsewhere.mission_id,"fix","port-holder").unwrap();
+        assert!(store.retry_verification(id,"fix",&request).unwrap_err().to_string().contains("port:4321"));
+        // A canceled worker keeps its named resource until the runtime drains.
+        store.control(&elsewhere.mission_id,"cancel").unwrap();
+        assert!(store.retry_verification(id,"fix",&request).is_err());
+        store.release_canceled_claims(&elsewhere.mission_id).unwrap();
+        store.retry_verification(id,"fix",&request).unwrap();
+        assert_eq!(store.attempt_workspace("impl").unwrap(),Some(mission.workspace.root));
+        let claim:String=store.connection().unwrap().query_row("SELECT workspace_key FROM mission_workspace_claims WHERE run_id='impl'",[],|row|row.get(0)).unwrap();
+        assert_eq!(claim,"attempt:impl");
+    }
+
+    #[test]
+    fn parallel_named_resources_and_executor_limits_filter_batch_and_atomic_admission() {
+        let store=store("parallel-named-capacity");let root=store.path.parent().unwrap().join("source");
+        let owner=parallel_review_fixture(&store,&root,Some("port:4321"));
+        store.begin_task_attempt(&owner.mission_id,"fix","owner").unwrap();
+        let target=parallel_review_fixture(&store,&root.with_extension("other"),Some("port:4321"));
+        let decision=store.ready_task_batch(&target.mission_id,&Default::default()).unwrap();
+        assert!(decision.admitted_task_ids.is_empty());assert!(serde_json::to_string(&decision).unwrap().contains("port:4321"));
+        assert!(store.begin_task_attempt(&target.mission_id,"fix","blocked").is_err());
+        store.complete_task_attempt(&owner.mission_id,"fix","owner",false,&[],"done").unwrap();
+        assert_eq!(store.ready_task_batch(&target.mission_id,&Default::default()).unwrap().admitted_task_ids,["fix"]);
+        let created=store.create(&create_input()).unwrap();let mut plan=proposal();
+        let mut a=task("a");a.write_paths.clear();let mut b=a.clone();b.id="b".into();
+        let mut c=a.clone();c.id="c".into();c.execution.executor="personal.codex".into();plan.tasks=vec![a,b,c];
+        let mut policy=super::super::parallel::MissionScheduling{max_active_tasks:2,..Default::default()};
+        policy.executor_limits.insert("himind.builtin".into(),1);plan.scheduling=Some(policy);
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["a".into(),"b".into(),"c".into()],&[],&[],&[],"fixture").unwrap();
+        let batch=store.ready_task_batch(&created.mission_id,&Default::default()).unwrap();
+        assert_eq!(batch.admitted_task_ids,["a","c"]);assert!(serde_json::to_string(&batch).unwrap().contains("executor_capacity"));
+        store.begin_task_attempt(&created.mission_id,"a","a").unwrap();
+        assert!(store.begin_task_attempt(&created.mission_id,"b","b").unwrap_err().to_string().contains("executor session capacity"));
+        store.begin_task_attempt(&created.mission_id,"c","c").unwrap();
+    }
+
+    #[test]
+    fn parallel_pause_resume_keeps_all_running_and_review_claims_and_refuses_missing_identity() {
+        let store=store("parallel-mixed-resume");let created=store.create(&create_input()).unwrap();
+        let mut plan=proposal();plan.tasks.truncate(1);plan.tasks[0].write_paths.clear();
+        let mut second=plan.tasks[0].clone();second.id="peer".into();plan.tasks.push(second);
+        plan.scheduling=Some(Default::default());
+        let proposed=store.propose_plan(&created.mission_id,&plan).unwrap();
+        store.confirm_plan(&created.mission_id,&proposed.plan_sha256,&["fix".into(),"peer".into()],&[],&[],&[],"fixture").unwrap();
+        store.begin_task_attempt(&created.mission_id,"fix","mixed-first").unwrap();
+        store.begin_task_attempt(&created.mission_id,"peer","mixed-peer").unwrap();
+        store.await_task_verification(&created.mission_id,"fix","mixed-first","fixture delivered").unwrap();
+        store.control(&created.mission_id,"pause").unwrap();
+        assert_eq!(store.control(&created.mission_id,"resume").unwrap().status,MissionStatus::Active);
+        store.control(&created.mission_id,"pause").unwrap();
+        store.connection().unwrap().execute("DELETE FROM mission_workspace_claims WHERE run_id='mixed-peer'",[]).unwrap();
+        assert!(store.control(&created.mission_id,"resume").unwrap_err().to_string().contains("workspace claim"));
+        assert_eq!(store.get(&created.mission_id).unwrap().status,MissionStatus::Waiting);
     }
 
     #[test]

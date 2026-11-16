@@ -305,6 +305,9 @@ pub(crate) struct MissionVerificationRetry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionPlanProposal {
+    /// Omitted historical plans retain serial scheduling and their original hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<super::parallel::MissionScheduling>,
     pub summary: String,
     pub tasks: Vec<MissionTaskSpec>,
     pub required_acceptance: Vec<String>,
@@ -500,6 +503,8 @@ fn default_plan_mode() -> MissionPlanMode { MissionPlanMode::Generated }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<super::parallel::MissionScheduling>,
     pub schema_version: String,
     pub mission_id: String,
     pub title: String,
@@ -574,6 +579,12 @@ pub(crate) fn validate_workflow_pin(pin: &MissionWorkflowPin) -> Result<(), Box<
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionRoleOption {
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub recommended_expert: Option<MissionExpertPin>,
+    #[serde(default)]
+    pub recommendation_reason: String,
     pub role_id: String,
     pub label: String,
     pub brief: String,
@@ -590,6 +601,8 @@ pub(crate) struct MissionRoleOption {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionAssignmentOptions {
+    #[serde(default)]
+    pub recommendation_warnings: Vec<String>,
     pub workflow_id: String,
     pub workflow_version: String,
     pub workflow_sha256: String,
@@ -719,6 +732,17 @@ pub(crate) fn validate_create(input: &MissionCreateInput) -> Result<(), Box<dyn 
 }
 
 pub(crate) fn validate_proposal(proposal: &MissionPlanProposal) -> Result<(), Box<dyn Error>> {
+    if let Some(scheduling) = &proposal.scheduling {
+        if !(1..=16).contains(&scheduling.max_active_tasks)
+            || scheduling.executor_limits.values().any(|limit| !(1..=16).contains(limit)) {
+            return Err("scheduling limits must be in 1..=16".into());
+        }
+        for (task_id, resources) in &scheduling.task_resources {
+            if !proposal.tasks.iter().any(|task| &task.id == task_id) { return Err("scheduling references an unknown task".into()); }
+            for resource in resources { require_text("exclusive resource", resource, 160)?; }
+        }
+        for executor in scheduling.executor_limits.keys() { require_text("executor limit", executor, 160)?; }
+    }
     require_text("plan.summary", &proposal.summary, MAX_SUMMARY_CHARS)?;
     if proposal.tasks.is_empty() {
         return Err("plan must contain at least one task".into());

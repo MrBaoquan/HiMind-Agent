@@ -23,7 +23,7 @@ fn confirmed(store: &MissionStore) -> MissionView {
         acceptance_criteria: vec!["independent verification required".into()],
     }).unwrap();
     let planned = store.propose_plan(&created.mission_id, &MissionPlanProposal {
-        summary: "Budget test".into(),
+        scheduling: None, summary: "Budget test".into(),
         tasks: vec![MissionTaskSpec {
             id: "fix".into(), title: "Fix".into(), objective: String::new(), depends_on: vec![],
             read_paths: vec!["frontend".into()], write_paths: vec!["frontend/src".into()],
