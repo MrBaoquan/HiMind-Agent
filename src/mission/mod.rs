@@ -113,9 +113,12 @@ fn assigned_role_contract(mission: &MissionView) -> (String, String) {
         if !role_ids.is_empty() {
             return (
                 format!(
-                    "已指派角色（每项任务的 execution.role_id 必须严格取自这里）：{}
-                     不得创建未列出的角色；executor/service/model 由宿主按角色绑定覆盖，                     不要在计划里自行引入其他执行器或模型。",
-                    role_ids.join("、")
+                    "已指派角色（每项任务的 execution.role_id 必须严格取自这里）：{}。\n固定执行绑定：{}\n每项任务必须完整复制对应角色的 execution（含 executor、service_id、model、expert），即使字符串为空也须保留；不得省略执行器，不得创建未列出的角色或自行引入其他执行配置。",
+                    role_ids.join("、"),
+                    serde_json::to_string(&assignment.roles.iter().map(|role| ExecutionBinding {
+                        role_id: role.role_id.clone(), executor: role.executor.clone(),
+                        service_id: role.service_id.clone(), model: role.model.clone(), expert: role.expert.clone(),
+                    }).collect::<Vec<_>>()).unwrap(),
                 ),
                 role_ids[0].to_string(),
             );
@@ -173,9 +176,16 @@ pub(crate) fn plan_with_format_retry(
     mut generate: impl FnMut(u8, Option<&str>) -> Result<String, String>,
 ) -> Result<MissionPlanProposal, String> {
     let output = generate(0, None)?;
-    match parse_plan_json(&output) {
+    let parse_generated = |output: &str| {
+        let plan = parse_plan_json(output)?;
+        for task in &plan.tasks {
+            validate_execution_binding(task).map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>(plan)
+    };
+    match parse_generated(&output) {
         Ok(plan) => Ok(plan),
-        Err(error) => parse_plan_json(&generate(1, Some(&error))?)
+        Err(error) => parse_generated(&generate(1, Some(&error))?)
             .map_err(|error| format!("协调计划格式重试一次后仍不合契约: {error}")),
     }
 }
@@ -260,7 +270,8 @@ mod parser_tests {
             "plan_revision":0,"plan_sha256":"","plan_summary":"","required_acceptance":[],
             "budget":null,"confirmation":null,"tasks":[],"created_at":"","updated_at":"",
             "assignment":{"roles":[{"role_id":"frontend","label":"UI","executor":"personal.codex",
-                "service_id":"","model":""}],"task_roles":[],"applied_by":"user","applied_at":"now","recommended":false}
+                "service_id":"","model":""},{"role_id":"backend","label":"Backend","executor":"himind.builtin",
+                "service_id":"svc","model":"himind:svc:chosen-model"}],"task_roles":[],"applied_by":"user","applied_at":"now","recommended":false}
         })).unwrap();
         let prompt = super::plan_prompt(&mission);
         let example = prompt.split("输出结构：").nth(1).unwrap().lines().next().unwrap();
@@ -268,6 +279,13 @@ mod parser_tests {
         assert_eq!(plan.tasks[0].execution.executor, "personal.codex");
         assert_eq!(plan.tasks[0].execution.role_id, "frontend");
         assert!(plan.tasks[0].execution.model.is_empty());
+        let bindings: Vec<crate::mission::ExecutionBinding> = serde_json::from_str(
+            prompt.split("固定执行绑定：").nth(1).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[1].role_id, "backend");
+        assert_eq!(bindings[1].executor, "himind.builtin");
+        assert_eq!(bindings[1].service_id, "svc");
+        assert_eq!(bindings[1].model, "himind:svc:chosen-model");
         assert!(!prompt.contains("必须有 executor=himind.builtin"));
     }
 
@@ -299,6 +317,24 @@ mod parser_tests {
         assert_eq!(calls, 2);
         assert_eq!(serde_json::to_value(&plan.tasks[0].execution).unwrap(), valid["tasks"][0]["execution"]);
         assert_eq!(plan.tasks[0].repair_of, "repair-8");
+    }
+
+    #[test]
+    fn format_retry_recovers_missing_execution_fields_without_inventing_a_binding() {
+        let valid = plan_value();
+        let mut invalid = valid.clone();
+        invalid["tasks"][0]["execution"]["executor"] = serde_json::json!("");
+        let mut calls = 0;
+        let plan = plan_with_format_retry(|attempt, error| {
+            calls += 1;
+            if attempt == 0 { Ok(invalid.to_string()) }
+            else { assert!(error.unwrap().contains("execution.executor")); Ok(valid.to_string()) }
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(serde_json::to_value(&plan.tasks[0].execution).unwrap(), valid["tasks"][0]["execution"]);
+        let mut calls = 0;
+        assert!(plan_with_format_retry(|_, _| { calls += 1; Ok(invalid.to_string()) }).is_err());
+        assert_eq!(calls, 2);
     }
 
     #[test]

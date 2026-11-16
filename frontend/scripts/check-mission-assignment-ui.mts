@@ -4,6 +4,8 @@ import { strict as assert } from 'node:assert';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { assignmentProblem, bindExpert, changeExecutor, changeService, hasMissingTaskAssignment, initialAssignmentRoles, initialTaskRoles, recommendedRole, serviceOptions } from '../src/pages/missionAssignment.ts';
 import type { ExpertSummary, MissionAssignmentOptions, MissionExecutionOption, MissionRoleAssignment, MissionView } from '../src/services/agentApi';
 
@@ -64,6 +66,8 @@ export async function checkMissionAssignmentBrowser() {
   const { default: react } = await import('@vitejs/plugin-react');
   const require = createRequire(import.meta.url);
   const { chromium } = process.env.PLAYWRIGHT_MODULE ? await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE).href) : require('playwright');
+  const recordedHeader = process.env.MISSION_HEADER_SNAPSHOT
+    ? JSON.parse(readFileSync(process.env.MISSION_HEADER_SNAPSHOT, 'utf8')).mission : null;
   // Virtual entry imports production components; this is not a static UI copy.
   const fixture = `
 import React,{useState} from 'react';
@@ -82,6 +86,14 @@ const options={workflow_id:'com.himind.workflow.test',workflow_version:'1.0.0',w
  executors:[{executor:'himind.builtin',label:'HiMind AI',available:true,reason:'',models:[model('svc-a','one'),model('svc-a','two'),model('svc-b','three')]},{executor:'personal.codex',label:'Codex CLI',available:true,reason:'',models:[]},{executor:'personal.github-copilot',label:'Copilot',available:false,reason:'未安装',models:[]}]};
 const task={id:'design',title:'设计任务',objective:'完成设计',depends_on:[],read_paths:[],write_paths:[],acceptance_criteria:[],required_checks:[],execution:{role_id:'designer',executor:'himind.builtin',service_id:'svc-a',model:'himind:svc-a:one'},repair_of:''};
 let mission={schema_version:'mission.v1',mission_id:'mission_ui_fixture',title:'浏览器测试协作任务',objective:'验证专家指派',status:'awaiting_assignment',workspace:{root:'F:/fixture',permission_mode:'workspace_write',read_scope:['.'],write_scope:[]},acceptance_criteria:[],plan_revision:0,plan_sha256:'',plan_summary:'',required_acceptance:[],proposed_tasks:scenario==='referenced'?[task]:[],budget:null,usage:null,handoff:null,workflow:{workflow_id:options.workflow_id,workflow_version:'1.0.0',workflow_sha256:'digest',entrypoint:''},assignment:scenario==='manual'?{roles:[{role_id:'reviewer',label:'审查',expert:manualPin,executor:'personal.codex',service_id:'',model:''}],task_roles:[],applied_at:'2026-11-16',applied_by:'user',recommended:false}:null,plan_mode:'generated',confirmation:null,tasks:[],created_at:'2026-11-16T00:00:00Z',updated_at:'2026-11-16T00:00:00Z'};
+if(scenario.startsWith('header-')){
+ const long=scenario.endsWith('-long');
+ const recorded=${JSON.stringify(recordedHeader ? {title:recordedHeader.title,objective:recordedHeader.objective} : null)};
+ mission={...mission,status:'planned',title:long?'协作任务长标题换行验证'.repeat(6):mission.title,
+  objective:long?'完成独立模块并记录验收结果，保留原始测试与工作区约束。'.repeat(8)+'F:/workspace/'+ 'unbroken-path-segment'.repeat(15):mission.objective,
+  ...(scenario.endsWith('-recorded')?recorded:{}),
+  tasks:scenario.startsWith('header-progress-')?[{spec:task,status:'ready',checks:[],artifacts:[],evidence_refs:[]}]:[]};
+}
 window.fixtureActions=[];
 window.fixtureWorkflowReads=0;
 agentApi.listMissions=async()=>[mission];
@@ -129,6 +141,66 @@ createRoot(document.getElementById('root')).render(<React.StrictMode><App/></Rea
       await page.getByLabel('需求描述').waitFor();
     };
     const checkWidth=async()=>{await page.setViewportSize({width:390,height:844});assert.equal(await dialog.evaluate((el: HTMLElement)=>el.scrollWidth<=el.clientWidth+1),true);await page.setViewportSize({width:1280,height:900});};
+
+    if(process.argv.includes('--header-layout')){
+      const evidence=process.env.MISSION_HEADER_EVIDENCE_DIR;
+      if(evidence)mkdirSync(evidence,{recursive:true});
+      const samples: any[]=[];
+      const failures: string[]=[];
+      const sizes=[{width:1280,height:900},{width:900,height:640},{width:721,height:900},{width:720,height:900},{width:390,height:844},{width:320,height:844}];
+      const variants=recordedHeader?['short','long','recorded']:['short','long'];
+      for(const size of sizes){
+        await page.setViewportSize(size);
+        for(const state of ['empty','progress'])for(const variant of variants){
+          const scenario=`header-${state}-${variant}`;
+          await page.goto(`${url}?scenario=${scenario}`);
+          const hero=page.locator('.mission-detail-hero');
+          await hero.waitFor();
+          await page.evaluate(()=>document.fonts.ready);
+          const geometry=await hero.evaluate((el: HTMLElement)=>{
+            const bounds=(node: Element)=>{const r=node.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,right:r.right,bottom:r.bottom};};
+            const measure=(node: HTMLElement)=>{
+              const range=document.createRange();range.selectNodeContents(node);
+              const fragments=[...range.getClientRects()].filter(rect=>rect.width>0);
+              return {...bounds(node),scrollWidth:node.scrollWidth,clientWidth:node.clientWidth,
+                fontSize:getComputedStyle(node).fontSize,lineCount:new Set(fragments.map(rect=>Math.round(rect.y))).size,
+                textFits:fragments.every(rect=>rect.x>=node.getBoundingClientRect().x-1&&rect.right<=node.getBoundingClientRect().right+1)};
+            };
+            const copy=el.firstElementChild as HTMLElement;
+            const progress=el.lastElementChild as HTMLElement;
+            const empty=progress.textContent==='未记录执行进度';
+            return {hero:bounds(el),heroScrollWidth:el.scrollWidth,heroClientWidth:el.clientWidth,
+              copy:bounds(copy),title:measure(copy.querySelector('h2')!),objective:measure(copy.querySelector('p')!),
+              progress:bounds(progress),progressScrollWidth:progress.scrollWidth,progressClientWidth:progress.clientWidth,
+              emptyText:empty?measure(progress.querySelector('span')||progress):null,
+              textAlign:getComputedStyle(progress).textAlign,zoom:getComputedStyle(document.documentElement).zoom};
+          });
+          const check=(passed: boolean,message: string)=>{if(!passed)failures.push(`${size.width}/${scenario}: ${message}`);};
+          const stacked=size.width<=720;
+          check(geometry.heroScrollWidth<=geometry.heroClientWidth+1,'hero overflows horizontally');
+          check(geometry.progressScrollWidth<=geometry.progressClientWidth+1,'progress overflows horizontally');
+          check(geometry.title.textFits&&geometry.objective.textFits,'title/objective text leaves its column');
+          check(geometry.progress.right<=geometry.hero.right+1,'progress leaves hero');
+          check(Math.abs(geometry.progress.width-(stacked?geometry.copy.width:220))<=1,'progress width changes with content');
+          check(stacked?geometry.progress.y>=geometry.copy.bottom+17:Math.abs(geometry.progress.y-geometry.copy.y)<=1,'incorrect row/stack placement');
+          check(stacked?Math.abs(geometry.progress.x-geometry.copy.x)<=1:geometry.progress.x>=geometry.copy.right+17,'columns overlap or lose gap');
+          check(geometry.textAlign===(stacked?'left':'right'),'incorrect progress alignment');
+          if(state==='empty')check(geometry.emptyText?.lineCount===1,'empty progress wraps into multiple lines');
+          if(variant==='long')check(geometry.title.lineCount>1&&geometry.objective.lineCount>1,'long copy does not wrap');
+          samples.push({viewport:size,scenario,...geometry});
+          if(evidence&&variant!=='short'&&[1280,900,720,390].includes(size.width))await hero.screenshot({path:resolve(evidence,`${scenario}-${size.width}.png`)});
+        }
+      }
+      assert.deepEqual(await actions(),[],'Header layout checks must not mutate the Agent');
+      const sourceHashes=Object.fromEntries(['src/pages/MissionTeamPanel.tsx','styles.css','scripts/check-mission-assignment-ui.mts'].map(path=>[path,createHash('sha256').update(readFileSync(resolve(root,path))).digest('hex')]));
+      const report={checkedAt:new Date().toISOString(),command:process.argv,recordedHeaderSource:process.env.MISSION_HEADER_SNAPSHOT||null,
+        browserVersion:browser.version(),sourceHashes,pageErrors:errors,failures,samples};
+      if(evidence)writeFileSync(resolve(evidence,'header-layout.json'),JSON.stringify(report,null,2)+'\n');
+      assert.deepEqual(errors,[]);
+      assert.deepEqual(failures,[]);
+      console.log(`Mission header layout passed (${samples.length} cases; normal font size; empty/progress; short/long/recorded; 320-1280px)`);
+      return;
+    }
 
     await load();
     assert.equal(await dialog.evaluate((el: Element)=>el.matches(':modal')),true);
