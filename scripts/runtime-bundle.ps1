@@ -78,28 +78,34 @@ function Resolve-RuntimeReleaseDirectory {
     )
 
     $candidates = [System.Collections.Generic.List[string]]::new()
-    $explicitCandidates = @(
-        $RequestedDirectory,
-        [Environment]::GetEnvironmentVariable("HIMIND_RUNTIME_RELEASE_DIRECTORY", "Process")
-    )
-    if (-not $ExcludeInstalledBundle) {
-        $explicitCandidates += (Join-Path $env:LOCALAPPDATA "HiMindAgent\resources\runtime")
+    $environmentDirectory = [Environment]::GetEnvironmentVariable("HIMIND_RUNTIME_RELEASE_DIRECTORY", "Process")
+    $configuredDirectory = if (-not [string]::IsNullOrWhiteSpace($RequestedDirectory)) { $RequestedDirectory }
+        elseif (-not [string]::IsNullOrWhiteSpace($environmentDirectory)) { $environmentDirectory }
+        else { $null }
+    $fallbackCandidates = @()
+    if ($configuredDirectory) {
+        $fallbackCandidates = @($configuredDirectory)
+    } else {
+        if (-not $ExcludeInstalledBundle) {
+            $fallbackCandidates += (Join-Path $env:LOCALAPPDATA "HiMindAgent\resources\runtime")
+        }
     }
-    foreach ($value in $explicitCandidates) {
+    foreach ($value in $fallbackCandidates) {
         if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
             $candidates.Add([IO.Path]::GetFullPath([string]$value))
         }
     }
-    $manualRoots = @(
-        (Join-Path $Root "manual-releases\deepseek-harness-runtime"),
-        (Join-Path (Split-Path -Parent $Root) "manual-releases\deepseek-harness-runtime")
-    ) | Select-Object -Unique
-    foreach ($manualRoot in $manualRoots) {
-        if (Test-Path -LiteralPath $manualRoot -PathType Container) {
-            Get-ChildItem -LiteralPath $manualRoot -Directory -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "himind-runtime-release.json") -PathType Leaf } |
-                Sort-Object LastWriteTime -Descending |
-                ForEach-Object { $candidates.Add($_.FullName) }
+    if (-not $configuredDirectory) {
+        foreach ($manualRoot in @(
+            (Join-Path $Root "manual-releases\deepseek-harness-runtime"),
+            (Join-Path (Split-Path -Parent $Root) "manual-releases\deepseek-harness-runtime")
+        ) | Select-Object -Unique) {
+            if (Test-Path -LiteralPath $manualRoot -PathType Container) {
+                Get-ChildItem -LiteralPath $manualRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "himind-runtime-release.json") -PathType Leaf } |
+                    Sort-Object LastWriteTime -Descending |
+                    ForEach-Object { $candidates.Add($_.FullName) }
+            }
         }
     }
     $lastError = $null

@@ -2,10 +2,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // The wrapper hashes content, including edits with preserved timestamps.
+    // Make that identity visible to Cargo's timestamp-based freshness checks.
+    println!("cargo:rerun-if-env-changed=HIMIND_BUILD_INPUT_HASH");
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_PUBLIC_KEY_PATH");
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_KEY_ID");
     println!("cargo:rerun-if-env-changed=HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH");
     println!("cargo:rerun-if-env-changed=HIMIND_EXTENSION_SIGNING_KEY_ID");
+    // An unchanged path can receive a rotated public key. Track its contents,
+    // so Cargo cannot reuse a binary with the previous trust root.
+    for variable in [
+        "HIMIND_SIGNING_PUBLIC_KEY_PATH",
+        "HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH",
+    ] {
+        if let Some(path) = std::env::var_os(variable) {
+            println!("cargo:rerun-if-changed={}", Path::new(&path).display());
+        }
+    }
     println!("cargo:rerun-if-changed=icons/icon.ico");
     // Windows agent threads run long-lived orchestration work (Dashboard
     // heartbeat/polling, plugin reconciliation, Skill rendering).  The MSVC
@@ -62,13 +75,30 @@ fn write_embedded_extension_key() {
 /// `/health` 与「关于」显示。
 fn write_embedded_build() {
     println!("cargo:rerun-if-env-changed=HIMIND_BUILD_CHANNEL");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    // `.git/HEAD` usually contains the stable text `ref: refs/heads/main`.
-    // Watching only that file misses a fast-forward: the branch ref changes,
-    // while HEAD itself does not. The embedded build marker would then keep
-    // advertising the pre-merge commit for every incremental build.
-    println!("cargo:rerun-if-changed=.git/refs/heads/main");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
+    // In linked worktrees and submodules .git is a file. Ask Git for the real
+    // HEAD/current branch/shared refs instead of assuming .git/refs/heads/main.
+    let mut git_inputs = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            git_inputs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+    }
+    for input in git_inputs {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-path", &input])
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if Path::new(&path).is_file() {
+                    println!("cargo:rerun-if-changed={path}");
+                }
+            }
+        }
+    }
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is required"));
     let channel = std::env::var("HIMIND_BUILD_CHANNEL")
         .ok()

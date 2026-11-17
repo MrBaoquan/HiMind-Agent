@@ -1,13 +1,16 @@
 [CmdletBinding()]
 param()
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'build-support.ps1')
+$ReuseRuntime = $false
+$deploymentManifest = $null
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $sourcePath = Join-Path $PSScriptRoot "deploy-local.ps1"
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$errors)
 if ($errors.Count) { throw ($errors -join "`n") }
 # Load actual functions without executing the build or touching the real installation.
-$names = @("Start-Agent", "Stop-Agent", "Invoke-LocalDeployment", "Remove-RuntimeDirectorySafely")
+$names = @("Start-Agent", "Stop-Agent", "Invoke-LocalDeployment", "Remove-RuntimeDirectorySafely", "Resolve-DeploymentStatePath")
 foreach ($name in $names) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -32,6 +35,15 @@ finally {
 # Start-Agent must return only a Process-shaped object, never its log text.
 $fixtureRoot = Join-Path $repoRoot ("target/deploy-local-tests-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
+$stateHome = Join-Path $fixtureRoot 'unenrolled home'
+$missingState = Join-Path $stateHome 'data/agent-state.json'
+Assert-True ((Resolve-DeploymentStatePath '' $stateHome) -eq $missingState) 'Default missing state must be accepted'
+Assert-True (-not (Test-Path -LiteralPath $missingState)) 'State resolution must not create enrollment data'
+$explicitState = Join-Path $fixtureRoot 'custom state/agent.json'
+Assert-True ((Resolve-DeploymentStatePath $explicitState $stateHome) -eq $explicitState) 'Explicit missing state must be accepted'
+$invalidStateRejected = $false
+try { Resolve-DeploymentStatePath $fixtureRoot $stateHome | Out-Null } catch { $invalidStateRejected = $true }
+Assert-True $invalidStateRejected 'Directory state path must be rejected'
 $AgentHome = Join-Path $fixtureRoot "start-agent home"
 $InstalledExe = "fixture.exe"
 $ApiBase = "https://example.invalid"
@@ -54,7 +66,7 @@ $cases = @(
     "success", "no-start-success", "preflight-failure", "stop-failure",
     "companion-stop-failure", "partial-copy-failure", "runtime-install-failure",
     "health-failure", "rollback-copy-failure", "no-start-failure", "foreign-port",
-    "previous-version-failure"
+    "previous-version-failure", "metadata-commit-failure"
 )
 $results = @()
 foreach ($case in $cases) {
@@ -64,19 +76,21 @@ foreach ($case in $cases) {
     $InstalledExe = Join-Path $VersionDir "himind-agent.exe"
     $InstalledMcp = Join-Path $VersionDir "himind-agent-mcp.exe"
     $InstalledLauncher = Join-Path $AgentHome "himind-agent-launcher.exe"
+    $InstalledUpdater = Join-Path $AgentHome "himind-agent-updater.exe"
     $RuntimeBundleDestination = Join-Path $AgentHome "resources/runtime"
     $versionFile = Join-Path $AgentHome "active-version"
     $BuiltExe = Join-Path $caseRoot "build/agent.exe"
     $BuiltMcp = Join-Path $caseRoot "build/mcp.exe"
     $BuiltLauncher = Join-Path $caseRoot "build/launcher.exe"
+    $BuiltUpdater = Join-Path $caseRoot "build/updater.exe"
     $RuntimeRelease = [pscustomobject]@{ Directory = "fixture-runtime"; Manifest = [pscustomobject]@{ version = "runtime-fixture" } }
     $ActiveVersion = "0.3.92"
     $NoStart = $case -in @("no-start-success", "no-start-failure")
     foreach ($directory in @($VersionDir, $RuntimeBundleDestination, (Split-Path $BuiltExe))) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
-    foreach ($file in @($InstalledExe, $InstalledMcp, $InstalledLauncher)) { [IO.File]::WriteAllText($file, "old") }
-    foreach ($file in @($BuiltExe, $BuiltMcp, $BuiltLauncher)) { [IO.File]::WriteAllText($file, "new") }
+    foreach ($file in @($InstalledExe, $InstalledMcp, $InstalledLauncher, $InstalledUpdater)) { [IO.File]::WriteAllText($file, "old") }
+    foreach ($file in @($BuiltExe, $BuiltMcp, $BuiltLauncher, $BuiltUpdater)) { [IO.File]::WriteAllText($file, "new") }
     [IO.File]::WriteAllText((Join-Path $RuntimeBundleDestination "marker"), "old-runtime")
     [IO.File]::WriteAllText($versionFile, $ActiveVersion)
     $originalExe = $InstalledExe
@@ -92,6 +106,25 @@ foreach ($case in $cases) {
     $script:starts = 0
     $script:copyFailure = $false
     $script:restartedExe = $null
+    $deploymentManifest = $null
+    if ($case -eq 'metadata-commit-failure') {
+        $deploymentManifest = [pscustomobject]@{commit='fixture-commit'}
+        $ArtifactManifest = 'new-manifest'
+        $managedRoot = Join-Path $caseRoot 'managed'
+        $runtimeIdentityPath = Join-Path $AgentHome 'deploy/runtime-identity.json'
+        $fixturePinPath = Join-Path $managedRoot ('pins/' + (Get-BuildHash $AgentHome.ToLowerInvariant()) + '.json')
+        Write-BuildJson $runtimeIdentityPath @{identity='old'}
+        Write-BuildJson $fixturePinPath @{current_manifest='old-manifest';previous_manifest='previous-manifest'}
+        $runtimeIdentityBefore = Get-BuildFileHash $runtimeIdentityPath
+        $pinBefore = Get-BuildFileHash $fixturePinPath
+        $actualWriteJson = (Get-Command Write-BuildJson).ScriptBlock
+        function Write-BuildJson {
+            param([string]$Path, [object]$Value)
+            & $actualWriteJson $Path $Value
+            if ($Path -eq $fixturePinPath) { throw 'injected metadata commit failure after write' }
+        }
+        function Get-InstalledRuntimeIdentity { return @{identity='new'} }
+    }
     function Get-ListenerPid([int]$port) { if ($script:listening) { return $script:listenPid }; return 0 }
     function Invoke-RestMethod {
         param($Uri, $TimeoutSec)
@@ -140,7 +173,7 @@ foreach ($case in $cases) {
     function Wait-AgentHealthy {
         if ($case -eq "health-failure" -and $script:starts -eq 1) { return $null }
         return [pscustomobject]@{
-            status = "online"; version = $ActiveVersion; build = @{ channel = "local" }; executable_path = $InstalledExe
+            status = "online"; version = $ActiveVersion; build = @{ channel = "local"; commit='fixture' }; executable_path = $InstalledExe
         }
     }
     function Assert-InstalledRuntime { param($Manifest) return $Manifest }
@@ -174,6 +207,11 @@ foreach ($case in $cases) {
             Assert-True ($script:restartedExe -eq $originalExe) "$case restarted wrong installed version"
         }
     }
+    if ($case -eq 'metadata-commit-failure') {
+        Assert-True ((Get-BuildFileHash $runtimeIdentityPath) -eq $runtimeIdentityBefore) 'Late failure changed Runtime identity'
+        Assert-True ((Get-BuildFileHash $fixturePinPath) -eq $pinBefore) 'Late failure changed deployment pin'
+        Set-Item Function:Write-BuildJson $actualWriteJson
+    }
     $results += [pscustomobject]@{ case = $case; passed = $true; stops = $script:stops; starts = $script:starts; failure = $failure }
 }
 # The actual OS file lock must reject a concurrent deployment.
@@ -186,5 +224,5 @@ try {
     Assert-True $rejected "Concurrent deployment lock was not exclusive"
 }
 finally { $lock.Dispose() }
-$report = [pscustomobject]@{ passed = $true; cases = $results; start_process_return = "passed"; real_windows_stop = "passed"; exclusive_lock = "passed"; fixtures = $fixtureRoot }
+$report = [pscustomobject]@{ passed = $true; cases = $results; unenrolled_state_path = "passed"; start_process_return = "passed"; real_windows_stop = "passed"; exclusive_lock = "passed"; fixtures = $fixtureRoot }
 $report | ConvertTo-Json -Depth 8

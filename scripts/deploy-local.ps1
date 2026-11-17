@@ -1,4 +1,5 @@
-﻿[CmdletBinding()]
+#Requires -Version 7.0
+[CmdletBinding()]
 param(
     # 生产实例的本地端口与状态文件（默认与安装版一致）。
     [int]$LocalPort = 18181,
@@ -9,6 +10,10 @@ param(
     [string]$ExtensionPublicKeyPath = "",
     # 与 Agent 固定清单匹配的已签名 Runtime 发布目录；留空时自动解析。
     [string]$RuntimeReleaseDirectory = "",
+    [string]$ArtifactManifest,
+    [string]$BuildRoot,
+    [string]$AgentHome,
+    [string]$AgentProfile,
     [switch]$SkipFrontend,
     [switch]$SkipTests,
     [switch]$NoStart
@@ -17,10 +22,19 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "runtime-bundle.ps1")
+. (Join-Path $PSScriptRoot "build-support.ps1")
+$Root = Split-Path -Parent $PSScriptRoot
+$buildLock = $null
+$oldAgentHome = [Environment]::GetEnvironmentVariable("HIMIND_AGENT_HOME", "Process")
+if (-not $AgentHome) { $AgentHome = Join-Path $env:LOCALAPPDATA "HiMindAgent" }
+$AgentHome = Assert-BuildPath $AgentHome
+$oldAgentProfile = [Environment]::GetEnvironmentVariable('HIMIND_AGENT_PROFILE','Process')
+if (-not $AgentProfile) { $AgentProfile = if ($AgentHome -eq (Join-Path $env:LOCALAPPDATA 'HiMindAgent')) { 'production' } else { 'build-acceptance' } }
+$ReuseRuntime = $false
+$deploymentManifest = $null
 
 $Root = Split-Path -Parent $PSScriptRoot
 $RepoRoot = $Root
-$AgentHome = Join-Path $env:LOCALAPPDATA "HiMindAgent"
 $lockDirectory = Join-Path $AgentHome "deploy"
 New-Item -ItemType Directory -Path $lockDirectory -Force | Out-Null
 $deploymentLock = $null
@@ -31,6 +45,8 @@ catch {
     throw "另一个本地部署正在运行或部署锁不可写，未停止 Agent：$($_.Exception.Message)"
 }
 try {
+$env:HIMIND_AGENT_HOME = $AgentHome
+$env:HIMIND_AGENT_PROFILE = $AgentProfile
 $CargoManifest = Join-Path $RepoRoot "Cargo.toml"
 if (-not (Test-Path -LiteralPath $CargoManifest -PathType Leaf)) {
     throw "找不到 Cargo 清单：$CargoManifest"
@@ -45,10 +61,21 @@ $VersionDir = Join-Path $AgentHome "versions\$ActiveVersion"
 $InstalledExe = Join-Path $VersionDir "himind-agent.exe"
 $InstalledMcp = Join-Path $VersionDir "himind-agent-mcp.exe"
 $InstalledLauncher = Join-Path $AgentHome "himind-agent-launcher.exe"
+$InstalledUpdater = Join-Path $AgentHome "himind-agent-updater.exe"
 $RuntimeBundleDestination = Join-Path $AgentHome "resources\runtime"
+foreach ($path in @($InstalledExe,$InstalledMcp,$InstalledLauncher,$InstalledUpdater,$RuntimeBundleDestination)) { [void](Assert-BuildPath $path -Within $AgentHome) }
 
-if (-not $StatePath) { $StatePath = Join-Path $AgentHome "data\agent-state.json" }
-if (-not (Test-Path $StatePath)) { throw "找不到生产实例状态文件：$StatePath" }
+function Resolve-DeploymentStatePath([string]$RequestedPath, [string]$AgentDirectory) {
+    if (-not $RequestedPath) { $RequestedPath = Join-Path $AgentDirectory 'data/agent-state.json' }
+    $path = Assert-BuildPath $RequestedPath
+    # An unenrolled workbench legitimately has no materialised legacy state.
+    # Agent owns creating/removing that file; deployment must not invent one.
+    if (Test-Path -LiteralPath $path -PathType Container) { throw "状态路径必须是文件路径：$path" }
+    $parent = Split-Path -Parent $path
+    if (Test-Path -LiteralPath $parent -PathType Leaf) { throw "状态目录不是目录：$parent" }
+    return $path
+}
+$StatePath = Resolve-DeploymentStatePath $StatePath $AgentHome
 if (-not $UpdatePublicKeyPath) { $UpdatePublicKeyPath = Join-Path $AgentHome "trusted-keys\himind-production-2026.pem" }
 if (-not $ExtensionPublicKeyPath) { $ExtensionPublicKeyPath = Join-Path $AgentHome "trusted-keys\himind-extension-production-2026.pem" }
 if (-not (Test-Path $UpdatePublicKeyPath)) { $UpdatePublicKeyPath = Join-Path $RepoRoot "artifacts-codesigned\0.3.84\himind-production-2026.pem" }
@@ -60,15 +87,20 @@ foreach ($key in @($UpdatePublicKeyPath, $ExtensionPublicKeyPath)) {
 $RuntimeRelease = Resolve-RuntimeReleaseDirectory -RequestedDirectory $RuntimeReleaseDirectory -RequireExactPackage -ExcludeInstalledBundle
 "已锁定 Runtime：version=$($RuntimeRelease.Manifest.version) sha256=$($RuntimeRelease.Manifest.sha256)"
 
-$Cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
-if (-not (Test-Path $Cargo)) { $Cargo = "cargo" }
-# Resolve Cargo's effective output directory before building. This honors both
-# CARGO_TARGET_DIR and workspace configuration, including external build disks.
-$cargoMetadata = & $Cargo metadata --no-deps --format-version 1 --manifest-path $CargoManifest
-if ($LASTEXITCODE -ne 0) { throw "无法解析 Cargo 构建目录，未停止现有 Agent" }
-$CargoTargetDirectory = [string](($cargoMetadata | ConvertFrom-Json).target_directory)
-if (-not [IO.Path]::IsPathRooted($CargoTargetDirectory)) {
-    throw "Cargo 未返回绝对构建目录，未停止现有 Agent"
+# Manifest deployments never invoke Cargo, rustc or npm. The build-root lock
+# protects the frozen artifact and pins against concurrent maintenance.
+if ($ArtifactManifest) {
+    $ArtifactManifest = Assert-BuildPath $ArtifactManifest
+    if (-not $BuildRoot) { $BuildRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ArtifactManifest)) }
+    $managedRoot = Get-BuildRoot $BuildRoot -ReadOnly
+    [void](Assert-BuildPath $ArtifactManifest -Within (Join-Path $managedRoot 'artifacts'))
+    $buildLock = Enter-BuildLock $managedRoot
+    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification
+    if ($deploymentManifest.channel -ne 'local' -or $deploymentManifest.configuration -ne 'release' -or $deploymentManifest.version -ne $ActiveVersion) { throw 'Artifact channel/configuration/version does not match local installation' }
+    foreach ($pair in @(@('HIMIND_SIGNING_PUBLIC_KEY_PATH',$UpdatePublicKeyPath),@('HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH',$ExtensionPublicKeyPath))) {
+        if ($deploymentManifest.tools.environment.($pair[0]) -ne (Get-BuildFileHash $pair[1])) { throw "Artifact trust root mismatch: $($pair[0])" }
+    }
+    if (-not $deploymentManifest.runtime -or $deploymentManifest.runtime.manifest_sha256 -ne (Get-BuildFileHash $RuntimeRelease.ManifestPath) -or $deploymentManifest.runtime.package_sha256 -ne $RuntimeRelease.Manifest.sha256 -or $deploymentManifest.runtime.signature_sha256 -ne (Get-BuildFileHash (Join-Path $RuntimeRelease.Directory "$($RuntimeRelease.PackageName).signature.json"))) { throw 'Artifact Runtime identity mismatch' }
 }
 
 function Get-ListenerPid([int]$port) {
@@ -110,7 +142,7 @@ function Get-InstalledAgentProcesses {
     return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
         $_.ExecutablePath -and
         $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
-        $_.Name -match '^himind-agent(?:-launcher|-mcp)?\.exe$'
+        $_.Name -match '^himind-agent(?:-launcher|-mcp|-updater)?\.exe$'
     })
 }
 
@@ -243,47 +275,59 @@ function Remove-RuntimeDirectorySafely([Parameter(Mandatory = $true)][string]$Di
     Remove-Item -LiteralPath $target -Recurse -Force
 }
 
-# 1) 前端先构建：Tauri 把 frontend/dist 编进二进制，先 Rust 会打进旧界面。
-if (-not $SkipFrontend) {
-    Push-Location (Join-Path $RepoRoot "frontend")
+if (-not $ArtifactManifest) {
+    if ($SkipFrontend -or $SkipTests) { throw 'Local deployment requires verified artifacts; use build.ps1 for explicit unverified development builds' }
+    . (Join-Path $PSScriptRoot 'build-pipeline.ps1')
+    $savedKeys = @{}
+    foreach ($name in @('HIMIND_SIGNING_PUBLIC_KEY_PATH','HIMIND_SIGNING_KEY_ID','HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH','HIMIND_EXTENSION_SIGNING_KEY_ID')) { $savedKeys[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
     try {
-        & npm.cmd run build
-        if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
+        $env:HIMIND_SIGNING_PUBLIC_KEY_PATH = $UpdatePublicKeyPath
+        $env:HIMIND_SIGNING_KEY_ID = 'himind-production-2026'
+        $env:HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH = $ExtensionPublicKeyPath
+        $env:HIMIND_EXTENSION_SIGNING_KEY_ID = 'himind-extension-production-2026'
+        $built = Invoke-AgentBuildPipeline -Repository $RepoRoot -BuildRoot $BuildRoot -Mode candidate -Build -RuntimeReleaseDirectory $RuntimeRelease.Directory
+        $ArtifactManifest = $built.manifest
     }
-    finally {
-        Pop-Location
-    }
+    finally { Exit-BuildEnvironment $savedKeys }
+    $managedRoot = Get-BuildRoot $BuildRoot -ReadOnly
+    $buildLock = Enter-BuildLock $managedRoot
+    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification
 }
-
-# 2) 带官方信任根 + 本地构建标记编 release。
-$env:HIMIND_SIGNING_PUBLIC_KEY_PATH = $UpdatePublicKeyPath
-$env:HIMIND_SIGNING_KEY_ID = "himind-production-2026"
-$env:HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH = $ExtensionPublicKeyPath
-$env:HIMIND_EXTENSION_SIGNING_KEY_ID = "himind-extension-production-2026"
-$env:HIMIND_BUILD_CHANNEL = "local"
-
-Push-Location $RepoRoot
+$artifactDirectory = Split-Path -Parent $ArtifactManifest
+$BuiltExe = Join-Path $artifactDirectory 'himind-agent.exe'
+$BuiltMcp = Join-Path $artifactDirectory 'himind-agent-mcp.exe'
+$BuiltLauncher = Join-Path $artifactDirectory 'himind-agent-launcher.exe'
+$BuiltUpdater = Join-Path $artifactDirectory 'himind-agent-updater.exe'
+$runtimeIdentityPath = Join-Path $AgentHome 'deploy/runtime-identity.json'
+function Get-InstalledRuntimeIdentity {
+    $state = Assert-InstalledRuntime $RuntimeRelease.Manifest
+    $directory = Split-Path -Parent (Split-Path -Parent $state.executable_path)
+    [void](Assert-BuildPath $directory -Within (Join-Path $AgentHome 'runtimes'))
+    return [ordered]@{package_sha256=$RuntimeRelease.Manifest.sha256; signature_sha256=Get-BuildFileHash (Join-Path $RuntimeRelease.Directory "$($RuntimeRelease.PackageName).signature.json"); installed_tree_hash=Get-BuildHash (Get-BuildTree $directory); executable_path=$state.executable_path}
+}
 try {
-    if (-not $SkipTests) {
-        & $Cargo test --locked 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "cargo test 失败，未停止现有 Agent；修复失败或显式使用 -SkipTests" }
+    if (Test-Path -LiteralPath $runtimeIdentityPath) {
+        $priorRuntimeIdentity = Get-Content -LiteralPath $runtimeIdentityPath -Raw | ConvertFrom-Json -AsHashtable
+        $ReuseRuntime = (Get-BuildHash (Get-InstalledRuntimeIdentity)) -eq (Get-BuildHash $priorRuntimeIdentity)
+        if ($ReuseRuntime) { Write-Host 'REUSED installed Runtime: package, installation contents and health match' }
     }
-    & $Cargo build --release --bin himind-agent --bin himind-agent-mcp --bin himind-agent-launcher
-    if ($LASTEXITCODE -ne 0) { throw "release 构建失败" }
 }
-finally {
-    Pop-Location
+catch { Write-Warning "Runtime reuse rejected; install required: $($_.Exception.Message)" }
+# Account for binaries, backups, package staging and uncompressed installation
+# on their actual volume. Never stop a running process before this check.
+$binaryBytes = [long](($deploymentManifest.artifacts | Measure-Object bytes -Sum).Sum)
+$runtimeBytes = [long]((Get-ChildItem -LiteralPath $RuntimeRelease.Directory -File | Measure-Object Length -Sum).Sum)
+$runtimeExpandedBytes = 0L
+if (-not $ReuseRuntime) {
+    $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $RuntimeRelease.Directory $RuntimeRelease.PackageName))
+    try { foreach ($entry in $zip.Entries) { $runtimeExpandedBytes += $entry.Length } } finally { $zip.Dispose() }
 }
-
-$BuiltExe = Join-Path $CargoTargetDirectory "release\himind-agent.exe"
-$BuiltMcp = Join-Path $CargoTargetDirectory "release\himind-agent-mcp.exe"
-$BuiltLauncher = Join-Path $CargoTargetDirectory "release\himind-agent-launcher.exe"
-foreach ($built in @($BuiltExe, $BuiltMcp, $BuiltLauncher)) {
-    if (-not (Test-Path -LiteralPath $built)) { throw "找不到构建产物：$built" }
-}
+Assert-BuildCapacity @(@{Path=$AgentHome;Bytes=($binaryBytes*3 + $(if($ReuseRuntime){0}else{$runtimeBytes*2+$runtimeExpandedBytes*2}))},@{Path=$env:TEMP;Bytes=32MB}) | Out-Host
 
 # 3) 预备、停服、替换、校验和失败恢复都由同一脚本执行，不依赖调用方会话。
 function Invoke-LocalDeployment {
+    $runtimeStatePath = Join-Path $AgentHome 'runtimes/deepseek-harness/state.json'
+    $priorRuntimeState = if (Test-Path -LiteralPath $runtimeStatePath) { [IO.File]::ReadAllBytes($runtimeStatePath) } else { $null }
     $runningPid = Get-ListenerPid $LocalPort
     $wasRunning = [bool]$runningPid
     $stamp = (Get-Date -Format "yyyyMMdd-HHmmss") + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
@@ -310,13 +354,19 @@ function Invoke-LocalDeployment {
     $artifacts = @(
         @{ Source = $BuiltExe; Target = $InstalledExe; Backup = "$InstalledExe.bak-$stamp"; Touched = $false },
         @{ Source = $BuiltMcp; Target = $InstalledMcp; Backup = "$InstalledMcp.bak-$stamp"; Touched = $false },
-        @{ Source = $BuiltLauncher; Target = $InstalledLauncher; Backup = "$InstalledLauncher.bak-$stamp"; Touched = $false }
+        @{ Source = $BuiltLauncher; Target = $InstalledLauncher; Backup = "$InstalledLauncher.bak-$stamp"; Touched = $false },
+        @{ Source = $BuiltUpdater; Target = $InstalledUpdater; Backup = "$InstalledUpdater.bak-$stamp"; Touched = $false }
     )
     $stopAttempted = $false
     $runtimeTouched = $false
     $versionTouched = $false
     $process = $null
     $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+    $runtimeIdentityTouched = $false
+    $pinTouched = $false
+    $pinPath = $null
+    $priorPinBytes = $null
+    $priorRuntimeIdentityBytes = if ($deploymentManifest -and (Test-Path -LiteralPath $runtimeIdentityPath -PathType Leaf)) { [IO.File]::ReadAllBytes($runtimeIdentityPath) } else { $null }
     try {
         # All large copies and backups finish while the gateway is still available.
         foreach ($artifact in $artifacts) {
@@ -326,7 +376,7 @@ function Invoke-LocalDeployment {
                 Copy-Item -LiteralPath $artifact.Target -Destination $artifact.Backup -ErrorAction Stop
             }
         }
-        Copy-RuntimeBundle -RuntimeReleaseDirectory $RuntimeRelease.Directory -DestinationDirectory $runtimeStaging -RequireExactPackage | Out-Null
+        if (-not $ReuseRuntime) { Copy-RuntimeBundle -RuntimeReleaseDirectory $RuntimeRelease.Directory -DestinationDirectory $runtimeStaging -RequireExactPackage | Out-Null }
 
         $stopAttempted = $true
         if ($runningPid) {
@@ -337,11 +387,13 @@ function Invoke-LocalDeployment {
         Stop-InstalledAgentProcesses
 
         New-Item -ItemType Directory -Path $VersionDir -Force | Out-Null
-        if ($hadRuntimeBundle) {
-            Move-Item -LiteralPath $RuntimeBundleDestination -Destination $runtimeBackup -ErrorAction Stop
+        if (-not $ReuseRuntime) {
+            if ($hadRuntimeBundle) {
+                Move-Item -LiteralPath $RuntimeBundleDestination -Destination $runtimeBackup -ErrorAction Stop
+            }
+            $runtimeTouched = $true
+            Move-Item -LiteralPath $runtimeStaging -Destination $RuntimeBundleDestination -ErrorAction Stop
         }
-        $runtimeTouched = $true
-        Move-Item -LiteralPath $runtimeStaging -Destination $RuntimeBundleDestination -ErrorAction Stop
         foreach ($artifact in $artifacts) {
             $artifact.Touched = $true
             Copy-InstalledExeWithRetry -Source $artifact.Source -Destination $artifact.Target
@@ -352,7 +404,7 @@ function Invoke-LocalDeployment {
             Write-Host "已安装：$($artifact.Target) sha256=$installedHash（备份 $($artifact.Backup)）"
         }
 
-        Install-RuntimeBundle $RuntimeRelease.Manifest
+        if (-not $ReuseRuntime) { Install-RuntimeBundle $RuntimeRelease.Manifest }
         $versionTouched = $true
         Set-Content -LiteralPath $versionFile -Value $ActiveVersion -Encoding ASCII -NoNewline
 
@@ -368,8 +420,22 @@ function Invoke-LocalDeployment {
             if ([string]$health.executable_path -ne $InstalledExe -or (Get-ListenerPid $LocalPort) -ne $process.Id) {
                 throw "健康检查未命中新启动的 Agent 进程"
             }
+            if ($deploymentManifest -and (-not $health.build.commit -or -not $deploymentManifest.commit.StartsWith([string]$health.build.commit))) { throw 'Installed Git identity differs from artifact manifest' }
         }
         $runtimeState = Assert-InstalledRuntime $RuntimeRelease.Manifest
+        if ($deploymentManifest) {
+            $runtimeIdentityTouched = $true
+            Write-BuildJson $runtimeIdentityPath (Get-InstalledRuntimeIdentity)
+            $pinPath = Join-Path $managedRoot ('pins/' + (Get-BuildHash $AgentHome.ToLowerInvariant()) + '.json')
+            $previousManifest = $null
+            if (Test-Path -LiteralPath $pinPath) {
+                $priorPinBytes = [IO.File]::ReadAllBytes($pinPath)
+                $priorPin = Get-Content -LiteralPath $pinPath -Raw | ConvertFrom-Json
+                $previousManifest = if ($priorPin.current_manifest -eq $ArtifactManifest) { $priorPin.previous_manifest } else { $priorPin.current_manifest }
+            }
+            $pinTouched = $true
+            Write-BuildJson $pinPath @{current_manifest=$ArtifactManifest;previous_manifest=$previousManifest;agent_home=$AgentHome}
+        }
         Write-Host "部署完成：version=$ActiveVersion runtime=$($runtimeState.version) port=$LocalPort started=$(-not $NoStart)"
         # Keep backups for explicit rollback; cleanup must never trigger rollback.
         Write-Host "Agent 备份：$($artifacts[0].Backup)；Runtime 备份：$runtimeBackup"
@@ -413,11 +479,27 @@ function Invoke-LocalDeployment {
                     Move-Item -LiteralPath $runtimeBackup -Destination $RuntimeBundleDestination -ErrorAction Stop
                 }
             }
+            Invoke-RecoveryStep '恢复 Runtime 状态指针' {
+                if ($null -ne $priorRuntimeState) { [IO.File]::WriteAllBytes($runtimeStatePath,$priorRuntimeState) }
+                elseif (Test-Path -LiteralPath $runtimeStatePath) { Remove-Item -LiteralPath $runtimeStatePath -Force }
+            }
         }
         if ($versionTouched) {
             Invoke-RecoveryStep "恢复 active-version" {
                 if ($hadActiveVersion) { [IO.File]::WriteAllBytes($versionFile, $previousActiveVersion) }
                 elseif (Test-Path -LiteralPath $versionFile -PathType Leaf) { Remove-Item -LiteralPath $versionFile -Force }
+            }
+        }
+        if ($runtimeIdentityTouched) {
+            Invoke-RecoveryStep '恢复 Runtime 身份收据' {
+                if ($null -ne $priorRuntimeIdentityBytes) { [IO.File]::WriteAllBytes($runtimeIdentityPath, $priorRuntimeIdentityBytes) }
+                elseif (Test-Path -LiteralPath $runtimeIdentityPath -PathType Leaf) { Remove-Item -LiteralPath $runtimeIdentityPath -Force }
+            }
+        }
+        if ($pinTouched) {
+            Invoke-RecoveryStep '恢复部署 pin' {
+                if ($null -ne $priorPinBytes) { [IO.File]::WriteAllBytes($pinPath, $priorPinBytes) }
+                elseif (Test-Path -LiteralPath $pinPath -PathType Leaf) { Remove-Item -LiteralPath $pinPath -Force }
             }
         }
         # NoStart applies only to a successful deployment. Failure restores the
@@ -452,4 +534,7 @@ Invoke-LocalDeployment
 }
 finally {
     if ($deploymentLock) { $deploymentLock.Dispose() }
+    if ($buildLock) { $buildLock.Dispose() }
+    Exit-BuildEnvironment @{HIMIND_AGENT_HOME=$oldAgentHome}
+    Exit-BuildEnvironment @{HIMIND_AGENT_PROFILE=$oldAgentProfile}
 }

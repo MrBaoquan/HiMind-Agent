@@ -265,8 +265,14 @@ pub(crate) enum McpServerAction {
 impl McpServer {
     pub(crate) fn inherit_runtime_lease(&mut self, client: &Value) -> Result<(), Box<dyn Error>> {
         if let Some(lease) = client.get("runtime_lease") {
-            let id = lease.get("lease_id").and_then(Value::as_str).ok_or("runtime lease id is required")?;
-            let workspace = lease.get("workspace_root").and_then(Value::as_str).ok_or("runtime lease workspace is required")?;
+            let id = lease
+                .get("lease_id")
+                .and_then(Value::as_str)
+                .ok_or("runtime lease id is required")?;
+            let workspace = lease
+                .get("workspace_root")
+                .and_then(Value::as_str)
+                .ok_or("runtime lease workspace is required")?;
             crate::workspace_lease::validate_active(id, std::path::Path::new(workspace), "write")?;
             self.session.runtime_lease = Some((id.into(), workspace.into()));
         }
@@ -708,7 +714,11 @@ fn handle_request_with_session(
                 )));
             }
             let context = mcp_invocation_context_for_session(session);
-            if let Some(result) = crate::workspace_lease::inherited_call(name, &arguments, session.runtime_lease.as_ref()) {
+            if let Some(result) = crate::workspace_lease::inherited_call(
+                name,
+                &arguments,
+                session.runtime_lease.as_ref(),
+            ) {
                 return match result {
                     Ok(value) => mcp_tool_call_result(value),
                     Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
@@ -949,7 +959,11 @@ fn invoke_activated_capability(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if let Some(result) = crate::workspace_lease::inherited_call(capability_id, &arguments, session.runtime_lease.as_ref()) {
+    if let Some(result) = crate::workspace_lease::inherited_call(
+        capability_id,
+        &arguments,
+        session.runtime_lease.as_ref(),
+    ) {
         return result;
     }
     gateway.invoke(
@@ -1393,7 +1407,10 @@ mod tests {
     }
 
     fn git(workspace: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-        let output = Command::new("git").args(args).current_dir(workspace).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()?;
         if !output.status.success() {
             return Err(format!(
                 "git {} failed: {}",
@@ -1421,7 +1438,11 @@ mod tests {
         session
     }
 
-    fn activate_for_client(gateway: &CapabilityGateway, session: &mut McpSessionState, query: &str) {
+    fn activate_for_client(
+        gateway: &CapabilityGateway,
+        session: &mut McpSessionState,
+        query: &str,
+    ) {
         let activated = handle_request_with_session(
             gateway,
             "tools/call",
@@ -1484,7 +1505,10 @@ mod tests {
         let root = target_root.join("test-fixtures").join(format!(
             "himind-mission-cross-client-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -1510,15 +1534,28 @@ mod tests {
             instructions: "执行确定性验证，保留宿主证据，不自行扩大任务范围。".to_string(),
             output_contract: Default::default(),
             harness: Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         git(&workspace, &["init"]).unwrap();
-        std::fs::write(workspace.join("README.md"), "cross-client mission e2e
-").unwrap();
+        std::fs::write(
+            workspace.join("README.md"),
+            "cross-client mission e2e
+",
+        )
+        .unwrap();
         git(&workspace, &["add", "README.md"]).unwrap();
         git(
             &workspace,
-            &["-c", "user.name=HiMind Test", "-c", "user.email=test@himind.local", "commit", "-m", "initial"],
+            &[
+                "-c",
+                "user.name=HiMind Test",
+                "-c",
+                "user.email=test@himind.local",
+                "commit",
+                "-m",
+                "initial",
+            ],
         )
         .unwrap();
 
@@ -1535,9 +1572,15 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!("himind.fixture"));
-        std::fs::write(&workflow_json_path, serde_json::to_vec_pretty(&workflow_json).unwrap()).unwrap();
+        std::fs::write(
+            &workflow_json_path,
+            serde_json::to_vec_pretty(&workflow_json).unwrap(),
+        )
+        .unwrap();
         let workflow_store = crate::workflow::WorkflowStore::new(home.join("workflows"));
-        let installed = workflow_store.install_from_directory(&package_source).unwrap();
+        let installed = workflow_store
+            .install_from_directory(&package_source)
+            .unwrap();
         let digest = crate::workflow::package_digest(&installed.package.source_root).unwrap();
 
         let mut options = Options::from_env();
@@ -1599,9 +1642,18 @@ mod tests {
 
         let mut codex = initialize_client(&gateway, "Codex");
         activate_for_client(&gateway, &mut codex, "mission.");
-        let denied = call_tool(&gateway, &mut codex, "mission.handoff.create", handoff_input.clone());
+        let denied = call_tool(
+            &gateway,
+            &mut codex,
+            "mission.handoff.create",
+            handoff_input.clone(),
+        );
         assert_eq!(denied["isError"], true, "{denied}");
-        assert!(crate::mission::MissionStore::open_default().unwrap().list(10).unwrap().is_empty());
+        assert!(crate::mission::MissionStore::open_default()
+            .unwrap()
+            .list(10)
+            .unwrap()
+            .is_empty());
 
         let created = call_tool_with_user_approval(
             &gateway,
@@ -1688,7 +1740,10 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(incomplete_assignment["isError"], true, "every fixed workflow slot must be assigned: {incomplete_assignment}");
+        assert_eq!(
+            incomplete_assignment["isError"], true,
+            "every fixed workflow slot must be assigned: {incomplete_assignment}"
+        );
         let missing_task_mapping = call_tool_with_user_approval(
             &gateway,
             Arc::clone(&approval_manager),
@@ -1704,7 +1759,10 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(missing_task_mapping["isError"], true, "every imported task must map to an assigned slot: {missing_task_mapping}");
+        assert_eq!(
+            missing_task_mapping["isError"], true,
+            "every imported task must map to an assigned slot: {missing_task_mapping}"
+        );
         let mut invalid_assignment_roles = assignment_roles.clone();
         invalid_assignment_roles[0]["service_id"] = json!("service-not-in-directory");
         let rejected_binding = call_tool_with_user_approval(
@@ -1722,7 +1780,10 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(rejected_binding["isError"], true, "invalid catalog binding must be rejected: {rejected_binding}");
+        assert_eq!(
+            rejected_binding["isError"], true,
+            "invalid catalog binding must be rejected: {rejected_binding}"
+        );
         let assigned = call_tool_with_user_approval(
             &gateway,
             Arc::clone(&approval_manager),
@@ -1739,7 +1800,10 @@ mod tests {
             }),
         );
         assert_eq!(assigned["isError"], false, "{assigned}");
-        assert_eq!(assigned["structuredContent"]["status"], "awaiting_confirmation");
+        assert_eq!(
+            assigned["structuredContent"]["status"],
+            "awaiting_confirmation"
+        );
 
         let store = crate::mission::MissionStore::open_default().unwrap();
         let ready_to_confirm = store.get(&mission_id).unwrap();
@@ -1758,8 +1822,14 @@ mod tests {
             "mission.plan.confirm",
             confirm_input.clone(),
         );
-        assert_eq!(unapproved_confirmation["isError"], true, "{unapproved_confirmation}");
-        assert_eq!(store.get(&mission_id).unwrap().status, crate::mission::MissionStatus::AwaitingConfirmation);
+        assert_eq!(
+            unapproved_confirmation["isError"], true,
+            "{unapproved_confirmation}"
+        );
+        assert_eq!(
+            store.get(&mission_id).unwrap().status,
+            crate::mission::MissionStatus::AwaitingConfirmation
+        );
         let confirmed = call_tool_with_user_approval(
             &gateway,
             Arc::clone(&approval_manager),
@@ -1769,28 +1839,55 @@ mod tests {
         );
         assert_eq!(confirmed["isError"], false, "{confirmed}");
         assert_eq!(confirmed["structuredContent"]["status"], "active");
-        let confirmed: crate::mission::MissionView = serde_json::from_value(confirmed["structuredContent"].clone()).unwrap();
+        let confirmed: crate::mission::MissionView =
+            serde_json::from_value(confirmed["structuredContent"].clone()).unwrap();
         assert_eq!(confirmed.status, crate::mission::MissionStatus::Active);
 
         // The same host recovery works across clients; a model cannot assert
         // its own permission approval or bypass the environment wait with resume.
-        store.suspend_runtime(&mission_id, "smoke", &json!({"code":"runtime_workspace_blocked"})).unwrap();
-        activate_for_client(&gateway, &mut codex, "runtime.workspace.");
-        activate_for_client(&gateway, &mut claude, "runtime.workspace.");
-        let diagnosis = call_tool(&gateway, &mut codex, "runtime.workspace.check", json!({"workspace":workspace.to_string_lossy()}));
+        store
+            .suspend_runtime(
+                &mission_id,
+                "smoke",
+                &json!({"code":"runtime_workspace_blocked"}),
+            )
+            .unwrap();
+        activate_for_client(&gateway, &mut codex, "workspace.runtime.");
+        activate_for_client(&gateway, &mut claude, "workspace.runtime.");
+        let diagnosis = call_tool(
+            &gateway,
+            &mut codex,
+            "workspace.runtime.check",
+            json!({"workspace":workspace.to_string_lossy()}),
+        );
         assert_eq!(diagnosis["isError"], false, "{diagnosis}");
         let resolve_input = json!({"workspace":workspace.to_string_lossy(),
             "expected_fingerprint":diagnosis["structuredContent"]["fingerprint"],
             "action":"files_only","mission_id":mission_id,"expected_plan_sha256":confirmed.plan_sha256});
-        let denied = call_tool(&gateway, &mut codex, "runtime.workspace.resolve", resolve_input.clone());
+        let denied = call_tool(
+            &gateway,
+            &mut codex,
+            "workspace.runtime.resolve",
+            resolve_input.clone(),
+        );
         assert_eq!(denied["isError"], true, "{denied}");
-        assert_eq!(store.get(&mission_id).unwrap().status, crate::mission::MissionStatus::Waiting);
-        let resolved = call_tool_with_user_approval(&gateway, Arc::clone(&approval_manager),
-            &mut claude, "runtime.workspace.resolve", resolve_input);
+        assert_eq!(
+            store.get(&mission_id).unwrap().status,
+            crate::mission::MissionStatus::Waiting
+        );
+        let resolved = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut claude,
+            "workspace.runtime.resolve",
+            resolve_input,
+        );
         assert_eq!(resolved["isError"], false, "{resolved}");
         assert_eq!(resolved["structuredContent"]["mission"]["status"], "active");
         assert_eq!(resolved["structuredContent"]["shell_verified"], false);
-        assert!(store.runtime_files_only(&mission_id, &confirmed.plan_sha256).unwrap());
+        assert!(store
+            .runtime_files_only(&mission_id, &confirmed.plan_sha256)
+            .unwrap());
 
         drop(codex);
         drop(claude);
@@ -1798,12 +1895,9 @@ mod tests {
         let supervisor_options = gateway.options().clone();
         let mut final_mission = confirmed;
         for _ in 0..4 {
-            let errors = crate::app::mission_supervisor::scan_once(
-                &gateway,
-                &supervisor_options,
-                &store,
-            )
-            .unwrap();
+            let errors =
+                crate::app::mission_supervisor::scan_once(&gateway, &supervisor_options, &store)
+                    .unwrap();
             assert!(errors.is_empty(), "supervisor errors: {errors:?}");
             final_mission = store.get(&mission_id).unwrap();
             if final_mission.status == crate::mission::MissionStatus::Completed {
@@ -1816,7 +1910,9 @@ mod tests {
             crate::mission::MissionStatus::Completed,
             "{final_mission:#?}"
         );
-        assert!(workspace.join(".himind-workflow-fixture/development.json").is_file());
+        assert!(workspace
+            .join(".himind-workflow-fixture/development.json")
+            .is_file());
 
         let mut third_client = initialize_client(&gateway, "Qoder");
         activate_for_client(&gateway, &mut third_client, "mission.");
@@ -1829,7 +1925,10 @@ mod tests {
         assert_eq!(shared["isError"], false, "{shared}");
         assert_eq!(shared["structuredContent"]["status"], "completed");
         assert_eq!(shared["structuredContent"]["mission_id"], mission_id);
-        assert_eq!(shared["structuredContent"]["tasks"][0]["verification_passed"], true);
+        assert_eq!(
+            shared["structuredContent"]["tasks"][0]["verification_passed"],
+            true
+        );
 
         let exported = call_tool_with_user_approval(
             &gateway,
@@ -1846,10 +1945,21 @@ mod tests {
         );
         assert_eq!(exported["isError"], false, "{exported}");
         assert_eq!(exported["structuredContent"]["state"], "tested");
-        assert_eq!(exported["structuredContent"]["package_id"], "com.himind.workflow.cross-client-smoke");
-        let candidate_path = exported["structuredContent"]["candidate_path"].as_str().unwrap();
-        assert!(Path::new(candidate_path).is_file(), "export candidate was not persisted: {candidate_path}");
-        assert!(!candidate_path.contains(&mission_id), "export used the Mission ID as its package identity");
+        assert_eq!(
+            exported["structuredContent"]["package_id"],
+            "com.himind.workflow.cross-client-smoke"
+        );
+        let candidate_path = exported["structuredContent"]["candidate_path"]
+            .as_str()
+            .unwrap();
+        assert!(
+            Path::new(candidate_path).is_file(),
+            "export candidate was not persisted: {candidate_path}"
+        );
+        assert!(
+            !candidate_path.contains(&mission_id),
+            "export used the Mission ID as its package identity"
+        );
 
         // Full access is a Mission choice, not an ACL repair. Exercise the
         // actual cross-client approval route without a permission fingerprint.
@@ -1858,41 +1968,114 @@ mod tests {
                 "root":workspace.to_string_lossy(), "read_scope":["."], "write_scope":[".himind-workflow-fixture"]
             }
         })).unwrap()).unwrap();
-        let full_plan = store.propose_plan(&full_mission.mission_id, &serde_json::from_value(plan.clone()).unwrap()).unwrap();
-        let configured = call_tool(&gateway, &mut third_client, "mission.permission.set", json!({
-            "mission_id":full_mission.mission_id,"expected_plan_sha256":full_plan.plan_sha256,"permission_mode":"full_access"
-        }));
-        assert_eq!(configured["isError"],false,"{configured}");
-        let configured_hash = configured["structuredContent"]["plan_sha256"].as_str().unwrap();
-        assert_ne!(configured_hash,full_plan.plan_sha256);
-        assert_eq!(configured["structuredContent"]["status"],"awaiting_confirmation");
-        assert!(store.confirm_plan(&full_mission.mission_id,&full_plan.plan_sha256,&["smoke".into()],&[".himind-workflow-fixture".into()],&[],&[],"fixture-user").is_err());
+        let full_plan = store
+            .propose_plan(
+                &full_mission.mission_id,
+                &serde_json::from_value(plan.clone()).unwrap(),
+            )
+            .unwrap();
+        let configured = call_tool(
+            &gateway,
+            &mut third_client,
+            "mission.permission.set",
+            json!({
+                "mission_id":full_mission.mission_id,"expected_plan_sha256":full_plan.plan_sha256,"permission_mode":"full_access"
+            }),
+        );
+        assert_eq!(configured["isError"], false, "{configured}");
+        let configured_hash = configured["structuredContent"]["plan_sha256"]
+            .as_str()
+            .unwrap();
+        assert_ne!(configured_hash, full_plan.plan_sha256);
+        assert_eq!(
+            configured["structuredContent"]["status"],
+            "awaiting_confirmation"
+        );
+        assert!(store
+            .confirm_plan(
+                &full_mission.mission_id,
+                &full_plan.plan_sha256,
+                &["smoke".into()],
+                &[".himind-workflow-fixture".into()],
+                &[],
+                &[],
+                "fixture-user"
+            )
+            .is_err());
         // Recover a restricted task, so the action must change effective access.
-        let restricted = call_tool(&gateway, &mut third_client, "mission.permission.set", json!({
-            "mission_id":full_mission.mission_id,"expected_plan_sha256":configured_hash,"permission_mode":"workspace_write"
-        }));
-        assert_eq!(restricted["isError"],false,"{restricted}");
-        let full_active = store.confirm_plan(&full_mission.mission_id,
-            restricted["structuredContent"]["plan_sha256"].as_str().unwrap(),
-            &["smoke".into()],&[".himind-workflow-fixture".into()],&[],&[],"fixture-user").unwrap();
-        store.suspend_runtime(&full_mission.mission_id,"smoke",&json!({"code":"runtime_workspace_blocked"})).unwrap();
-        activate_for_client(&gateway,&mut third_client,"runtime.workspace.");
+        let restricted = call_tool(
+            &gateway,
+            &mut third_client,
+            "mission.permission.set",
+            json!({
+                "mission_id":full_mission.mission_id,"expected_plan_sha256":configured_hash,"permission_mode":"workspace_write"
+            }),
+        );
+        assert_eq!(restricted["isError"], false, "{restricted}");
+        let full_active = store
+            .confirm_plan(
+                &full_mission.mission_id,
+                restricted["structuredContent"]["plan_sha256"]
+                    .as_str()
+                    .unwrap(),
+                &["smoke".into()],
+                &[".himind-workflow-fixture".into()],
+                &[],
+                &[],
+                "fixture-user",
+            )
+            .unwrap();
+        store
+            .suspend_runtime(
+                &full_mission.mission_id,
+                "smoke",
+                &json!({"code":"runtime_workspace_blocked"}),
+            )
+            .unwrap();
+        activate_for_client(&gateway, &mut third_client, "workspace.runtime.");
         let full_resolution = json!({"workspace":workspace.to_string_lossy(),"action":"full_access",
             "mission_id":full_mission.mission_id,"expected_plan_sha256":full_active.plan_sha256});
-        let denied = call_tool(&gateway,&mut third_client,"runtime.workspace.resolve",full_resolution.clone());
-        assert_eq!(denied["isError"],true,"{denied}");
-        assert_eq!(store.runtime_mode(&full_mission.mission_id,&full_active.plan_sha256).unwrap(),"default");
-        let mut fourth_client = initialize_client(&gateway,"Codex");
-        activate_for_client(&gateway,&mut fourth_client,"runtime.workspace.");
-        let full_resolved = call_tool_with_user_approval(&gateway,Arc::clone(&approval_manager),&mut fourth_client,
-            "runtime.workspace.resolve",full_resolution);
-        assert_eq!(full_resolved["isError"],false,"{full_resolved}");
-        assert_eq!(full_resolved["structuredContent"]["mode"],"full_access");
-        assert_eq!(full_resolved["structuredContent"]["mission"]["status"],"active");
-        assert_eq!(full_resolved["structuredContent"]["permission_prepared"],false);
+        let denied = call_tool(
+            &gateway,
+            &mut third_client,
+            "workspace.runtime.resolve",
+            full_resolution.clone(),
+        );
+        assert_eq!(denied["isError"], true, "{denied}");
+        assert_eq!(
+            store
+                .runtime_mode(&full_mission.mission_id, &full_active.plan_sha256)
+                .unwrap(),
+            "default"
+        );
+        let mut fourth_client = initialize_client(&gateway, "Codex");
+        activate_for_client(&gateway, &mut fourth_client, "workspace.runtime.");
+        let full_resolved = call_tool_with_user_approval(
+            &gateway,
+            Arc::clone(&approval_manager),
+            &mut fourth_client,
+            "workspace.runtime.resolve",
+            full_resolution,
+        );
+        assert_eq!(full_resolved["isError"], false, "{full_resolved}");
+        assert_eq!(full_resolved["structuredContent"]["mode"], "full_access");
+        assert_eq!(
+            full_resolved["structuredContent"]["mission"]["status"],
+            "active"
+        );
+        assert_eq!(
+            full_resolved["structuredContent"]["permission_prepared"],
+            false
+        );
         assert!(full_resolved["structuredContent"]["repair"].is_null());
-        assert_eq!(crate::mission::MissionStore::open_default().unwrap().runtime_mode(&full_mission.mission_id,&full_active.plan_sha256).unwrap(),"full_access");
-        store.control(&full_mission.mission_id,"cancel").unwrap();
+        assert_eq!(
+            crate::mission::MissionStore::open_default()
+                .unwrap()
+                .runtime_mode(&full_mission.mission_id, &full_active.plan_sha256)
+                .unwrap(),
+            "full_access"
+        );
+        store.control(&full_mission.mission_id, "cancel").unwrap();
         drop(fourth_client);
         drop(third_client);
         drop(store);
@@ -2609,16 +2792,21 @@ mod tests {
             .is_some());
         // 现在有两类模板：Skill 附属资料与 Workflow 运行详情。
         // 断言从「完全相等」改成「包含」：新增资源不该让这条用例天天改。
-        let templates =
-            handle_request(&gateway, "resources/templates/list", json!({})).unwrap();
+        let templates = handle_request(&gateway, "resources/templates/list", json!({})).unwrap();
         let items = templates["resourceTemplates"].as_array().unwrap();
-        assert!(items.iter().any(|item| item["uriTemplate"] == "himind://skill/{skill_id}/{path}"));
+        assert!(items
+            .iter()
+            .any(|item| item["uriTemplate"] == "himind://skill/{skill_id}/{path}"));
         assert!(
-            items.iter().any(|item| item["uriTemplate"] == "himind://run/{run_id}"),
+            items
+                .iter()
+                .any(|item| item["uriTemplate"] == "himind://run/{run_id}"),
             "运行资源模板必须暴露：客户端靠它发现可读的运行"
         );
         assert!(
-            items.iter().any(|item| item["uriTemplate"] == "himind://ui-audit-ledger"),
+            items
+                .iter()
+                .any(|item| item["uriTemplate"] == "himind://ui-audit-ledger"),
             "审查台账必须暴露：它是跨运行追踪的唯一入口"
         );
         assert_eq!(
@@ -2940,17 +3128,20 @@ mod tests {
             "mission.assignment.apply",
             "mission.permission.set",
             "mission.plan.confirm",
-            "mission.follow_up.add",
+            "mission.follow-up.add",
             "mission.budget.extend",
             "mission.verification.retry",
             "mission.control",
             "mission.workflow.export",
         ] {
-            assert!(tools.iter().any(|tool| tool["name"] == name), "missing Mission control capability: {name}");
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name),
+                "missing Mission control capability: {name}"
+            );
         }
         for (name, approval) in [
-            ("runtime.workspace.check", false),
-            ("runtime.workspace.resolve", true),
+            ("workspace.runtime.check", false),
+            ("workspace.runtime.resolve", true),
             ("mission.permission.set", false),
             ("mission.get", false),
             ("mission.events.list", false),
@@ -2958,7 +3149,7 @@ mod tests {
             ("mission.handoff.create", true),
             ("mission.assignment.apply", true),
             ("mission.plan.confirm", true),
-            ("mission.follow_up.add", true),
+            ("mission.follow-up.add", true),
             ("mission.budget.extend", true),
             ("mission.verification.retry", true),
             ("mission.control", true),
@@ -2967,18 +3158,52 @@ mod tests {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["approvalRequired"], approval, "{name}");
         }
-        let retry = tools.iter().find(|tool| tool["name"] == "mission.verification.retry").unwrap();
-        let retry_override = &retry["inputSchema"]["properties"]["input"]["properties"]["legacy_verification_override"];
-        assert_eq!(retry_override["required"], json!(["expected_pause_event_id", "expected_runtime_failure_event_id"]));
-        let budget = tools.iter().find(|tool| tool["name"] == "mission.budget.extend").unwrap();
-        let budget_override = &budget["inputSchema"]["properties"]["input"]["properties"]["legacy_verification_override"];
-        assert_eq!(budget_override["required"], json!(["expected_pause_event_id", "expected_runtime_failure_event_id"]));
-        assert!(budget_override["description"].as_str().unwrap().contains("增额后 Mission 仍保持等待"));
+        let retry = tools
+            .iter()
+            .find(|tool| tool["name"] == "mission.verification.retry")
+            .unwrap();
+        let retry_override = &retry["inputSchema"]["properties"]["input"]["properties"]
+            ["legacy_verification_override"];
+        assert_eq!(
+            retry_override["required"],
+            json!([
+                "expected_pause_event_id",
+                "expected_runtime_failure_event_id"
+            ])
+        );
+        let budget = tools
+            .iter()
+            .find(|tool| tool["name"] == "mission.budget.extend")
+            .unwrap();
+        let budget_override = &budget["inputSchema"]["properties"]["input"]["properties"]
+            ["legacy_verification_override"];
+        assert_eq!(
+            budget_override["required"],
+            json!([
+                "expected_pause_event_id",
+                "expected_runtime_failure_event_id"
+            ])
+        );
+        assert!(budget_override["description"]
+            .as_str()
+            .unwrap()
+            .contains("增额后 Mission 仍保持等待"));
         let budget_input = &budget["inputSchema"]["properties"]["input"];
-        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["additional_rounds"]["const"], 0);
-        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["additional_minutes"]["minimum"], 1);
-        assert_eq!(budget_input["allOf"][0]["then"]["properties"]["unlimited_tokens"]["const"], false);
-        assert!(!tools.iter().any(|tool| tool["name"] == "mission.paths.authorize"));
+        assert_eq!(
+            budget_input["allOf"][0]["then"]["properties"]["additional_rounds"]["const"],
+            0
+        );
+        assert_eq!(
+            budget_input["allOf"][0]["then"]["properties"]["additional_minutes"]["minimum"],
+            1
+        );
+        assert_eq!(
+            budget_input["allOf"][0]["then"]["properties"]["unlimited_tokens"]["const"],
+            false
+        );
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "mission.paths.authorize"));
     }
 
     #[test]

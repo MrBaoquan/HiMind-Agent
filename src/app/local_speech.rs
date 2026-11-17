@@ -960,7 +960,7 @@ Connection: close
         ai_services::upsert(ai_services::CustomAIServiceInput {
             id: service_id.to_string(),
             display_name: "Fish Voice List".to_string(),
-            base_url: format!("http://{address}"),
+            base_url: format!("http://{address}/fish"),
             protocol: AIServiceProtocol::OpenaiResponses,
             endpoints: Vec::new(),
             model: "chat".to_string(),
@@ -982,7 +982,7 @@ Connection: close
         assert_eq!(result["items"][0]["voice_model_id"], "fish-voice-1");
         assert_eq!(result["items"][0]["title"], "叙事女声");
         let request = captured.lock().unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("get /model?"));
+        assert!(request.starts_with("get /fish/model?"));
         assert!(request.contains("authorization: bearer sk-fish-voice-list-test"));
         assert!(request.contains("title="));
         assert!(!result.to_string().contains("sk-fish-voice-list-test"));

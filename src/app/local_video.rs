@@ -880,7 +880,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        (format!("http://{address}"), captured)
+        (format!("http://{address}/api/v3"), captured)
     }
 
     fn fake_wan_video() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
@@ -935,7 +935,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        (format!("http://{address}"), captured)
+        (format!("http://{address}/api/v1"), captured)
     }
 
     fn temp_dir(name: &str) -> PathBuf {
