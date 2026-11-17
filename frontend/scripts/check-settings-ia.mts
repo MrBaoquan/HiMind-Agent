@@ -167,7 +167,9 @@ assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有可用�
 assert.ok(/onOpenModelSources=\{\(\) => setActiveTab\('services'\)\}/.test(aiPage), '「新增模型来源」要能直接切到模型来源页签');
 assert.ok(/hasAnySource/.test(aiTools), '一条来源都没有时，工具接入页要在列表之前说明并给出入口');
 assert.ok(/AiServiceRoutesPanel/.test(aiPage), '能力路由必须从 AI 服务页独立出来');
-assert.ok(/ai-capability-picker/.test(aiProviders), '能力选择必须与连接信息分开');
+const connectionStep = aiProviders.slice(aiProviders.indexOf('{formStep === 0 ? <>'), aiProviders.indexOf('{formStep === 1 ? <>'));
+const modelStep = aiProviders.slice(aiProviders.indexOf('{formStep === 1 ? <>'), aiProviders.indexOf('<div className="modal-actions">'));
+assert.ok(connectionStep.includes('API Key') && !connectionStep.includes('<AiModelCatalogEditor') && modelStep.includes('<AiModelCatalogEditor'), '模型与用途选择必须位于独立于连接信息的步骤');
 assert.ok(/ai-service-toolbar/.test(aiProviders), '服务列表必须提供搜索与能力筛选');
 assert.ok(!/applyPreset\(group\.items\[0\]\.id\)/.test(aiProviders), '预设分类页签只切换列表，不能顺手替用户选中第一个厂商');
 assert.ok(/ai-service-delete-note/.test(aiProviders), '不能删除的原因要写成看得见的字（禁用按钮的 title 在 Chromium 里弹不出来）');

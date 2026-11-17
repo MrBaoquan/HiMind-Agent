@@ -436,7 +436,7 @@ export function AiProvidersPanel({
       const accepted = await confirm({
         title: '保存前确认冲突',
         description: existingById
-          ? `${conflicts}。继续会用当前表单覆盖该服务的连接信息、模型和能力；已分发客户端的绑定不会自动迁移。`
+          ? `${conflicts}。将覆盖连接、模型和能力；已分发的客户端绑定需手动迁移。`
           : `${conflicts}。继续会创建同名服务，列表和聚合入口里可能难以区分。`,
         confirmText: existingById ? '覆盖保存' : '仍然保存',
         danger: existingById,
@@ -469,7 +469,7 @@ export function AiProvidersPanel({
       });
       setDraft(emptyDraft);
       setModelSetup(emptyModelSetup());
-      setSavedNotice('服务配置已保存，尚未验证全部模型。全局默认路由保持原设置；未指定默认时仍按现有自动规则选择。');
+      setSavedNotice('服务已保存，模型尚未全部验证。默认路由未更改。');
       discoveryRevision.current++;
       setFormStep(0);
       setEditingServiceId(null);
@@ -508,12 +508,12 @@ export function AiProvidersPanel({
     const turn = ++discoveryRevision.current;
     setFormError(''); setFormNotice('');
     if (isVolcengineAgentPlan(draft.base_url) || selectedPreset === 'wan-video') {
-      setFormNotice('此接入方式未提供通用模型目录，已显示预设建议；也可手动添加。模型尚未验证。');
+      setFormNotice('此接口无模型目录。请用预设或手动添加，使用前需验证。');
       return;
     }
     const saved = customServices.find(service => service.id === editingServiceId);
     if (!draft.api_key.trim() && saved && (saved.base_url !== draft.base_url.trim() || saved.protocol !== draft.protocol)) {
-      setFormNotice('连接地址或接口已修改；请填写 API Key 后获取新目录，避免使用旧连接的模型列表。');
+      setFormNotice('连接已修改，请填写 API Key 后重新获取模型目录。');
       return;
     }
     setFetchingModels(true);
@@ -573,7 +573,7 @@ export function AiProvidersPanel({
         [service.id]: { state: 'ok', message: `AI 服务已复制为 ${cloned.display_name}` },
       }));
       openEditService(cloned);
-      setFormNotice('已复制连接信息、模型、能力与加密凭据。可修改名称或参数后保存为新服务。');
+      setFormNotice('已复制连接、模型、用途和加密凭据，可另存为新服务。');
     } catch (error) {
       setConnectionChecks(current => ({
         ...current,
@@ -657,7 +657,7 @@ export function AiProvidersPanel({
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">AI 服务</span>
             <strong>{serviceCount ? `${serviceCount} 个本机 AI 服务` : '还没有可用的 AI 服务'}</strong>
-            <span>一个服务可同时提供对话、图像、视频和音频模型；默认路由在「能力路由」查看。</span>
+            <span>对话、图像、视频和音频可共用服务；默认项在「能力路由」。</span>
           </div>
         </div>
         <div className="ai-overview-actions">
@@ -757,7 +757,7 @@ export function AiProvidersPanel({
                     <label className="field-label ai-service-field"><span>接口类型</span><select aria-label="接口类型" value={draft.protocol} onChange={event => updateConnection('protocol', event.target.value)}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                     </details>
                   </div>
-                  <small className="ai-service-hint">接口按供应商说明填写；获取目录不会发起模型推理。高级媒体调用方式可在下一步调整。</small>
+                  <small className="ai-service-hint">按供应商说明配置接口。获取目录不发起推理。</small>
                 </div>
 
                 <details className="ai-onboarding-details">
@@ -777,7 +777,7 @@ export function AiProvidersPanel({
                 <AiModelCatalogEditor value={modelSetup} onChange={setModelSetup} disabled={saving} />
                 <details className="ai-onboarding-details"><summary>高级：调用方式与账户用量</summary>
                   <label className="field-label"><span>服务 ID</span><input {...fieldProps('id')} value={draft.id} disabled={editing} onChange={event => setDraft(current => ({ ...current, id: event.target.value }))} placeholder={`自动生成：${suggestedServiceId(serviceName())}`} /></label>
-                  <p className="ai-service-hint">同一用途的多个模型共用调用方式。仅在供应商接口不兼容时调整。</p>
+                  <p className="ai-service-hint">同一用途共用调用方式；仅在接口不兼容时调整。</p>
                   {configuredOperations(modelSetup).filter(op => op !== 'chat' && op !== 'vision.describe').map(op => <label key={op} className="field-label"><span>{AI_SERVICE_CAPABILITY_LABELS[op]}调用方式</span><select value={modelSetup.adapters[op] || ({ 'image.generate': 'openai-images', 'image.edit': 'openai-images-edit', 'video.generate': 'ark-video', 'audio.speech': 'openai-speech', 'audio.transcribe': 'openai-audio' } as Record<string, string>)[op]} onChange={event => setModelSetup(current => ({ ...current, adapters: { ...current.adapters, [op]: event.target.value } }))}>
                     {({ 'image.generate': [['openai-images', 'OpenAI 兼容'], ['ark-images', '火山方舟']], 'image.edit': [['openai-images-edit', 'OpenAI 兼容'], ['ark-images', '火山方舟']], 'video.generate': [['ark-video', '火山方舟'], ['wan-video', '阿里云百炼万相']], 'audio.speech': [['openai-speech', 'OpenAI 兼容'], ['fish-audio-tts', 'Fish Audio']], 'audio.transcribe': [['openai-audio', 'OpenAI 兼容'], ['fish-audio-asr', 'Fish Audio']] } as Record<string, string[][]>)[op].map(([id, label]) => <option key={id} value={id}>{label}</option>)}
                   </select></label>)}
