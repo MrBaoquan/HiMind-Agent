@@ -30,6 +30,8 @@ fn acp_fixture_enabled() -> bool {
 struct AcpTurn {
     user: String,
     assistant: String,
+    user_at: Option<u64>,
+    assistant_at: Option<u64>,
 }
 
 struct AcpSession {
@@ -387,6 +389,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                         continue;
                                     }
                                 };
+                            let prompt_received_at = unix_timestamp();
                             active.store(true, Ordering::SeqCst);
                             let writer_for_prompt = Arc::clone(&writer);
                             let options_for_prompt = options.clone();
@@ -507,6 +510,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                             &history_for_prompt,
                                             &prompt,
                                             &output,
+                                            prompt_received_at,
                                         ) {
                                             let _ = recorder.fail(run, &error.to_string());
                                             let _ = write_error(
@@ -853,6 +857,8 @@ fn load_persisted_session(params: &Value) -> Result<LoadedAcpSession, Box<dyn Er
             .map(|turn| AcpTurn {
                 user: turn.user,
                 assistant: turn.assistant,
+                user_at: turn.user_at,
+                assistant_at: turn.assistant_at,
             })
             .collect(),
     })
@@ -905,6 +911,7 @@ fn persist_session_turn(
     history: &Arc<Mutex<Vec<AcpTurn>>>,
     user: &str,
     assistant: &str,
+    user_at: u64,
 ) -> Result<(), Box<dyn Error>> {
     let mut updated = history
         .lock()
@@ -913,6 +920,8 @@ fn persist_session_turn(
     updated.push(AcpTurn {
         user: user.to_string(),
         assistant: assistant.to_string(),
+        user_at: Some(user_at),
+        assistant_at: Some(unix_timestamp()),
     });
     let stored = StoredAcpSession {
         schema_version: "acp_session.v1".to_string(),
@@ -925,6 +934,8 @@ fn persist_session_turn(
             .map(|turn| StoredAcpTurn {
                 user: turn.user.clone(),
                 assistant: turn.assistant.clone(),
+                user_at: turn.user_at,
+                assistant_at: turn.assistant_at,
             })
             .collect(),
     };
@@ -1008,6 +1019,8 @@ mod tests {
             &[AcpTurn {
                 user: "first user".to_string(),
                 assistant: "first answer".to_string(),
+                user_at: None,
+                assistant_at: None,
             }],
             "follow up",
         )
@@ -1023,6 +1036,8 @@ mod tests {
             &[AcpTurn {
                 user: "x".repeat(100_000),
                 assistant: "y".repeat(40_000),
+                user_at: None,
+                assistant_at: None,
             }],
             "follow up",
         )
