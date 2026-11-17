@@ -2130,7 +2130,7 @@ mod tests {
     fn retirement_preserves_default_and_external_development_pins_without_removing_source() {
         let _guard = test_env_lock();
         let root = std::env::temp_dir().join(format!(
-            "expert-retirement-override-{}-{}",
+            "ero-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         ));
