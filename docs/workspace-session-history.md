@@ -18,12 +18,15 @@
 
 实现边界与回归入口见 [工作区项目层级与会话历史](workspace-projects-and-history.md)。本机截图、候选程序和部署记录作为本地验收证据保留。
 
+新增公共能力、未归属范围、日期活动素材和工作日志消费合同见 [会话与活动公共服务](session-activity-service.md)。
+
 ## 架构
 
 ```mermaid
 flowchart TD
     Panel[工作区项目详情 / 会话历史面板] --> IPC[Tauri 列表与正文分页命令]
-    IPC --> Projection[统一会话模型 / 项目归属 / 能力声明]
+    IPC --> Projection[共享 session_service / 统一模型 / 项目归属]
+    Gateway[CapabilityGateway / MCP / Plugin] --> Projection
     Projection --> DSH[DSH Runtime session/list + session/page]
     Projection --> ACP[Agent ACP 加密持久存储]
     Projection --> Files[Claude / Codex JSONL 只读适配]

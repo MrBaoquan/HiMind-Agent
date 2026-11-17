@@ -511,6 +511,20 @@ impl BuiltinAiProxy {
 }
 
 impl BuiltinAiProxyControl {
+    /// Restore an Agent-owned, current-user protected proxy reference. Never accepts a
+    /// caller supplied URL or a DSH private storage path.
+    pub(crate) fn from_history_url(value: &str) -> Result<Self, String> {
+        let url = url::Url::parse(value).map_err(|_| "history_host_invalid".to_string())?;
+        if url.scheme() != "http" || url.host_str() != Some("127.0.0.1")
+            || url.port().is_none() || !url.username().is_empty() || url.password().is_some()
+            || url.path() != "/" || url.fragment().is_some()
+            || url.query_pairs().count() != 1
+            || !url.query_pairs().any(|(key,value)| key == SESSION_QUERY && !value.is_empty()) {
+            return Err("history_host_invalid".into());
+        }
+        Ok(Self { url: value.into(), rail_view_preset: Arc::new(RwLock::new(None)) })
+    }
+
     pub(crate) fn verify_browser_entry(&self) -> Result<(), String> {
         // reqwest 0.12 默认启用 system-proxy：Windows 上它读 WinINET 注册表，
         // 而那份绕过列表里的 `127.*` 既不是 CIDR 也不是域名，环回请求因此会被

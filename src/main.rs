@@ -66,6 +66,7 @@ mod remote;
 mod runtime;
 mod scan;
 mod session_history;
+mod session_service;
 mod session_history_actions;
 mod session_history_inspect;
 mod session_history_tools;

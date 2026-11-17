@@ -223,11 +223,18 @@ pub(crate) fn paired_transcript_page(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn dsh_projected_session_as_of_seq(
     registry: &Registry,
     value: &Value,
     native_id: &str,
     project_id: &str,
+) -> Result<Option<i64>, String> {
+    dsh_session_as_of_seq(registry, value, native_id, Some(project_id))
+}
+
+pub(crate) fn dsh_session_as_of_seq(
+    registry: &Registry, value: &Value, native_id: &str, project_id: Option<&str>,
 ) -> Result<Option<i64>, String> {
     let items = value
         .get("items")
@@ -249,10 +256,8 @@ pub(crate) fn dsh_projected_session_as_of_seq(
     let Some(working_directory) = working_directory else {
         return Ok(None);
     };
-    let Some(association) = associate_workspace(registry, working_directory)? else {
-        return Ok(None);
-    };
-    if association.project_id != project_id {
+    let association = associate_workspace(registry, working_directory)?;
+    if project_id.is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id)) {
         return Ok(None);
     }
     let sequence = item

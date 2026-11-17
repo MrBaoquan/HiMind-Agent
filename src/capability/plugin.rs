@@ -1283,6 +1283,12 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             &["workbench.knowledge.search"],
             &["dashboard.knowledge.search", "oauth.delegated_user"],
         ),
+        builtin_plugin(
+            "com.himind.session-history", "会话历史服务", "1.0.0",
+            "向工作区、工作日志和工作流提供跨客户端会话与活动的只读投影。",
+            &["workspace.session.sources", "workspace.session.list", "workspace.session.messages", "workspace.session.activity"],
+            &[],
+        ),
         // 工作区登记表：数据落 data/ 而不是 plugin-data/，因为后者不进备份包。
         // 能力全部由内核实现，与扩展开发工具同一形态。
         builtin_plugin(

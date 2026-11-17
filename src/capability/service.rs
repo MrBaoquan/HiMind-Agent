@@ -308,6 +308,7 @@ enum CapabilityHandler {
     MarketInstallPlan,
     MarketInstall,
     /// 工作区登记表的 10 条能力，全部由 `crate::workspace_registry` 实现。
+    WorkspaceSession(&'static str),
     WorkspaceRegistryResolve,
     WorkspaceRegistryContextGet,
     WorkspaceRegistryProjectList,
@@ -3614,6 +3615,10 @@ impl CapabilityGateway {
             media_registration("workbench.media.audio.transcribe", "语音转写（工作台）", "由 AI 工作台媒体通道转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
             media_registration("workbench.media.job.get", "查看工作台媒体任务", "查看工作台图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
             media_registration("workbench.media.job.cancel", "取消工作台媒体任务", "取消工作台上仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
+            registration_versioned("workspace.session.sources", "1.0.0", "查看会话来源", "探测 Agent 支持的会话历史来源、可用性及完整性；不返回正文。", "read_only", crate::session_service::capability_schema("sources"), CapabilityHandler::WorkspaceSession("sources")),
+            registration_versioned("workspace.session.list", "1.0.0", "查询跨客户端会话", "按项目、子项目、全部或未归属范围分页列出本机历史会话。", "read_only", crate::session_service::capability_schema("list"), CapabilityHandler::WorkspaceSession("list")),
+            registration_versioned("workspace.session.messages", "1.0.0", "读取会话消息页", "读取已校验范围内的会话正文；使用与快照绑定的可恢复游标。", "read_only", crate::session_service::capability_schema("messages"), CapabilityHandler::WorkspaceSession("messages")),
+            registration_versioned("workspace.session.activity", "1.0.0", "查询会话活动素材", "按带时区的时间区间读取有限批次的活动和证据引用；缺时间不伪造，游标可跨进程恢复。", "read_only", crate::session_service::capability_schema("activity"), CapabilityHandler::WorkspaceSession("activity")),
             // 工作区登记表：10 条能力全部由内核实现，并作为内置插件
             // com.himind.workspace-registry 对外暴露。数据落 data/ 而不是
             // plugin-data/，因为后者不进备份包（见 app::backup 与 ADR 0002）。
@@ -4826,6 +4831,7 @@ impl CapabilityGateway {
                     context.source,
                 )?)
             }
+            CapabilityHandler::WorkspaceSession(operation) => crate::session_service::invoke(operation, &input),
             // ---- 工作区登记表 ----
             //
             // `resolve` / `context.get` 会在未命中时产出候选，所以它们不只是读：
@@ -10153,6 +10159,28 @@ fn authoring_upgrade_hint(asset_kind: &str, asset_id: &str, minimum: &str) -> St
 mod tests {
     use super::*;
     use crate::capability::types::{InvocationSource, InvocationTransport};
+
+    #[test]
+    fn workspace_session_capabilities_are_read_only_and_have_strict_schemas() {
+        let gateway=CapabilityGateway::new(Options::from_env(),Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry=gateway.build_registry_scoped(false).unwrap();
+        for operation in ["sources","list","messages","activity"] {
+            let id=format!("workspace.session.{operation}");let item=registry.get(&id).unwrap();
+            assert!(matches!(item.handler,CapabilityHandler::WorkspaceSession(_)));
+            assert_eq!(item.descriptor.risk_level,"read_only");
+            let valid=match operation {
+                "messages"=>json!({"scope":"unassigned","session_id":"codex:synthetic","limit":1}),
+                "activity"=>json!({"scope":"all","from":"2026-11-16T00:00:00-07:00","to":"2026-11-17T00:00:00-07:00"}),
+                _=>json!({"scope":"project","project_id":"synthetic","include_children":true})
+            };
+            validate_capability_input_schema(&item.descriptor.input_schema,&valid).unwrap();
+            let mut invalid=valid.clone();invalid["arbitrary_path"]=json!("private-store");
+            assert!(validate_capability_input_schema(&item.descriptor.input_schema,&invalid).is_err());
+            invalid=valid.clone();invalid["limit"]=json!(201);
+            assert!(validate_capability_input_schema(&item.descriptor.input_schema,&invalid).is_err());
+        }
+        assert!(crate::session_service::invoke("activity",&json!({"from":"2026-11-16","to":"2026-11-17"})).is_err());
+    }
 
     #[test]
     fn pending_repair_cancel_registry_exposes_only_strict_plan_bound_withdrawal() {

@@ -1702,6 +1702,7 @@ pub(crate) fn start_builtin_ai_session(
         .lock()
         .map_err(|_| "HiMind AI 会话状态不可用")?
         .insert(key, session);
+    publish_builtin_ai_history_host();
     Ok(session_url)
 }
 
@@ -2083,6 +2084,7 @@ fn stop_builtin_ai_sessions(key: Option<String>) -> bool {
             None => sessions.drain().map(|(_, session)| session).collect(),
         }
     };
+    publish_builtin_ai_history_host();
     let stopped_any = !stopped.is_empty();
     for mut session in stopped {
         if let Some(command_gateway) = session.command_gateway.as_mut() {
@@ -2121,6 +2123,14 @@ pub(crate) fn builtin_ai_session_snapshots() -> Vec<BuiltinAiSessionSnapshot> {
         .collect();
     snapshots.sort_by(|left, right| left.workspace_root.cmp(&right.workspace_root));
     snapshots
+}
+
+fn publish_builtin_ai_history_host() {
+    let snapshots = builtin_ai_session_snapshots();
+    let references = snapshots.into_iter().map(|s| (s.workspace_root,s.url)).collect::<Vec<_>>();
+    if let Err(error) = crate::session_service::host::publish(&references) {
+        crate::app::crash::record_event("warn", &error);
+    }
 }
 
 pub(crate) fn builtin_ai_history_controls() -> Result<Vec<(String, BuiltinAiProxyControl)>, String>

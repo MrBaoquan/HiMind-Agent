@@ -17,6 +17,10 @@ const MAX_ACP_SESSION_FILES: usize = 10_000;
 pub(crate) struct StoredAcpTurn {
     pub user: String,
     pub assistant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -507,6 +511,17 @@ mod tests {
     }
 
     #[test]
+    fn session_turn_timestamps_are_optional_for_legacy_and_survive_encrypted_storage() {
+        let legacy:StoredAcpTurn=serde_json::from_str(r#"{"user":"old","assistant":"answer"}"#).unwrap();
+        assert_eq!(legacy.user_at,None);assert_eq!(legacy.assistant_at,None);
+        let root=temp_root();
+        let mut session=StoredAcpSession::new("timestamped".into(),"G:/synthetic".into());
+        session.turns.push(StoredAcpTurn{user:"new".into(),assistant:"reply".into(),user_at:Some(1794880000),assistant_at:Some(1794880060)});
+        save_at(&root,&session).unwrap();assert_eq!(load_at(&root,"timestamped").unwrap(),Some(session));
+        let _=std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn protects_round_trips_and_deletes_session_history() {
         let root = temp_root();
         let mut session =
@@ -514,6 +529,8 @@ mod tests {
         session.turns.push(StoredAcpTurn {
             user: "first user".to_string(),
             assistant: "first answer".to_string(),
+            user_at: None,
+            assistant_at: None,
         });
         let path = save_at(&root, &session).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -535,6 +552,8 @@ mod tests {
         session.turns.push(StoredAcpTurn {
             user: "private prompt text".to_string(),
             assistant: "private response text".to_string(),
+            user_at: None,
+            assistant_at: None,
         });
         let body_path = save_at(&root, &session).unwrap();
         let index_path = metadata_path(&body_path);
@@ -601,6 +620,8 @@ mod tests {
         session.turns.push(StoredAcpTurn {
             user: "synthetic prompt".to_string(),
             assistant: "synthetic response".to_string(),
+            user_at: None,
+            assistant_at: None,
         });
         let body = save_at(&root, &session).unwrap();
         let index = metadata_path(&body);

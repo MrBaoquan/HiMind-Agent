@@ -261,8 +261,7 @@ fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary
             continue;
         }
         let association = match session_history::associate_workspace(registry, &directory) {
-            Ok(Some(value)) => value,
-            Ok(None) => continue,
+            Ok(value) => value,
             Err(_) => {
                 partial = true;
                 continue;
@@ -288,7 +287,7 @@ fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary
                 can_open_original: false,
                 can_resume: false,
             },
-            Some(association),
+            association,
         ) {
             sessions.push(summary);
         } else {
@@ -298,16 +297,13 @@ fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary
     Ok((sessions, partial))
 }
 
-pub(crate) fn opencode_transcript_page_for_project(
-    registry: &Registry,
-    project_id: &str,
-    native_id: &str,
-    end_offset: Option<usize>,
-    page_size: usize,
+pub(crate) fn opencode_transcript_page(
+    registry: &Registry, project_id: Option<&str>, native_id: &str,
+    end_offset: Option<usize>, page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::OpenCode.stable_session_id(native_id)?;
     let base = opencode_base_dir().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
-    opencode_transcript_page_from_paths(
+    opencode_transcript_page_scoped_from_paths(
         registry,
         project_id,
         native_id,
@@ -317,6 +313,7 @@ pub(crate) fn opencode_transcript_page_for_project(
     )
 }
 
+#[cfg(test)]
 fn opencode_transcript_page_from_paths(
     registry: &Registry,
     project_id: &str,
@@ -324,6 +321,13 @@ fn opencode_transcript_page_from_paths(
     paths: &[PathBuf],
     end_offset: Option<usize>,
     page_size: usize,
+) -> Result<session_history::SessionTranscriptPage, String> {
+    opencode_transcript_page_scoped_from_paths(registry, Some(project_id), native_id, paths, end_offset, page_size)
+}
+
+fn opencode_transcript_page_scoped_from_paths(
+    registry: &Registry, project_id: Option<&str>, native_id: &str, paths: &[PathBuf],
+    end_offset: Option<usize>, page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::OpenCode.stable_session_id(native_id)?;
     for path in paths.iter().take(MAX_OPENCODE_DATABASES) {
@@ -334,10 +338,10 @@ fn opencode_transcript_page_from_paths(
             continue;
         };
         let association = match session_history::associate_workspace(registry, &directory) {
-            Ok(Some(association)) => association,
-            Ok(None) | Err(_) => continue,
+            Ok(association) => association,
+            Err(_) => continue,
         };
-        if association.project_id != project_id {
+        if project_id.is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id)) {
             continue;
         }
         let selection = read_opencode_messages(&connection, native_id, end_offset, page_size)?;
@@ -823,6 +827,16 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn opencode_session_unassigned_retains_metadata_and_read_only_body() {
+        let temp=TempRoot::new();let path=temp.0.join("session.db");create_v2_database(&path);
+        Connection::open(&path).unwrap().execute("UPDATE session SET directory='G:/synthetic-unregistered'",[]).unwrap();
+        let paths=vec![path];let scan=scan_opencode_at(&registry(),&paths,true);
+        assert!(scan.sessions.iter().any(|s|s.project_id.is_none()));
+        assert!(opencode_transcript_page_scoped_from_paths(&registry(),None,"ses_synthetic",&paths,None,50).is_ok());
+        assert!(opencode_transcript_page_from_paths(&registry(),"project-a","ses_synthetic",&paths,None,50).is_err());
     }
 
     #[test]

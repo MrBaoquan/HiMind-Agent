@@ -296,11 +296,8 @@ fn parse_codex_metadata(
     let Some(working_directory) = working_directory else {
         return Ok(None);
     };
-    let Some(association) = session_history::associate_workspace(registry, &working_directory)
-        .map_err(|_| "workspace_association_ambiguous".to_string())?
-    else {
-        return Ok(None);
-    };
+    let association = session_history::associate_workspace(registry, &working_directory)
+        .map_err(|_| "workspace_association_ambiguous".to_string())?;
     let title = titles.get(&native_id).cloned().unwrap_or_else(|| {
         format!(
             "Codex 会话 {}",
@@ -324,22 +321,19 @@ fn parse_codex_metadata(
             can_open_original: false,
             can_resume: false,
         },
-        Some(association),
+        association,
     )
     .map(Some)
 }
 
-pub(crate) fn codex_transcript_page_for_project(
-    registry: &Registry,
-    project_id: &str,
-    native_id: &str,
-    end_offset: Option<u64>,
-    page_size: usize,
+pub(crate) fn codex_transcript_page(
+    registry: &Registry, project_id: Option<&str>, native_id: &str,
+    end_offset: Option<u64>, page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::Codex.stable_session_id(native_id)?;
     let config_root = codex_config_root().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
     let (titles, _) = load_session_titles(&config_root);
-    codex_transcript_page_at(
+    codex_transcript_page_scoped_at(
         registry,
         project_id,
         native_id,
@@ -350,6 +344,7 @@ pub(crate) fn codex_transcript_page_for_project(
     )
 }
 
+#[cfg(test)]
 fn codex_transcript_page_at(
     registry: &Registry,
     project_id: &str,
@@ -359,10 +354,18 @@ fn codex_transcript_page_at(
     end_offset: Option<u64>,
     page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
+    codex_transcript_page_scoped_at(registry, Some(project_id), native_id, config_root, titles, end_offset, page_size)
+}
+
+fn codex_transcript_page_scoped_at(
+    registry: &Registry, project_id: Option<&str>, native_id: &str,
+    config_root: &Path, titles: &HashMap<String, String>,
+    end_offset: Option<u64>, page_size: usize,
+) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::Codex.stable_session_id(native_id)?;
     let canonical_config_root =
         fs::canonicalize(config_root).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
-    let cache_key = super::path_cache::key(&canonical_config_root, "codex", project_id, native_id);
+    let cache_key = super::path_cache::key(&canonical_config_root, "codex", project_id.unwrap_or("*"), native_id);
     let path = if let Some(path) = super::path_cache::get(&cache_key) {
         path
     } else {
@@ -401,19 +404,19 @@ fn codex_transcript_page_at(
                     let Ok(Some(summary)) = parse_codex_metadata(registry, &path, &titles) else {
                         continue;
                     };
-                    if summary.project_id.as_deref() == Some(project_id) {
+                    if project_id.is_none_or(|id| summary.project_id.as_deref() == Some(id)) {
                         super::path_cache::remember(
                             super::path_cache::key(
                                 &canonical_config_root,
                                 "codex",
-                                project_id,
+                                project_id.unwrap_or("*"),
                                 &summary.native_id,
                             ),
                             &path,
                         );
                     }
                     if summary.native_id == native_id
-                        && summary.project_id.as_deref() == Some(project_id)
+                        && project_id.is_none_or(|id| summary.project_id.as_deref() == Some(id))
                     {
                         let updated = fs::metadata(&path)
                             .and_then(|metadata| metadata.modified())
@@ -432,7 +435,7 @@ fn codex_transcript_page_at(
     let summary = parse_codex_metadata(registry, &path, titles)
         .map_err(|_| "SESSION_NOT_FOUND".to_string())?
         .ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
-    if summary.native_id != native_id || summary.project_id.as_deref() != Some(project_id) {
+    if summary.native_id != native_id || project_id.is_some_and(|id| summary.project_id.as_deref() != Some(id)) {
         return Err("SESSION_NOT_FOUND".to_string());
     }
     let metadata = fs::metadata(&path).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
@@ -688,6 +691,16 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn codex_session_unassigned_body_is_available_only_without_project_scope() {
+        let temp=TempRoot::new();let root=temp.0.join(".codex");
+        write_codex_session(&root.join("sessions/unassigned.jsonl"),"outside","G:/synthetic-unregistered");
+        let scan=scan_codex_at(&registry(),&root,&HashMap::new(),false);
+        assert!(scan.sessions.iter().any(|s|s.native_id=="outside" && s.project_id.is_none()));
+        assert!(codex_transcript_page_scoped_at(&registry(),None,"outside",&root,&HashMap::new(),None,50).is_ok());
+        assert!(codex_transcript_page_at(&registry(),"project-a","outside",&root,&HashMap::new(),None,50).is_err());
     }
 
     #[test]
