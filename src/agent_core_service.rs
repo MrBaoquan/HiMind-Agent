@@ -357,7 +357,9 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert!(blocked.is_err());
-        assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+        // Best-effort audit writes have a three-second busy budget. Allow
+        // scheduling headroom while rejecting the default 30-second wait.
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
 
         drop(transaction);
         let run = recorder

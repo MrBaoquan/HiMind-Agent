@@ -292,25 +292,8 @@ try {
     await page.getByRole('button', { name: '关闭正文搜索' }).click();
   }
   await page.setViewportSize({ width: 1280, height: 900 });
-  // CSS zoom exercises text/control growth; this is not a native WebView zoom claim.
-  await page.evaluate(() => {
-    // CSS zoom does not shrink dvh like browser zoom. Keep the physical fixture
-    // window fixed so this test measures the available reading space honestly.
-    document.documentElement.style.zoom = '2';
-    document.querySelector('main').style.height = '50dvh';
-  });
-  await page.getByRole('button', { name: '搜索正文', exact: true }).click();
-  await bodyQuery.fill('needle');
-  await page.getByRole('button', { name: '搜索', exact: true }).click();
-  await page.getByText(/扫描结束/).waitFor();
-  await page.locator('.workspace-history-inspector-list li > button').first().click();
-  await page.locator('.workspace-session-history-message.located').waitFor();
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), true);
-  assert.ok(await page.locator('.workspace-session-history-messages').evaluate(element => element.clientHeight > 40));
-  const zoomBounds = await page.locator('.workspace-session-history-preview .workspace-session-history-pagination').evaluate(element => ({ bottom: element.getBoundingClientRect().bottom, height: innerHeight }));
-  assert.ok(zoomBounds.bottom <= zoomBounds.height + 1, JSON.stringify(zoomBounds));
-  await page.screenshot({ path: resolve(evidence, 'session-history-css-zoom-200.png') });
-  await page.evaluate(() => { document.documentElement.style.zoom = ''; document.querySelector('main').style.height = '100dvh'; });
+  // Zoom scaling is outside the supported acceptance scope. Keep the normal
+  // desktop and narrow viewport coverage above for transcript navigation.
   await page.goto(`http://127.0.0.1:${address.port}/__session-history-fixture?resume-error`);
   await sourceFilter.selectOption('codex');
   await rows.first().getByRole('button', { name: /^预览会话/ }).click();
@@ -331,7 +314,7 @@ try {
   assert.deepEqual(failedResponses, []);
   writeFileSync(resolve(evidence, 'session-history-browser-result.json'), JSON.stringify({
     passed: true,
-    checks: ['source-labels', 'source-health', 'source-filter', 'sort-change-resets-pagination', 'search-with-filter', 'empty-state', 'error-state', 'server-pagination', 'five-source-preview-pagination', 'native-sequence-boundary', 'transcript-return-refetches-page', 'transcript-error-preserves-navigation-and-retries', 'close-clears-content', 'responsive-overflow', 'body-search-cross-page-jump', 'keyboard-result-navigation', 'message-copy', 'resume-command-copy', 'resume-launch-double', 'located-page-navigation', 'prompt-navigation', 'related-file-source-jump', 'literal-fragment-comparison', 'search-budget-warning', 'search-partial-warning', 'search-empty', 'search-error', 'cancel-and-late-result', 'close-search-restores-focus', 'project-related-files-and-path-filter', 'inspector-escape-and-focus', 'narrow-and-small-height-dark-layout', 'css-zoom-200', 'resume-error', 'missing-source-message-feedback', 'no-console-errors', 'no-http-errors'],
+    checks: ['source-labels', 'source-health', 'source-filter', 'sort-change-resets-pagination', 'search-with-filter', 'empty-state', 'error-state', 'server-pagination', 'five-source-preview-pagination', 'native-sequence-boundary', 'transcript-return-refetches-page', 'transcript-error-preserves-navigation-and-retries', 'close-clears-content', 'responsive-overflow', 'body-search-cross-page-jump', 'keyboard-result-navigation', 'message-copy', 'resume-command-copy', 'resume-launch-double', 'located-page-navigation', 'prompt-navigation', 'related-file-source-jump', 'literal-fragment-comparison', 'search-budget-warning', 'search-partial-warning', 'search-empty', 'search-error', 'cancel-and-late-result', 'close-search-restores-focus', 'project-related-files-and-path-filter', 'inspector-escape-and-focus', 'narrow-and-small-height-dark-layout', 'resume-error', 'missing-source-message-feedback', 'no-console-errors', 'no-http-errors'],
     pageErrors: errors,
     failedResponses,
   }, null, 2));

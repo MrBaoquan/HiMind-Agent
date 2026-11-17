@@ -1909,8 +1909,8 @@ mod tests {
     /// The startup scan has to read the integrity level without starting a
     /// console program. A console child of this GUI process is handed a console
     /// window of its own, so the `icacls`-per-path query this replaced flashed a
-    /// black window for every path it checked. Guard both halves: a normal file
-    /// is not flagged, and a Low label is still recognised.
+    /// black window for every path it checked. Use an existing normal file and
+    /// an in-memory Low SACL so the test needs no permission to change labels.
     #[cfg(windows)]
     #[test]
     fn integrity_reader_sees_labels_without_a_console_query() {
@@ -1918,30 +1918,43 @@ mod tests {
             std::env::temp_dir().join(format!("himind-integrity-reader-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let file = root.join("probe.txt");
-        fs::write(&file, b"probe").unwrap();
-
-        let (level, rid) = super::read_integrity_level(&file);
+        let normal = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("kernel32.dll");
+        let (level, rid) = super::read_integrity_level(&normal);
         assert!(
             !level.needs_repair(),
-            "a freshly created file must not be scheduled for repair: {level:?} rid={rid:?}"
+            "a normal system file must not be scheduled for repair: {level:?} rid={rid:?}"
         );
 
-        let labelled = std::process::Command::new("icacls")
-            .arg(&file)
-            .arg("/setintegritylevel")
-            .arg("L")
-            .arg("/C")
-            .output()
-            .expect("icacls ships with Windows");
-        assert!(
-            labelled.status.success(),
-            "could not set a Low label for the test: {}",
-            String::from_utf8_lossy(&labelled.stderr)
-        );
-
-        let (level, rid) = super::read_integrity_level(&file);
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::{GetSecurityDescriptorSacl, PSECURITY_DESCRIPTOR};
+        let sddl: Vec<u16> = "S:(ML;;NW;;;LW)\0".encode_utf16().collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(converted, 0, "{}", std::io::Error::last_os_error());
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut sacl = std::ptr::null_mut();
+        let extracted = unsafe {
+            GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted)
+        };
+        let rid = if extracted != 0 && present != 0 {
+            unsafe { super::label_rid_in_sacl(sacl) }
+        } else {
+            None
+        };
+        unsafe { LocalFree(descriptor) };
         assert_eq!(rid, Some(0x1000), "a Low label reads as SID RID 0x1000");
+        let level = super::integrity_level_for_rid(rid.unwrap());
         assert!(level.needs_repair(), "a Low label must trigger a repair");
 
         assert_eq!(
