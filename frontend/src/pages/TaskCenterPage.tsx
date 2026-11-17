@@ -317,11 +317,11 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
   }, [missionId, activityId, loading, catalog.loading, filtered.length, context, ownedScrollHost]);
   const openRun = onOpenWorkflowRun ? (id:string) => { depart(); onOpenWorkflowRun(id); } : undefined;
   const selectedActivity = items.find(i=>i.id===activityId);
-  return <div className="task-center-page" ref={pageRef}>
-    <PageHeader title="我的任务" description="跟踪任务进展、处理待办、查看交付结果。" actions={!missionId && !activityId ? <div className="task-create-menu">
+  return <div className={`task-center-page${missionId ? ' is-mission-workspace' : ''}`} ref={pageRef}>
+    {!missionId ? <PageHeader title="我的任务" description="跟踪任务进展、处理待办、查看交付结果。" actions={!activityId ? <div className="task-create-menu">
       <button type="button" className="btn btn-primary" aria-expanded={newMenu} onClick={()=>setNewMenu(v=>!v)}>新建任务</button>
       {newMenu ? <div className="task-create-options"><button className="btn" onClick={()=>{setNewMenu(false);setCreateOpen(true);}}>新建协作任务</button>{onOpenWorkflowLibrary ? <button className="btn" onClick={()=>{setNewMenu(false);depart();onOpenWorkflowLibrary();}}>运行工作流</button> : null}{dashboardEnabled ? <button className="btn" onClick={()=>{rememberScroll();onOpenDashboard();}}>打开工作台</button> : null}</div> : null}
-    </div> : undefined} />
+    </div> : undefined} /> : null}
     {missionId ? <CollaborationTaskDetail key={missionId} missionId={missionId} openAssignmentRevision={missionNavigationRevision}
       onBack={()=>openMission('')} onRefresh={catalog.refresh} onMissionChanged={catalog.upsert}
       relatedActivities={missionActivities(missionId)} onOpenWorkflowRun={openRun} />

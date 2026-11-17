@@ -35,6 +35,7 @@ agentApi.listMissions=async()=>missions.map(m=>({...m}));
 agentApi.missionSnapshot=async(id)=>({mission:{...missions.find(m=>m.mission_id===id)},events:[],cursor:0});
 agentApi.confirmMissionPlan=async(id)=>{
  window.fixtureMutations.push('confirm-memory-only');
+ activities.push(activity('new-run',{mission_id:id,mission_task_id:'t1',status:'running'}));
  missions=missions.map(m=>m.mission_id===id?{...m,status:'active',tasks:[{spec,status:'running',attempt_run_id:'new-run',verification_passed:null,evidence_refs:[]}]}:m);
  return missions.find(m=>m.mission_id===id);
 };

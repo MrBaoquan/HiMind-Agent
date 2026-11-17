@@ -78,6 +78,7 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
                 | "mission.handoff.create"
                 | "mission.assignment.apply"
                 | "mission.plan.confirm"
+                | "mission.plan-change.apply"
                 | "mission.follow-up.add"
                 | "mission.follow_up.add"
                 | "mission.task.cancel-pending"
@@ -86,6 +87,7 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
                 | "mission.verification.retry"
                 | "mission.control"
                 | "mission.workflow.export"
+                | "mission.workflow.save"
         )
     {
         "R3"
@@ -133,6 +135,10 @@ pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value)
     if capability_id == "mission.plan.confirm" {
         return mission_plan_confirmation_target(input)
             .unwrap_or_else(|_| "计划确认信息无效或超出显示限制".to_string());
+    }
+    if capability_id == "mission.plan-change.apply" {
+        return mission_plan_change_apply_target(input)
+            .unwrap_or_else(|_| "计划变更授权信息无效或超出显示限制".to_string());
     }
     if matches!(
         capability_id,
@@ -214,6 +220,30 @@ pub(crate) fn mission_plan_confirmation_target(
     let text = serde_json::to_string_pretty(&details).map_err(|error| error.to_string())?;
     if text.len() > 4_000 {
         return Err("plan confirmation scope exceeds the approval display limit".to_string());
+    }
+    Ok(text)
+}
+
+pub(crate) fn mission_plan_change_apply_target(
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    let field = |name: &str| {
+        input
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("missing {name}"))
+    };
+    let details = serde_json::json!({
+        "mission_id": field("mission_id")?,
+        "request_id": field("request_id")?,
+        "expected_plan_revision": field("expected_plan_revision")?,
+        "expected_plan_sha256": field("expected_plan_sha256")?,
+        "additional_read_paths": field("read_paths")?,
+        "additional_write_paths": field("write_paths")?,
+    });
+    let text = serde_json::to_string_pretty(&details).map_err(|error| error.to_string())?;
+    if text.len() > 4_000 {
+        return Err("plan change approval details exceed the display limit".to_string());
     }
     Ok(text)
 }

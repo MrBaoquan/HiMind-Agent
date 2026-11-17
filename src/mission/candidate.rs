@@ -10,22 +10,39 @@ use std::path::{Component, Path, PathBuf};
 /// Peer changes are permitted only for a host-integrated isolated attempt.
 /// Integration independently checks that attempt against its exact write scope.
 pub(crate) fn baseline_protection_task(
-    mission: &super::MissionView, task: &super::MissionTaskSpec, run_id: &str,
-    baseline: &Value, integration: Option<&Value>,
+    mission: &super::MissionView,
+    task: &super::MissionTaskSpec,
+    run_id: &str,
+    baseline: &Value,
+    integration: Option<&Value>,
 ) -> Result<super::MissionTaskSpec, Box<dyn Error>> {
     let mut protected = task.clone();
-    let Some(paths) = baseline.get("excluded_peer_write_paths") else { return Ok(protected); };
+    let Some(paths) = baseline.get("excluded_peer_write_paths") else {
+        return Ok(protected);
+    };
     let paths = paths.as_array().ok_or("invalid host baseline peer paths")?;
-    if paths.is_empty() { return Ok(protected); }
-    let receipt = integration.and_then(|value| value.get("receipt")).ok_or("peer exclusions require a host integration receipt")?;
+    if paths.is_empty() {
+        return Ok(protected);
+    }
+    let receipt = integration
+        .and_then(|value| value.get("receipt"))
+        .ok_or("peer exclusions require a host integration receipt")?;
     if baseline["provenance"] != "host_before_execution"
-        || receipt["mission_id"] != mission.mission_id || receipt["task_id"] != task.id
-        || receipt["attempt_id"] != run_id {
-        return Err("peer baseline exclusions are not bound to this host-integrated attempt".into());
+        || receipt["mission_id"] != mission.mission_id
+        || receipt["task_id"] != task.id
+        || receipt["attempt_id"] != run_id
+    {
+        return Err(
+            "peer baseline exclusions are not bound to this host-integrated attempt".into(),
+        );
     }
     for path in paths {
         let path = path.as_str().ok_or("invalid host baseline peer path")?;
-        if !mission.tasks.iter().any(|peer| peer.spec.write_paths.iter().any(|allowed| allowed == path)) {
+        if !mission
+            .tasks
+            .iter()
+            .any(|peer| peer.spec.write_paths.iter().any(|allowed| allowed == path))
+        {
             return Err("host baseline excludes a path outside the confirmed team plan".into());
         }
         protected.write_paths.push(path.to_string());
@@ -41,10 +58,17 @@ pub(crate) fn scoped_candidate_identity(
     let mut entries = BTreeSet::new();
     for raw in paths {
         let raw = Path::new(raw.as_ref());
-        if raw.components().any(|part| matches!(part, Component::ParentDir)) {
+        if raw
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
             return Err("candidate scope must not contain parent traversal".into());
         }
-        let path = if raw.is_absolute() { raw.to_path_buf() } else { workspace.join(raw) };
+        let path = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.join(raw)
+        };
         // Refuse symlink ancestors as well as symlink leaves; walking a scoped
         // directory must not silently start reading a different directory.
         for ancestor in path.ancestors() {
@@ -63,7 +87,9 @@ pub(crate) fn scoped_candidate_identity(
             }
             Err(error) => return Err(error.into()),
             Ok(_) => {
-                for entry in walkdir::WalkDir::new(&path).follow_links(false).into_iter()
+                for entry in walkdir::WalkDir::new(&path)
+                    .follow_links(false)
+                    .into_iter()
                     .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
                 {
                     let entry = entry?;
@@ -86,26 +112,42 @@ pub(crate) fn scoped_candidate_identity(
     let mut total_bytes = 0u64;
     let mut files = serde_json::Map::new();
     for path in entries {
-        let label = path.strip_prefix(&workspace).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let label = path
+            .strip_prefix(&workspace)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         hash_field(&mut content, path.to_string_lossy().as_bytes());
         hash_field(&mut manifest, path.to_string_lossy().as_bytes());
         let kind = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Err("candidate path became a symlink".into()),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("candidate path became a symlink".into())
+            }
             Ok(metadata) if metadata.is_file() => {
-                total_bytes = total_bytes.checked_add(metadata.len()).ok_or("candidate size overflow")?;
-                if total_bytes > 256 * 1024 * 1024 { return Err("candidate scope exceeds 256 MiB".into()); }
+                total_bytes = total_bytes
+                    .checked_add(metadata.len())
+                    .ok_or("candidate size overflow")?;
+                if total_bytes > 256 * 1024 * 1024 {
+                    return Err("candidate scope exceeds 256 MiB".into());
+                }
                 let mut file = std::fs::File::open(&path)?;
                 let mut digest = Sha256::new();
                 let mut buffer = [0u8; 65536];
                 let mut read_bytes = 0u64;
                 loop {
                     let count = file.read(&mut buffer)?;
-                    if count == 0 { break; }
+                    if count == 0 {
+                        break;
+                    }
                     read_bytes += count as u64;
-                    if read_bytes > metadata.len() { return Err("candidate file changed while reading".into()); }
+                    if read_bytes > metadata.len() {
+                        return Err("candidate file changed while reading".into());
+                    }
                     digest.update(&buffer[..count]);
                 }
-                if read_bytes != metadata.len() { return Err("candidate file changed while reading".into()); }
+                if read_bytes != metadata.len() {
+                    return Err("candidate file changed while reading".into());
+                }
                 let digest = digest.finalize();
                 files.insert(label.clone(), json!(format!("{digest:x}")));
                 hash_field(&mut content, &digest);
@@ -124,7 +166,10 @@ pub(crate) fn scoped_candidate_identity(
     }
     let tree_digest = format!("{:x}", content.finalize());
     let status_digest = format!("{:x}", manifest.finalize());
-    let candidate_id = format!("{:x}", Sha256::digest(format!("{}:{tree_digest}:{status_digest}", workspace.display()).as_bytes()));
+    let candidate_id = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{tree_digest}:{status_digest}", workspace.display()).as_bytes())
+    );
     Ok(json!({"candidate": {
         "schema_version": "mission_candidate.v1", "identity_kind": "scoped_files_sha256",
         "workspace_root": workspace, "candidate_id": candidate_id,
@@ -140,24 +185,48 @@ pub(crate) fn protected_files(
     task: &super::MissionTaskSpec,
 ) -> Result<Value, Box<dyn Error>> {
     let root = workspace.canonicalize()?;
-    let writes = task.write_paths.iter().map(|raw| {
-        let path = Path::new(raw);
-        let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-        protected_path_key(&path)
-    }).collect::<Vec<_>>();
+    let requested_root = protected_path_key(&std::path::absolute(workspace)?);
+    let path_key = |path: &Path| {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let key = protected_path_key(&path);
+        // Windows can expose the workspace through an ordinary path whose
+        // canonical root differs (for example packaged-app LocalAppData).
+        // Rebase only that workspace alias, using whole path components; do
+        // not resolve arbitrary write paths through symlinks or grant siblings.
+        match key.strip_prefix(&requested_root) {
+            Ok(relative) => protected_path_key(&root.join(relative)),
+            Err(_) => key,
+        }
+    };
+    let writes = task
+        .write_paths
+        .iter()
+        .map(|raw| path_key(Path::new(raw)))
+        .collect::<Vec<_>>();
     let identity = scoped_candidate_identity(workspace, &task.read_paths)?;
-    let files = identity["files"].as_object().ok_or("candidate file manifest missing")?;
-    Ok(Value::Object(files.iter().filter(|(label, value)| {
-        let path = Path::new(label);
-        let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-        let path = protected_path_key(&path);
-        // A missing read directory can be a required parent of an authorized
-        // output. Creating that directory must not look like deleting a
-        // protected file. Existing files at that path and new siblings still
-        // remain protected; unrelated missing inputs retain their null entry.
-        !writes.iter().any(|write| path.starts_with(write)
-            || (value.is_null() && write.starts_with(&path)))
-    }).map(|(key, value)| (key.clone(), value.clone())).collect()))
+    let files = identity["files"]
+        .as_object()
+        .ok_or("candidate file manifest missing")?;
+    Ok(Value::Object(
+        files
+            .iter()
+            .filter(|(label, value)| {
+                let path = path_key(Path::new(label));
+                // A missing read directory can be a required parent of an authorized
+                // output. Creating that directory must not look like deleting a
+                // protected file. Existing files at that path and new siblings still
+                // remain protected; unrelated missing inputs retain their null entry.
+                !writes.iter().any(|write| {
+                    path.starts_with(write) || (value.is_null() && write.starts_with(&path))
+                })
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    ))
 }
 
 /// Normalize only comparison keys; keep manifest labels and candidate hashes
@@ -172,7 +241,10 @@ fn protected_path_key(path: &Path) -> PathBuf {
         let normalized = if let Some(unc) = normalized.strip_prefix("//?/unc/") {
             format!("//{unc}")
         } else {
-            normalized.strip_prefix("//?/").unwrap_or(&normalized).to_string()
+            normalized
+                .strip_prefix("//?/")
+                .unwrap_or(&normalized)
+                .to_string()
         };
         PathBuf::from(normalized)
     }
@@ -193,7 +265,8 @@ mod tests {
 
     #[test]
     fn ignored_nested_workspace_is_bound_without_reading_its_parent() {
-        let parent = std::env::temp_dir().join(format!("mission-candidate-{}", rand::random::<u64>()));
+        let parent =
+            std::env::temp_dir().join(format!("mission-candidate-{}", rand::random::<u64>()));
         let root = parent.join(".himind/test");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(parent.join(".gitignore"), ".himind/\n").unwrap();
@@ -213,7 +286,8 @@ mod tests {
 
     #[test]
     fn protected_manifest_excludes_writes_and_detects_changes_and_added_files() {
-        let root = std::env::temp_dir().join(format!("mission-protected-{}", rand::random::<u64>()));
+        let root =
+            std::env::temp_dir().join(format!("mission-protected-{}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("test")).unwrap();
         std::fs::write(root.join("src/app.js"), "before").unwrap();
@@ -234,12 +308,16 @@ mod tests {
 
     #[test]
     fn protected_manifest_allows_creation_of_authorized_parent_directories() {
-        let root = std::env::temp_dir().join(format!("mission-protected-parent-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "mission-protected-parent-{}",
+            rand::random::<u64>()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let task = serde_json::from_value(json!({"id":"plan", "title":"plan",
             "read_paths":["reports", "unavailable-input.txt"],
             "write_paths":["reports/nested/plan.json"],
-            "execution":{"executor":"himind.fixture","role_id":"plan"}})).unwrap();
+            "execution":{"executor":"himind.fixture","role_id":"plan"}}))
+        .unwrap();
         let baseline = protected_files(&root, &task).unwrap();
         assert_eq!(baseline, json!({"unavailable-input.txt":null}));
         std::fs::create_dir_all(root.join("reports/nested")).unwrap();
@@ -248,7 +326,11 @@ mod tests {
         std::fs::write(root.join("reports/read-only.txt"), "unauthorized sibling").unwrap();
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
         std::fs::remove_file(root.join("reports/read-only.txt")).unwrap();
-        std::fs::write(root.join("unavailable-input.txt"), "created outside write scope").unwrap();
+        std::fs::write(
+            root.join("unavailable-input.txt"),
+            "created outside write scope",
+        )
+        .unwrap();
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
         std::fs::remove_file(root.join("unavailable-input.txt")).unwrap();
         std::fs::remove_dir_all(root.join("reports")).unwrap();
@@ -260,17 +342,36 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn protected_manifest_windows_case_and_separator_scopes_keep_siblings_protected() {
-        let root = std::env::temp_dir().join(format!("mission-protected-case-{}", rand::random::<u64>()));
+        let root =
+            std::env::temp_dir().join(format!("mission-protected-case-{}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("src-extra")).unwrap();
         std::fs::write(root.join("src/app.js"), "before").unwrap();
         std::fs::write(root.join("src/app.js.extra"), "protected file sibling").unwrap();
-        std::fs::write(root.join("src-extra/input.js"), "protected directory sibling").unwrap();
-        for scope in ["SRC\\APP.JS".to_string(), root.join("SRC/APP.JS").to_string_lossy().into_owned()] {
-            let task = serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["."],
-                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+        std::fs::write(
+            root.join("src-extra/input.js"),
+            "protected directory sibling",
+        )
+        .unwrap();
+        for scope in [
+            "SRC\\APP.JS".to_string(),
+            root.join("SRC/APP.JS").to_string_lossy().into_owned(),
+            root.canonicalize()
+                .unwrap()
+                .join("SRC/APP.JS")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let task =
+                serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["."],
+                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}}))
+                .unwrap();
             let baseline = protected_files(&root, &task).unwrap();
-            assert!(baseline.get("src/app.js").is_none());
+            assert!(
+                baseline.get("src/app.js").is_none(),
+                "scope {:?}, protected {baseline}",
+                task.write_paths
+            );
             assert!(baseline.get("src/app.js.extra").is_some());
             assert!(baseline.get("src-extra/input.js").is_some());
             std::fs::write(root.join("src/app.js"), "authorized change").unwrap();
@@ -279,12 +380,19 @@ mod tests {
             assert_ne!(baseline, protected_files(&root, &task).unwrap());
             std::fs::write(root.join("src/app.js.extra"), "protected file sibling").unwrap();
         }
-        let task = serde_json::from_value(json!({"id":"directory", "title":"directory", "read_paths":["."],
-            "write_paths":["SRC\\"], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+        let task = serde_json::from_value(
+            json!({"id":"directory", "title":"directory", "read_paths":["."],
+            "write_paths":["SRC\\"], "execution":{"executor":"himind.fixture","role_id":"fix"}}),
+        )
+        .unwrap();
         let baseline = protected_files(&root, &task).unwrap();
         assert_eq!(baseline.as_object().unwrap().len(), 1);
         assert!(baseline.get("src-extra/input.js").is_some());
-        std::fs::write(root.join("src-extra/input.js"), "unauthorized directory sibling change").unwrap();
+        std::fs::write(
+            root.join("src-extra/input.js"),
+            "unauthorized directory sibling change",
+        )
+        .unwrap();
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -292,7 +400,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn protected_manifest_windows_case_allows_only_authorized_missing_parents() {
-        let root = std::env::temp_dir().join(format!("mission-protected-parent-case-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "mission-protected-parent-case-{}",
+            rand::random::<u64>()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let task = serde_json::from_value(json!({"id":"report", "title":"report",
             "read_paths":["reports", "unavailable-input.txt"], "write_paths":["REPORTS\\Nested\\PLAN.json"],
@@ -310,12 +421,17 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn protected_manifest_non_windows_keeps_case_and_backslash_semantics() {
-        let root = std::env::temp_dir().join(format!("mission-protected-case-sensitive-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "mission-protected-case-sensitive-{}",
+            rand::random::<u64>()
+        ));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/app.js"), "before").unwrap();
         for scope in ["SRC/APP.JS", "src\\app.js"] {
-            let task = serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["src"],
-                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+            let task =
+                serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["src"],
+                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}}))
+                .unwrap();
             std::fs::write(root.join("src/app.js"), "before").unwrap();
             let baseline = protected_files(&root, &task).unwrap();
             assert!(baseline.get("src/app.js").is_some());
@@ -327,7 +443,10 @@ mod tests {
 
     #[test]
     fn explicit_external_inputs_are_also_bound() {
-        let parent = std::env::temp_dir().join(format!("mission-external-candidate-{}", rand::random::<u64>()));
+        let parent = std::env::temp_dir().join(format!(
+            "mission-external-candidate-{}",
+            rand::random::<u64>()
+        ));
         let root = parent.join("workspace");
         std::fs::create_dir_all(&root).unwrap();
         let external = parent.join("input.txt");

@@ -487,3 +487,23 @@ export function legacyBudgetExtensionAction(isLegacyRecovery: boolean, authorize
     description: '本次只增加核验时限，任务仍保持等待；之后需单独确认重试同一交付核验。',
   };
 }
+
+/** Display provenance only; result admission remains a host responsibility. */
+export function missionEvidencePlanCompatible(mission: MissionView, task: MissionTaskView, plan: unknown, events: MissionEvent[]) {
+  if (typeof plan!=='string' || !plan || !task.attempt_run_id || task.status==='canceled') return false;
+  if (plan===mission.plan_sha256) return true;
+  const visited=new Set<string>(); let current=plan; let signature='';
+  while (!visited.has(current)) {
+    visited.add(current);
+    const link=[...events].reverse().find(event=>event.event_type==='mission_attempt_plan_retained'
+      && event.mission_id===mission.mission_id && event.task_id===task.spec.id && event.payload.from_plan_sha256===current);
+    if (!link || link.payload.implementation_run_id!==task.attempt_run_id
+      || typeof link.payload.input_sha256!=='string' || !link.payload.input_sha256
+      || signature && signature!==link.payload.input_sha256
+      || link.payload.verification_run_id && link.payload.verification_run_id!==task.verification_run_id
+      || typeof link.payload.to_plan_sha256!=='string') return false;
+    signature=link.payload.input_sha256; current=link.payload.to_plan_sha256;
+    if (current===mission.plan_sha256) return true;
+  }
+  return false;
+}

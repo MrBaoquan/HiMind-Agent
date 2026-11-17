@@ -109,9 +109,13 @@ enum CapabilityHandler {
     MissionPendingRepairCancel,
     MissionBudgetExtend,
     MissionFeedbackSubmit,
+    MissionMessageSubmit,
+    MissionMessageWithdraw,
+    MissionPlanChangeApply,
     MissionVerificationRetry,
     MissionControl,
     MissionWorkflowExport,
+    MissionWorkflowSave,
     WorkflowCatalogList,
     WorkflowCatalogDescribe,
     WorkflowRunStart,
@@ -2031,6 +2035,7 @@ impl CapabilityGateway {
                             "properties": {
                                 "root":{"type":"string","minLength":1},
                                 "permission_mode":{"enum":["workspace_write","full_access"]},
+                                "adjustment_mode":{"enum":["automatic","confirm_changes"]},
                                 "read_scope":{"type":"array","items":{"type":"string"}},
                                 "write_scope":{"type":"array","items":{"type":"string"}}
                             },
@@ -2130,6 +2135,49 @@ impl CapabilityGateway {
                     },"required":["request_id","expected_plan_sha256","target_task_ids","message"],"additionalProperties":false}
                 },"required":["mission_id","input"],"additionalProperties":false}),
                 CapabilityHandler::MissionFeedbackSubmit,
+            ),
+            registration(
+                "mission.communication.submit",
+                "与协作任务协调助手沟通",
+                "读取真实任务状态并持久记录询问、用户指令或专家观察。询问只读；指令在计划变更通过宿主校验并提交前不会生效；观察不构成用户授权。",
+                "local_write",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1,"maxLength":160},
+                    "input":{"type":"object","properties":{
+                        "request_id":{"type":"string","minLength":1,"maxLength":200},
+                        "expected_plan_revision":{"type":"integer","minimum":0},
+                        "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                        "kind":{"enum":["message","question","instruction"]},
+                        "target_task_ids":{"type":"array","items":{"type":"string"},"maxItems":32,"uniqueItems":true},
+                        "message":{"type":"string","minLength":1,"maxLength":8000}
+                    },"required":["request_id","expected_plan_revision","expected_plan_sha256","kind","message"],"additionalProperties":false}
+                },"required":["mission_id","input"],"additionalProperties":false}),
+                CapabilityHandler::MissionMessageSubmit,
+            ),
+            registration(
+                "mission.communication.withdraw", "撤回未生效的协作要求",
+                "撤回分析中或待确认、待收尾的要求，释放受影响未启动任务；不回滚已发生的外部操作。",
+                "local_write",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1,"maxLength":160},
+                    "request_id":{"type":"string","minLength":1,"maxLength":200}},
+                    "required":["mission_id","request_id"],"additionalProperties":false}),
+                CapabilityHandler::MissionMessageWithdraw,
+            ),
+            registration(
+                "mission.plan-change.apply",
+                "确认并应用协作任务计划变更",
+                "显示并确认当前计划版本的结构化变更及精确新增路径；宿主重新校验专家目录、依赖、版本和授权后才会提交。需要高风险审批。",
+                "R3",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1,"maxLength":160},
+                    "request_id":{"type":"string","minLength":1,"maxLength":200},
+                    "expected_plan_revision":{"type":"integer","minimum":0},
+                    "expected_plan_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
+                    "read_paths":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1024},"maxItems":128,"uniqueItems":true},
+                    "write_paths":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1024},"maxItems":128,"uniqueItems":true}
+                },"required":["mission_id","request_id","expected_plan_revision","expected_plan_sha256","read_paths","write_paths"],"additionalProperties":false}),
+                CapabilityHandler::MissionPlanChangeApply,
             ),
             registration(
                 "mission.assignment.options",
@@ -2301,6 +2349,19 @@ impl CapabilityGateway {
                     "required":["mission_id","workflow_id","version"],"additionalProperties":false
                 }),
                 CapabilityHandler::MissionWorkflowExport,
+            ),
+            registration(
+                "mission.workflow.save",
+                "保存协作方法到我的能力",
+                "用户明确保存后，将已完成任务的脱敏方法预检并安装为本机可复用工作流。新任务重新选择工作区和授权；不发布、不提交审核、不携带旧执行记录。",
+                "R3",
+                json!({"type":"object","properties":{
+                    "mission_id":{"type":"string","minLength":1},
+                    "workflow_id":{"type":"string","minLength":1},
+                    "version":{"type":"string","minLength":1},
+                    "name":{"type":"string"},"entrypoint":{"type":"string"}
+                },"required":["mission_id","workflow_id","version"],"additionalProperties":false}),
+                CapabilityHandler::MissionWorkflowSave,
             ),
             registration(
                 "mission.control",
@@ -4205,6 +4266,9 @@ impl CapabilityGateway {
         if capability_id == "mission.plan.confirm" {
             policy::mission_plan_confirmation_target(&input)?;
         }
+        if capability_id == "mission.plan-change.apply" {
+            policy::mission_plan_change_apply_target(&input)?;
+        }
         // Keep the exact successfully validated display. Never regenerate it
         // through target_description's infallible fallback during approval.
         let follow_up_review_target = if capability_id == "mission.follow-up.add" {
@@ -4578,6 +4642,68 @@ impl CapabilityGateway {
             CapabilityHandler::MissionFeedbackSubmit => {
                 crate::app::mission_commands::submit_mission_feedback_for_mcp(&input)
             }
+            CapabilityHandler::MissionMessageWithdraw => {
+                let mission_id = input["mission_id"].as_str().ok_or("mission_id missing")?;
+                let request_id = input["request_id"].as_str().ok_or("request_id missing")?;
+                Ok(
+                    json!({"event_sequence":crate::app::mission_commands::withdraw_mission_instruction(mission_id,request_id)?}),
+                )
+            }
+            CapabilityHandler::MissionMessageSubmit => {
+                let mission_id = input
+                    .get("mission_id")
+                    .and_then(Value::as_str)
+                    .ok_or("mission.communication.submit requires mission_id")?;
+                crate::app::mission_commands::submit_mission_message(
+                    &self.options,
+                    mission_id,
+                    &input["input"],
+                )
+            }
+            CapabilityHandler::MissionPlanChangeApply => {
+                let mission_id = input
+                    .get("mission_id")
+                    .and_then(Value::as_str)
+                    .ok_or("mission.plan-change.apply requires mission_id")?;
+                let request_id = input
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .ok_or("mission.plan-change.apply requires request_id")?;
+                let revision = input
+                    .get("expected_plan_revision")
+                    .and_then(Value::as_u64)
+                    .ok_or("mission.plan-change.apply requires expected_plan_revision")?;
+                let hash = input
+                    .get("expected_plan_sha256")
+                    .and_then(Value::as_str)
+                    .ok_or("mission.plan-change.apply requires expected_plan_sha256")?;
+                let strings = |field: &str| -> Result<Vec<String>, std::io::Error> {
+                    input
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| std::io::Error::other(format!("{field} must be an array")))?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().map(str::to_string).ok_or_else(|| {
+                                std::io::Error::other(format!("{field} must contain strings"))
+                            })
+                        })
+                        .collect()
+                };
+                let read_paths = strings("read_paths")?;
+                let write_paths = strings("write_paths")?;
+                Ok(serde_json::to_value(
+                    crate::app::mission_commands::apply_mission_plan_change(
+                        mission_id,
+                        request_id,
+                        revision,
+                        hash,
+                        &read_paths,
+                        &write_paths,
+                        "mcp-user-approval",
+                    )?,
+                )?)
+            }
             CapabilityHandler::MissionBudgetExtend => {
                 let mission_id = input
                     .get("mission_id")
@@ -4618,6 +4744,9 @@ impl CapabilityGateway {
             }
             CapabilityHandler::MissionWorkflowExport => {
                 crate::app::mission_commands::export_mission_workflow_for_mcp(self, &input)
+            }
+            CapabilityHandler::MissionWorkflowSave => {
+                crate::app::mission_commands::save_mission_workflow_for_mcp(self, &input)
             }
             CapabilityHandler::WorkflowCatalogList => {
                 let store = crate::workflow::WorkflowStore::open_default()?;
@@ -8326,6 +8455,9 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
             | CapabilityHandler::DashboardProjectExhibitDetach
             | CapabilityHandler::MediaJobCancel
             | CapabilityHandler::MissionFeedbackSubmit
+            | CapabilityHandler::MissionMessageSubmit
+            | CapabilityHandler::MissionMessageWithdraw
+            | CapabilityHandler::MissionPlanChangeApply
             | CapabilityHandler::MissionFollowUpAdd
             | CapabilityHandler::MissionPendingRepairCancel
     ) {
@@ -10437,6 +10569,42 @@ mod tests {
                         "{id}: invalid {field}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn mission_creation_schemas_share_runtime_adjustment_policy() {
+        let gateway = CapabilityGateway::new(
+            Options::from_env(),
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+        );
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        for id in ["mission.intent.create", "mission.handoff.create"] {
+            let schema = &registry.get(id).unwrap().descriptor.input_schema;
+            let mut input = json!({
+                "idempotency_key":"policy-parity", "source_client":"codex",
+                "source_reference":"acceptance", "title":"Policy parity",
+                "objective":"Implement a verified change", "plan_mode":"generated",
+                "workflow":{"workflow_id":"com.example.method","workflow_version":"1.0.0",
+                    "workflow_sha256":"a".repeat(64)},
+                "workspace":{"root":"F:/acceptance","permission_mode":"full_access"}
+            });
+            if id == "mission.intent.create" {
+                input.as_object_mut().unwrap().remove("plan_mode");
+                input.as_object_mut().unwrap().remove("workflow");
+            }
+            validate_capability_input_schema(schema, &input).unwrap();
+            for mode in ["automatic", "confirm_changes"] {
+                input["workspace"]["adjustment_mode"] = json!(mode);
+                validate_capability_input_schema(schema, &input).unwrap();
+            }
+            for invalid in [json!("silent-unbounded"), Value::Null, json!(false)] {
+                input["workspace"]["adjustment_mode"] = invalid;
+                assert!(
+                    validate_capability_input_schema(schema, &input).is_err(),
+                    "{id}"
+                );
             }
         }
     }

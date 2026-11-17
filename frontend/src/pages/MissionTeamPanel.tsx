@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, CheckCircle2, Clock3, Download, Plus, ShieldCheck } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react';
+import { Activity, CheckCircle2, Clock3, Download, MessageCircle, PackageCheck, Plus, ShieldCheck, Users } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState } from '../components/Common';
-import { agentApi, type AgentActivityItem, type MissionAssignmentInput, type MissionAssignmentOptions, type WorkflowCenterItem, type MissionBudgetIncrease, type MissionEvent, type MissionExecutionOption, type MissionRoleAssignment, type MissionSnapshot, type MissionTaskSpec, type MissionView } from '../services/agentApi';
+import { agentApi, type AgentActivityItem, type MissionAssignmentInput, type MissionAssignmentOptions, type WorkflowCenterItem, type MissionBudgetIncrease, type MissionEvent, type MissionExecutionOption, type MissionMessageInput, type MissionPlanChangeProposal, type MissionRoleAssignment, type MissionSnapshot, type MissionTaskSpec, type MissionView } from '../services/agentApi';
 import { formatError } from '../types';
 import { formatRelativeStamp, useNowTick } from '../timeFormat';
 import { ENDED_STATUSES, executionTodoId, missionTodo, clientLabel, activityStatusLabel } from './taskCenterModel';
@@ -21,6 +21,7 @@ import {
   legacyVerificationOverrideForTask,
   missionNextAction,
   missionRunningTasks,
+  missionTaskActivity,
   missionRunningVerifications,
   missionTaskExecutionLabel,
   missionWait,
@@ -42,6 +43,107 @@ import {
 
 const COLLAB_ACTIVE_STATUSES = new Set(['draft', 'awaiting_assignment', 'planned', 'awaiting_confirmation', 'active', 'waiting']);
 
+function MissionWorkCard({ mission, task, activities, fresh, event, onSelect }: { mission: MissionView; task: MissionView['tasks'][number]; activities: AgentActivityItem[]; fresh: boolean; event?: MissionEvent; onSelect: () => void }) {
+  const role = mission.assignment?.roles.find(value => value.role_id === task.spec.execution.role_id);
+  const label = role?.label || task.spec.execution.role_id || '协作专家';
+  const initials = Array.from(label.replace(/专家|工程师|设计师/g, '').trim()).slice(0, 2).join('') || 'AI';
+  const activity = fresh ? missionTaskActivity(mission, task, activities) : undefined;
+  const live = activity?.status === 'running';
+  const status = !fresh && ['running','awaiting_verification'].includes(task.status) ? '运行状态待核实' : missionTaskExecutionLabel(mission, task, fresh ? activities : []);
+  const dependencies = task.spec.depends_on.map(id => mission.tasks.find(item => item.spec.id === id));
+  const waiting = dependencies.filter(item => item?.status !== 'completed').map(item => item?.spec.title || '前置任务');
+  const [motion, setMotion] = useState(false);
+  useEffect(() => {
+    if (!fresh || !event || Date.now()-Date.parse(event.occurred_at)>10000) return;
+    setMotion(true); const timer = window.setTimeout(() => setMotion(false), 650);
+    return () => window.clearTimeout(timer);
+  }, [event?.event_id]);
+  return <button type="button" className={`mission-work-card${live ? ' is-running' : ''}${motion ? ' has-new-event' : ''}`} data-task-id={task.spec.id} data-runtime-live={live} onClick={onSelect}>
+    <div className="mission-work-card-head"><span className="mission-expert-avatar" aria-hidden="true">{initials}</span><span className="mission-work-expert">{label}<small>{task.spec.execution.executor === 'personal.codex' ? 'Codex' : task.spec.execution.executor === 'himind.builtin' ? 'HiMind AI' : task.spec.execution.executor}</small></span><span className={`mission-work-status is-${task.status}`}>{status}</span></div>
+    <strong>{task.spec.title}</strong><p>{task.spec.objective || task.spec.acceptance_criteria[0] || '执行已确认的任务要求'}</p>
+    {dependencies.length ? <span className="mission-dependency-chips">{dependencies.map((dependency,index) => <small key={task.spec.depends_on[index]}>{dependency?.status === 'completed' ? '✓ 已交接' : '← 等待'} · {dependency?.spec.title || task.spec.depends_on[index]}</small>)}</span> : null}
+    <small className="mission-work-activity">{!fresh ? '连接状态待核实，显示上次快照' : live ? <><span className="mission-live-dot"/>执行器已确认正在处理</> : task.status === 'running' ? status : task.status === 'blocked' ? `等待 ${waiting.join('、') || '资源、计划变更或调度容量'}` : task.status === 'awaiting_verification' ? '实现已交付 · 由另一执行实例检查实际成果' : task.status === 'completed' ? '宿主检查及独立验收已通过' : task.status === 'failed' ? '执行失败 · 查看证据与下一步' : task.status === 'ready' ? '可派发 · 等待调度' : '按确认后的任务计划执行'}</small>
+  </button>;
+}
+
+function MissionCoordination({ mission, events, busy, message, onMessageChange, scrollPosition, focusChange, onSend, onApply, onWithdraw }: {
+  mission: MissionView; events: MissionEvent[]; busy: boolean;
+  message: string; onMessageChange: (value: string) => void; scrollPosition: { current: number };
+  focusChange: { id: string; revision: number } | null;
+  onSend: (input: MissionMessageInput) => Promise<void>;
+  onWithdraw: (requestId: string) => Promise<void>;
+  onApply: (proposal: MissionPlanChangeProposal, readPaths: string[], writePaths: string[]) => Promise<void>;
+}) {
+  const conversationRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => { if (conversationRef.current) conversationRef.current.scrollTop = scrollPosition.current; }, [scrollPosition]);
+  useLayoutEffect(() => {
+    if (!focusChange) return;
+    const card = Array.from(conversationRef.current?.querySelectorAll<HTMLElement>('[data-change-id]') || [])
+      .find(item => item.dataset.changeId === focusChange.id);
+    card?.scrollIntoView({block:'nearest'});
+  }, [focusChange]);
+  const messages = events.filter(event => event.event_type === 'mission_message_submitted');
+  const progressByRequest = new Map<string, { status?: string; answer?: string }>();
+  for (const event of events.filter(item => item.event_type === 'mission_instruction_status_changed')) {
+    const payload = event.payload as { request_id?: string; status?: string; answer?: string };
+    if (payload.request_id) progressByRequest.set(payload.request_id, payload);
+  }
+  const proposals = events.filter(event => event.event_type === 'mission_plan_change_proposed').map(event => {
+    const payload = event.payload as { proposal?: MissionPlanChangeProposal; status?: string; read_scope_delta?: string[]; write_scope_delta?: string[] };
+    return { proposal: payload.proposal, status: payload.status || 'proposed', reads: payload.read_scope_delta || [], writes: payload.write_scope_delta || [] };
+  }).filter((item): item is { proposal: MissionPlanChangeProposal; status: string; reads: string[]; writes: string[] } => Boolean(item.proposal));
+  const statusLabel = (status?: string) => ({
+    needs_clarification: '请澄清含义', awaiting_checkpoint: '受影响工作收尾后生效', received: '已接收', analyzing: '正在分析', awaiting_authorization: '待确认新增访问范围',
+    awaiting_confirmation: '待确认变更', ready_to_apply: '正在提交', applied: '已应用',
+    partially_applied: '部分生效', not_applied: '未应用', failed: '失败', answered: '已回答', recorded: '已记录',
+  } as Record<string, string>)[status || ''] || status || '已记录';
+  return <section className="mission-coordination" aria-label="与协调助手沟通">
+    <header><div><span className="mission-coordination-icon"><MessageCircle size={17}/></span><div><h3>与协调助手沟通</h3><p>随时询问进展或补充要求，执行与沟通分别跟踪。</p></div></div></header>
+    <div className="mission-conversation" ref={conversationRef} onScroll={event => { scrollPosition.current = event.currentTarget.scrollTop; }} aria-live="polite">{messages.length ? messages.map(event => { const payload = event.payload as { request_id?: string; input?: { kind?: string; message?: string }; status?: string; answer?: string }; const progress = progressByRequest.get(payload.request_id || ''); return <article key={event.event_id} className="mission-message-entry">
+      <small>{payload.input?.kind === 'question' ? '你 · 询问' : payload.input?.kind === 'instruction' ? '你 · 要求' : '你'} · {statusLabel(progress?.status || payload.status)}</small>
+      <p>{payload.input?.message || event.summary}</p><div>{progress?.answer || payload.answer || '等待协调助手处理'}</div>{(progress?.status || payload.status)==='needs_clarification' && payload.input?.message ? <div className="mission-clarification-actions">{(['question','instruction'] as const).map(kind=><button className="btn" disabled={busy} key={kind} onClick={()=>void onSend({request_id:`agent-ui:clarification:${crypto.randomUUID()}`,expected_plan_revision:mission.plan_revision,expected_plan_sha256:mission.plan_sha256,kind,message:payload.input!.message!}).catch(()=>{})}>{kind==='question'?'只是询问':'这是明确执行要求'}</button>)}</div> : null}
+      {payload.request_id && ['received','analyzing','awaiting_checkpoint','awaiting_authorization','awaiting_confirmation','ready_to_apply'].includes(progress?.status || payload.status || '') ? <button className="btn" disabled={busy} onClick={()=>void onWithdraw(payload.request_id!)}>撤回未生效要求</button> : null}
+    </article>;}) : <p className="mission-conversation-empty">暂无沟通记录</p>}
+    {proposals.map(({ proposal, status: storedStatus, reads, writes }) => {
+      const status = progressByRequest.get(proposal.instruction_request_id)?.status || storedStatus;
+      const canApply = ['awaiting_authorization', 'awaiting_confirmation'].includes(status)
+        && proposal.expected_plan_revision === mission.plan_revision && proposal.expected_plan_sha256 === mission.plan_sha256;
+      return <article className="mission-change-review" key={proposal.request_id} data-change-id={proposal.request_id}>
+        <header><div><strong>{proposal.summary}</strong><small>计划 r{proposal.expected_plan_revision} · {statusLabel(status)}</small></div></header>
+        {proposal.rationale ? <p>{proposal.rationale}</p> : null}
+        {proposal.added_roles.length ? <p>新增专家：{proposal.added_roles.map(role => role.label).join('、')}</p> : null}
+        {proposal.added_tasks.length ? <ul>{proposal.added_tasks.map(task => <li key={task.id}>{task.title}{task.depends_on.length ? ` · 等待 ${task.depends_on.join('、')}` : ' · 可并行'}</li>)}</ul> : null}
+        {proposal.updates?.length ? <div className="mission-change-updates"><strong>调整已有工作</strong>{proposal.updates.map(update => {
+          const task = mission.tasks.find(item => item.spec.id === update.task_id);
+          const role = [...(mission.assignment?.roles || []), ...proposal.added_roles].find(item => item.role_id === update.role_id);
+          const dependencyTitle = (id: string) => [...mission.tasks.map(item => item.spec), ...proposal.added_tasks].find(item => item.id === id)?.title || id;
+          return <article key={update.task_id}>
+            <strong>{task?.spec.title || update.task_id}</strong>
+            {update.title != null ? <p>标题改为：{update.title}</p> : null}
+            {update.objective != null ? <p>目标：{update.objective}</p> : null}
+            {update.depends_on != null ? <p>依赖改为：{update.depends_on.length ? update.depends_on.map(dependencyTitle).join('、') : '无前置依赖'}</p> : null}
+            {update.role_id != null ? <p>改派：{role?.label || update.role_id}</p> : null}
+            {update.priority != null ? <p>优先级：{update.priority}</p> : null}
+            {update.acceptance_criteria != null ? <p>验收改为：{update.acceptance_criteria.join('；') || '无单项验收声明'}</p> : null}
+            {update.required_checks != null ? <p>检查改为：{update.required_checks.join('；') || '无指定命令'}</p> : null}
+            {task && ['running', 'awaiting_verification'].includes(task.status) ? <small>当前工作收尾后重新执行</small> : null}
+          </article>;
+        })}</div> : null}
+        {proposal.cancel_task_ids?.length ? <p>撤销未启动工作：{proposal.cancel_task_ids.map(id => mission.tasks.find(task => task.spec.id === id)?.spec.title || id).join('、')}</p> : null}
+        {proposal.required_acceptance?.length ? <p>新增整体验收：{proposal.required_acceptance.join('；')}</p> : null}
+        {reads.length || writes.length ? <div className="mission-change-scope"><strong>新增访问授权</strong>{reads.map(path => <code key={`r:${path}`}>读取 · {path}</code>)}{writes.map(path => <code key={`w:${path}`}>写入 · {path}</code>)}</div> : null}
+        {canApply ? <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void onApply(proposal, reads, writes)}>{busy ? <BusyIndicator size={14}/> : <CheckCircle2 size={14}/>}确认并应用这项变更</button>
+          : !['applied', 'partially_applied', 'not_applied', 'failed', 'ready_to_apply', 'awaiting_checkpoint'].includes(status) ? <small>计划版本已变化；此提案不能应用，需要按最新计划重新分析。</small> : null}
+      </article>;
+    })}
+    </div>
+    <form onSubmit={event => { event.preventDefault(); if (!message.trim() || busy) return; void onSend({request_id:`agent-ui:communication:${crypto.randomUUID()}`, expected_plan_revision:mission.plan_revision, expected_plan_sha256:mission.plan_sha256, kind:'message', message:message.trim()}).then(()=>onMessageChange('')).catch(()=>{}); }}>
+      <textarea aria-label="发给协调助手的消息" value={message} onChange={event=>onMessageChange(event.target.value)} placeholder="询问进展，或提出要求，例如：新增离线运行支持，界面工作继续" maxLength={8000}/>
+      <footer><small>询问不会改动计划；要求经宿主校验并提交后才生效。</small><button className="btn btn-primary" disabled={busy || !message.trim()}>{busy?'提交中':'发送'}</button></footer>
+    </form>
+  </section>;
+}
+
 function MissionPermissionPanel({ mission, events, onSaved }: { mission: MissionView; events: MissionEvent[]; onSaved: (mission: MissionView) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -56,6 +158,7 @@ function MissionPermissionPanel({ mission, events, onSaved }: { mission: Mission
   }
   return <section className="mission-detail-panel"><h3>执行权限</h3>
     {editable ? <label><span>任务访问模式</span><select value={full ? 'full_access' : 'workspace_write'} disabled={busy} onChange={event => void save(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label> : <strong>{full ? '完全访问' : recovery?.payload?.mode === 'files_only' ? '仅文件工具' : '工作区访问'}</strong>}
+    <p>运行中计划调整：{mission.workspace.adjustment_mode === 'confirm_changes' ? '每次变更前确认' : '已授权范围内自动调整'}</p>
     <p>{full ? <>按当前用户权限访问工作区外文件；ACP 请求自动批准。<br />目标与验收标准仍有效。</> : 'HiMind AI 隔离工作区；外部执行器自行控制访问。受阻时可调整权限。'}</p>
     {editable ? <small>确认计划后生效，无需逐次确认；不会自动提权。</small> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
@@ -68,6 +171,7 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
   const [root, setRoot] = useState('');
   const [writeScope, setWriteScope] = useState('.');
   const [permissionMode, setPermissionMode] = useState<'workspace_write' | 'full_access'>('workspace_write');
+  const [adjustmentMode, setAdjustmentMode] = useState<'automatic' | 'confirm_changes'>('automatic');
   const [acceptance, setAcceptance] = useState('');
   const [workflows, setWorkflows] = useState<WorkflowCenterItem[]>([]);
   const [workflowId, setWorkflowId] = useState('');
@@ -98,7 +202,7 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
       const input = {
         idempotency_key: requestId.current, source_client: 'agent-ui', source_reference: requestId.current,
         title: title.trim() || Array.from(objective.trim().split('\n')[0]).slice(0, 120).join(''), objective: objective.trim(),
-        workspace: { root: root.trim(), permission_mode: permissionMode, read_scope: ['.'], write_scope: writeScope.split(/[,\n]/).map(value => value.trim()).filter(Boolean) },
+        workspace: { root: root.trim(), permission_mode: permissionMode, adjustment_mode: adjustmentMode, read_scope: ['.'], write_scope: writeScope.split(/[,\n]/).map(value => value.trim()).filter(Boolean) },
         acceptance_criteria: acceptance.split('\n').map(value => value.trim()).filter(Boolean),
       };
       onCreated(await (selected ? agentApi.createMissionHandoff({
@@ -123,13 +227,15 @@ export function CreateMissionDialog({ onClose, onCreated }: { onClose: () => voi
           <label><span>任务标题（可选）</span><input value={title} onChange={event => setTitle(event.target.value)} placeholder="留空时使用需求首行" /></label>
           <label><span>工作区根目录 *</span><input required value={root} onChange={event => setRoot(event.target.value)} placeholder="项目的本地绝对路径" /></label>
           <label><span>执行权限</span><select value={permissionMode} onChange={event => setPermissionMode(event.target.value as 'workspace_write' | 'full_access')}><option value="workspace_write">工作区访问</option><option value="full_access">完全访问</option></select></label>
-          <small>默认可在工作区内修改；可在进阶选项缩小范围。最终计划会列出具体修改路径，确认后才执行。</small>
+          <small>默认允许修改工作区；确认计划后执行，可在进阶选项缩小范围。</small>
           <small>{permissionMode === 'full_access' ? <>确认计划后，HiMind AI 或 ACP 按当前用户权限运行。<br />ACP 请求自动批准；不会自动提权为管理员。</> : 'HiMind AI 使用工作区沙箱；外部执行器遵循自身访问控制。'}</small>
           <label><span>完成标准</span><textarea value={acceptance} onChange={event => setAcceptance(event.target.value)} placeholder="每行一条可验证标准" /></label>
           <details onToggle={event => setAdvancedOpen(event.currentTarget.open)}>
             <summary>进阶选项：固定工作流与修改范围</summary>
             <label><span>固定工作流（可选）</span><select value={workflowId} onChange={event => setWorkflowId(event.target.value)}><option value="">自动组队（推荐）</option>{workflows.map(item => <option key={item.package.id} value={item.package.id}>{item.package.name} · {item.package.version}</option>)}</select></label>
             {workflowLoading ? <small>正在读取固定工作流</small> : workflowError ? <p className="muted" role="status">{workflowError}</p> : !workflows.length ? <small>暂无已安装的协作工作流，可继续自动组队。</small> : null}
+            <label><span>运行中计划调整</span><select value={adjustmentMode} onChange={event => setAdjustmentMode(event.target.value as 'automatic' | 'confirm_changes')}><option value="automatic">授权范围内自动调整</option><option value="confirm_changes">每次变更前确认</option></select></label>
+            <small>自动调整遵循现有授权；新增访问范围需另行确认。</small>
             <label><span>允许修改的范围（可选）</span><textarea value={writeScope} onChange={event => setWriteScope(event.target.value)} placeholder="例如：frontend/src，行或逗号分隔；后续确认计划时核对" /></label>
           </details>
         </div>
@@ -166,7 +272,8 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   onMissionChanged?: (mission: MissionView) => void; relatedActivities?: AgentActivityItem[];
   onOpenWorkflowRun?: (runId: string) => void;
 }) {
-  const [tab, setTab] = useState<'overview' | 'plan' | 'experts' | 'activity'>('overview');
+  const [tab, setDetailTab] = useState<'overview' | 'plan' | 'experts' | 'activity'>('overview');
+  const [viewTab, setViewTab] = useState<'collaboration' | 'delivery'>('collaboration');
   const [mission, setMission] = useState<MissionView | null>(null);
   const [events, setEvents] = useState<MissionEvent[]>([]);
   const [historyComplete, setHistoryComplete] = useState(false);
@@ -183,6 +290,23 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const [runtimeWorkspaceOpen, setRuntimeWorkspaceOpen] = useState(false);
   const [budgetExtensionOpen, setBudgetExtensionOpen] = useState(false);
   const [assignmentOpen, setAssignmentOpen] = useState(false);
+  const [contextPanel, setContextPanel] = useState<'none' | 'coordination' | 'detail'>('none');
+  const coordinationOpen = contextPanel === 'coordination';
+  const detailsOpen = contextPanel === 'detail';
+  const [messageDraft, setMessageDraft] = useState('');
+  const conversationScroll = useRef(0);
+  const [selectedWorkId, setSelectedWorkId] = useState('');
+  const [focusChange, setFocusChange] = useState<{ id: string; revision: number } | null>(null);
+  const setTab = (next: typeof tab) => { setDetailTab(next); setContextPanel('detail'); };
+  const openTask = (id: string) => { setSelectedWorkId(id); setTab('plan'); };
+  const [lastReceivedAt, setLastReceivedAt] = useState(0);
+  const [connectionFailed, setConnectionFailed] = useState(false);
+  const completedView = useRef('');
+  useEffect(() => { if (mission?.status === 'completed' && completedView.current !== mission.mission_id) {
+    completedView.current=mission.mission_id; setViewTab('delivery');
+  } }, [mission?.mission_id, mission?.status]);
+
+  const [messageBusy, setMessageBusy] = useState(false);
   const openedAssignment = useRef('');
   useEffect(() => {
     const request = `${missionId}:${openAssignmentRevision}`;
@@ -213,6 +337,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         setApprovedAbsoluteReadPaths([]);
         setApprovedAbsoluteWritePaths([]);
       }
+      setLastReceivedAt(Date.now()); setConnectionFailed(false);
       setMission(snapshot.mission);
       onMissionChanged?.(snapshot.mission);
       setEvents(current => reset ? snapshot.events : mergeEvents(current, snapshot.events));
@@ -222,7 +347,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
     } catch (cause) {
       if (revision !== pollRevision.current) return;
       setMission(current => current ? {...current, effective_wait: null} : current);
-      setHistoryComplete(false);
+      setHistoryComplete(false); setConnectionFailed(true);
       setError(formatError(cause, '协作任务详情读取失败'));
     }
   }, [missionId, onMissionChanged]);
@@ -239,7 +364,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
 
   // Store budget time is wall time since confirmation, including every wait.
   // There is no contractual terminal timestamp: never freeze at updated_at.
-  const now = useNowTick(Boolean(mission?.confirmation));
+  const now = useNowTick(true);
   if (!mission) return <section className="mission-detail"><button type="button" className="btn" onClick={onBack}>返回我的任务</button>{error ? <p className="error" role="alert">{error}</p> : <div className="collaboration-task-loading"><BusyIndicator size={18} />正在读取任务详情</div>}</section>;
   const stage = missionStage(mission);
   const progress = missionProgress(mission);
@@ -252,7 +377,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const verificationRunLive = runningVerifications.length > 0;
   const verificationStarted = progress.awaitingVerification > 0 && progress.startedVerification > 0;
   const verificationQueued = mission.status === 'active' && progress.awaitingVerification > 0 && !verificationStarted;
-  const liveWork = runningTasks.length > 0 || verificationRunLive;
+  const liveWork = !connectionFailed && lastReceivedAt > 0 && now-lastReceivedAt < 20000 && (runningTasks.length > 0 || verificationRunLive);
   const detailStatusLabel = missionStatusLabel(mission, events, relatedActivities);
   const runtimeBlocked = missionRuntimeBlocked(mission, events);
   const wait = missionWait(mission);
@@ -310,6 +435,34 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       await onRefresh();
     } catch (cause) { setError(formatError(cause, '任务状态更新失败')); }
     finally { setControlling(false); }
+  }
+
+  async function sendCoordinationMessage(input: MissionMessageInput) {
+    setMessageBusy(true);
+    try {
+      await agentApi.submitMissionMessage(missionId, input);
+      // The durable conversation carries the reply; do not repeat it above the workspace.
+      await poll(true);
+    } catch (cause) {
+      setError(formatError(cause, '沟通消息提交失败'));
+      throw cause;
+    } finally { setMessageBusy(false); }
+  }
+
+  async function applyCoordinationChange(proposal: MissionPlanChangeProposal, readPaths: string[], writePaths: string[]) {
+    setMessageBusy(true);
+    setError('');
+    try {
+      const result = await agentApi.applyMissionPlanChange({
+        mission_id: proposal.mission_id, request_id: proposal.request_id,
+        expected_plan_revision: proposal.expected_plan_revision, expected_plan_sha256: proposal.expected_plan_sha256,
+        read_paths: readPaths, write_paths: writePaths,
+      });
+      setNotice(result.status==='applied' ? `已应用：${proposal.summary}` : `已确认，受影响工作收尾后生效：${proposal.summary}`);
+      await poll(true);
+      await onRefresh();
+    } catch (cause) { setError(formatError(cause, '计划变更未应用')); }
+    finally { setMessageBusy(false); }
   }
 
   async function dispatchNext() {
@@ -382,24 +535,48 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const legacyCandidates = mission.tasks.map(task => ({ task, override: legacyVerificationOverrideForTask(mission, events, task) }))
     .filter(item => item.override !== null);
   const legacyRetry = legacyCandidates.find(item => canRetryWaitingVerification(mission, events, item.task));
+  const cardTasks = mission.status === 'awaiting_confirmation'
+    ? mission.proposed_tasks.map(spec => ({ spec, status: 'proposed' as const, attempt_run_id: '', verification_run_id: '', verification_passed: null, evidence_refs: [] }))
+    : mission.tasks;
+  const completedCards = cardTasks.filter(task => task.status === 'completed');
+  const currentCards = cardTasks.filter(task => task.status !== 'completed' && task.status !== 'canceled');
+  const activeCards = currentCards.filter(task => ['running','awaiting_verification','failed'].includes(task.status));
+  const upcomingCards = currentCards.filter(task => !['running','awaiting_verification','failed'].includes(task.status));
+  const fresh = !connectionFailed && lastReceivedAt > 0 && now-lastReceivedAt < 20000;
+  const actualConcurrency = fresh ? runningTasks.length + runningVerifications.length : null;
+  const cardEvent = (id: string) => [...events].reverse().find(event => event.task_id===id && ['task_dispatched','task_completed','verification_started','verification_failed','task_candidate_integrated','mission_task_evidence_invalidated'].includes(event.event_type));
+  const lastEvent = events.length ? events[events.length - 1] : null;
+  const instructionStatuses = new Map<string, string>();
+  for (const event of events.filter(item => item.event_type === 'mission_instruction_status_changed')) {
+    const payload = event.payload as { request_id?: string; status?: string };
+    if (payload.request_id && payload.status) instructionStatuses.set(payload.request_id, payload.status);
+  }
+  const pendingPlanChange = [...events].reverse().filter(event => event.event_type === 'mission_plan_change_proposed')
+    .map(event => {
+      const payload = event.payload as { proposal?: MissionPlanChangeProposal; status?: string };
+      return payload.proposal ? { proposal: payload.proposal, status: instructionStatuses.get(payload.proposal.instruction_request_id) || payload.status || 'proposed' } : null;
+    }).find(item => item && ['awaiting_authorization', 'awaiting_confirmation'].includes(item.status));
+  const pendingChangeIsCurrent = Boolean(pendingPlanChange && pendingPlanChange.proposal.expected_plan_revision === mission.plan_revision
+    && pendingPlanChange.proposal.expected_plan_sha256 === mission.plan_sha256);
   return (
-    <section className="mission-detail" data-mission-id={mission.mission_id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, relatedActivities)}>
-      <div className="mission-detail-head"><button type="button" className="btn" onClick={onBack}>返回我的任务</button><span className={'collaboration-task-status status-'+mission.status}>{detailStatusLabel}</span></div>
-      <header className="mission-detail-hero"><div className="mission-detail-hero-copy"><span className="collaboration-task-kicker"><ShieldCheck size={15}/>协作任务</span><h2>{mission.title}</h2><p>{mission.objective || '尚未填写目标说明'}</p></div>
-        {progress.total ? <div className="mission-detail-progress"><strong>{progress.done}/{progress.total}</strong><span>原始交付已通过验收</span><div className="task-center-progress"><span style={{width:Math.round(progress.done/progress.total*100)+'%'}}/></div><small>{runningTasks.length} 项任务同时执行 · {progress.running} 项已派发占用 · {progress.awaitingVerification} 项结果待核验</small></div> : <div className="mission-detail-progress is-empty"><span className="muted">未记录执行进度</span></div>}
+    <section className="mission-detail mission-workbench" data-mission-id={mission.mission_id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, relatedActivities)}>
+      <div className="mission-detail-head"><button type="button" className="btn" onClick={onBack}>返回我的任务</button><span className={'collaboration-task-status status-'+mission.status}>{fresh ? detailStatusLabel : '状态待核实'}</span>        <details className="mission-more-actions"><summary>任务操作</summary>
+          {pendingBudget || wait?.can_increase_budget ? <button className="btn" onClick={()=>setBudgetExtensionOpen(true)}>{pendingBudget ? '重试原增额申请' : '主动增加预算并续跑'}</button> : null}
+          <p>续跑继续未完成任务；重核只检查同一实现。<br />重做按方案修改交付，保留历史。</p>
+          {mission.status==='active'?<button className="btn" disabled={controlling} onClick={()=>void controlMission('pause')}>暂停后续执行</button>:null}
+          {COLLAB_ACTIVE_STATUSES.has(mission.status)?<button className="btn" disabled={controlling} onClick={()=>void controlMission('cancel')}>取消任务</button>:null}
+          <button className="btn" onClick={()=>{setBusy(true);void poll(true).finally(()=>setBusy(false));}}>{busy?'刷新中':'刷新任务'}</button>
+        </details></div>
+      <header className="mission-detail-hero"><div className="mission-detail-hero-copy"><h2>{mission.title}</h2><p>{fresh ? missionResponsibility(mission, relatedActivities) : '状态连接中断或快照过期，正在核实当前执行；请稍候或刷新。'}</p></div>
+        <div className="mission-detail-progress"><strong>{progress.total || cardTasks.length ? `${progress.done}/${progress.total || cardTasks.length}` : '待规划'}</strong><span>已完成 · {actualConcurrency === null ? '待核实' : `${actualConcurrency} 项实际执行`} · {lastEvent ? `最近：${eventLabel(lastEvent)} ${formatRelativeStamp(lastEvent.occurred_at, now)}` : '尚无活动记录'}</span></div>
       </header>
-      {!['failed', 'canceled'].includes(mission.status) ? <nav className={`mission-stage-rail${liveWork ? ' is-live' : ''}`} aria-label="协作任务进度">
-        {flow.map((step, index) => <div key={step.label} className={`is-${step.state}${step.state === 'current' && currentStageIsVerification && !verificationStarted ? ' is-attention' : ''}${step.state === 'current' && liveWork ? ' is-running' : ''}`} aria-current={step.state === 'current' ? 'step' : undefined}>
-          <span>{index < currentFlowIndex || mission.status === 'completed' ? <CheckCircle2 size={13} /> : index + 1}</span><strong>{step.label}</strong>
-          {step.state === 'current' ? <small>{currentStageIsVerification ? (verificationRunLive ? '另一位专家核验中' : verificationStarted ? '核验任务已派发' : verificationQueued ? '等待系统安排核验' : '等待任务恢复') : liveWork ? '正在处理' : '当前阶段'}</small> : null}
-        </div>)}
-      </nav> : null}
-      <dl className="task-facts"><div><dt>工作区</dt><dd>{mission.workspace.root || '未记录'}</dd></div><div><dt>来源</dt><dd>{clientLabel(mission.handoff?.source_client || '')}</dd></div><div><dt>当前阶段</dt><dd>{detailStageLabel}</dd></div><div><dt>更新时间</dt><dd>{new Date(mission.updated_at).toLocaleString()}</dd></div></dl>
       {error ? <p className="error" role="alert">{error}</p> : null}
+      {!fresh ? <p className="mission-connection-status" role="status">{connectionFailed ? '连接中断' : '快照已过期'} · 保留上次记录，当前运行情况待核实。</p> : null}
       {notice ? <p role="status">{notice}</p> : null}
-      <div className="mission-current-action" role="status" aria-live="polite" aria-atomic="true">
-        <div><strong>{liveWork ? <BusyIndicator size={14}/> : null}{missionStatusLabel(mission, events, relatedActivities)} · {missionNextAction(mission, events, relatedActivities)}</strong><p>{missionResponsibility(mission, relatedActivities)}</p>{verificationExplanation ? <p>{verificationExplanation}</p> : ['waiting','failed'].includes(mission.status) || missionStalled(mission) ? <p>{wait?.budget_reason || (runtimeBlocked ? '命令环境需要处理；授权范围由你选择。' : '以当前快照为准，活动记录仅供追溯。')}</p> : null}{events.length > 0 ? <p className="muted">最近事件：{eventLabel(events[events.length - 1])} · {formatRelativeStamp(events[events.length - 1].occurred_at, now)}。状态每 5 秒刷新。</p> : null}</div>
-        {mission.status==='awaiting_assignment' ? <button className="btn btn-primary" onClick={()=>setAssignmentOpen(true)}>选择协作专家</button>
+      {(pendingPlanChange || todo || mission.status === 'waiting' || mission.status === 'failed' || missionStalled(mission) || verificationExplanation) ? <div className="mission-current-action" role="status" aria-live="polite" aria-atomic="true">
+        <div><strong>{pendingPlanChange ? '计划变更待你确认' : <>{missionNextAction(mission, events, relatedActivities)}</>}</strong><p>{pendingPlanChange ? `${pendingPlanChange.proposal.summary}${pendingChangeIsCurrent ? '。请查看影响和新增授权范围。' : '。计划已变化，此提案需按最新状态重新分析。'}` : ''}</p>{verificationExplanation ? <p>{verificationExplanation}</p> : ['waiting','failed'].includes(mission.status) || missionStalled(mission) ? <p>{wait?.budget_reason || (runtimeBlocked ? '命令环境需要处理；授权范围由你选择。' : '以当前快照为准，活动记录仅供追溯。')}</p> : null}</div>
+        {pendingPlanChange ? <button className="btn btn-primary" onClick={()=>{setFocusChange({id:pendingPlanChange.proposal.request_id,revision:Date.now()});setContextPanel('coordination');}}>{pendingChangeIsCurrent ? '查看并确认变更' : '查看变更冲突'}</button>
+        : mission.status==='awaiting_assignment' ? <button className="btn btn-primary" onClick={()=>setAssignmentOpen(true)}>选择协作专家</button>
         : ['draft','planned'].includes(mission.status) ? <button className="btn btn-primary" disabled={planning} onClick={()=>void generatePlan()}>{planning?'生成中':'生成执行计划'}</button>
         : mission.status==='awaiting_confirmation' ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>审查计划与访问范围</button>
         : (verificationRunLive || mission.status==='active') && progress.awaitingVerification > 0 ? <button className="btn btn-primary" onClick={()=>setTab('plan')}>查看验收详情</button>
@@ -409,27 +586,46 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         : legacyRetry ? <button className="btn btn-primary" disabled={Boolean(rechecking)} onClick={()=>void recheckTask(legacyRetry.task.spec.id, legacyRetry.task.verification_run_id, legacyRetry.override)}>{rechecking === legacyRetry.task.spec.id ? '提交中' : '确认覆盖并重试核验'}</button>
         : mission.status==='waiting' && budgetExhausted && wait?.can_increase_budget ? <button className="btn btn-primary" onClick={()=>setBudgetExtensionOpen(true)}><Plus size={14}/>{legacyCandidates.length ? '补充核验时限' : '增加预算并继续'}</button>
         : resumeAction ? <button className={resumeAction.kind === 'verification' ? 'btn btn-primary' : 'btn'} disabled={controlling} onClick={()=>void controlMission('resume')}>{resumeAction.label}</button>
-        : mission.status==='completed' ? <button className="btn" onClick={()=>setTab('overview')}>查看交付结果</button>
+        : mission.status==='completed' ? <button className="btn" onClick={()=>{setViewTab('delivery');}}>查看交付结果</button>
         : mission.status==='failed' ? <button className="btn" onClick={()=>setTab('activity')}>查看失败原因</button> : null}
-        <details className="mission-more-actions"><summary>任务操作</summary>
-          {pendingBudget || wait?.can_increase_budget ? <button className="btn" onClick={()=>setBudgetExtensionOpen(true)}>{pendingBudget ? '重试原增额申请' : '主动增加预算并续跑'}</button> : null}
-          <p>续跑继续未完成任务；重核只检查同一实现。<br />重做按方案修改交付，保留历史。</p>
-          {mission.status==='active'?<button className="btn" disabled={controlling} onClick={()=>void controlMission('pause')}>暂停后续执行</button>:null}
-          {COLLAB_ACTIVE_STATUSES.has(mission.status)?<button className="btn" disabled={controlling} onClick={()=>void controlMission('cancel')}>取消任务</button>:null}
-          <button className="btn" onClick={()=>{setBusy(true);void poll(true).finally(()=>setBusy(false));}}>{busy?'刷新中':'刷新任务'}</button>
-        </details>
-      </div>
+
+      </div> : null}
       {userRuns.length ? <section className="mission-detail-panel"><h3>需要你处理的执行事项</h3>{userRuns.map(item=><div className="task-related-execution" key={item.id} data-todo-id={executionTodoId(item.workflow_run_id || item.id, item.current_step_id || '', item.pause_kind || '')}><span>{taskTitle(mission,item.mission_task_id||'') || item.title} · {activityStatusLabel(item)}</span>{onOpenWorkflowRun&&item.workflow_run_id?<button className="btn btn-primary" onClick={()=>onOpenWorkflowRun(item.workflow_run_id!)}>处理执行事项</button>:null}</div>)}</section>:null}
-      <div className="mission-detail-tabs segmented-control" role="tablist" aria-label="任务详情内容">{([{id:'overview',label:'概览'},{id:'plan',label:'执行计划'},{id:'experts',label:'协作专家'},{id:'activity',label:'活动记录'}] as const).map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} className={tab===item.id?'active':''} onClick={()=>setTab(item.id)}>{item.label}</button>)}</div>
-      {tab==='overview'?<div role="tabpanel" aria-label="概览">
-        <MissionExecutionOverview mission={mission} events={events} activities={relatedActivities}/>
-        <MissionEvidence mission={mission} events={events}/>
-        <MissionBudgetSummary mission={mission} events={events} historyComplete={historyComplete} now={now}/>
-        <section className="mission-detail-panel"><h3>完成标准</h3>{mission.acceptance_criteria.length?<ul>{mission.acceptance_criteria.map((value,index)=><li key={index}>{value}</li>)}</ul>:<p className="muted">尚未填写完成标准。</p>}{mission.required_acceptance.length?<><h4>必须通过的验收</h4><ul>{mission.required_acceptance.map((value,index)=><li key={index}>{value}</li>)}</ul></>:null}</section>
-        <section className="mission-detail-panel"><h3>计划摘要</h3><p>{mission.plan_summary || '尚未生成执行计划。'}</p>{progress.total?<p>{progress.done}/{progress.total} 项已通过验收 · {runningTasks.length} 项执行中 · {progress.running} 项已派发占用 · {progress.awaitingVerification} 项验收未完成</p>:null}<button className="btn" onClick={()=>setTab('plan')}>查看执行计划</button></section>
-        {mission.handoff?.context_summary?<section className="mission-detail-panel"><h3>来源上下文</h3><p>{mission.handoff.context_summary}</p></section>:null}
-        {mission.status==='completed'?<details className="mission-optional-export"><summary>将本次协作方式保存为工作流</summary><CollaborationWorkflowExportPanel mission={mission}/></details>:null}
+      <div className="mission-workbench-tabs" role="tablist" aria-label="协作任务内容">
+        <button role="tab" aria-selected={viewTab==='collaboration'} className={viewTab==='collaboration'?'active':''} onClick={()=>{setViewTab('collaboration');}}><Users size={15}/>协作</button>
+        <button role="tab" aria-selected={viewTab==='delivery'} className={viewTab==='delivery'?'active':''} onClick={()=>setViewTab('delivery')}><PackageCheck size={15}/>交付</button>
+        <button className="mission-talk-action" aria-expanded={coordinationOpen} aria-controls="mission-context-panel" onClick={()=>{setFocusChange(null);setContextPanel(coordinationOpen ? 'none' : 'coordination');}}><MessageCircle size={15}/>{coordinationOpen?'收起对话':'与协调助手沟通'}</button>
+      </div>
+
+      <div className={`mission-desktop-workspace${coordinationOpen || detailsOpen ? ' has-context-panel' : ''}`} data-panel={coordinationOpen?'coordination':detailsOpen?'detail':'none'}>
+      <div className="mission-workspace-main">
+      {viewTab==='collaboration'?<div className="mission-collaboration-view" role="tabpanel" aria-label="协作">
+        <section className="mission-work-section"><div className="mission-work-section-head"><h3>当前工作</h3><span>{actualConcurrency===null ? '并发状态待核实' : `${actualConcurrency} 项正在执行`}</span></div>
+          {activeCards.length ? <div className="mission-work-grid">{activeCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div> : !upcomingCards.length ? <div className="mission-work-empty">{completedCards.length ? '工作已交付，可在交付页查看成果和验收。' : '计划尚未生成，将按需求推荐专家团队。'}</div> : null}
+        </section>
+        {upcomingCards.length ? upcomingCards.length > 4 ? <details className="mission-upcoming-work"><summary>待派发与等待依赖 · {upcomingCards.length} 项</summary><div className="mission-work-grid">{upcomingCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></details>
+          : <section className="mission-work-section"><div className="mission-work-section-head"><h3>下一步与交接</h3><span>等待中的工作不计入并发</span></div><div className="mission-work-grid">{upcomingCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></section> : null}
+        {completedCards.length ? <details className="mission-completed-work"><summary>已完成的工作 · {completedCards.length} 项</summary><div className="mission-work-grid">{completedCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></details> : null}
+        <button type="button" className="btn mission-secondary-toggle" onClick={()=>{setSelectedWorkId('');setContextPanel(detailsOpen ? 'none' : 'detail');}}>{detailsOpen?'收起':'查看'}计划、团队与活动记录</button>
       </div>:null}
+      {viewTab==='delivery'?<div className="mission-delivery-view" role="tabpanel" aria-label="交付">
+        <MissionEvidence mission={mission} events={events}/>
+        <section className="mission-detail-panel"><h3>验收状态</h3><p>{verificationExplanation || (mission.status==='completed'?'当前交付已完成。':'当前交付尚未通过全部验收，可先查看已有证据。')}</p><p>{progress.done}/{progress.total || cardTasks.length} 项已通过 · {progress.awaitingVerification} 项待验收</p></section>
+        {mission.status==='completed'?<details className="mission-workflow-save mission-optional-export"><summary>保存为可复用工作流</summary><p>保存后进入“我的能力”，移除本次路径、授权与私有记录。</p><CollaborationWorkflowExportPanel mission={mission}/></details>:null}
+      </div>:null}
+      </div>
+      {coordinationOpen || detailsOpen ? <aside id="mission-context-panel" className="mission-workspace-aside" aria-label={coordinationOpen?'任务协调面板':'任务详情面板'}>
+        <div className="mission-context-head"><strong>{coordinationOpen?'协调助手':'任务详情'}</strong><button type="button" className="btn" onClick={()=>{setContextPanel('none');}}>关闭面板</button></div>
+      {coordinationOpen ? <MissionCoordination message={messageDraft} onMessageChange={setMessageDraft} scrollPosition={conversationScroll} focusChange={focusChange} mission={mission} events={events} busy={messageBusy} onSend={sendCoordinationMessage} onApply={applyCoordinationChange} onWithdraw={async requestId=>{setMessageBusy(true);try{await agentApi.withdrawMissionInstruction(mission.mission_id,requestId);await poll(true);}catch(cause){setError(formatError(cause,'要求未撤回'));}finally{setMessageBusy(false);}}}/> : null}
+      {!coordinationOpen && detailsOpen ? <section className="mission-secondary-panel">
+        <div className="mission-detail-tabs segmented-control" role="tablist" aria-label="任务详细信息">{([{id:'overview',label:'运行概况'},{id:'plan',label:'计划与授权'},{id:'experts',label:'协作专家'},{id:'activity',label:'活动记录'}] as const).map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} onClick={()=>setTab(item.id)}>{item.label}</button>)}<button className="btn" onClick={()=>{setContextPanel('none');}}>关闭详情</button></div>
+        {tab==='overview'?<>      {!['failed', 'canceled'].includes(mission.status) ? <nav className={`mission-stage-rail${liveWork ? ' is-live' : ''}`} aria-label="协作任务进度">
+        {flow.map((step, index) => <div key={step.label} className={`is-${step.state}${step.state === 'current' && currentStageIsVerification && !verificationStarted ? ' is-attention' : ''}${step.state === 'current' && liveWork ? ' is-running' : ''}`} aria-current={step.state === 'current' ? 'step' : undefined}>
+          <span>{index < currentFlowIndex || mission.status === 'completed' ? <CheckCircle2 size={13} /> : index + 1}</span><strong>{step.label}</strong>
+          {step.state === 'current' ? <small>{currentStageIsVerification ? (verificationRunLive ? '另一位专家核验中' : verificationStarted ? '核验任务已派发' : verificationQueued ? '等待系统安排核验' : '等待任务恢复') : liveWork ? '正在处理' : '当前阶段'}</small> : null}
+        </div>)}
+      </nav> : null}
+      <div className="mission-detail-foot"><span>计划 {mission.plan_sha256 || '尚未生成'}</span><span>快照 {wait ? `${wait.contract_version} · ${wait.cursor}` : '关联未确认'}</span></div><MissionExecutionOverview mission={mission} events={events} activities={relatedActivities}/><MissionBudgetSummary mission={mission} events={events} historyComplete={historyComplete} now={now}/><dl className="task-facts"><div><dt>工作区</dt><dd>{mission.workspace.root || '未记录'}</dd></div><div><dt>来源</dt><dd>{clientLabel(mission.handoff?.source_client || '')}</dd></div><div><dt>当前阶段</dt><dd>{detailStageLabel}</dd></div><div><dt>更新时间</dt><dd>{new Date(mission.updated_at).toLocaleString()}</dd></div></dl></>:null}
       {tab==='plan'?<div role="tabpanel" aria-label="执行计划">
       <MissionPermissionPanel mission={mission} events={events} onSaved={next => { setMission(next); void poll(true); void onRefresh(); }} />
       {mission.status === 'awaiting_confirmation' ? <CollaborationAuthorizationPanel
@@ -444,7 +640,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         <section className="mission-detail-panel"><div className="mission-detail-panel-head"><h3>计划与确认</h3><span>r{mission.plan_revision || 0}</span></div>{mission.plan_summary ? <p>{mission.plan_summary}</p> : <p className="muted">还没有执行计划，确认前不会派发写任务。</p>}{(mission.status === 'draft' || mission.status === 'planned') ? <button type="button" className="btn" disabled={planning} onClick={() => void generatePlan()}>{planning ? <BusyIndicator size={14} /> : <ShieldCheck size={14} />}{planning ? '协调中' : '生成执行计划'}</button> : null}{mission.confirmation ? <div className="mission-confirmation"><strong>已确认</strong><small>{mission.confirmation.confirmed_by} · 相对写入：{mission.confirmation.approved_paths.join('、') || '无'} · 绝对读取：{mission.confirmation.approved_absolute_read_paths.join('、') || '无'} · 绝对写入：{mission.confirmation.approved_absolute_write_paths.join('、') || '无'}</small><code title={mission.confirmation.plan_sha256}>{mission.confirmation.plan_sha256.slice(0, 16)}…</code></div> : mission.plan_sha256 ? <div className="mission-confirmation is-pending"><strong>等待确认</strong><small>计划摘要 {mission.plan_sha256.slice(0, 16)}…</small></div> : null}{mission.status === 'awaiting_confirmation' && mission.plan_sha256 ? <button type="button" className="btn btn-primary" disabled={confirming || eligibleMissionTasks(mission.proposed_tasks, approvedAbsoluteReadPaths, approvedAbsoluteWritePaths, selectedTaskIds).length === 0} onClick={() => void confirmPlan()}>{confirming ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{confirming ? '确认中' : '确认计划并允许派发'}</button> : null}</section>
         <section className="mission-detail-panel">
           <div className="mission-detail-panel-head">
-            <h3>{mission.status === 'awaiting_confirmation' ? '待确认任务' : '执行子任务'}</h3>
+            <h3>{mission.status === 'awaiting_confirmation' ? '待确认任务' : selectedWorkId ? '当前任务详情' : '执行子任务'}</h3>{selectedWorkId ? <button className="btn" onClick={()=>setSelectedWorkId('')}>查看全部任务</button> : null}
             <span>{(mission.status === 'awaiting_confirmation' ? mission.proposed_tasks : mission.tasks.map(task => task.spec)).length} 项</span>
           </div>
           {mission.status === 'awaiting_confirmation' && mission.proposed_tasks.length ? (
@@ -469,7 +665,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
             </div>
           ) : mission.tasks.length ? (
             <div className="mission-task-list">
-              {mission.tasks.map(task => {
+              {mission.tasks.filter(task => !selectedWorkId || task.spec.id === selectedWorkId).map(task => {
                 const taskVerificationLive = runningVerifications.some(current => current.spec.id === task.spec.id);
                 const verificationStatus = task.status !== 'awaiting_verification' ? ''
                   : taskVerificationLive ? '独立核验进行中'
@@ -536,10 +732,13 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       {tab==='activity'?<div role="tabpanel" aria-label="活动记录">
       <section className="mission-detail-panel mission-timeline-panel"><div className="mission-detail-panel-head"><div><h3>执行过程</h3><small>{progressDisclosure(mission, events)}</small></div><span className="mission-timeline-actions"><button type="button" className="btn" onClick={() => { setBusy(true); void poll(true).finally(() => setBusy(false)); }}>{busy ? <BusyIndicator size={14} /> : <Clock3 size={14} />}刷新</button></span></div>{events.length ? <ol className="mission-timeline">{events.map(event => <li key={event.event_id}><span className={`mission-timeline-dot type-${event.event_type}`} aria-hidden="true" /><div><strong>{eventLabel(event)}{event.task_id ? ` · ${taskTitle(mission, event.task_id)}` : ''}</strong><p>{event.summary}</p><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleString()}</time></div></li>)}</ol> : <p className="muted">暂无细粒度执行事件，只显示任务状态。</p>}</section>
       </div>:null}
+      </section> : null}
+      </aside> : null}
+      </div>
       {assignmentOpen ? <CollaborationAssignmentDialog mission={mission} onClose={() => setAssignmentOpen(false)} onAssigned={next => { setMission(next); onMissionChanged?.(next); setAssignmentOpen(false); setTab('experts'); void poll(true); void onRefresh(); }} /> : null}
       {runtimeWorkspaceOpen ? <RuntimeWorkspaceDialog mission={mission} onClose={() => setRuntimeWorkspaceOpen(false)} onResolved={next => { setMission(next); onMissionChanged?.(next); setRuntimeWorkspaceOpen(false); void poll(true); void onRefresh(); }} /> : null}
       {budgetExtensionOpen ? <MissionBudgetExtensionDialog mission={mission} events={events} historyComplete={historyComplete} now={now} reason={wait?.budget_reason || ''} onClose={() => setBudgetExtensionOpen(false)} onUpdated={next => { setMission(next); onMissionChanged?.(next); setBudgetExtensionOpen(false); setNotice(next.status === 'waiting' ? '预算已更新；任务仍在等待，请按当前原因处理。' : '预算已更新；继续尚未完成的任务，交付结果仍需检查与独立验收。'); void poll(true); void onRefresh(); }} /> : null}
-      <div className="mission-detail-foot"><span>计划 {mission.plan_sha256 || '尚未生成'}</span><span>快照 {wait ? `${wait.contract_version} · ${wait.cursor}` : '关联未确认'}</span></div>
+
     </section>
   );
 }
@@ -729,7 +928,7 @@ function CollaborationAssignmentDialog({ mission, onClose, onAssigned }: { missi
           <div><span>需求对应的协作职责</span><h2 id="mission-assignment-title">选择协作专家</h2><small>{options ? `${options.workflow_id}@${options.workflow_version}` : '正在读取职责与推荐'}</small></div>
           <button type="button" className="btn" onClick={onClose}>关闭</button>
         </header>
-        <p>核对推荐专家和执行配置，可按需启停可选职责；应用指派后，单独确认计划与路径授权。</p>
+        <p>核对推荐专家与配置，应用后确认计划和访问范围。</p>
         {options?.recommendation_warnings?.length ? <div role="status"><strong>推荐说明与局限</strong><ul>{options.recommendation_warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div> : null}
         {error ? <p className="error" role="alert">{error}</p> : null}
         {options ? <div className="collaboration-assignment-list">{options.roles.map(option => {
@@ -867,8 +1066,8 @@ function CollaborationWorkflowExportPanel({ mission }: { mission: MissionView })
     if (busy) return;
     setBusy(true); setError(''); setNotice('');
     try {
-      const draft = await agentApi.exportMissionWorkflow(mission.mission_id, workflowId.trim(), version.trim(), name.trim(), 'start');
-      setNotice(`候选 ${draft.package_id}@${draft.version} 已生成 · ${draft.state}。请到开发工作区确认。`);
+      const saved = await agentApi.saveMissionWorkflow(mission.mission_id, workflowId.trim(), version.trim(), name.trim(), 'start');
+      setNotice(`${saved.package.name} · ${saved.package.version} 已保存到“我的能力”，创建新任务时可选择此工作流。`);
     } catch (cause) { setError(formatError(cause, '协作工作流导出失败')); }
     finally { setBusy(false); }
   }
@@ -876,14 +1075,14 @@ function CollaborationWorkflowExportPanel({ mission }: { mission: MissionView })
     <div className="mission-detail-panel-head"><div><h3 id="mission-export-title">沉淀为协作工作流</h3><small>只提取已验证的角色、步骤与验收；不会发布</small></div><Download size={16} aria-hidden="true" /></div>
     <p>仅保留可复用角色、步骤和验收。</p>
     <p>本次路径、对话、运行记录与用量不会导出。</p>
-    <p>导出只生成候选并预检，不提交审核。</p>
+    <p>保存后可在新工作区复用，每次执行重新确认访问范围。</p>
     {error ? <p className="error" role="alert">{error}</p> : null}
     {notice ? <p className="collaboration-export-notice" role="status">{notice}</p> : null}
     <div className="collaboration-export-fields">
       <label><span>工作流 ID</span><input value={workflowId} onChange={event => setWorkflowId(event.target.value)} /></label>
       <label><span>版本</span><input value={version} onChange={event => setVersion(event.target.value)} /></label>
       <label><span>名称</span><input value={name} onChange={event => setName(event.target.value)} /></label>
-      <button type="button" className="btn" disabled={busy || !workflowId.trim() || !version.trim() || !name.trim()} onClick={() => void exportWorkflow()}>{busy ? <BusyIndicator size={14} /> : <Download size={14} />}{busy ? '生成中' : '生成工作流候选'}</button>
+      <button type="button" className="btn" disabled={busy || !workflowId.trim() || !version.trim() || !name.trim()} onClick={() => void exportWorkflow()}>{busy ? <BusyIndicator size={14} /> : <Download size={14} />}{busy ? '保存中' : '保存到我的能力'}</button>
     </div>
   </section>;
 }

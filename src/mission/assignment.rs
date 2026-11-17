@@ -388,6 +388,34 @@ pub(crate) fn validate_catalog_assignment(
     Ok(())
 }
 
+pub(crate) fn validate_runtime_role_assignment(
+    role: &super::MissionRoleAssignment,
+    catalog: &MissionAssignmentOptions,
+) -> Result<(), Box<dyn Error>> {
+    let pin = role
+        .expert
+        .as_ref()
+        .ok_or("runtime-added role requires an installed expert pin")?;
+    if !catalog.experts.iter().any(|expert| {
+        expert.id == pin.expert_id
+            && expert.version == pin.expert_version
+            && expert.digest == pin.expert_digest
+    }) {
+        return Err("runtime-added expert is not present in the current installed catalog".into());
+    }
+    validate_expert_pin(pin)?;
+    validate_execution_catalog(
+        &super::ExecutionBinding {
+            expert: role.expert.clone(),
+            role_id: role.role_id.clone(),
+            executor: role.executor.clone(),
+            service_id: role.service_id.clone(),
+            model: role.model.clone(),
+        },
+        &catalog.executors,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

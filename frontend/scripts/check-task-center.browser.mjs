@@ -54,7 +54,7 @@ try {
  assert.equal(await page.locator('[data-todo-id="'+todoId+'"]').count(),1);
  await page.locator('[data-todo-id="'+todoId+'"]').click();
  assert.equal(await page.locator('.mission-detail').getAttribute('data-todo-id'),todoId);
- assert.equal(await page.getByRole('tab',{name:'概览',exact:true}).getAttribute('aria-selected'),'true');
+ assert.equal(await page.getByRole('tab',{name:'协作',exact:true}).getAttribute('aria-selected'),'true');
  assert.equal(await page.getByText('0/0',{exact:false}).count(),0);
  await page.getByRole('button',{name:'审查计划与访问范围',exact:true}).click();
  await page.getByRole('button',{name:'确认计划并允许派发'}).click();
@@ -75,12 +75,15 @@ try {
  assert.equal(await page.getByText('F:/project/results/搜索报告.md',{exact:true}).count(),1);
  assert.equal(await page.locator('.mission-optional-export').getAttribute('open'),null);
  await page.screenshot({path:resolve(evidence,'task-delivery-desktop.png')});
- await page.getByRole('tab',{name:'执行计划',exact:true}).click();
+ await page.getByRole('tab',{name:'协作',exact:true}).click();
+ await page.getByRole('button',{name:'查看计划、团队与活动记录',exact:true}).click();
+ await page.getByRole('tab',{name:'计划与授权',exact:true}).click();
  assert.equal(await page.getByText('执行尝试与重试',{exact:true}).count(),1);
  await page.getByRole('button',{name:'返回我的任务',exact:true}).click();
  await page.getByRole('button',{name:'待验收任务',exact:true}).click();
  assert.equal(await page.locator('.mission-detail-head .collaboration-task-status').textContent(),'待核验');
  await page.getByText(/系统将运行必需检查并由另一位专家核对/).waitFor();
+ await page.getByRole('button',{name:'查看计划、团队与活动记录',exact:true}).click();
  assert.equal(await page.locator('.mission-stage-rail [aria-current="step"] strong').textContent(),'独立验收');
  assert.equal(await page.getByRole('button',{name:'查看验收详情',exact:true}).count(),1);
  await page.getByRole('button',{name:'查看验收详情',exact:true}).click();
@@ -116,11 +119,11 @@ try {
  await page.screenshot({path:resolve(evidence,'task-list-mobile.png')});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
  await page.getByRole('button',{name:'搜索改造',exact:true}).click();
- await page.getByRole('tab',{name:'概览',exact:true}).waitFor();
+ await page.getByRole('tab',{name:'协作',exact:true}).waitFor();
  await page.screenshot({path:resolve(evidence,'task-overview-mobile.png')});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
  assert.deepEqual(await page.evaluate(()=>window.fixtureMutations),['confirm-memory-only']);
  assert.deepEqual(errors,[]);
- writeFileSync(resolve(evidence,'task-center-browser-result.json'),JSON.stringify({passed:true,checks:['single-list','explicit-ownership','unknown-visible','attention-user-only','shared-todo-id','memory-confirm-clears-inbox-and-badge','four-detail-tabs','delivery-evidence','optional-export','attempt-hierarchy','real-workflow-detail-return','search-workspace-scroll-restored','desktop-mobile-layout'],pageErrors:errors},null,2));
+ writeFileSync(resolve(evidence,'task-center-browser-result.json'),JSON.stringify({passed:true,checks:['single-list','explicit-ownership','unknown-visible','attention-user-only','shared-todo-id','memory-confirm-clears-inbox-and-badge','two-workbench-tabs-contextual-details','delivery-evidence','optional-export','attempt-hierarchy','real-workflow-detail-return','search-workspace-scroll-restored','desktop-mobile-layout'],pageErrors:errors},null,2));
  console.log('Task center browser integration passed');
 } finally {await browser.close();await server.close();}

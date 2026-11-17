@@ -247,6 +247,335 @@ pub(crate) struct MissionFeedbackSubmit {
     pub input: MissionFeedbackInput,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissionMessageKind {
+    Message,
+    Question,
+    Instruction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionMessageInput {
+    pub request_id: String,
+    pub expected_plan_revision: u64,
+    pub expected_plan_sha256: String,
+    pub kind: MissionMessageKind,
+    #[serde(default)]
+    pub target_task_ids: Vec<String>,
+    pub message: String,
+}
+
+impl MissionMessageInput {
+    /// Conservative routing for the unified composer. Ambiguous requests stay
+    /// read-only and ask for clarification; they never grant change authority.
+    pub(crate) fn resolved(&self) -> Self {
+        let mut input = self.clone();
+        if input.kind != MissionMessageKind::Message {
+            return input;
+        }
+        let text = input.message.trim().to_lowercase();
+        let ambiguous = [
+            "能否",
+            "是否可以",
+            "可不可以",
+            "要不要",
+            "would you",
+            "could we",
+            "can we",
+            "?",
+            "？",
+        ]
+        .iter()
+        .any(|part| text.contains(part));
+        let question = [
+            "为什么",
+            "为何",
+            "进展",
+            "状态",
+            "到哪",
+            "还没开始",
+            "what is",
+            "why ",
+            "status",
+            "progress",
+        ]
+        .iter()
+        .any(|part| text.contains(part));
+        let imperative = [
+            "请增加",
+            "请新增",
+            "请调整",
+            "请修改",
+            "请改为",
+            "增加",
+            "新增",
+            "改为",
+            "调整优先",
+            "优先处理",
+            "实现",
+            "补充",
+            "请支持",
+            "add ",
+            "change ",
+            "implement ",
+            "prioritize ",
+        ]
+        .iter()
+        .any(|part| text.starts_with(part));
+        input.kind = if imperative && !ambiguous {
+            MissionMessageKind::Instruction
+        } else if question && !imperative {
+            MissionMessageKind::Question
+        } else {
+            MissionMessageKind::Message
+        };
+        input
+    }
+    pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
+        require_text("request_id", &self.request_id, 200)?;
+        require_sha256(&self.expected_plan_sha256)?;
+        require_text("message", &self.message, 8_000)?;
+        if self.target_task_ids.len() > 32 {
+            return Err("target_task_ids exceeds 32 items".into());
+        }
+        let mut ids = HashSet::new();
+        for id in &self.target_task_ids {
+            require_id("target_task_ids", id)?;
+            if !ids.insert(id) {
+                return Err("target_task_ids must be unique".into());
+            }
+        }
+        if matches!(self.kind, MissionMessageKind::Instruction) && self.message.trim().is_empty() {
+            return Err("instruction cannot be empty".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MissionMessageResult {
+    pub request_id: String,
+    pub status: String,
+    pub answer: String,
+    pub plan_revision: u64,
+    pub plan_sha256: String,
+    pub event_sequence: u64,
+    #[serde(default)]
+    pub plan_change: Option<MissionPlanChangeProposal>,
+}
+
+/// A coordinator proposal is data only. The host revalidates every binding,
+/// graph edge, budget and authorization before committing it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionPlanChangeProposal {
+    #[serde(default)]
+    pub mission_id: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub instruction_request_id: String,
+    #[serde(default)]
+    pub expected_plan_revision: u64,
+    #[serde(default)]
+    pub expected_plan_sha256: String,
+    pub summary: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub added_roles: Vec<MissionRoleAssignment>,
+    #[serde(default)]
+    pub added_tasks: Vec<MissionTaskSpec>,
+    #[serde(default)]
+    pub updates: Vec<MissionPlanTaskUpdate>,
+    #[serde(default)]
+    pub cancel_task_ids: Vec<String>,
+    #[serde(default)]
+    pub required_acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionPlanTaskUpdate {
+    pub task_id: String,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    pub acceptance_criteria: Option<Vec<String>>,
+    #[serde(default)]
+    pub required_checks: Option<Vec<String>>,
+    #[serde(default)]
+    pub role_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionPlanChangeAuthorization {
+    #[serde(default)]
+    pub read_paths: Vec<String>,
+    #[serde(default)]
+    pub write_paths: Vec<String>,
+    pub authorized_by: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionPlanChangeApply {
+    pub mission_id: String,
+    pub request_id: String,
+    pub expected_plan_revision: u64,
+    pub expected_plan_sha256: String,
+    #[serde(default)]
+    pub authorization: Option<MissionPlanChangeAuthorization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MissionPlanChangeResult {
+    pub request_id: String,
+    pub status: String,
+    pub summary: String,
+    pub plan_revision: u64,
+    pub plan_sha256: String,
+    pub added_task_ids: Vec<String>,
+    pub updated_task_ids: Vec<String>,
+    pub canceled_task_ids: Vec<String>,
+    pub authorization_read_paths: Vec<String>,
+    pub authorization_write_paths: Vec<String>,
+    pub event_sequence: u64,
+}
+
+impl MissionPlanChangeProposal {
+    pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
+        require_id("plan_change.mission_id", &self.mission_id)?;
+        require_id("plan_change.request_id", &self.request_id)?;
+        require_id(
+            "plan_change.instruction_request_id",
+            &self.instruction_request_id,
+        )?;
+        require_sha256(&self.expected_plan_sha256)?;
+        require_text("plan_change.summary", &self.summary, 2_000)?;
+        if self.rationale.chars().count() > 4_000 {
+            return Err("plan_change.rationale exceeds 4000 characters".into());
+        }
+        if self.added_roles.len() > 16
+            || self.added_tasks.len() > 8
+            || self.updates.len() > 32
+            || self.cancel_task_ids.len() > 32
+            || self.required_acceptance.len() > 32
+            || self.added_roles.is_empty()
+                && self.added_tasks.is_empty()
+                && self.updates.is_empty()
+                && self.cancel_task_ids.is_empty()
+        {
+            return Err("plan_change operation count is empty or exceeds its limit".into());
+        }
+        for item in &self.required_acceptance {
+            require_text("plan_change.required_acceptance", item, 2_000)?;
+        }
+        let mut roles = HashSet::new();
+        for role in &self.added_roles {
+            require_id("plan_change.role_id", &role.role_id)?;
+            require_text("plan_change.role.label", &role.label, 240)?;
+            require_text("plan_change.role.executor", &role.executor, MAX_ID_BYTES)?;
+            if !roles.insert(&role.role_id) {
+                return Err("plan_change role ids must be unique".into());
+            }
+            let pin = role
+                .expert
+                .as_ref()
+                .ok_or("added roles require an exact installed expert pin")?;
+            super::validate_expert_pin(pin)?;
+        }
+        let mut task_ids = HashSet::new();
+        for task in &self.added_tasks {
+            validate_execution_binding(task)?;
+            if !task.repair_of.is_empty() {
+                return Err(
+                    "runtime plan additions cannot masquerade as failed-task repairs".into(),
+                );
+            }
+            if !task_ids.insert(&task.id) {
+                return Err("added task ids must be unique".into());
+            }
+        }
+        let mut updated = HashSet::new();
+        for update in &self.updates {
+            require_id("plan_change.update.task_id", &update.task_id)?;
+            if update.priority.is_some_and(|priority| priority > 100) {
+                return Err("task priority must be 0..100".into());
+            };
+            if !updated.insert(&update.task_id) {
+                return Err("updated task ids must be unique".into());
+            }
+            if let Some(title) = &update.title {
+                require_text("plan_change.update.title", title, MAX_TITLE_CHARS)?;
+            }
+            if let Some(objective) = &update.objective {
+                require_text("plan_change.update.objective", objective, 8_000)?;
+            }
+            if let Some(role_id) = &update.role_id {
+                require_id("plan_change.update.role_id", role_id)?;
+            }
+            if let Some(dependencies) = &update.depends_on {
+                if dependencies.len() > MAX_TASKS {
+                    return Err("updated dependency list exceeds the task limit".into());
+                }
+                let mut unique = HashSet::new();
+                for dependency in dependencies {
+                    require_id("plan_change.update.depends_on", dependency)?;
+                    if !unique.insert(dependency) {
+                        return Err("updated dependencies must be unique".into());
+                    }
+                }
+            }
+            for (name, values) in [
+                ("acceptance_criteria", &update.acceptance_criteria),
+                ("required_checks", &update.required_checks),
+            ] {
+                if let Some(values) = values {
+                    if !(1..=32).contains(&values.len()) {
+                        return Err(format!("updated {name} requires 1..32 items").into());
+                    }
+                    for value in values {
+                        require_text(name, value, 2_000)?;
+                    }
+                }
+            }
+            if let Some(checks) = &update.required_checks {
+                for check in checks {
+                    super::checks::validate_required_check(check)?;
+                }
+            }
+        }
+        let mut canceled = HashSet::new();
+        for id in &self.cancel_task_ids {
+            require_id("plan_change.cancel_task_id", id)?;
+            if !canceled.insert(id) {
+                return Err("canceled task ids must be unique".into());
+            }
+        }
+        if updated.iter().any(|id| canceled.contains(id)) {
+            return Err("one plan change cannot both update and cancel a task".into());
+        }
+        if task_ids
+            .iter()
+            .any(|id| updated.contains(id) || canceled.contains(id))
+        {
+            return Err("added task ids conflict with another change operation".into());
+        }
+        Ok(())
+    }
+}
+
 impl MissionFeedbackInput {
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
         require_text("request_id", &self.request_id, 200)?;
@@ -504,6 +833,23 @@ pub(crate) struct MissionAssignmentInput {
     pub recommended: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissionAdjustmentMode {
+    Automatic,
+    ConfirmChanges,
+}
+
+impl Default for MissionAdjustmentMode {
+    fn default() -> Self {
+        Self::Automatic
+    }
+}
+
+fn is_default_mission_adjustment_mode(mode: &MissionAdjustmentMode) -> bool {
+    *mode == MissionAdjustmentMode::Automatic
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MissionWorkspace {
@@ -512,6 +858,10 @@ pub(crate) struct MissionWorkspace {
     /// user choice confirmed with the plan, never inferred from a tool error.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub permission_mode: String,
+    /// Historical missions default to scoped automatic adjustments. This field
+    /// is omitted for that default so existing plan hashes remain stable.
+    #[serde(default, skip_serializing_if = "is_default_mission_adjustment_mode")]
+    pub adjustment_mode: MissionAdjustmentMode,
     #[serde(default)]
     pub read_scope: Vec<String>,
     #[serde(default)]
@@ -534,6 +884,8 @@ pub(crate) struct MissionCreateInput {
 pub(crate) struct MissionConfirmation {
     pub plan_sha256: String,
     pub selected_task_ids: Vec<String>,
+    #[serde(default)]
+    pub approved_read_paths: Vec<String>,
     #[serde(default)]
     pub approved_absolute_read_paths: Vec<String>,
     #[serde(default)]

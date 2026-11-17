@@ -1,5 +1,5 @@
 import type { MissionEvent, MissionTaskView, MissionView } from '../services/agentApi';
-import { eventLabel, missionDeliveries } from './missionView';
+import { eventLabel, missionDeliveries, missionEvidencePlanCompatible } from './missionView';
 
 const body = (value: unknown) => value == null || value === '' ? '未提供正文' : typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 const object = (value: unknown): Record<string, unknown> | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -43,7 +43,7 @@ function AttemptEvidence({task, events, missionId, plan, workspace, entries = fa
   const implementation = task.attempt_run_id ? [...matching].reverse().find(event => event.event_type === 'task_awaiting_verification' && event.payload.run_id === task.attempt_run_id) : undefined;
   const distinctRuns = Boolean(task.attempt_run_id && task.verification_run_id && task.attempt_run_id !== task.verification_run_id);
   const rawChecked = distinctRuns ? [...matching].reverse().find(event => event.event_type === 'host_verification_checked'
-    && event.payload.plan_sha256 === plan
+    && missionEvidencePlanCompatible({mission_id:missionId,plan_sha256:plan} as MissionView, task, event.payload.plan_sha256, events)
     && event.payload.implementation_run_id === task.attempt_run_id && event.payload.verification_run_id === task.verification_run_id) : undefined;
   const started = distinctRuns ? [...matching].reverse().find(event => event.event_type === 'verification_started'
     && event.payload.implementation_run_id === task.attempt_run_id && event.payload.verification_run_id === task.verification_run_id) : undefined;

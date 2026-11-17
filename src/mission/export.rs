@@ -8,26 +8,55 @@
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::mission::{ExecutionBinding, MissionStatus, MissionView, TaskStatus};
 use crate::workflow::{WorkflowPackage, WorkflowRole, WorkflowRuntimeStep, WorkflowStep};
 
 fn safe_component(value: &str) -> String {
-    let cleaned = value.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect::<String>();
+    let cleaned = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
     let cleaned = cleaned.trim_matches('.').trim_matches('-').to_string();
-    if cleaned.is_empty() { "collaboration".to_string() } else { cleaned.chars().take(80).collect() }
+    if cleaned.is_empty() {
+        "collaboration".to_string()
+    } else {
+        cleaned.chars().take(80).collect()
+    }
 }
 
 fn safe_role_id(value: &str) -> String {
     let cleaned = safe_component(value);
-    if cleaned.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) { cleaned } else { format!("role.{cleaned}") }
+    if cleaned
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        cleaned
+    } else {
+        format!("role.{cleaned}")
+    }
 }
 
 fn task_id(value: &str) -> String {
     let cleaned = safe_component(value).replace('.', "-");
-    if cleaned.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) { cleaned.chars().take(80).collect() } else { "task".to_string() }
+    if cleaned
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        cleaned.chars().take(80).collect()
+    } else {
+        "task".to_string()
+    }
 }
 
 fn prompt(task: &crate::mission::MissionTaskSpec) -> String {
@@ -35,6 +64,115 @@ fn prompt(task: &crate::mission::MissionTaskSpec) -> String {
         "执行协作任务：{}\n目标：{}\n验收：{}\n必须检查：{}\n遵守本次 Mission 已确认的读取、写入与权限边界；不得扩大范围，不得自行验证通过。",
         task.title, task.objective, task.acceptance_criteria.join("；"), task.required_checks.join("；")
     )
+}
+
+/// Free text can contain the instance root even after structural fields have
+/// been omitted. Relativize only that exact directory (never a sibling); other
+/// machine paths need authoring review instead of silently becoming authority.
+fn portable_text(text: &str, workspace: &str) -> Result<String, Box<dyn Error>> {
+    let ordinary = workspace.strip_prefix(r"\\?\").unwrap_or(workspace);
+    let normalized = ordinary
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let normalized = normalized
+        .strip_prefix("UNC/")
+        .map(|tail| format!("//{tail}"))
+        .unwrap_or(normalized);
+    let mut roots = vec![
+        workspace.trim_end_matches(['/', '\\']).to_string(),
+        normalized.clone(),
+        normalized.replace('/', r"\"),
+        format!("//?/{normalized}"),
+        format!(r"\\?\{}", normalized.replace('/', r"\")),
+    ];
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    roots.dedup();
+    let mut result = text.to_string();
+    for root in roots.into_iter().filter(|root| !root.is_empty()) {
+        let haystack = result.to_ascii_lowercase();
+        let needle = root.to_ascii_lowercase();
+        let mut output = String::new();
+        let mut cursor = 0;
+        for (start, _) in haystack.match_indices(&needle) {
+            let end = start + root.len();
+            if result[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                continue;
+            }
+            output.push_str(&result[cursor..start]);
+            output.push('.');
+            cursor = end;
+        }
+        output.push_str(&result[cursor..]);
+        result = output;
+    }
+    let bytes = result.as_bytes();
+    let drive = bytes.windows(3).enumerate().any(|(index, part)| {
+        part[0].is_ascii_alphabetic()
+            && part[1] == b':'
+            && matches!(part[2], b'/' | b'\\')
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+    });
+    let unc = result.match_indices(r"\\").any(|(start, _)| {
+        let tail = &result[start + 2..];
+        tail.find(['/', '\\']).is_some_and(|end| {
+            end > 0
+                && !tail[..end].chars().any(char::is_whitespace)
+                && tail[end + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace())
+        })
+    });
+    let unix = [
+        "/Users/",
+        "/home/",
+        "/root/",
+        "/tmp/",
+        "/private/",
+        "/var/",
+        "/mnt/",
+        "/Volumes/",
+        "/etc/",
+        "/opt/",
+        "/srv/",
+    ]
+    .iter()
+    .any(|root| {
+        result.match_indices(*root).any(|(index, _)| {
+            index == 0
+                || result[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | '=' | '`'))
+        })
+    });
+    if drive || unc || unix {
+        return Err("workflow method contains an external machine path; replace it with a new-run input in the task requirements before export".into());
+    }
+    Ok(result)
+}
+
+fn portable_method(value: &mut serde_json::Value, workspace: &str) -> Result<(), Box<dyn Error>> {
+    match value {
+        serde_json::Value::String(text) => *text = portable_text(text, workspace)?,
+        serde_json::Value::Array(items) => {
+            for item in items {
+                portable_method(item, workspace)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values_mut() {
+                portable_method(item, workspace)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn role_from_binding(role_id: &str, binding: &ExecutionBinding) -> WorkflowRole {
@@ -49,24 +187,60 @@ fn role_from_binding(role_id: &str, binding: &ExecutionBinding) -> WorkflowRole 
     }
 }
 
-fn scrubbed_task(task: &crate::mission::MissionTaskSpec, role_id: &str, id: &str, deps: &BTreeMap<String, String>) -> Result<WorkflowStep, Box<dyn Error>> {
-    let mut depends_on = task.depends_on.iter().map(|dependency| {
-        deps.get(dependency).cloned().ok_or_else(|| format!(
-            "task {} references missing exported delivery dependency {dependency}", task.id
-        ))
-    }).collect::<Result<Vec<_>, _>>()?;
-    depends_on.sort(); depends_on.dedup();
+fn scrubbed_task(
+    task: &crate::mission::MissionTaskSpec,
+    role_id: &str,
+    id: &str,
+    deps: &BTreeMap<String, String>,
+) -> Result<WorkflowStep, Box<dyn Error>> {
+    let mut depends_on = task
+        .depends_on
+        .iter()
+        .map(|dependency| {
+            deps.get(dependency).cloned().ok_or_else(|| {
+                format!(
+                    "task {} references missing exported delivery dependency {dependency}",
+                    task.id
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    depends_on.sort();
+    depends_on.dedup();
     Ok(WorkflowStep {
-        id: id.to_string(), title: task.title.clone(), kind: "runtime".to_string(),
-        capability_id: String::new(), runtime: Some(WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: task.execution.executor.clone(), prompt: prompt(task),
-            workspace_path: String::new(), result_schema: String::new(),
-            allow_network: None, input_artifacts: vec![], tool_policy: "default".to_string(),
-            model: task.execution.model.clone(), model_fallbacks: vec![], timeout_seconds: 900,
-        }), loop_config: None, delegate: None, when: None, fail_when: None,
-        candidate_action: String::new(), input: json!({}), execution_mode: "long_running".to_string(),
-        risk_level: if task.write_paths.is_empty() { "read_only" } else { "local_write" }.to_string(),
-        role_id: role_id.to_string(), approval_required: false, on_failure: String::new(),
+        id: id.to_string(),
+        title: task.title.clone(),
+        kind: "runtime".to_string(),
+        capability_id: String::new(),
+        runtime: Some(WorkflowRuntimeStep {
+            permission_mode: String::new(),
+            provider: task.execution.executor.clone(),
+            prompt: prompt(task),
+            workspace_path: String::new(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: vec![],
+            tool_policy: "default".to_string(),
+            model: task.execution.model.clone(),
+            model_fallbacks: vec![],
+            timeout_seconds: 900,
+        }),
+        loop_config: None,
+        delegate: None,
+        when: None,
+        fail_when: None,
+        candidate_action: String::new(),
+        input: json!({}),
+        execution_mode: "long_running".to_string(),
+        risk_level: if task.write_paths.is_empty() {
+            "read_only"
+        } else {
+            "local_write"
+        }
+        .to_string(),
+        role_id: role_id.to_string(),
+        approval_required: false,
+        on_failure: String::new(),
         depends_on,
     })
 }
@@ -90,15 +264,21 @@ pub(crate) fn package_from_completed_mission(
     // without replacing the original specs (MissionStore::record_verification_result).
     // Keep those delivery specs and edges: repair specs describe instance rework
     // and may omit original dependencies, so neither replay nor substitute them.
-    let reusable = mission.tasks.iter().filter(|task|
-        task.spec.repair_of.is_empty() && task.status != TaskStatus::Canceled
-    ).collect::<Vec<_>>();
+    let reusable = mission
+        .tasks
+        .iter()
+        .filter(|task| task.spec.repair_of.is_empty() && task.status != TaskStatus::Canceled)
+        .collect::<Vec<_>>();
     if reusable.is_empty() {
         return Err("Mission has no independently verified reusable tasks".into());
     }
     for task in &reusable {
         if task.status != TaskStatus::Completed || task.verification_passed != Some(true) {
-            return Err(format!("delivery task {} is not completed and independently verified", task.spec.id).into());
+            return Err(format!(
+                "delivery task {} is not completed and independently verified",
+                task.spec.id
+            )
+            .into());
         }
     }
     let mut task_ids = BTreeMap::new();
@@ -109,7 +289,11 @@ pub(crate) fn package_from_completed_mission(
             return Err(format!("duplicate delivery task id: {}", task.spec.id).into());
         }
         if let Some(previous) = exported_ids.insert(id.clone(), task.spec.id.clone()) {
-            return Err(format!("task ID normalization collision: {previous} and {} both become {id}", task.spec.id).into());
+            return Err(format!(
+                "task ID normalization collision: {previous} and {} both become {id}",
+                task.spec.id
+            )
+            .into());
         }
     }
     let mut role_bindings = BTreeMap::<String, ExecutionBinding>::new();
@@ -117,7 +301,11 @@ pub(crate) fn package_from_completed_mission(
         let role_id = safe_role_id(&task.spec.execution.role_id);
         if let Some(existing) = role_bindings.get(&role_id) {
             if existing.role_id != task.spec.execution.role_id {
-                return Err(format!("role ID normalization collision: {} and {} both become {role_id}", existing.role_id, task.spec.execution.role_id).into());
+                return Err(format!(
+                    "role ID normalization collision: {} and {} both become {role_id}",
+                    existing.role_id, task.spec.execution.role_id
+                )
+                .into());
             }
             if existing != &task.spec.execution {
                 return Err(format!("role {role_id} has conflicting execution bindings").into());
@@ -126,14 +314,34 @@ pub(crate) fn package_from_completed_mission(
             role_bindings.insert(role_id, task.spec.execution.clone());
         }
     }
-    let roles = role_bindings.iter().map(|(id, binding)| (id.clone(), role_from_binding(id, binding))).collect::<BTreeMap<_, _>>();
-    let steps = reusable.iter().map(|task| {
-        let role_id = safe_role_id(&task.spec.execution.role_id);
-        scrubbed_task(&task.spec, &role_id, task_ids.get(&task.spec.id).expect("mapped task"), &task_ids)
-    }).collect::<Result<Vec<_>, _>>()?;
+    let roles = role_bindings
+        .iter()
+        .map(|(id, binding)| (id.clone(), role_from_binding(id, binding)))
+        .collect::<BTreeMap<_, _>>();
+    let mut steps = reusable
+        .iter()
+        .map(|task| {
+            let role_id = safe_role_id(&task.spec.execution.role_id);
+            scrubbed_task(
+                &task.spec,
+                &role_id,
+                task_ids.get(&task.spec.id).expect("mapped task"),
+                &task_ids,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut requirements = mission.required_acceptance.clone();
     requirements.extend(mission.acceptance_criteria.clone());
-    requirements.sort(); requirements.dedup();
+    requirements.sort();
+    requirements.dedup();
+    for step in &mut steps {
+        if let Some(runtime) = &mut step.runtime {
+            runtime.prompt.push_str(&format!(
+                "\n工作流整体验收要求：{}\n本步骤只执行自身职责；最终交付必须满足整体验收。",
+                requirements.join("；")
+            ));
+        }
+    }
     let exports = BTreeSet::from(["workbench".to_string(), "github".to_string()]);
     let package: WorkflowPackage = serde_json::from_value(json!({
         "schema_version": "workflow_package.v1",
@@ -151,16 +359,25 @@ pub(crate) fn package_from_completed_mission(
         "dependencies": {"skills": [], "plugins": [], "connectors": [], "runtimes": []},
         "created_at": ""
     }))?;
+    let mut method = serde_json::to_value(package)?;
+    portable_method(&mut method, &mission.workspace.root)?;
+    let package: WorkflowPackage = serde_json::from_value(method)?;
     package.validate()?;
     Ok(package)
 }
 
 /// Write a validated package into a staging directory. The writer intentionally
 /// takes no Mission workspace and never copies from it.
-pub(crate) fn write_package(root: &Path, package: &WorkflowPackage) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn write_package(
+    root: &Path,
+    package: &WorkflowPackage,
+) -> Result<PathBuf, Box<dyn Error>> {
     package.validate()?;
     fs::create_dir_all(root)?;
-    fs::write(root.join("workflow.json"), serde_json::to_vec_pretty(package)?)?;
+    fs::write(
+        root.join("workflow.json"),
+        serde_json::to_vec_pretty(package)?,
+    )?;
     Ok(root.join("workflow.json"))
 }
 
@@ -188,7 +405,9 @@ pub(crate) fn write_export_package(
     let expected = serde_json::to_value(&package)?;
     let actual = serde_json::to_value(&loaded)?;
     if expected != actual {
-        return Err("workflow export changed while round-tripping through the package loader".into());
+        return Err(
+            "workflow export changed while round-tripping through the package loader".into(),
+        );
     }
     Ok(package)
 }
@@ -196,32 +415,99 @@ pub(crate) fn write_export_package(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mission::{MissionBudget, MissionConfirmation, MissionPlanMode, MissionTaskView, MissionWorkspace};
+    use crate::mission::{
+        MissionBudget, MissionConfirmation, MissionPlanMode, MissionTaskView, MissionWorkspace,
+    };
     use crate::workflow::WorkflowRunner;
 
     fn completed_mission() -> MissionView {
         let spec = crate::mission::MissionTaskSpec {
-            id: "fix-1".to_string(), title: "Fix".to_string(), objective: "Change code".to_string(),
-            depends_on: vec![], read_paths: vec!["src".to_string()],
-            write_paths: vec!["src/lib.rs".to_string()], acceptance_criteria: vec!["tests pass".to_string()],
+            id: "fix-1".to_string(),
+            title: "Fix".to_string(),
+            objective: "Change code".to_string(),
+            depends_on: vec![],
+            read_paths: vec!["src".to_string()],
+            write_paths: vec!["src/lib.rs".to_string()],
+            acceptance_criteria: vec!["tests pass".to_string()],
             required_checks: vec!["node --test".to_string()],
-            execution: ExecutionBinding { expert: None, executor: "himind.builtin".to_string(), service_id: "svc".to_string(), model: "himind:svc:model".to_string(), role_id: "implementer".to_string() },
+            execution: ExecutionBinding {
+                expert: None,
+                executor: "himind.builtin".to_string(),
+                service_id: "svc".to_string(),
+                model: "himind:svc:model".to_string(),
+                role_id: "implementer".to_string(),
+            },
             repair_of: String::new(),
         };
         MissionView {
-            scheduling: None, schema_version: "mission.v1".to_string(), mission_id: "mission_secret".to_string(), title: "Secret title".to_string(),
-            objective: "Secret objective".to_string(), status: MissionStatus::Completed,
-            workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/secret/workspace".to_string(), read_scope: vec!["secret".to_string()], write_scope: vec!["secret".to_string()] },
-            acceptance_criteria: vec!["tests pass".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),
-            plan_summary: "secret plan".to_string(), required_acceptance: vec!["tests pass".to_string()], proposed_tasks: vec![],
-            budget: Some(MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None, currency: None }),
-            cost_usage: Default::default(), effective_wait: None,
-            usage: Some(crate::agent_core_contracts::LocalRunUsage { input_tokens: 1, output_tokens: 1, estimated_cost: 1.0, currency: "USD".to_string(), billing_owner: "secret".to_string() }),
-            handoff: Some(crate::mission::MissionHandoff { idempotency_key: "secret-key".to_string(), source_client: "codex".to_string(), source_reference: "secret-thread".to_string(), source_message_refs: vec![], context_summary: "secret transcript".to_string(), request_sha256: "b".repeat(64), received_at: "2026-11-10T00:00:00Z".to_string() }),
-            workflow: None, assignment: None, plan_mode: MissionPlanMode::Generated,
-            confirmation: Some(MissionConfirmation { plan_sha256: "a".repeat(64), selected_task_ids: vec!["fix-1".to_string()], approved_absolute_read_paths: vec![], approved_absolute_write_paths: vec![], approved_paths: vec!["secret".to_string()], confirmed_by: "secret".to_string(), confirmed_at: "2026-11-10T00:00:00Z".to_string() }),
-            tasks: vec![MissionTaskView { spec, status: TaskStatus::Completed, attempt_run_id: "run-secret".to_string(), verification_run_id: "verify-secret".to_string(), verification_passed: Some(true), evidence_refs: vec!["secret-evidence".to_string()] }],
-            created_at: "2026-11-10T00:00:00Z".to_string(), updated_at: "2026-11-10T00:00:00Z".to_string(),
+            scheduling: None,
+            schema_version: "mission.v1".to_string(),
+            mission_id: "mission_secret".to_string(),
+            title: "Secret title".to_string(),
+            objective: "Secret objective".to_string(),
+            status: MissionStatus::Completed,
+            workspace: MissionWorkspace {
+                permission_mode: String::new(),
+                adjustment_mode: Default::default(),
+                root: "F:/secret/workspace".to_string(),
+                read_scope: vec!["secret".to_string()],
+                write_scope: vec!["secret".to_string()],
+            },
+            acceptance_criteria: vec!["tests pass".to_string()],
+            plan_revision: 1,
+            plan_sha256: "a".repeat(64),
+            plan_summary: "secret plan".to_string(),
+            required_acceptance: vec!["tests pass".to_string()],
+            proposed_tasks: vec![],
+            budget: Some(MissionBudget {
+                max_rounds: 1,
+                max_minutes: 1,
+                max_repair_attempts: 0,
+                max_total_tokens: None,
+                max_cost: None,
+                currency: None,
+            }),
+            cost_usage: Default::default(),
+            effective_wait: None,
+            usage: Some(crate::agent_core_contracts::LocalRunUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                estimated_cost: 1.0,
+                currency: "USD".to_string(),
+                billing_owner: "secret".to_string(),
+            }),
+            handoff: Some(crate::mission::MissionHandoff {
+                idempotency_key: "secret-key".to_string(),
+                source_client: "codex".to_string(),
+                source_reference: "secret-thread".to_string(),
+                source_message_refs: vec![],
+                context_summary: "secret transcript".to_string(),
+                request_sha256: "b".repeat(64),
+                received_at: "2026-11-10T00:00:00Z".to_string(),
+            }),
+            workflow: None,
+            assignment: None,
+            plan_mode: MissionPlanMode::Generated,
+            confirmation: Some(MissionConfirmation {
+                plan_sha256: "a".repeat(64),
+                selected_task_ids: vec!["fix-1".to_string()],
+                approved_read_paths: vec![],
+                approved_absolute_read_paths: vec![],
+                approved_absolute_write_paths: vec![],
+                approved_paths: vec!["secret".to_string()],
+                confirmed_by: "secret".to_string(),
+                confirmed_at: "2026-11-10T00:00:00Z".to_string(),
+            }),
+            tasks: vec![MissionTaskView {
+                spec,
+                status: TaskStatus::Completed,
+                attempt_run_id: "run-secret".to_string(),
+                verification_run_id: "verify-secret".to_string(),
+                verification_passed: Some(true),
+                evidence_refs: vec!["secret-evidence".to_string()],
+            }],
+            created_at: "2026-11-10T00:00:00Z".to_string(),
+            updated_at: "2026-11-10T00:00:00Z".to_string(),
         }
     }
 
@@ -237,17 +523,36 @@ mod tests {
     fn only_completed_missions_can_be_exported() {
         let mut mission = completed_mission();
         mission.status = MissionStatus::Active;
-        assert!(package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap_err().to_string().contains("completed"));
+        assert!(package_from_completed_mission(
+            &mission,
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("completed"));
     }
 
     #[test]
     fn default_plan_covers_three_independent_deliveries_and_their_downstream() {
         let mut mission = completed_mission();
         mission.tasks = vec![
-            delivery("analysis", &[]), delivery("design", &[]), delivery("presentation", &[]),
-            delivery("synthesis", &["analysis", "design"]), delivery("review", &["synthesis"]),
+            delivery("analysis", &[]),
+            delivery("design", &[]),
+            delivery("presentation", &[]),
+            delivery("synthesis", &["analysis", "design"]),
+            delivery("review", &["synthesis"]),
         ];
-        let package = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap();
+        let package = package_from_completed_mission(
+            &mission,
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start",
+        )
+        .unwrap();
         assert_eq!(package.execution_policy, "strict");
         assert!(package.entrypoints.is_empty());
         assert!(package.exits.is_empty());
@@ -257,7 +562,10 @@ mod tests {
         assert_eq!(package.steps[3].depends_on, ["analysis", "design"]);
         assert_eq!(package.steps[4].depends_on, ["synthesis"]);
         let plan = WorkflowRunner::build_execution_plan(&package, &json!({})).unwrap();
-        assert_eq!(plan.active_step_ids, ["analysis", "design", "presentation", "synthesis", "review"]);
+        assert_eq!(
+            plan.active_step_ids,
+            ["analysis", "design", "presentation", "synthesis", "review"]
+        );
         assert_eq!(plan.entrypoint, "full");
         assert_eq!(plan.exitpoint, "full");
         assert!(plan.assumptions.is_empty());
@@ -266,14 +574,32 @@ mod tests {
     #[test]
     fn legacy_export_entrypoint_is_compatible_with_strict_full_graph() {
         let mission = completed_mission();
-        let expected = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "").unwrap();
+        let expected =
+            package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "")
+                .unwrap();
         for entrypoint in ["start", "custom-entry"] {
-            let package = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", entrypoint).unwrap();
-            assert_eq!(serde_json::to_value(&package).unwrap(), serde_json::to_value(&expected).unwrap());
+            let package = package_from_completed_mission(
+                &mission,
+                "com.example.export",
+                "1.0.0",
+                "Export",
+                entrypoint,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&package).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
             let plan = WorkflowRunner::build_execution_plan(&package, &json!({})).unwrap();
             assert_eq!(plan.active_step_ids, ["fix-1"]);
-            let error = WorkflowRunner::build_execution_plan(&package, &json!({"execution": {"entrypoint": entrypoint}})).unwrap_err();
-            assert!(error.to_string().contains("strict workflow does not allow selecting"));
+            let error = WorkflowRunner::build_execution_plan(
+                &package,
+                &json!({"execution": {"entrypoint": entrypoint}}),
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("strict workflow does not allow selecting"));
         }
     }
 
@@ -281,7 +607,14 @@ mod tests {
     fn multilevel_repairs_export_original_delivery_graph_without_instance_history() {
         let mut mission = completed_mission();
         mission.tasks.push(delivery("review", &["fix-1"]));
-        let expected = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap();
+        let expected = package_from_completed_mission(
+            &mission,
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start",
+        )
+        .unwrap();
         // These ancestors are completed/verified by repair projection, while
         // their original failed run identities remain in the Mission view.
         mission.tasks[0].attempt_run_id = "failed-original-run".into();
@@ -289,8 +622,12 @@ mod tests {
         let mut first = delivery("repair-first", &[]);
         first.spec.repair_of = "fix-1".into();
         first.spec.title = "Instance-only repair instructions".into();
-        first.spec.objective = "Fix the previous failed-original-run using old-instance-output".into();
-        first.spec.required_checks.push("node --test old-instance-output.test.js".into());
+        first.spec.objective =
+            "Fix the previous failed-original-run using old-instance-output".into();
+        first
+            .spec
+            .required_checks
+            .push("node --test old-instance-output.test.js".into());
         let mut final_repair = first.clone();
         final_repair.spec.id = "repair-final".into();
         final_repair.spec.repair_of = "repair-first".into();
@@ -300,17 +637,41 @@ mod tests {
         withdrawn.spec.id = "repair-withdrawn".into();
         withdrawn.status = TaskStatus::Canceled;
         withdrawn.verification_passed = None;
-        mission.tasks.extend([first, final_repair, review_retry, withdrawn]);
+        mission
+            .tasks
+            .extend([first, final_repair, review_retry, withdrawn]);
         let original = mission.clone();
-        let package = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap();
+        let package = package_from_completed_mission(
+            &mission,
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start",
+        )
+        .unwrap();
         assert_eq!(mission, original);
-        assert_eq!(serde_json::to_value(&package).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(
+            serde_json::to_value(&package).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
         let plan = WorkflowRunner::build_execution_plan(&package, &json!({})).unwrap();
         assert_eq!(plan.active_step_ids, ["fix-1", "review"]);
         assert_eq!(package.steps[1].depends_on, ["fix-1"]);
         let serialized = serde_json::to_string(&package).unwrap();
-        for forbidden in ["repair-first", "repair-final", "review-retry", "repair-withdrawn", "Instance-only", "failed-original-run", "failed-original-verification", "old-instance-output"] {
-            assert!(!serialized.contains(forbidden), "export replayed history: {forbidden}");
+        for forbidden in [
+            "repair-first",
+            "repair-final",
+            "review-retry",
+            "repair-withdrawn",
+            "Instance-only",
+            "failed-original-run",
+            "failed-original-verification",
+            "old-instance-output",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "export replayed history: {forbidden}"
+            );
         }
     }
 
@@ -323,9 +684,22 @@ mod tests {
             canceled.verification_passed = None;
             let mut repair = delivery("repair-history", &[]);
             repair.spec.repair_of = "fix-1".into();
-            mission.tasks.extend([canceled, repair, delivery("review", &[dependency])]);
-            let error = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap_err().to_string();
-            assert!(error.contains("missing exported delivery dependency"), "{error}");
+            mission
+                .tasks
+                .extend([canceled, repair, delivery("review", &[dependency])]);
+            let error = package_from_completed_mission(
+                &mission,
+                "com.example.export",
+                "1.0.0",
+                "Export",
+                "start",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("missing exported delivery dependency"),
+                "{error}"
+            );
             assert!(error.contains(dependency), "{error}");
         }
     }
@@ -340,7 +714,15 @@ mod tests {
         ] {
             let mut mission = completed_mission();
             mission.tasks = vec![delivery(&first, &[]), delivery(&second, &[])];
-            let error = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap_err().to_string();
+            let error = package_from_completed_mission(
+                &mission,
+                "com.example.export",
+                "1.0.0",
+                "Export",
+                "start",
+            )
+            .unwrap_err()
+            .to_string();
             assert!(error.contains("task ID normalization collision"), "{error}");
             assert!(error.contains(&first) && error.contains(&second), "{error}");
         }
@@ -352,7 +734,15 @@ mod tests {
         mission.tasks.push(delivery("review", &["fix-1"]));
         mission.tasks[0].spec.execution.role_id = ".writer".into();
         mission.tasks[1].spec.execution.role_id = "writer".into();
-        let error = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap_err().to_string();
+        let error = package_from_completed_mission(
+            &mission,
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("role ID normalization collision"), "{error}");
     }
 
@@ -364,8 +754,21 @@ mod tests {
             unverified.status = status;
             unverified.verification_passed = Some(false);
             mission.tasks.push(unverified);
-            let error = package_from_completed_mission(&mission, "com.example.export", "1.0.0", "Export", "start").unwrap_err().to_string();
-            assert!(error.contains("delivery task independent is not completed and independently verified"), "{error}");
+            let error = package_from_completed_mission(
+                &mission,
+                "com.example.export",
+                "1.0.0",
+                "Export",
+                "start",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(
+                    "delivery task independent is not completed and independently verified"
+                ),
+                "{error}"
+            );
         }
     }
 
@@ -373,12 +776,20 @@ mod tests {
     fn export_writes_a_loadable_sanitized_package() {
         let root = std::env::temp_dir().join(format!(
             "himind-mission-export-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let package = write_export_package(
-            &completed_mission(), &root, "com.example.export-file", "1.0.0",
-            "Export file", "start",
-        ).unwrap();
+            &completed_mission(),
+            &root,
+            "com.example.export-file",
+            "1.0.0",
+            "Export file",
+            "start",
+        )
+        .unwrap();
         assert_eq!(package.id, "com.example.export-file");
         let text = fs::read_to_string(root.join("workflow.json")).unwrap();
         assert!(!text.contains("F:/secret/workspace"));
@@ -388,14 +799,98 @@ mod tests {
 
     #[test]
     fn export_drops_instance_and_private_data() {
-        let package = package_from_completed_mission(&completed_mission(), "com.example.export", "1.0.0", "Export", "start").unwrap();
+        let package = package_from_completed_mission(
+            &completed_mission(),
+            "com.example.export",
+            "1.0.0",
+            "Export",
+            "start",
+        )
+        .unwrap();
         let serialized = serde_json::to_string(&package).unwrap();
-        for forbidden in ["mission_secret", "run-secret", "verify-secret", "secret transcript", "F:/secret/workspace", "secret-evidence", "USD", "secret-key"] {
+        for forbidden in [
+            "mission_secret",
+            "run-secret",
+            "verify-secret",
+            "secret transcript",
+            "F:/secret/workspace",
+            "secret-evidence",
+            "USD",
+            "secret-key",
+        ] {
             assert!(!serialized.contains(forbidden), "export leaked {forbidden}");
         }
         assert_eq!(package.steps.len(), 1);
         assert_eq!(package.roles["implementer"].model, "himind:svc:model");
-        assert_eq!(package.steps[0].runtime.as_ref().unwrap().workspace_path, "");
-        assert!(package.steps[0].runtime.as_ref().unwrap().prompt.contains("node --test"));
+        assert_eq!(
+            package.steps[0].runtime.as_ref().unwrap().workspace_path,
+            ""
+        );
+        assert!(package.steps[0]
+            .runtime
+            .as_ref()
+            .unwrap()
+            .prompt
+            .contains("node --test"));
+    }
+
+    #[test]
+    fn export_relativizes_workspace_text_and_retains_overall_acceptance() {
+        let mut mission = completed_mission();
+        mission.tasks[0].spec.title = "Build F:/secret/workspace/src".into();
+        mission.tasks[0].spec.objective = r"Write F:\SECRET\WORKSPACE\src\lib.rs".into();
+        mission.tasks[0].spec.required_checks =
+            vec![r"node --test F:\secret\workspace\tests".into()];
+        mission.required_acceptance = vec!["断网后仍可读取本次存储".into()];
+        mission.acceptance_criteria = vec!["Verify F:/secret/workspace/src".into()];
+        let package = package_from_completed_mission(
+            &mission,
+            "com.example.portable",
+            "1.0.0",
+            "Portable",
+            "",
+        )
+        .unwrap();
+        let text = serde_json::to_string(&package).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("secret"));
+        assert_eq!(package.steps[0].title, "Build ./src");
+        let prompt = &package.steps[0].runtime.as_ref().unwrap().prompt;
+        assert!(prompt.contains(r"node --test .\tests"));
+        assert!(prompt.contains("断网后仍可读取本次存储"));
+        assert!(prompt.contains("Verify ./src"));
+        assert_eq!(mission.workspace.root, "F:/secret/workspace");
+    }
+
+    #[test]
+    fn export_refuses_external_machine_paths_in_free_text_without_granting_them() {
+        for external in [
+            r"C:\Users\private\key.txt",
+            "F:/secret/workspace-sibling/file",
+            r"\\server\share\file",
+            "/home/private/input",
+        ] {
+            let mut mission = completed_mission();
+            mission.tasks[0].spec.objective = format!("Use {external}");
+            let error = package_from_completed_mission(
+                &mission,
+                "com.example.portable",
+                "1.0.0",
+                "Portable",
+                "",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("external machine path"),
+                "{external}: {error}"
+            );
+        }
+        assert_eq!(
+            portable_text("Use https://example.test/api/v1 and src/lib.rs", "F:/root").unwrap(),
+            "Use https://example.test/api/v1 and src/lib.rs"
+        );
+        assert_eq!(
+            portable_text(r"Use \\?\F:\root\src", "F:/root").unwrap(),
+            r"Use .\src"
+        );
     }
 }

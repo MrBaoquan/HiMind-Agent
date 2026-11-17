@@ -600,12 +600,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::mission_commands::confirm_mission_plan,
             super::mission_commands::add_mission_follow_up_tasks,
             super::mission_commands::get_mission_snapshot,
+            super::mission_commands::submit_mission_message_ui,
+            super::mission_commands::apply_mission_plan_change_ui,
+            super::mission_commands::withdraw_mission_instruction_ui,
             super::mission_commands::list_mission_execution_options,
             super::mission_commands::create_mission_handoff,
             super::mission_commands::create_mission_intent,
             super::mission_commands::list_mission_assignment_options,
             super::mission_commands::assign_mission_roles,
             super::mission_commands::export_mission_workflow,
+            super::mission_commands::save_mission_workflow,
             super::mission_commands::update_mission_task_execution,
             super::mission_dispatch::dispatch_next_mission_task,
             super::mission_dispatch::retry_mission_verification,
@@ -916,17 +920,19 @@ fn create_main_window(
         }
         _ => None,
     };
-    let window_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("HiMind Agent")
-        .inner_size(1280.0, 820.0)
-        .min_inner_size(1024.0, 680.0)
-        .visible(false)
-        .decorations(false)
-        .resizable(true)
-        .center()
-        .data_directory(data_directory.to_path_buf());
+    let window_builder =
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("HiMind Agent")
+            .inner_size(1280.0, 820.0)
+            .min_inner_size(1024.0, 680.0)
+            .visible(false)
+            .decorations(false)
+            .resizable(true)
+            .center()
+            .data_directory(data_directory.to_path_buf());
     let window_builder = if let Some(bootstrap) = mission_bootstrap {
-        window_builder.initialization_script(format!("window.__HIMIND_MISSION_OPEN__ = {bootstrap};"))
+        window_builder
+            .initialization_script(format!("window.__HIMIND_MISSION_OPEN__ = {bootstrap};"))
     } else {
         window_builder
     };
@@ -1433,7 +1439,10 @@ fn open_agent_open_target(app: &tauri::AppHandle, target: crate::AgentOpenTarget
         crate::AgentOpenTarget::Main => show_main_window(app),
         crate::AgentOpenTarget::MissionAssignment(mission_id) => {
             show_main_window(app);
-            if let Err(error) = app.emit("himind:mission-navigate", serde_json::json!({ "mission_id": mission_id })) {
+            if let Err(error) = app.emit(
+                "himind:mission-navigate",
+                serde_json::json!({ "mission_id": mission_id }),
+            ) {
                 eprintln!("deep link open mission failed: {error}");
             }
         }
@@ -2129,7 +2138,10 @@ pub(crate) fn builtin_ai_session_snapshots() -> Vec<BuiltinAiSessionSnapshot> {
 
 fn publish_builtin_ai_history_host() {
     let snapshots = builtin_ai_session_snapshots();
-    let references = snapshots.into_iter().map(|s| (s.workspace_root,s.url)).collect::<Vec<_>>();
+    let references = snapshots
+        .into_iter()
+        .map(|s| (s.workspace_root, s.url))
+        .collect::<Vec<_>>();
     if let Err(error) = crate::session_service::host::publish(&references) {
         crate::app::crash::record_event("warn", &error);
     }
@@ -2369,12 +2381,17 @@ fn plugin_ui_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     const MAX_PLUGIN_UI_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
     let result = (|| -> Result<Response<Vec<u8>>, Box<dyn std::error::Error>> {
         let url = url::Url::parse(&request.uri().to_string())?;
-        let (body, content_type) = if let Some(bytes) = crate::capability::plugin::embedded_plugin_sdk_resource(&url)? {
+        let (body, content_type) = if let Some(bytes) =
+            crate::capability::plugin::embedded_plugin_sdk_resource(&url)?
+        {
             (bytes.to_vec(), "text/javascript; charset=utf-8")
         } else {
             let (path, content_type) = crate::capability::plugin::resolve_plugin_ui_resource(&url)?;
             if std::fs::metadata(&path)?.len() > MAX_PLUGIN_UI_RESOURCE_BYTES {
-                return Err(format!("plugin UI resource exceeds {MAX_PLUGIN_UI_RESOURCE_BYTES} bytes").into());
+                return Err(format!(
+                    "plugin UI resource exceeds {MAX_PLUGIN_UI_RESOURCE_BYTES} bytes"
+                )
+                .into());
             }
             (std::fs::read(path)?, content_type)
         };

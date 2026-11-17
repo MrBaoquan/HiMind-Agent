@@ -14,9 +14,11 @@ use super::contract::{
     validate_selection_with_scopes, validate_task_graph, validate_task_paths, MissionAssignment,
     MissionAssignmentInput, MissionBudgetIncrease, MissionConfirmation, MissionCreateInput,
     MissionEvent, MissionFeedbackInput, MissionHandoff, MissionHandoffInput,
-    MissionLegacyVerificationOverride, MissionPlanMode, MissionPlanProposal, MissionStatus,
-    MissionTaskSpec, MissionTaskView, MissionVerificationRetry, MissionView, MissionWorkflowPin,
-    TaskStatus,
+    MissionLegacyVerificationOverride, MissionMessageInput, MissionMessageKind,
+    MissionMessageResult, MissionPlanChangeApply, MissionPlanChangeAuthorization,
+    MissionPlanChangeProposal, MissionPlanChangeResult, MissionPlanMode, MissionPlanProposal,
+    MissionPlanTaskUpdate, MissionStatus, MissionTaskSpec, MissionTaskView,
+    MissionVerificationRetry, MissionView, MissionWorkflowPin, TaskStatus,
 };
 
 /// Unlike validate_task_paths, this inspects the actual filesystem. Only fresh
@@ -1513,6 +1515,15 @@ impl MissionStore {
         let confirmation = MissionConfirmation {
             plan_sha256: mission.plan_sha256.clone(),
             selected_task_ids: selected.iter().cloned().collect(),
+            approved_read_paths: normalized_paths(
+                &proposal
+                    .tasks
+                    .iter()
+                    .filter(|task| selected.contains(&task.id))
+                    .flat_map(|task| task.read_paths.iter().cloned())
+                    .chain(mission.workspace.read_scope.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ),
             approved_paths: normalized_paths(approved_paths),
             approved_absolute_read_paths: normalized_paths(approved_absolute_read_paths),
             approved_absolute_write_paths: normalized_paths(approved_absolute_write_paths),
@@ -2337,6 +2348,1238 @@ impl MissionStore {
         Ok(mission)
     }
 
+    /// Conversation requests share the Mission event ledger and revision checks.
+    /// Questions receive a deterministic state answer; instructions are merely
+    /// recorded for coordination and never masquerade as an applied plan change.
+    pub(crate) fn submit_message(
+        &self,
+        mission_id: &str,
+        input: &MissionMessageInput,
+    ) -> Result<MissionMessageResult, Box<dyn Error>> {
+        require_id("mission_id", mission_id)?;
+        input.validate()?;
+        let normalized = input.resolved();
+        let input = &normalized;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission not found")?;
+        let request = serde_json::to_value(input)?;
+        let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+        let existing = decision_event(
+            &tx,
+            "mission_id=?1 AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, input.request_id],
+            false,
+        )?;
+        if let Some(event) = existing {
+            if event.payload["input"] != request
+                || event.payload["payload_sha256"] != payload_sha256
+            {
+                return Err("request_id already has a different communication payload".into());
+            }
+            let progress = decision_event(&tx,
+                "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+                params![mission_id,input.request_id], true)?;
+            let status = progress
+                .as_ref()
+                .and_then(|item| item.payload["status"].as_str())
+                .or_else(|| event.payload["status"].as_str())
+                .unwrap_or("received")
+                .to_string();
+            let answer = progress
+                .as_ref()
+                .and_then(|item| item.payload["answer"].as_str())
+                .or_else(|| event.payload["answer"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let change = decision_event(&tx,
+                "mission_id=?1 AND event_type IN ('mission_plan_change_proposed','mission_plan_change_applied') AND json_extract(payload_json,'$.instruction_request_id')=?2",
+                params![mission_id,input.request_id], true)?
+                .map(|item|serde_json::from_value(item.payload["proposal"].clone())).transpose()?;
+            let result = MissionMessageResult {
+                request_id: input.request_id.clone(),
+                status,
+                answer,
+                plan_revision: mission.plan_revision,
+                plan_sha256: mission.plan_sha256.clone(),
+                event_sequence: progress.map(|item| item.sequence).unwrap_or(event.sequence),
+                plan_change: change,
+            };
+            tx.commit()?;
+            return Ok(result);
+        }
+        if !matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Waiting
+        ) {
+            return Err("conversation requires an active or waiting Mission".into());
+        }
+        if mission.plan_revision != input.expected_plan_revision
+            || mission.plan_sha256 != input.expected_plan_sha256
+            || !mission
+                .confirmation
+                .as_ref()
+                .is_some_and(|confirmation| confirmation.plan_sha256 == mission.plan_sha256)
+        {
+            return Err("conversation is based on a stale Mission plan; refresh and retry".into());
+        }
+        for id in &input.target_task_ids {
+            if !mission
+                .tasks
+                .iter()
+                .any(|task| task.spec.id == *id && task.status != TaskStatus::Canceled)
+            {
+                return Err(format!("conversation target is unknown or canceled: {id}").into());
+            }
+        }
+        let (status, answer) = match &input.kind {
+            MissionMessageKind::Message => (
+                "needs_clarification",
+                "这是一项需要执行的明确要求，还是对方案的询问？请确认含义；当前计划未改变。".into(),
+            ),
+            MissionMessageKind::Question => (
+                "answered",
+                answer_mission_question(&mission, &input.target_task_ids),
+            ),
+            MissionMessageKind::Instruction => (
+                "received",
+                "已记录为用户指令；尚未分析或改变计划。协调分析完成并由宿主提交变更后才会生效。"
+                    .to_string(),
+            ),
+        };
+        let event = append_event_tx(
+            &tx,
+            mission_id,
+            "mission_message_submitted",
+            "",
+            match &input.kind {
+                MissionMessageKind::Question => "用户询问任务状态",
+                MissionMessageKind::Instruction => "用户提交运行中要求",
+                MissionMessageKind::Message => "沟通含义待澄清",
+            },
+            serde_json::json!({"request_id":input.request_id,"payload_sha256":payload_sha256,"input":request,"status":status,"answer":answer}),
+            &now_stamp(),
+        )?;
+        let result = MissionMessageResult {
+            request_id: input.request_id.clone(),
+            status: status.into(),
+            answer,
+            plan_revision: mission.plan_revision,
+            plan_sha256: mission.plan_sha256.clone(),
+            event_sequence: event,
+            plan_change: None,
+        };
+        if input.kind == MissionMessageKind::Instruction {
+            recompute_task_readiness_tx(&tx, mission_id, &now_stamp())?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Called only while the application owns the per-request process lock.
+    /// A second admission means the previous call lost its owner; do not bill twice.
+    pub(crate) fn admit_instruction_analysis(
+        &self,
+        mission_id: &str,
+        request_id: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let message=decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id,request_id],false)?.ok_or("instruction request not found")?;
+        if message
+            .payload
+            .pointer("/input/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("instruction")
+        {
+            return Err("only user instructions can invoke coordination".into());
+        }
+        let exists=decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_coordination_started' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id,request_id],false)?.is_some();
+        if !exists {
+            append_event_tx(
+                &tx,
+                mission_id,
+                "mission_coordination_started",
+                "",
+                "协调请求已交由宿主处理",
+                serde_json::json!({"request_id":request_id,"recovery_policy":"do_not_repeat_uncertain_model_call"}),
+                &now_stamp(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(!exists)
+    }
+
+    pub(crate) fn pending_coordination_messages(
+        &self,
+        mission_id: &str,
+    ) -> Result<Vec<MissionMessageInput>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = load_mission(&connection, mission_id)?.ok_or("mission not found")?;
+        if !matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Waiting
+        ) {
+            return Ok(Vec::new());
+        }
+        let mut statement=connection.prepare("SELECT payload_json FROM mission_events WHERE mission_id=?1
+            AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.input.kind')='instruction' ORDER BY sequence")?;
+        let raws = statement
+            .query_map([mission_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result = Vec::new();
+        for raw in raws {
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            let input: MissionMessageInput = serde_json::from_value(value["input"].clone())?;
+            let latest=decision_event(&connection,
+                "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+                params![mission_id,input.request_id],true)?;
+            if latest.as_ref().is_none_or(|event| {
+                matches!(
+                    event.payload["status"].as_str(),
+                    Some("analyzing" | "ready_to_apply" | "awaiting_checkpoint")
+                )
+            }) {
+                result.push(input);
+                if result.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn instruction_context(
+        &self,
+        mission_id: &str,
+        request_id: &str,
+    ) -> Result<(MissionView, MissionMessageInput), Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = load_mission(&connection, mission_id)?.ok_or("mission not found")?;
+        let event = decision_event(
+            &connection,
+            "mission_id=?1 AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, request_id],
+            false,
+        )?.ok_or("instruction request not found")?;
+        let input: MissionMessageInput = serde_json::from_value(event.payload["input"].clone())?;
+        if input.kind != MissionMessageKind::Instruction {
+            return Err(
+                "only an explicit user instruction can be analyzed into a plan change".into(),
+            );
+        }
+        Ok((mission, input))
+    }
+
+    pub(crate) fn record_instruction_status(
+        &self,
+        mission_id: &str,
+        request_id: &str,
+        status: &str,
+        answer: &str,
+    ) -> Result<u64, Box<dyn Error>> {
+        require_id("mission_id", mission_id)?;
+        require_id("request_id", request_id)?;
+        require_text("status", status, 40)?;
+        if !matches!(
+            status,
+            "analyzing"
+                | "awaiting_checkpoint"
+                | "awaiting_confirmation"
+                | "awaiting_authorization"
+                | "applied"
+                | "partially_applied"
+                | "not_applied"
+                | "failed"
+        ) {
+            return Err("unsupported instruction status".into());
+        }
+        require_text("answer", answer, 8_000)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let message = decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, request_id], false)?.ok_or("instruction request not found")?;
+        if message
+            .payload
+            .pointer("/input/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("instruction")
+        {
+            return Err(
+                "instruction status cannot be attached to a question or observation".into(),
+            );
+        }
+        if let Some(previous) = decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, request_id], true)? {
+            if previous.payload["status"] == status && previous.payload["answer"] == answer {
+                tx.commit()?;
+                return Ok(previous.sequence);
+            }
+            let old = previous.payload["status"].as_str().unwrap_or_default();
+            let terminal = matches!(old, "applied" | "partially_applied" | "not_applied" | "failed");
+            let allowed = match old {
+                "analyzing" => matches!(status, "analyzing" | "awaiting_checkpoint" | "awaiting_confirmation" | "awaiting_authorization" | "applied" | "not_applied" | "failed"),
+                "awaiting_checkpoint" | "awaiting_confirmation" | "awaiting_authorization" | "ready_to_apply" => matches!(status, "applied" | "partially_applied" | "not_applied" | "failed"),
+                _ => false,
+            };
+            if terminal || !allowed {
+                return Err(format!("instruction status cannot move from {old} to {status}").into());
+            }
+        } else if !matches!(status,"analyzing" | "not_applied") {
+            return Err("instruction must enter analysis before it can change status".into());
+        }
+        let sequence = append_event_tx(
+            &tx,
+            mission_id,
+            "mission_instruction_status_changed",
+            "",
+            format!("用户要求状态：{status}"),
+            serde_json::json!({"request_id":request_id,"status":status,"answer":answer}),
+            &now_stamp(),
+        )?;
+        recompute_task_readiness_tx(&tx, mission_id, &now_stamp())?;
+        maybe_complete_mission_tx(&tx, mission_id)?;
+        tx.commit()?;
+        Ok(sequence)
+    }
+
+    pub(crate) fn record_plan_change_proposal(
+        &self,
+        proposal: &MissionPlanChangeProposal,
+        catalog: &super::MissionAssignmentOptions,
+    ) -> Result<MissionPlanChangeResult, Box<dyn Error>> {
+        proposal.validate()?;
+        let mut connection = Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(30))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encoded = serde_json::to_value(proposal)?;
+        let mission_id = proposal.mission_id.as_str();
+        if let Some(previous) = decision_event(&tx,
+            "mission_id=?1 AND event_type IN ('mission_plan_change_proposed','mission_plan_change_applied') AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, proposal.request_id], true)? {
+            if previous.payload["proposal"] != encoded {
+                return Err("plan change request_id already has a different proposal".into());
+            }
+            let mut result = Self::plan_change_result_from_event(&previous)?;
+            if let Some(latest)=decision_event(&tx,
+                "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+                params![mission_id,proposal.instruction_request_id],true)? {
+                result.status=latest.payload["status"].as_str().unwrap_or(&result.status).to_string();
+            }
+            tx.commit()?;
+            return Ok(result);
+        }
+        let message = decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, proposal.instruction_request_id], false)?.ok_or("instruction request not found")?;
+        if message
+            .payload
+            .pointer("/input/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("instruction")
+        {
+            return Err("plan change must be linked to an explicit user instruction".into());
+        }
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission not found")?;
+        if !matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Waiting
+        ) || mission.plan_revision != proposal.expected_plan_revision
+            || mission.plan_sha256 != proposal.expected_plan_sha256
+            || !mission
+                .confirmation
+                .as_ref()
+                .is_some_and(|c| c.plan_sha256 == mission.plan_sha256)
+        {
+            return Err("plan change is based on a stale or unconfirmed Mission plan".into());
+        }
+        if message.payload["input"]["expected_plan_revision"] != proposal.expected_plan_revision
+            || message.payload["input"]["expected_plan_sha256"] != proposal.expected_plan_sha256
+        {
+            return Err("instruction and plan change do not share the same plan version".into());
+        }
+        Self::validate_change_instruction(&tx, &proposal)?;
+        let _candidate = Self::plan_change_candidate(&tx, &mission, proposal, catalog)?;
+        let scope = Self::plan_change_scope_delta(&mission, &proposal.added_tasks)?;
+        let scope_review = !scope.0.is_empty() || !scope.1.is_empty();
+        let prior_changes: i64 = tx.query_row("SELECT COUNT(*) FROM mission_events WHERE mission_id=?1 AND event_type='mission_plan_change_applied'",
+            params![mission_id],|row|row.get(0))?;
+        if prior_changes >= 16 {
+            return Err(
+                "Mission runtime plan-change limit reached; split work into a new Mission".into(),
+            );
+        }
+        let status = if scope_review {
+            "awaiting_authorization"
+        } else if mission.workspace.adjustment_mode == super::MissionAdjustmentMode::ConfirmChanges
+            || change_requires_service_confirmation(&mission, proposal)
+        {
+            "awaiting_confirmation"
+        } else {
+            "ready_to_apply"
+        };
+        let sequence = append_event_tx(
+            &tx,
+            mission_id,
+            "mission_plan_change_proposed",
+            "",
+            format!("计划变更 {}：{status}", proposal.summary),
+            serde_json::json!({"request_id":proposal.request_id,"instruction_request_id":proposal.instruction_request_id,
+                "proposal":encoded,"status":status,"plan_revision":mission.plan_revision,"plan_sha256":mission.plan_sha256,
+                "read_scope_delta":scope.0,"write_scope_delta":scope.1}),
+            &now_stamp(),
+        )?;
+        append_event_tx(
+            &tx,
+            mission_id,
+            "mission_instruction_status_changed",
+            "",
+            format!("用户要求状态：{status}"),
+            serde_json::json!({"request_id":proposal.instruction_request_id,"status":status,
+                "answer":format!("{}；{}",proposal.summary, if scope_review { "需要确认新增访问范围" } else if status == "awaiting_confirmation" { "等待你确认这项计划调整" } else { "变更已通过宿主校验，正在提交" })}),
+            &now_stamp(),
+        )?;
+        let result = MissionPlanChangeResult {
+            request_id: proposal.request_id.clone(),
+            status: status.into(),
+            summary: proposal.summary.clone(),
+            plan_revision: mission.plan_revision,
+            plan_sha256: mission.plan_sha256.clone(),
+            added_task_ids: proposal
+                .added_tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect(),
+            updated_task_ids: proposal
+                .updates
+                .iter()
+                .map(|item| item.task_id.clone())
+                .collect(),
+            canceled_task_ids: proposal.cancel_task_ids.clone(),
+            authorization_read_paths: scope.0,
+            authorization_write_paths: scope.1,
+            event_sequence: sequence,
+        };
+        recompute_task_readiness_tx(&tx, mission_id, &now_stamp())?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn apply_plan_change(
+        &self,
+        request: &MissionPlanChangeApply,
+        catalog: &super::MissionAssignmentOptions,
+        confirmed_by: Option<&str>,
+    ) -> Result<MissionPlanChangeResult, Box<dyn Error>> {
+        require_id("mission_id", &request.mission_id)?;
+        require_id("plan_change.request_id", &request.request_id)?;
+        require_sha256(&request.expected_plan_sha256)?;
+        let mut connection = Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(30))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mission_id = request.mission_id.as_str();
+        let event = Self::find_plan_change_event(&tx, mission_id, &request.request_id)?
+            .ok_or("plan change proposal not found")?;
+        if let Some(applied) = decision_event(&tx,
+            "mission_id=?1 AND event_type='mission_plan_change_applied' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id, request.request_id], false)? {
+            let request_json = serde_json::to_value(request)?;
+            if applied.payload["apply_request"] != request_json { return Err("plan change replay has a different authorization payload".into()); }
+            let result = Self::plan_change_result_from_event(&applied)?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        let proposal: MissionPlanChangeProposal =
+            serde_json::from_value(event.payload["proposal"].clone())?;
+        proposal.validate()?;
+        let mission = load_mission(&tx, mission_id)?.ok_or("mission not found")?;
+        if mission.plan_revision != request.expected_plan_revision
+            || mission.plan_sha256 != request.expected_plan_sha256
+            || mission.plan_revision != proposal.expected_plan_revision
+            || mission.plan_sha256 != proposal.expected_plan_sha256
+            || !mission
+                .confirmation
+                .as_ref()
+                .is_some_and(|c| c.plan_sha256 == mission.plan_sha256)
+        {
+            return Err(
+                "plan change conflicts with a newer Mission revision; reload and re-analyze".into(),
+            );
+        }
+        if !matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Waiting
+        ) {
+            return Err("Mission is no longer active for plan changes".into());
+        }
+        Self::validate_change_instruction(&tx, &proposal)?;
+        if let Some(actor) = confirmed_by {
+            require_text("plan_change.confirmed_by", actor, 160)?;
+        }
+        if (mission.workspace.adjustment_mode == super::MissionAdjustmentMode::ConfirmChanges
+            || change_requires_service_confirmation(&mission, &proposal)
+            || request.authorization.is_some())
+            && confirmed_by.is_none()
+        {
+            return Err(
+                "this plan change requires an explicit confirmation through the host application"
+                    .into(),
+            );
+        }
+        let candidate = Self::plan_change_candidate(&tx, &mission, &proposal, catalog)?;
+        let scope = Self::plan_change_scope_delta(&mission, &proposal.added_tasks)?;
+        let required_read = scope.0.iter().cloned().collect::<BTreeSet<_>>();
+        let required_write = scope.1.iter().cloned().collect::<BTreeSet<_>>();
+        let mut confirmation = mission
+            .confirmation
+            .clone()
+            .ok_or("confirmed plan is missing")?;
+        let mut newly_read = BTreeSet::new();
+        let mut newly_write = BTreeSet::new();
+        if let Some(auth) = &request.authorization {
+            require_text("authorization.authorized_by", &auth.authorized_by, 160)?;
+            require_text("authorization.reason", &auth.reason, 2_000)?;
+            super::contract::validate_approved_paths("authorization.read_paths", &auth.read_paths)?;
+            super::contract::validate_approved_paths(
+                "authorization.write_paths",
+                &auth.write_paths,
+            )?;
+            newly_read.extend(
+                auth.read_paths
+                    .iter()
+                    .filter(|path| {
+                        if is_absolute_path(path) {
+                            !absolute_path_approved(
+                                path,
+                                &confirmation.approved_absolute_read_paths,
+                            )
+                        } else {
+                            !path_allowed(path, &confirmation.approved_read_paths)
+                        }
+                    })
+                    .cloned(),
+            );
+            newly_write.extend(
+                auth.write_paths
+                    .iter()
+                    .filter(|path| {
+                        if is_absolute_path(path) {
+                            !absolute_path_approved(
+                                path,
+                                &confirmation.approved_absolute_write_paths,
+                            )
+                        } else {
+                            !path_allowed(path, &confirmation.approved_paths)
+                        }
+                    })
+                    .cloned(),
+            );
+            if newly_read.len() != auth.read_paths.len()
+                || newly_write.len() != auth.write_paths.len()
+            {
+                return Err("authorization must contain only the exact new paths".into());
+            }
+        }
+        if newly_read != required_read || newly_write != required_write {
+            if !required_read.is_empty() || !required_write.is_empty() {
+                return Err("this plan change requires explicit authorization for the exact additional paths".into());
+            }
+            if request.authorization.is_some() {
+                return Err("unused authorization is not accepted".into());
+            }
+        }
+        let affected = plan_change_affected(&mission, &proposal);
+        if mission.tasks.iter().any(|task| {
+            affected.contains(&task.spec.id)
+                && matches!(
+                    task.status,
+                    TaskStatus::Running | TaskStatus::AwaitingVerification
+                )
+        }) {
+            let apply_json = serde_json::to_value(request)?;
+            let previous=decision_event(&tx,
+                "mission_id=?1 AND event_type='mission_plan_change_checkpoint' AND json_extract(payload_json,'$.request_id')=?2",
+                params![mission_id,request.request_id],false)?;
+            if let Some(previous) = previous {
+                if previous.payload["apply_request"] != apply_json {
+                    return Err("checkpoint request conflicts with its approved input".into());
+                }
+            } else {
+                append_event_tx(
+                    &tx,
+                    mission_id,
+                    "mission_plan_change_checkpoint",
+                    "",
+                    "受影响工作收尾后应用变更",
+                    serde_json::json!({"request_id":request.request_id,"apply_request":apply_json,"confirmed_by":confirmed_by,
+                        "affected_task_ids":affected}),
+                    &now_stamp(),
+                )?;
+                append_event_tx(
+                    &tx,
+                    mission_id,
+                    "mission_instruction_status_changed",
+                    "",
+                    "变更等待安全检查点",
+                    serde_json::json!({"request_id":proposal.instruction_request_id,"status":"awaiting_checkpoint",
+                        "answer":"受影响工作及其核验收尾后应用；未向执行器注入新要求，无关分支继续执行。"}),
+                    &now_stamp(),
+                )?;
+            }
+            recompute_task_readiness_tx(&tx, mission_id, &now_stamp())?;
+            let mut result = Self::plan_change_result_from_event(&event)?;
+            result.status = "awaiting_checkpoint".into();
+            tx.commit()?;
+            return Ok(result);
+        }
+        let assignment = mission
+            .assignment
+            .clone()
+            .ok_or("runtime changes require a pinned expert assignment")?;
+        let mut updated_assignment = assignment;
+        for role in &proposal.added_roles {
+            updated_assignment.roles.push(role.clone());
+        }
+        let selected = &mut confirmation.selected_task_ids;
+        selected.retain(|id| !proposal.cancel_task_ids.contains(id));
+        for task in &proposal.added_tasks {
+            if !selected.contains(&task.id) {
+                selected.push(task.id.clone());
+            }
+        }
+        if selected.is_empty() {
+            return Err("plan change cannot cancel every selected task".into());
+        }
+        confirmation.approved_read_paths.extend(
+            newly_read
+                .iter()
+                .filter(|path| !is_absolute_path(path))
+                .cloned(),
+        );
+        confirmation.approved_absolute_read_paths.extend(
+            newly_read
+                .iter()
+                .filter(|path| is_absolute_path(path))
+                .cloned(),
+        );
+        confirmation.approved_paths.extend(
+            newly_write
+                .iter()
+                .filter(|path| !is_absolute_path(path))
+                .cloned(),
+        );
+        confirmation.approved_absolute_write_paths.extend(
+            newly_write
+                .iter()
+                .filter(|path| is_absolute_path(path))
+                .cloned(),
+        );
+        for paths in [
+            &mut confirmation.approved_read_paths,
+            &mut confirmation.approved_absolute_read_paths,
+            &mut confirmation.approved_paths,
+            &mut confirmation.approved_absolute_write_paths,
+        ] {
+            paths.sort();
+            paths.dedup();
+        }
+        let new_revision = mission
+            .plan_revision
+            .checked_add(1)
+            .ok_or("plan revision exhausted")?;
+        let new_hash = super::contract::plan_hash_for_workspace(
+            &mission.mission_id,
+            &mission.workspace,
+            &mission.acceptance_criteria,
+            &candidate,
+        )?;
+        confirmation.plan_sha256 = new_hash.clone();
+        let now = now_stamp();
+        let changed = tx.execute("UPDATE mission_runs SET plan_revision=?2,plan_sha256=?3,plan_json=?4,
+                confirmation_json=?5,assignment_json=?6,budget_json=?7,updated_at=?8
+             WHERE mission_id=?1 AND plan_revision=?9 AND plan_sha256=?10 AND status IN ('active','waiting')",
+            params![mission_id,new_revision as i64,new_hash,serde_json::to_string(&candidate)?,
+                serde_json::to_string(&confirmation)?,serde_json::to_string(&updated_assignment)?,
+                serde_json::to_string(&candidate.budget)?,now,mission.plan_revision as i64,mission.plan_sha256])?;
+        if changed != 1 {
+            return Err("plan changed concurrently while applying this change".into());
+        }
+        for task in mission
+            .tasks
+            .iter()
+            .filter(|task| affected.contains(&task.spec.id) && !task.attempt_run_id.is_empty())
+        {
+            let claims: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mission_workspace_claims WHERE mission_id=?1 AND task_id=?2",
+                params![mission_id, task.spec.id],
+                |row| row.get(0),
+            )?;
+            if claims != 0 {
+                return Err("affected Attempt still owns resources; wait for confirmed process/checkpoint completion".into());
+            }
+            append_event_tx(
+                &tx,
+                mission_id,
+                "mission_task_evidence_invalidated",
+                &task.spec.id,
+                "要求变化，产物及下游需重新执行和验收",
+                serde_json::json!({"request_id":request.request_id,"previous_attempt":task,"previous_plan_sha256":mission.plan_sha256,
+                    "plan_sha256":new_hash}),
+                &now,
+            )?;
+            tx.execute("UPDATE mission_tasks SET status='blocked',attempt_run_id='',verification_run_id='',verification_passed=NULL,
+                evidence_json='[]',updated_at=?3 WHERE mission_id=?1 AND task_id=?2",params![mission_id,task.spec.id,now])?;
+        }
+        for update in &proposal.updates {
+            let spec = candidate
+                .tasks
+                .iter()
+                .find(|task| task.id == update.task_id)
+                .ok_or("updated task missing")?;
+            tx.execute(
+                "UPDATE mission_tasks SET spec_json=?3,status='blocked',updated_at=?4
+                WHERE mission_id=?1 AND task_id=?2 AND status IN ('proposed','blocked','ready')",
+                params![
+                    mission_id,
+                    update.task_id,
+                    serde_json::to_string(spec)?,
+                    now
+                ],
+            )?;
+        }
+        for id in &proposal.cancel_task_ids {
+            tx.execute("UPDATE mission_tasks SET status='canceled',updated_at=?3 WHERE mission_id=?1 AND task_id=?2
+                AND status IN ('proposed','blocked','ready')",params![mission_id,id,now])?;
+        }
+        let offset = mission.tasks.len() as i64;
+        for (index, task) in proposal.added_tasks.iter().enumerate() {
+            tx.execute("INSERT INTO mission_tasks(mission_id,task_id,position,status,spec_json,attempt_run_id,
+                verification_passed,evidence_json,updated_at) VALUES(?1,?2,?3,'blocked',?4,'',NULL,'[]',?5)",
+                params![mission_id,task.id,offset+index as i64,serde_json::to_string(task)?,now])?;
+            if !updated_assignment
+                .task_roles
+                .iter()
+                .any(|mapping| mapping.task_id == task.id)
+            {
+                updated_assignment
+                    .task_roles
+                    .push(super::MissionTaskRoleMapping {
+                        task_id: task.id.clone(),
+                        role_id: task.execution.role_id.clone(),
+                    });
+            }
+        }
+        for update in &proposal.updates {
+            let role_id = candidate
+                .tasks
+                .iter()
+                .find(|task| task.id == update.task_id)
+                .map(|task| task.execution.role_id.clone())
+                .unwrap_or_default();
+            updated_assignment
+                .task_roles
+                .retain(|mapping| mapping.task_id != update.task_id);
+            if !role_id.is_empty() {
+                updated_assignment
+                    .task_roles
+                    .push(super::MissionTaskRoleMapping {
+                        task_id: update.task_id.clone(),
+                        role_id,
+                    });
+            }
+        }
+        tx.execute(
+            "UPDATE mission_runs SET assignment_json=?2 WHERE mission_id=?1",
+            params![mission_id, serde_json::to_string(&updated_assignment)?],
+        )?;
+        for (position, task) in candidate.tasks.iter().enumerate() {
+            tx.execute(
+                "UPDATE mission_tasks SET position=?3 WHERE mission_id=?1 AND task_id=?2",
+                params![mission_id, task.id, position as i64],
+            )?;
+        }
+        for task in mission.tasks.iter().filter(|task| {
+            !task.attempt_run_id.is_empty()
+                && !matches!(task.status, TaskStatus::Canceled | TaskStatus::Failed)
+                && !affected.contains(&task.spec.id)
+                && !proposal.cancel_task_ids.contains(&task.spec.id)
+        }) {
+            let signature = super::attempt_signature::input_signature(&mission, task);
+            let dispatched=decision_event(&tx,
+                "mission_id=?1 AND task_id=?2 AND event_type='task_dispatched' AND json_extract(payload_json,'$.run_id')=?3",
+                params![mission_id,task.spec.id,task.attempt_run_id],false)?.ok_or("retained Attempt has no host admission")?;
+            if dispatched
+                .payload
+                .get("input_sha256")
+                .is_some_and(|value| value != &signature)
+            {
+                return Err("retained Attempt inputs changed since admission; explicit revalidation is required".into());
+            }
+            append_event_tx(
+                &tx,
+                mission_id,
+                "mission_attempt_plan_retained",
+                &task.spec.id,
+                "无关执行尝试沿用固定输入",
+                serde_json::json!({"implementation_run_id":task.attempt_run_id,"verification_run_id":task.verification_run_id,
+                    "input_sha256":signature,"from_plan_sha256":mission.plan_sha256,"to_plan_sha256":new_hash,
+                    "legacy_input_pinned_at_change":dispatched.payload.get("input_sha256").is_none()}),
+                &now,
+            )?;
+        }
+        let apply_json = serde_json::to_value(request)?;
+        let sequence = append_event_tx(
+            &tx,
+            mission_id,
+            "mission_plan_change_applied",
+            "",
+            format!("计划变更已应用：{}", proposal.summary),
+            serde_json::json!({"request_id":request.request_id,"instruction_request_id":proposal.instruction_request_id,
+                "apply_request":apply_json,"confirmed_by":confirmed_by,"proposal":proposal,"previous_plan_revision":mission.plan_revision,
+                "previous_plan_sha256":mission.plan_sha256,"plan_revision":new_revision,"plan_sha256":new_hash,
+                "status":"applied","read_scope_delta":newly_read,"write_scope_delta":newly_write}),
+            &now,
+        )?;
+        append_event_tx(
+            &tx,
+            mission_id,
+            "mission_instruction_status_changed",
+            "",
+            "用户要求已应用",
+            serde_json::json!({"request_id":proposal.instruction_request_id,"status":"applied",
+                "answer":format!("{}；计划已更新到 r{}，新增 {} 项任务，原有无关工作继续。",proposal.summary,new_revision,proposal.added_tasks.len())}),
+            &now,
+        )?;
+        // Other clients may still hold proposals for the previous revision.
+        // End those requests explicitly rather than leaving a stale confirmation actionable.
+        let obsolete = {
+            let mut statement=tx.prepare("SELECT payload_json FROM mission_events WHERE mission_id=?1
+                AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.input.kind')='instruction'
+                AND json_extract(payload_json,'$.input.expected_plan_sha256')=?2
+                AND json_extract(payload_json,'$.request_id')<>?3")?;
+            let rows = statement
+                .query_map(
+                    params![
+                        mission_id,
+                        mission.plan_sha256,
+                        proposal.instruction_request_id
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for raw in obsolete {
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            let id = value["request_id"]
+                .as_str()
+                .ok_or("instruction identity missing")?;
+            let latest=decision_event(&tx,
+                "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+                params![mission_id,id],true)?;
+            if latest.as_ref().is_none_or(|event| {
+                !matches!(
+                    event.payload["status"].as_str(),
+                    Some("applied" | "partially_applied" | "not_applied" | "failed")
+                )
+            }) {
+                append_event_tx(
+                    &tx,
+                    mission_id,
+                    "mission_instruction_status_changed",
+                    "",
+                    "旧版本要求未应用",
+                    serde_json::json!({"request_id":id,"status":"not_applied","answer":"计划已由另一项变更更新；这项旧版本要求未应用，请核对最新计划后重新提交。"}),
+                    &now,
+                )?;
+            }
+        }
+        recompute_task_readiness_tx(&tx, mission_id, &now)?;
+        maybe_complete_mission_tx(&tx, mission_id)?;
+        let result = MissionPlanChangeResult {
+            request_id: request.request_id.clone(),
+            status: "applied".into(),
+            summary: proposal.summary,
+            plan_revision: new_revision,
+            plan_sha256: new_hash,
+            added_task_ids: proposal
+                .added_tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect(),
+            updated_task_ids: proposal
+                .updates
+                .iter()
+                .map(|item| item.task_id.clone())
+                .collect(),
+            canceled_task_ids: proposal.cancel_task_ids,
+            authorization_read_paths: newly_read.into_iter().collect(),
+            authorization_write_paths: newly_write.into_iter().collect(),
+            event_sequence: sequence,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn checkpoint_change_request(
+        &self,
+        mission_id: &str,
+        request_id: &str,
+    ) -> Result<Option<(MissionPlanChangeApply, Option<String>)>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let event=decision_event(&connection,
+            "mission_id=?1 AND event_type='mission_plan_change_checkpoint' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id,request_id],false)?;
+        event
+            .map(|event| {
+                Ok((
+                    serde_json::from_value(event.payload["apply_request"].clone())?,
+                    event.payload["confirmed_by"].as_str().map(str::to_string),
+                ))
+            })
+            .transpose()
+    }
+
+    fn validate_change_instruction(
+        connection: &Connection,
+        proposal: &MissionPlanChangeProposal,
+    ) -> Result<(), Box<dyn Error>> {
+        let status = decision_event(connection,
+            "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+            params![proposal.mission_id, proposal.instruction_request_id], true)?;
+        if status.as_ref().is_none_or(|event| {
+            !matches!(
+                event.payload["status"].as_str(),
+                Some(
+                    "analyzing"
+                        | "ready_to_apply"
+                        | "awaiting_checkpoint"
+                        | "awaiting_confirmation"
+                        | "awaiting_authorization"
+                )
+            )
+        }) {
+            return Err("plan change instruction is not in an actionable state".into());
+        }
+        let other: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mission_events WHERE mission_id=?1
+             AND event_type='mission_plan_change_proposed'
+             AND json_extract(payload_json,'$.instruction_request_id')=?2
+             AND json_extract(payload_json,'$.request_id')<>?3)",
+            params![
+                proposal.mission_id,
+                proposal.instruction_request_id,
+                proposal.request_id
+            ],
+            |row| row.get(0),
+        )?;
+        if other {
+            return Err("instruction already owns a different plan change".into());
+        }
+        Ok(())
+    }
+
+    fn plan_change_candidate(
+        connection: &Connection,
+        mission: &MissionView,
+        proposal: &MissionPlanChangeProposal,
+        catalog: &super::MissionAssignmentOptions,
+    ) -> Result<MissionPlanProposal, Box<dyn Error>> {
+        let assignment = mission
+            .assignment
+            .as_ref()
+            .ok_or("runtime changes require a pinned expert assignment")?;
+        if assignment.roles.len() + proposal.added_roles.len() > 32 {
+            return Err("Mission expert responsibility limit reached".into());
+        }
+        let mut roles = assignment
+            .roles
+            .iter()
+            .map(|role| (role.role_id.as_str(), role))
+            .collect::<BTreeMap<_, _>>();
+        for role in &proposal.added_roles {
+            if roles.insert(role.role_id.as_str(), role).is_some() {
+                return Err("added expert role already exists".into());
+            }
+            super::validate_runtime_role_assignment(role, catalog)?;
+        }
+        let raw: String = connection.query_row(
+            "SELECT plan_json FROM mission_runs WHERE mission_id=?1",
+            [&mission.mission_id],
+            |row| row.get(0),
+        )?;
+        let mut candidate: MissionPlanProposal = serde_json::from_str(&raw)?;
+        // Budget extension is independently persisted; stale plan JSON must not undo it.
+        candidate.budget = mission
+            .budget
+            .clone()
+            .ok_or("confirmed Mission budget is missing")?;
+        candidate.tasks = mission.tasks.iter().map(|task| task.spec.clone()).collect();
+        for update in &proposal.updates {
+            let current = mission
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == update.task_id)
+                .ok_or("updated task missing")?;
+            if update.priority.is_some()
+                && !matches!(
+                    current.status,
+                    TaskStatus::Proposed | TaskStatus::Blocked | TaskStatus::Ready
+                )
+            {
+                return Err("priority changes only apply to unstarted work".into());
+            }
+            if current.status == TaskStatus::Canceled {
+                return Err("a canceled task cannot be revised".into());
+            }
+            let spec = candidate
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == update.task_id)
+                .ok_or("updated task missing")?;
+            Self::apply_task_update(spec, update, &roles)?;
+            let role = roles
+                .get(spec.execution.role_id.as_str())
+                .ok_or("updated task role is not assigned")?;
+            super::validate_runtime_role_assignment(role, catalog)?;
+        }
+        for id in &proposal.cancel_task_ids {
+            let current = mission
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == *id)
+                .ok_or("canceled task missing")?;
+            if !matches!(
+                current.status,
+                TaskStatus::Proposed | TaskStatus::Blocked | TaskStatus::Ready
+            ) {
+                return Err(format!("task {id} has an active or finalized Attempt and cannot be canceled by this change").into());
+            }
+        }
+        for task in &proposal.added_tasks {
+            let role = roles
+                .get(task.execution.role_id.as_str())
+                .ok_or("added task must select an assigned expert")?;
+            super::validate_runtime_role_assignment(role, catalog)?;
+            let expected = super::ExecutionBinding {
+                expert: role.expert.clone(),
+                role_id: role.role_id.clone(),
+                executor: role.executor.clone(),
+                service_id: role.service_id.clone(),
+                model: role.model.clone(),
+            };
+            if task.execution != expected {
+                return Err("new task differs from its pinned expert binding".into());
+            }
+        }
+        candidate.tasks.extend(proposal.added_tasks.clone());
+        candidate.tasks.sort_by_key(|task| {
+            std::cmp::Reverse(
+                proposal
+                    .updates
+                    .iter()
+                    .find(|update| update.task_id == task.id)
+                    .and_then(|update| update.priority)
+                    .unwrap_or(50),
+            )
+        });
+        if candidate.tasks.len() > super::parallel::MAX_SCHEDULE_TASKS {
+            return Err("Mission task limit reached".into());
+        }
+        let mut selected = mission
+            .confirmation
+            .as_ref()
+            .ok_or("confirmation missing")?
+            .selected_task_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        selected.extend(proposal.added_tasks.iter().map(|task| task.id.clone()));
+        for id in &proposal.cancel_task_ids {
+            selected.remove(id);
+        }
+        for task in candidate
+            .tasks
+            .iter()
+            .filter(|task| selected.contains(&task.id))
+        {
+            if task.depends_on.iter().any(|id| !selected.contains(id)) {
+                return Err(format!(
+                    "task {} depends on a task outside the new confirmed selection",
+                    task.id
+                )
+                .into());
+            }
+        }
+        for value in &proposal.required_acceptance {
+            if !candidate.required_acceptance.contains(value) {
+                candidate.required_acceptance.push(value.clone());
+            }
+        }
+        candidate.summary = proposal.summary.clone();
+        validate_proposal(&candidate)?;
+        validate_task_paths(&candidate.tasks, &mission.workspace.root)?;
+        Ok(candidate)
+    }
+
+    fn find_plan_change_event(
+        connection: &Connection,
+        mission_id: &str,
+        request_id: &str,
+    ) -> Result<Option<MissionEvent>, Box<dyn Error>> {
+        decision_event(connection,
+        "mission_id=?1 AND event_type='mission_plan_change_proposed' AND json_extract(payload_json,'$.request_id')=?2",
+        params![mission_id,request_id], false)
+    }
+
+    fn plan_change_result_from_event(
+        event: &MissionEvent,
+    ) -> Result<MissionPlanChangeResult, Box<dyn Error>> {
+        let proposal: MissionPlanChangeProposal =
+            serde_json::from_value(event.payload["proposal"].clone())?;
+        let applied = event.event_type == "mission_plan_change_applied";
+        Ok(MissionPlanChangeResult {
+            request_id: proposal.request_id.clone(),
+            status: event.payload["status"]
+                .as_str()
+                .unwrap_or(if applied { "applied" } else { "ready_to_apply" })
+                .to_string(),
+            summary: proposal.summary.clone(),
+            plan_revision: event.payload["plan_revision"]
+                .as_u64()
+                .or_else(|| event.payload["previous_plan_revision"].as_u64())
+                .unwrap_or(proposal.expected_plan_revision),
+            plan_sha256: event.payload["plan_sha256"]
+                .as_str()
+                .or_else(|| event.payload["previous_plan_sha256"].as_str())
+                .unwrap_or(&proposal.expected_plan_sha256)
+                .to_string(),
+            added_task_ids: proposal
+                .added_tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect(),
+            updated_task_ids: proposal
+                .updates
+                .iter()
+                .map(|item| item.task_id.clone())
+                .collect(),
+            canceled_task_ids: proposal.cancel_task_ids,
+            authorization_read_paths: event.payload["read_scope_delta"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            authorization_write_paths: event.payload["write_scope_delta"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            event_sequence: event.sequence,
+        })
+    }
+
+    fn apply_task_update(
+        task: &mut MissionTaskSpec,
+        update: &MissionPlanTaskUpdate,
+        roles: &BTreeMap<&str, &super::MissionRoleAssignment>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(title) = &update.title {
+            task.title = title.clone();
+        }
+        if let Some(objective) = &update.objective {
+            task.objective = objective.clone();
+        }
+        if let Some(dependencies) = &update.depends_on {
+            task.depends_on = dependencies.clone();
+        }
+        if let Some(criteria) = &update.acceptance_criteria {
+            task.acceptance_criteria = criteria.clone();
+        }
+        if let Some(checks) = &update.required_checks {
+            task.required_checks = checks.clone();
+        }
+        if let Some(role_id) = &update.role_id {
+            let role = roles
+                .get(role_id.as_str())
+                .ok_or("updated task role is not assigned")?;
+            task.execution = super::ExecutionBinding {
+                expert: role.expert.clone(),
+                role_id: role.role_id.clone(),
+                executor: role.executor.clone(),
+                service_id: role.service_id.clone(),
+                model: role.model.clone(),
+            };
+        }
+        super::validate_execution_binding(task)?;
+        Ok(())
+    }
+
+    fn plan_change_scope_delta(
+        mission: &MissionView,
+        tasks: &[MissionTaskSpec],
+    ) -> Result<(Vec<String>, Vec<String>), Box<dyn Error>> {
+        let confirmation = mission
+            .confirmation
+            .as_ref()
+            .ok_or("confirmed plan is missing")?;
+        let mut reads = BTreeSet::new();
+        let mut writes = BTreeSet::new();
+        for task in tasks {
+            for path in &task.read_paths {
+                if is_absolute_path(path) {
+                    if !absolute_path_approved(path, &confirmation.approved_absolute_read_paths) {
+                        reads.insert(path.clone());
+                    }
+                } else if !path_allowed(path, &confirmation.approved_read_paths) {
+                    reads.insert(path.clone());
+                }
+            }
+            for path in &task.write_paths {
+                if is_absolute_path(path) {
+                    if !absolute_path_approved(path, &confirmation.approved_absolute_write_paths) {
+                        writes.insert(path.clone());
+                    }
+                } else if !path_allowed(path, &confirmation.approved_paths) {
+                    writes.insert(path.clone());
+                }
+            }
+        }
+        super::contract::validate_approved_paths(
+            "plan_change.read_scope_delta",
+            &reads.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        super::contract::validate_approved_paths(
+            "plan_change.write_scope_delta",
+            &writes.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        Ok((reads.into_iter().collect(), writes.into_iter().collect()))
+    }
+
     /// Query matching feedback across the whole ledger, not a UI event page.
     /// Only repair_of ancestors propagate observations; dependency peers do not.
     pub(crate) fn feedback_context(
@@ -2620,6 +3863,21 @@ impl MissionStore {
                 }
             }
         }
+        let mut statement=tx.prepare("SELECT sequence FROM mission_events WHERE mission_id=?1 AND event_type='mission_attempt_plan_retained' ORDER BY sequence")?;
+        let sequences = statement
+            .query_map([mission_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for sequence in sequences {
+            if let Some(event) = decision_event(
+                &tx,
+                "mission_id=?1 AND sequence=?2",
+                params![mission_id, sequence],
+                false,
+            )? {
+                events.push(event);
+            }
+        }
         tx.commit()?;
         Ok((mission, events))
     }
@@ -2747,9 +4005,7 @@ impl MissionStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mission = load_mission(&transaction, mission_id)?.ok_or("mission not found")?;
-        if mission.status == MissionStatus::Canceled {
-            return Err("canceled mission cannot accept usage".into());
-        }
+
         let previous = effective_usage_payloads(&transaction, mission_id)?
             .into_iter()
             .find(|raw| {
@@ -2917,6 +4173,11 @@ impl MissionStore {
             return Err(format!("task {task_id} is not ready (status={status})").into());
         }
         let current = load_mission(&transaction, mission_id)?.ok_or("mission missing")?;
+        if pending_plan_change_tasks_on(&transaction, mission_id, &current.plan_sha256)?
+            .contains(task_id)
+        {
+            return Err("task is held for a pending instruction or plan change".into());
+        }
         if let Some(reason) = budget_exhaustion_reason_on(&transaction, &current)? {
             return Err(reason.into());
         }
@@ -3024,7 +4285,8 @@ impl MissionStore {
             "task_dispatched",
             task_id,
             format!("任务 {task_id} 已派发到执行器"),
-            serde_json::json!({"run_id": run_id}),
+            serde_json::json!({"run_id":run_id,"plan_sha256":current.plan_sha256,"plan_revision":current.plan_revision,
+                "input_sha256":super::attempt_signature::input_signature(&current,current.tasks.iter().find(|task|task.spec.id==task_id).ok_or("task missing")?)}),
             &now,
         )?;
         transaction.commit()?;
@@ -3128,7 +4390,7 @@ impl MissionStore {
             ],
             |row| row.get(0),
         )?;
-        if passed && remaining == 0 {
+        if passed && remaining == 0 && !has_pending_mission_instruction(&transaction, mission_id)? {
             transaction.execute(
                 "UPDATE mission_runs SET status = ?2, updated_at = ?3 WHERE mission_id = ?1",
                 params![mission_id, MissionStatus::Completed.as_str(), now],
@@ -3573,6 +4835,18 @@ impl MissionStore {
         assert_verification_ownership_on(&connection, &mission, task_id, implementation_run_id)
     }
 
+    pub(crate) fn evidence_plan_compatible(
+        &self,
+        mission_id: &str,
+        task_id: &str,
+        run_id: &str,
+        plan_sha256: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mission = load_mission(&connection, mission_id)?.ok_or("mission not found")?;
+        evidence_plan_compatible_on(&connection, &mission, task_id, run_id, plan_sha256)
+    }
+
     pub(crate) fn record_verification_result(
         &self,
         mission_id: &str,
@@ -3665,7 +4939,13 @@ impl MissionStore {
             let evidence: serde_json::Value =
                 serde_json::from_str(&evidence.ok_or("missing host verification evidence")?)?;
             if evidence["passed"] != true
-                || evidence["plan_sha256"] != mission.plan_sha256
+                || !evidence_plan_compatible_on(
+                    &transaction,
+                    &mission,
+                    task_id,
+                    implementation_run_id,
+                    evidence["plan_sha256"].as_str().unwrap_or_default(),
+                )?
                 || evidence["implementation_run_id"] != implementation_run_id
                 || evidence["verification_run_id"] != verification_run_id
             {
@@ -3759,7 +5039,7 @@ impl MissionStore {
             ],
             |row| row.get(0),
         )?;
-        if passed && remaining == 0 {
+        if passed && remaining == 0 && !has_pending_mission_instruction(&transaction, mission_id)? {
             transaction.execute(
                 "UPDATE mission_runs SET status = ?2, updated_at = ?3 WHERE mission_id = ?1",
                 params![mission_id, MissionStatus::Completed.as_str(), now],
@@ -4134,6 +5414,66 @@ impl MissionStore {
             .into_iter()
             .find(|task| task.status == TaskStatus::AwaitingVerification))
     }
+}
+
+fn answer_mission_question(mission: &MissionView, targets: &[String]) -> String {
+    let selected = mission
+        .tasks
+        .iter()
+        .filter(|task| targets.is_empty() || targets.contains(&task.spec.id))
+        .collect::<Vec<_>>();
+    let running = selected
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .count();
+    let completed = selected
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .count();
+    let blocked = selected
+        .iter()
+        .filter(|task| task.status == TaskStatus::Blocked)
+        .collect::<Vec<_>>();
+    let failed = selected
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count();
+    let mut answer = format!(
+        "当前计划 r{}：{} 项通过验收、{} 项实际运行、{} 项等待依赖、{} 项失败。",
+        mission.plan_revision,
+        completed,
+        running,
+        blocked.len(),
+        failed
+    );
+    for task in blocked.iter().take(3) {
+        let dependencies = task
+            .spec
+            .depends_on
+            .iter()
+            .filter(|id| {
+                mission.tasks.iter().any(|candidate| {
+                    candidate.spec.id == **id && candidate.status != TaskStatus::Completed
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        answer.push_str(&format!(
+            " {} 等待依赖任务 {}。",
+            task.spec.title,
+            if dependencies.is_empty() {
+                "状态核对".into()
+            } else {
+                dependencies.join("、")
+            }
+        ));
+    }
+    if running > 0 {
+        answer.push_str("询问仅读取当前状态，没有修改计划或中断执行。");
+    } else if blocked.is_empty() && failed == 0 {
+        answer.push_str("当前没有执行中的任务。");
+    }
+    answer
 }
 
 /// Until an executor can enforce a per-attempt token/cost reservation, finite
@@ -4772,6 +6112,161 @@ fn load_mission(
     Ok(Some(mission))
 }
 
+/// Pending changes reserve only affected, unstarted work. A newer plan makes
+/// stale proposals inert; explicit rejection/withdrawal releases their holds.
+fn evidence_plan_compatible_on(
+    connection: &Connection,
+    mission: &MissionView,
+    task_id: &str,
+    run_id: &str,
+    plan_sha256: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(task) = mission.tasks.iter().find(|task| {
+        task.spec.id == task_id
+            && task.attempt_run_id == run_id
+            && task.status != TaskStatus::Canceled
+    }) else {
+        return Ok(false);
+    };
+    let mut statement = connection.prepare(
+        "SELECT sequence FROM mission_events WHERE mission_id=?1 AND task_id=?2
+        AND event_type='mission_attempt_plan_retained' ORDER BY sequence",
+    )?;
+    let sequences = statement
+        .query_map(params![mission.mission_id, task_id], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut events = Vec::new();
+    for sequence in sequences {
+        if let Some(event) = decision_event(
+            connection,
+            "mission_id=?1 AND sequence=?2",
+            params![mission.mission_id, sequence],
+            false,
+        )? {
+            events.push(event);
+        }
+    }
+    Ok(super::attempt_signature::evidence_plan_compatible(
+        mission,
+        task,
+        plan_sha256,
+        &events,
+    ))
+}
+
+fn change_requires_service_confirmation(
+    mission: &MissionView,
+    proposal: &MissionPlanChangeProposal,
+) -> bool {
+    proposal.added_roles.iter().any(|role| {
+        !mission.assignment.as_ref().is_some_and(|assignment| {
+            assignment.roles.iter().any(|allowed| {
+                allowed.executor == role.executor
+                    && allowed.service_id == role.service_id
+                    && allowed.model == role.model
+            })
+        })
+    })
+}
+
+fn plan_change_affected(
+    mission: &MissionView,
+    proposal: &MissionPlanChangeProposal,
+) -> BTreeSet<String> {
+    let mut affected = proposal
+        .updates
+        .iter()
+        .map(|update| update.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = affected.len();
+        for task in &mission.tasks {
+            if task.spec.depends_on.iter().any(|id| affected.contains(id))
+                || affected.contains(&task.spec.repair_of)
+            {
+                affected.insert(task.spec.id.clone());
+            }
+        }
+        if before == affected.len() {
+            return affected;
+        }
+    }
+}
+
+fn maybe_complete_mission_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mission_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM mission_tasks WHERE mission_id=?1 AND status='completed')
+        AND NOT EXISTS(SELECT 1 FROM mission_tasks WHERE mission_id=?1 AND status NOT IN ('completed','canceled'))",
+        [mission_id],|row|row.get(0))?;
+    if complete && !has_pending_mission_instruction(tx, mission_id)? {
+        let now = now_stamp();
+        if tx.execute("UPDATE mission_runs SET status='completed',updated_at=?2 WHERE mission_id=?1 AND status IN ('active','waiting')",
+            params![mission_id,now])?==1 {
+            append_event_tx(tx,mission_id,"mission_completed","","全部任务已验收，沟通要求均已处理",serde_json::json!({}),&now)?;
+        }
+    }
+    Ok(())
+}
+
+fn has_pending_mission_instruction(
+    connection: &Connection,
+    mission_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_events m WHERE m.mission_id=?1
+        AND m.event_type='mission_message_submitted' AND json_extract(m.payload_json,'$.input.kind')='instruction'
+        AND COALESCE((SELECT json_extract(s.payload_json,'$.status') FROM mission_events s WHERE s.mission_id=m.mission_id
+            AND s.event_type='mission_instruction_status_changed'
+            AND json_extract(s.payload_json,'$.request_id')=json_extract(m.payload_json,'$.request_id')
+            ORDER BY s.sequence DESC LIMIT 1),'received') NOT IN ('applied','partially_applied','not_applied','failed'))",
+        [mission_id],|row|row.get(0))?)
+}
+
+fn pending_plan_change_tasks_on(
+    connection: &Connection,
+    mission_id: &str,
+    plan_sha256: &str,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let mut statement = connection.prepare(
+        "SELECT payload_json FROM mission_events WHERE mission_id=?1
+         AND event_type='mission_message_submitted' AND json_extract(payload_json,'$.input.kind')='instruction'
+         AND json_extract(payload_json,'$.input.expected_plan_sha256')=?2")?;
+    let messages = statement
+        .query_map(params![mission_id, plan_sha256], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut held = BTreeSet::new();
+    for raw in messages {
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let input: MissionMessageInput = serde_json::from_value(value["input"].clone())?;
+        let latest=decision_event(connection,
+            "mission_id=?1 AND event_type='mission_instruction_status_changed' AND json_extract(payload_json,'$.request_id')=?2",
+            params![mission_id,input.request_id],true)?;
+        if latest.as_ref().is_some_and(|event| {
+            matches!(
+                event.payload["status"].as_str(),
+                Some("applied" | "partially_applied" | "not_applied" | "failed")
+            )
+        }) {
+            continue;
+        }
+        held.extend(input.target_task_ids);
+        if let Some(event)=decision_event(connection,
+            "mission_id=?1 AND event_type='mission_plan_change_proposed' AND json_extract(payload_json,'$.instruction_request_id')=?2",
+            params![mission_id,input.request_id],false)? {
+            let proposal: MissionPlanChangeProposal=serde_json::from_value(event.payload["proposal"].clone())?;
+            let mission=load_mission(connection,mission_id)?.ok_or("mission missing")?;
+            held.extend(plan_change_affected(&mission,&proposal));
+            held.extend(proposal.cancel_task_ids);
+        }
+    }
+    Ok(held)
+}
+
 fn recompute_task_readiness_tx(
     transaction: &rusqlite::Transaction<'_>,
     mission_id: &str,
@@ -4795,6 +6290,12 @@ fn recompute_task_readiness_tx(
         statuses.insert(id.clone(), status);
         specs.insert(id, serde_json::from_str::<MissionTaskSpec>(&spec)?);
     }
+    let plan_sha256: String = transaction.query_row(
+        "SELECT plan_sha256 FROM mission_runs WHERE mission_id=?1",
+        [mission_id],
+        |row| row.get(0),
+    )?;
+    let held = pending_plan_change_tasks_on(transaction, mission_id, &plan_sha256)?;
     for (id, spec) in specs {
         // Failed attempts are terminal until an explicit retry/follow-up creates
         // a new attempt. Recomputing readiness must never resurrect a failed
@@ -4805,10 +6306,10 @@ fn recompute_task_readiness_tx(
         ) {
             continue;
         }
-        let ready = spec
-            .depends_on
-            .iter()
-            .all(|dependency| statuses.get(dependency).map(String::as_str) == Some("completed"));
+        let ready = !held.contains(&id)
+            && spec.depends_on.iter().all(|dependency| {
+                statuses.get(dependency).map(String::as_str) == Some("completed")
+            });
         let next = if ready { "ready" } else { "blocked" };
         if statuses.get(&id).map(String::as_str) != Some(next) {
             transaction.execute(
@@ -5444,6 +6945,7 @@ mod tests {
                 objective: "Preserve every event".into(),
                 workspace: super::super::MissionWorkspace {
                     permission_mode: String::new(),
+                    adjustment_mode: Default::default(),
                     root: "F:/pagination-fixture".into(),
                     read_scope: vec!["src".into()],
                     write_scope: vec!["src".into()],
@@ -5509,6 +7011,7 @@ mod tests {
             objective: "Global event sequence".into(),
             workspace: super::super::MissionWorkspace {
                 permission_mode: String::new(),
+                adjustment_mode: Default::default(),
                 root: "F:/pagination-fixture".into(),
                 read_scope: vec!["src".into()],
                 write_scope: vec!["src".into()],
@@ -7011,6 +8514,106 @@ mod tests {
     }
 
     #[test]
+    fn mission_conversation_distinguishes_questions_instructions_and_observations_idempotently() {
+        let store = store("mission-conversation");
+        let active = feedback_mission(&store);
+        let make =
+            |request_id: &str, kind: MissionMessageKind, message: &str| MissionMessageInput {
+                request_id: request_id.into(),
+                expected_plan_revision: active.plan_revision,
+                expected_plan_sha256: active.plan_sha256.clone(),
+                kind,
+                target_task_ids: vec!["verify".into()],
+                message: message.into(),
+            };
+        let question = make(
+            "ask-1",
+            MissionMessageKind::Question,
+            "为什么验收还没开始？",
+        );
+        let before = store.snapshot(&active.mission_id, 0).unwrap();
+        let answer = store.submit_message(&active.mission_id, &question).unwrap();
+        assert_eq!(answer.status, "answered");
+        assert!(answer.answer.contains("等待依赖"));
+        let replay = store.submit_message(&active.mission_id, &question).unwrap();
+        assert_eq!(answer, replay);
+        let after_question = store.snapshot(&active.mission_id, 0).unwrap();
+        assert_eq!(after_question.mission.tasks, before.mission.tasks);
+        assert_eq!(
+            after_question.mission.plan_sha256,
+            before.mission.plan_sha256
+        );
+        assert_eq!(
+            after_question
+                .events
+                .iter()
+                .filter(|event| event.event_type == "mission_message_submitted")
+                .count(),
+            1
+        );
+
+        let instruction = make(
+            "instruction-1",
+            MissionMessageKind::Instruction,
+            "新增离线支持",
+        );
+        let received = store
+            .submit_message(&active.mission_id, &instruction)
+            .unwrap();
+        assert_eq!(received.status, "received");
+        assert!(received.answer.contains("尚未分析或改变计划"));
+        store
+            .record_instruction_status(
+                &active.mission_id,
+                &instruction.request_id,
+                "analyzing",
+                "正在分析",
+            )
+            .unwrap();
+        store
+            .record_instruction_status(
+                &active.mission_id,
+                &instruction.request_id,
+                "failed",
+                "宿主拒绝了无效提案；任务计划未改变。",
+            )
+            .unwrap();
+        let failed = store
+            .submit_message(&active.mission_id, &instruction)
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.answer.contains("宿主拒绝了无效提案"));
+        let mut observation = serde_json::to_value(make(
+            "observation-1",
+            MissionMessageKind::Instruction,
+            "缺少缓存恢复测试",
+        ))
+        .unwrap();
+        observation["kind"] = serde_json::json!("observation");
+        assert!(serde_json::from_value::<MissionMessageInput>(observation).is_err());
+
+        let feedback = MissionFeedbackInput {
+            request_id: "observation-feedback-1".into(),
+            expected_plan_sha256: active.plan_sha256.clone(),
+            target_task_ids: vec!["verify".into()],
+            message: "缺少缓存恢复测试".into(),
+            evidence_refs: vec![],
+        };
+        store
+            .submit_feedback(&active.mission_id, &feedback)
+            .unwrap();
+
+        let mut stale = question.clone();
+        stale.expected_plan_revision += 1;
+        stale.request_id = "stale-ask".into();
+        assert!(store
+            .submit_message(&active.mission_id, &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+    }
+
+    #[test]
     fn mission_feedback_is_append_only_idempotent_and_preserves_running_authority() {
         let store = store("feedback-submit");
         let active = feedback_mission(&store);
@@ -7439,6 +9042,7 @@ mod tests {
             objective: "Implement reviewed plan".to_string(),
             workspace: MissionWorkspace {
                 permission_mode: String::new(),
+                adjustment_mode: Default::default(),
                 root: "F:/repo".to_string(),
                 read_scope: vec!["frontend".to_string()],
                 write_scope: vec!["frontend/src".to_string()],
@@ -7547,6 +9151,8 @@ mod tests {
             }
         }
     }
+
+    include!("plan_change_tests.rs");
 
     fn assignment_fixture(
         name: &str,
@@ -7857,6 +9463,7 @@ mod tests {
             objective: "完成可验证的 UI 修复".to_string(),
             workspace: MissionWorkspace {
                 permission_mode: String::new(),
+                adjustment_mode: Default::default(),
                 root: "F:/repo".to_string(),
                 read_scope: vec!["frontend".to_string()],
                 write_scope: vec!["frontend".to_string()],
@@ -9649,6 +11256,7 @@ mod tests {
         input.workspace = MissionWorkspace {
             root: root.to_string_lossy().into_owned(),
             permission_mode: String::new(),
+            adjustment_mode: Default::default(),
             read_scope: vec!["readonly.txt".into()],
             write_scope: vec!["src".into()],
         };
@@ -10137,6 +11745,7 @@ mod tests {
             input.workspace = MissionWorkspace {
                 root: root.to_string_lossy().into_owned(),
                 permission_mode: String::new(),
+                adjustment_mode: Default::default(),
                 read_scope: vec!["read.txt".into()],
                 write_scope: vec![],
             };
@@ -10796,6 +12405,7 @@ mod tests {
                 objective: String::new(),
                 workspace: MissionWorkspace {
                     permission_mode: String::new(),
+                    adjustment_mode: Default::default(),
                     root: root.to_string_lossy().into(),
                     read_scope: vec![".".into()],
                     write_scope: vec!["src".into()],

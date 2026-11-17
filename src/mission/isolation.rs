@@ -247,6 +247,44 @@ fn prepare_request(request: PrepareRequest<'_>) -> Result<TaskIsolation> {
         write_json_new(&pin_path, &baseline)?;
     }
     let common = git_directory(&source, "--git-common-dir")?;
+    #[cfg(windows)]
+    {
+        // Git 2.32's child update-ref and process cwd are MAX_PATH-limited,
+        // even with core.longpaths. Initialize only host-owned data under the
+        // source Git metadata, then let Git move it to the full isolated path.
+        // Never overwrite or clean up an interrupted staging workspace.
+        let staging = common.join(format!(".hm-{}", id_key(path_str(&isolated)?)));
+        guard_path(&staging)?;
+        if staging.exists() {
+            return Err(IsolationError::Rejected(
+                "host staging workspace exists; preserved without cleanup".into(),
+            ));
+        }
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                path_str(&staging)?,
+                &head,
+            ],
+            None,
+        )?;
+        git(
+            &source,
+            &[
+                "worktree",
+                "move",
+                "--",
+                path_str(&staging)?,
+                path_str(&isolated)?,
+            ],
+            None,
+        )?;
+    }
+    #[cfg(not(windows))]
     git(
         &source,
         &[
@@ -579,7 +617,7 @@ fn verify_attempt(attempt: &TaskIsolation) -> Result<()> {
             "workspace no longer belongs to its recorded Git worktree".into(),
         ));
     }
-    let symbolic = git_command(&attempt.isolated_root, None)
+    let symbolic = git_command(&attempt.isolated_root, None)?
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()?;
     if symbolic.status.code() != Some(1) {
@@ -847,7 +885,7 @@ fn index_file(
     Ok(())
 }
 
-fn git_command(root: &Path, index: Option<&Path>) -> Command {
+fn git_command(root: &Path, index: Option<&Path>) -> Result<Command> {
     let mut command = crate::runtime::process::hidden_command("git");
     // Inherited Git routing/index/config injection must not redirect the host.
     for (key, _) in std::env::vars_os() {
@@ -860,7 +898,6 @@ fn git_command(root: &Path, index: Option<&Path>) -> Command {
         }
     }
     command
-        .current_dir(root)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -869,18 +906,50 @@ fn git_command(root: &Path, index: Option<&Path>) -> Command {
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
+    // Host-owned attempt roots can exceed MAX_PATH even with hashed IDs.
+    // Apply this to each child process without changing repository/user config.
+    #[cfg(windows)]
+    {
+        command.args(["-c", "core.longpaths=true"]);
+        if path_str(root)?.len() >= 220 {
+            // All isolated-workspace Git calls below are metadata/index
+            // operations; content is read by explicit absolute paths. Avoid
+            // asking Git or CreateProcessW to discover/chdir to a long root.
+            // Verify the pointer without following symlinks/reparse points;
+            // verify_attempt independently binds its common dir and identity.
+            let pointer = read_regular(&root.join(".git"))?;
+            let target = text(&pointer)?
+                .trim()
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| IsolationError::Rejected("invalid worktree Git pointer".into()))?;
+            let target = canonical_directory(&root.join(target))?;
+            command
+                .current_dir(&target)
+                .arg("--git-dir")
+                .arg(&target)
+                .arg("--work-tree=.");
+        } else {
+            command.current_dir(root);
+        }
+    }
+    #[cfg(not(windows))]
+    command.current_dir(root);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
-    command
+    Ok(command)
 }
 
 fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
+    git_output(git_command(root, index)?, args)
+}
+
+fn git_output(mut command: Command, args: &[&str]) -> Result<Vec<u8>> {
     let Output {
         status,
         stdout,
         stderr,
-    } = git_command(root, index).args(args).output()?;
+    } = command.args(args).output()?;
     if !status.success() {
         return Err(IsolationError::Failure(format!(
             "git {}: {}",
@@ -1162,6 +1231,34 @@ mod tests {
 
     fn writes(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).into()).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_host_paths_support_prepare_integrate_and_replay() {
+        use std::os::windows::ffi::OsStrExt;
+        let mut repo = Repo::new();
+        repo.storage = repo
+            .storage
+            .join("隔离 host-".repeat(10))
+            .join("nested-host-".repeat(10));
+        let attempt = repo.prepare("long-path").unwrap();
+        assert!(attempt.isolated_root.as_os_str().encode_wide().count() > 260);
+        fs::write(
+            attempt.isolated_root.join("src/a.txt"),
+            b"long path output\n",
+        )
+        .unwrap();
+        let scope = writes(&["src/a.txt"]);
+        let first = integrate(&attempt, &scope).unwrap();
+        assert_eq!(
+            fs::read(repo.source.join("src/a.txt")).unwrap(),
+            b"long path output\n"
+        );
+        let replay = integrate(&attempt, &scope).unwrap();
+        assert!(replay.already_integrated);
+        assert_eq!(replay.receipt, first.receipt);
+        assert_eq!(repo.prepare("long-path").unwrap(), attempt);
     }
 
     #[test]

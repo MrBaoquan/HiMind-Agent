@@ -27,8 +27,10 @@ assert.ok(!/'engine'/.test(types), 'PageKey 不应再包含 engine');
 assert.ok(!/EngineBuildPage/.test(main), 'main.tsx 不应再有工程构建页面分支');
 assert.ok(!existsSync(agentPath(join('frontend', 'src', 'pages', 'EngineBuildPage.tsx'))), '独立的工程构建页面应已删除');
 
-// 2. 构建以工作流交付：包结构、能力步骤、阻塞等待、声明式表单。
-const workflow = JSON.parse(readAgent(join('workflows', 'engine-build', 'workflow.json')));
+// 2. Retired engine workflow remains a contract fixture, not a bundled capability.
+// Expert/workflow consolidation moved it alongside the Rust regression fixture.
+const fixtureRoot = join('tests', 'fixtures', 'workflows', 'engine-build');
+const workflow = JSON.parse(readAgent(join(fixtureRoot, 'workflow.json')));
 assert.equal(workflow.schema_version, 'workflow_package.v1');
 assert.equal(workflow.id, 'com.himind.workflow.engine-build');
 assert.ok(workflow.capabilities.includes('workspace.exhibit.build'), '工作流必须声明构建能力');
@@ -38,10 +40,10 @@ assert.equal(buildStep.capability_id, 'workspace.exhibit.build');
 assert.equal(buildStep.execution_mode, 'long_running', '构建要按长任务声明');
 assert.equal(buildStep.input.wait, true, '构建步骤必须要求等待终态，否则运行会秒完成');
 assert.equal(workflow.ui.mode, 'declarative');
-assert.ok(existsSync(agentPath(join('workflows', 'engine-build', 'ui', 'workflow-view.json'))), '工作流缺少声明式表单');
+assert.ok(existsSync(agentPath(join(fixtureRoot, 'ui', 'workflow-view.json'))), '工作流夹具缺少声明式表单');
 
 // 3. 表单字段必须落在能力入参里，否则会被 strict schema 过滤掉。
-const view = JSON.parse(readAgent(join('workflows', 'engine-build', 'ui', 'workflow-view.json')));
+const view = JSON.parse(readAgent(join(fixtureRoot, 'ui', 'workflow-view.json')));
 const fieldIds = view.sections.flatMap((section: { fields: Array<{ id: string }> }) => section.fields.map((field: { id: string }) => field.id));
 for (const field of ['target_path', 'engine_type', 'engine_version', 'provider', 'target_platform', 'architecture', 'configuration', 'output_path', 'clean']) {
   assert.ok(fieldIds.includes(field), `表单缺少能力入参：${field}`);

@@ -278,6 +278,7 @@ export type MissionPlanProposal = {
 export type MissionWorkspace = {
     root: string;
     permission_mode?: 'workspace_write' | 'full_access';
+    adjustment_mode?: 'automatic' | 'confirm_changes';
     read_scope: string[];
     write_scope: string[];
 };
@@ -472,6 +473,39 @@ export type MissionSnapshot = {
     events: MissionEvent[];
     cursor: number;
     requires_snapshot?: boolean;
+};
+
+export type MissionMessageInput = {
+  request_id: string;
+  expected_plan_revision: number;
+  expected_plan_sha256: string;
+  kind: 'message' | 'question' | 'instruction';
+  target_task_ids?: string[];
+  message: string;
+};
+export type MissionMessageResult = {
+  request_id: string; status: string; answer: string; plan_revision: number;
+  plan_sha256: string; event_sequence: number; plan_change?: MissionPlanChangeProposal | null;
+};
+export type MissionPlanChangeResult = {
+  request_id: string; status: string; summary: string; plan_revision: number; plan_sha256: string;
+  added_task_ids: string[]; updated_task_ids: string[]; canceled_task_ids: string[];
+  authorization_read_paths: string[]; authorization_write_paths: string[]; event_sequence: number;
+};
+export type MissionPlanTaskUpdate = {
+  task_id: string; priority?: number | null; title?: string | null; objective?: string | null;
+  depends_on?: string[] | null; acceptance_criteria?: string[] | null;
+  required_checks?: string[] | null; role_id?: string | null;
+};
+export type MissionPlanChangeProposal = {
+  mission_id: string; request_id: string; instruction_request_id: string;
+  expected_plan_revision: number; expected_plan_sha256: string; summary: string; rationale: string;
+  added_roles: MissionRoleAssignment[]; added_tasks: MissionTaskSpec[];
+  updates: MissionPlanTaskUpdate[]; cancel_task_ids: string[]; required_acceptance: string[];
+};
+export type MissionPlanChangeApply = {
+  mission_id: string; request_id: string; expected_plan_revision: number; expected_plan_sha256: string;
+  authorization?: { read_paths: string[]; write_paths: string[]; authorized_by: string; reason: string } | null;
 };
 
 export type CatalogPage<T> = {
@@ -3887,6 +3921,8 @@ export const agentApi = {
     assignMissionRoles: (missionId: string, input: MissionAssignmentInput) => invoke<MissionView>('assign_mission_roles', { missionId, input }),
     exportMissionWorkflow: (missionId: string, workflowId: string, version: string, name: string, entrypoint = 'start') =>
         invoke<AuthoringWorkflowDraft>('export_mission_workflow', { missionId, workflowId, version, name, entrypoint }),
+    saveMissionWorkflow: (missionId: string, workflowId: string, version: string, name: string, entrypoint = 'start') =>
+        invoke<{ package: { id: string; version: string; name: string }; package_digest: string }>('save_mission_workflow', { missionId, workflowId, version, name, entrypoint }),
     listMissions: (limit = 50) => invoke<MissionView[]>('list_missions', { limit }),
     getMission: (missionId: string) => invoke<MissionView>('get_mission', { missionId }),
     checkRuntimeWorkspace: (workspace: string) => invoke<RuntimeWorkspaceDiagnosis>('check_runtime_workspace', { workspace }),
@@ -3922,6 +3958,10 @@ export const agentApi = {
     addMissionFollowUpTasks: (missionId: string, tasks: MissionTaskSpec[], reason: string) =>
         invoke<MissionView>('add_mission_follow_up_tasks', { missionId, tasks, reason }),
     missionSnapshot: (missionId: string, afterSequence = 0) => invoke<MissionSnapshot>('get_mission_snapshot', { missionId, afterSequence }),
+    submitMissionMessage: (missionId: string, input: MissionMessageInput) => invoke<MissionMessageResult>('submit_mission_message_ui', { missionId, input }),
+    withdrawMissionInstruction: (missionId: string, requestId: string) => invoke<number>('withdraw_mission_instruction_ui', { missionId, requestId }),
+    applyMissionPlanChange: (input: { mission_id: string; request_id: string; expected_plan_revision: number; expected_plan_sha256: string; read_paths: string[]; write_paths: string[] }) =>
+        invoke<MissionPlanChangeResult>('apply_mission_plan_change_ui', { missionId: input.mission_id, requestId: input.request_id, expectedPlanRevision: input.expected_plan_revision, expectedPlanSha256: input.expected_plan_sha256, readPaths: input.read_paths, writePaths: input.write_paths }),
     dispatchNextMissionTask: (missionId: string) => invoke<{ accepted?: boolean; dispatched?: boolean; task_id?: string; run_id?: string; run_status?: string; mission?: MissionView; reason?: string }>('dispatch_next_mission_task', { missionId }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
     checkUpdate: () => invoke<AgentUpdateStatus>('check_agent_update'),

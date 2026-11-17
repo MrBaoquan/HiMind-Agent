@@ -1407,10 +1407,10 @@ mod tests {
     }
 
     fn git(workspace: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(workspace)
-            .output()?;
+        let mut command = Command::new("git");
+        #[cfg(windows)]
+        command.args(["-c", "core.longpaths=true"]);
+        let output = command.args(args).current_dir(workspace).output()?;
         if !output.status.success() {
             return Err(format!(
                 "git {} failed: {}",

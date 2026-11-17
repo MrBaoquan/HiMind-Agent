@@ -38,6 +38,7 @@ pub(crate) fn input_schema() -> Value {
         "workspace":{"type":"object","properties":{
             "root":{"type":"string","minLength":1},
             "permission_mode":{"enum":["workspace_write","full_access"]},
+            "adjustment_mode":{"enum":["automatic","confirm_changes"]},
             "read_scope":{"type":"array","items":{"type":"string"}},
             "write_scope":{"type":"array","items":{"type":"string"}}
         },"required":["root"],"additionalProperties":false},

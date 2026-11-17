@@ -148,6 +148,18 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
         ));
     }
 
+    // Unlike std::fs, raw Win32 calls do not add extended-length syntax.
+    // Resolve both existing parents so long ordinary/relative paths and UNC
+    // roots use the same canonical directory as the temporary file writes.
+    let source = source.canonicalize()?;
+    let destination = std::path::absolute(destination)?;
+    let destination = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replacement has no parent"))?
+        .canonicalize()?
+        .join(destination.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "replacement has no file name")
+        })?);
     let source_wide = source
         .as_os_str()
         .encode_wide()
@@ -251,5 +263,30 @@ mod tests {
             name.len() <= 64,
             "temporary file name should stay bounded: {name}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_paths_preserve_atomic_replacement_backup_and_restore() {
+        use std::os::windows::ffi::OsStrExt;
+        let root = test_path("long-root").with_extension("");
+        let directory = root
+            .join("中文 long directory-".repeat(6))
+            .join("nested-directory-".repeat(7));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        assert!(path.as_os_str().encode_wide().count() > 260);
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), b"first");
+        assert!(restore_backup(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        FAIL_BEFORE_REPLACE.with(|value| value.set(true));
+        let failed = atomic_write(&path, b"rejected");
+        FAIL_BEFORE_REPLACE.with(|value| value.set(false));
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -39,13 +39,24 @@ impl CheckRuntimeResources {
     /// An isolated implementation and its integrated-source review are distinct
     /// workspace generations. Keep the existing source allocation pinned and
     /// give the host-created execution workspace its own cache allocation.
-    pub(crate) fn prepare_isolated(workspace: &Path, mission_id: &str, task_id: &str) -> Result<Self, Box<dyn Error>> {
-        let workspace=canonical_directory(workspace)?;
-        let home=crate::store::paths::agent_home();
-        let key=format!("{:x}",Sha256::digest(workspace.to_string_lossy().as_bytes()));
-        Self::prepare_in(&workspace,mission_id,task_id,
+    pub(crate) fn prepare_isolated(
+        workspace: &Path,
+        mission_id: &str,
+        task_id: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        let workspace = canonical_directory(workspace)?;
+        let home = crate::store::paths::agent_home();
+        let key = format!(
+            "{:x}",
+            Sha256::digest(workspace.to_string_lossy().as_bytes())
+        );
+        Self::prepare_in(
+            &workspace,
+            mission_id,
+            task_id,
             &home.join("cache/mission-isolated-checks").join(&key[..16]),
-            None)
+            None,
+        )
     }
 
     fn prepare_in(
@@ -82,11 +93,18 @@ impl CheckRuntimeResources {
             Some(path) => read_policy(path, &mut guards)?,
             None => None,
         };
-        if let Some(preferred) = &preferred { reject_control_base(preferred, &allocations)?; }
-        let short_record_path = allocations.join(short_mission).join(format!("{short_task}.json"));
-        let legacy_record_path = allocations.join(&mission_hash).join(format!("{task_hash}.json"));
+        if let Some(preferred) = &preferred {
+            reject_control_base(preferred, &allocations)?;
+        }
+        let short_record_path = allocations
+            .join(short_mission)
+            .join(format!("{short_task}.json"));
+        let legacy_record_path = allocations
+            .join(&mission_hash)
+            .join(format!("{task_hash}.json"));
         let short_record = read_control_json::<StorageAllocation>(&short_record_path, &mut guards)?;
-        let legacy_record = read_control_json::<StorageAllocation>(&legacy_record_path, &mut guards)?;
+        let legacy_record =
+            read_control_json::<StorageAllocation>(&legacy_record_path, &mut guards)?;
         if short_record.is_some() && legacy_record.is_some() {
             return Err("duplicate runtime allocation records for one task".into());
         }
@@ -96,19 +114,24 @@ impl CheckRuntimeResources {
             (None, None) => (short_record_path, None),
             (Some(_), Some(_)) => unreachable!(),
         };
-        let other_roots = registered_task_roots(&base, &allocations, &mission_hash, &task_hash, &mut guards)?;
+        let other_roots =
+            registered_task_roots(&base, &allocations, &mission_hash, &task_hash, &mut guards)?;
         let (root, allocation) = if let Some((record, file)) = existing {
-            if record.version != 1 || record.mission_hash != mission_hash
-                || record.task_hash != task_hash || record.workspace != workspace
+            if record.version != 1
+                || record.mission_hash != mission_hash
+                || record.task_hash != task_hash
+                || record.workspace != workspace
             {
                 return Err("runtime storage allocation identity/workspace mismatch".into());
             }
-            let pinned_base = resolve_future_directory(&ordinary_absolute(&record.base)?, &mut guards)?;
+            let pinned_base =
+                resolve_future_directory(&ordinary_absolute(&record.base)?, &mut guards)?;
             validate_local_disk(&pinned_base)?;
             let root = resolve_future_directory(&ordinary_absolute(&record.root)?, &mut guards)?;
             let expected_short_root = pinned_base.join(short_mission).join(short_task);
             let expected_legacy_root = pinned_base.join(&mission_hash).join(&task_hash);
-            if pinned_base != record.base || root != record.root
+            if pinned_base != record.base
+                || root != record.root
                 || root != expected_short_root && root != expected_legacy_root
             {
                 return Err("runtime storage allocation path mismatch".into());
@@ -122,38 +145,60 @@ impl CheckRuntimeResources {
             if !legacy_exists && short_exists {
                 return Err("unregistered shortened runtime resource directory".into());
             }
-            let selected_base = if legacy_exists { base.clone() } else { preferred.unwrap_or(base.clone()) };
+            let selected_base = if legacy_exists {
+                base.clone()
+            } else {
+                preferred.unwrap_or(base.clone())
+            };
             let selected_short_root = resolve_future_directory(
-                &selected_base.join(short_mission).join(short_task), &mut guards,
+                &selected_base.join(short_mission).join(short_task),
+                &mut guards,
             )?;
             let selected_legacy_root = resolve_future_directory(
-                &selected_base.join(&mission_hash).join(&task_hash), &mut guards,
+                &selected_base.join(&mission_hash).join(&task_hash),
+                &mut guards,
             )?;
-            if !legacy_exists && (directory_exists(&selected_short_root)?
-                || directory_exists(&selected_legacy_root)?)
+            if !legacy_exists
+                && (directory_exists(&selected_short_root)?
+                    || directory_exists(&selected_legacy_root)?)
             {
                 return Err("unregistered runtime resource directory in selected storage".into());
             }
-            let root = if legacy_exists { legacy_legacy_root.clone() } else { selected_short_root };
+            let root = if legacy_exists {
+                legacy_legacy_root.clone()
+            } else {
+                selected_short_root
+            };
             ensure_separate(&root, &workspace)?;
             ensure_separate(&root, &allocations)?;
-            for other in &other_roots { ensure_separate(&root, other)?; }
+            for other in &other_roots {
+                ensure_separate(&root, other)?;
+            }
             let record = StorageAllocation {
-                version: 1, mission_hash, task_hash, workspace: workspace.clone(),
-                base: selected_base, root: root.clone(),
+                version: 1,
+                mission_hash,
+                task_hash,
+                workspace: workspace.clone(),
+                base: selected_base,
+                root: root.clone(),
             };
             control_bytes(&record)?;
             // A previously unallocated alternate root is not ours to adopt.
             // Exclusive creation also prevents two host homes claiming one root.
             if !legacy_exists {
-                guards.extend(checked_directory_chain(root.parent().ok_or("missing root parent")?, true)?);
+                guards.extend(checked_directory_chain(
+                    root.parent().ok_or("missing root parent")?,
+                    true,
+                )?);
                 fs::create_dir(&root)?;
             }
             (root, Some(record))
         };
         ensure_separate(&root, &workspace)?;
         ensure_separate(&root, &allocations)?;
-        for other in &other_roots { ensure_separate(&root, other)?; }
+        for other in &other_roots {
+            ensure_separate(&root, other)?;
+        }
         guards.extend(checked_directory_chain(&root, true)?);
         let root = canonical_directory(&root)?;
         ensure_separate(&root, &workspace)?;
@@ -162,7 +207,10 @@ impl CheckRuntimeResources {
         }
         validate_output_tree(&root)?;
         if let Some(record) = allocation {
-            guards.extend(checked_directory_chain(record_path.parent().ok_or("missing allocation parent")?, true)?);
+            guards.extend(checked_directory_chain(
+                record_path.parent().ok_or("missing allocation parent")?,
+                true,
+            )?);
             atomic_control_json(&record_path, &record, false)?;
             let (_, file) = read_control_json::<StorageAllocation>(&record_path, &mut guards)?
                 .ok_or("runtime storage allocation disappeared")?;
@@ -214,7 +262,11 @@ impl CheckRuntimeResources {
 
     // Bind the caller workspace and validate the entire resource tree once.
     // Required checks previously walked the same build/cache tree twice here.
-    pub(super) fn apply_for_workspace(&self, workspace: &Path, command: &mut Command) -> Result<(), Box<dyn Error>> {
+    pub(super) fn apply_for_workspace(
+        &self,
+        workspace: &Path,
+        command: &mut Command,
+    ) -> Result<(), Box<dyn Error>> {
         self.validate_for_workspace(workspace)?;
         command
             .env("HIMIND_MISSION_CHECK_ROOT", &self.root)
@@ -277,7 +329,9 @@ fn storage_status_in(home: &Path) -> Result<Value, Box<dyn Error>> {
     let default_base = resolve_future_directory(&home.join("cache/mission-checks"), &mut guards)?;
     let policy = read_policy(&home.join("mission-runtime-storage.json"), &mut guards)?;
     let allocations = resolve_future_directory(&default_base.join(".allocations-v1"), &mut guards)?;
-    if let Some(preferred) = &policy { reject_control_base(preferred, &allocations)?; }
+    if let Some(preferred) = &policy {
+        reject_control_base(preferred, &allocations)?;
+    }
     Ok(json!({
         "version": 1,
         "policy_file": home.join("mission-runtime-storage.json"),
@@ -312,11 +366,21 @@ fn configure_storage_in(home: &Path, base: &Path) -> Result<Value, Box<dyn Error
     if previous.as_deref() == Some(base.as_path()) {
         return storage_status_in(&home);
     }
-    let policy = StoragePolicy { version: 1, preferred_base: base.clone() };
+    let policy = StoragePolicy {
+        version: 1,
+        preferred_base: base.clone(),
+    };
     control_bytes(&policy)?;
     guards.extend(checked_directory_chain(&base, true)?);
     let base = canonical_directory(&base)?;
-    atomic_control_json(&policy_path, &StoragePolicy { version: 1, preferred_base: base }, true)?;
+    atomic_control_json(
+        &policy_path,
+        &StoragePolicy {
+            version: 1,
+            preferred_base: base,
+        },
+        true,
+    )?;
     storage_status_in(&home)
 }
 
@@ -336,7 +400,9 @@ fn directory_exists(path: &Path) -> Result<bool, Box<dyn Error>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             verify_kind(&metadata)?;
-            if !metadata.is_dir() { return Err("runtime storage root is not a directory".into()); }
+            if !metadata.is_dir() {
+                return Err("runtime storage root is not a directory".into());
+            }
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -347,28 +413,52 @@ fn directory_exists(path: &Path) -> Result<bool, Box<dyn Error>> {
 /// Inspect only host allocation records and the two-level legacy directory
 /// layout, never build outputs. The caller holds the host allocation lock.
 fn registered_task_roots(
-    default_base: &Path, allocations: &Path, mission: &str, task: &str,
+    default_base: &Path,
+    allocations: &Path,
+    mission: &str,
+    task: &str,
     guards: &mut Vec<fs::File>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let is_hash = |name: &str| matches!(name.len(), RESOURCE_PATH_HASH_LEN | 64)
-        && name.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_hash = |name: &str| {
+        matches!(name.len(), RESOURCE_PATH_HASH_LEN | 64)
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+    };
     let mut roots = std::collections::BTreeSet::new();
     let mut count = 0usize;
     for folder in fs::read_dir(allocations)? {
         let folder = folder?;
-        let name = folder.file_name().to_str().ok_or("invalid allocation name")?.to_owned();
-        if name == ".storage.lock" { continue; }
-        if !is_hash(&name) { return Err("unexpected host allocation entry".into()); }
+        let name = folder
+            .file_name()
+            .to_str()
+            .ok_or("invalid allocation name")?
+            .to_owned();
+        if name == ".storage.lock" {
+            continue;
+        }
+        if !is_hash(&name) {
+            return Err("unexpected host allocation entry".into());
+        }
         guards.extend(checked_directory_chain(&folder.path(), false)?);
         for entry in fs::read_dir(folder.path())? {
             count += 1;
-            if count > 10_000 { return Err("runtime allocation registry exceeds limit".into()); }
+            if count > 10_000 {
+                return Err("runtime allocation registry exceeds limit".into());
+            }
             let entry = entry?;
-            let file_name = entry.file_name().to_str().ok_or("invalid allocation name")?.to_owned();
-            if file_name.strip_prefix(".storage-").and_then(|name| name.strip_suffix(".tmp"))
-                .and_then(|name| name.split_once('-')).is_some_and(|(pid, nonce)| {
-                    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
-                        && nonce.len() == 16 && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+            let file_name = entry
+                .file_name()
+                .to_str()
+                .ok_or("invalid allocation name")?
+                .to_owned();
+            if file_name
+                .strip_prefix(".storage-")
+                .and_then(|name| name.strip_suffix(".tmp"))
+                .and_then(|name| name.split_once('-'))
+                .is_some_and(|(pid, nonce)| {
+                    !pid.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && nonce.len() == 16
+                        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
                 })
             {
                 // Interrupted publication is not an allocation. Preserve it for
@@ -377,13 +467,17 @@ fn registered_task_roots(
                 verify_control_file(&file)?;
                 continue;
             }
-            let task_hash = file_name.strip_suffix(".json").filter(|value| is_hash(value))
+            let task_hash = file_name
+                .strip_suffix(".json")
+                .filter(|value| is_hash(value))
                 .ok_or("unexpected host allocation record")?;
             let (record, _file) = read_control_json::<StorageAllocation>(&entry.path(), guards)?
                 .ok_or("runtime allocation disappeared")?;
-            if record.version != 1 || !record.mission_hash.starts_with(&name)
+            if record.version != 1
+                || !record.mission_hash.starts_with(&name)
                 || !record.task_hash.starts_with(task_hash)
-                || record.mission_hash.len() != 64 || record.task_hash.len() != 64
+                || record.mission_hash.len() != 64
+                || record.task_hash.len() != 64
                 || name.len() == 64 && record.mission_hash != name
                 || task_hash.len() == 64 && record.task_hash != task_hash
             {
@@ -391,31 +485,49 @@ fn registered_task_roots(
             }
             let base = resolve_future_directory(&ordinary_absolute(&record.base)?, guards)?;
             let root = resolve_future_directory(&ordinary_absolute(&record.root)?, guards)?;
-            let short_root = base.join(&record.mission_hash[..RESOURCE_PATH_HASH_LEN])
+            let short_root = base
+                .join(&record.mission_hash[..RESOURCE_PATH_HASH_LEN])
                 .join(&record.task_hash[..RESOURCE_PATH_HASH_LEN]);
             let legacy_root = base.join(&record.mission_hash).join(&record.task_hash);
-            if base != record.base || root != record.root
+            if base != record.base
+                || root != record.root
                 || root != short_root && root != legacy_root
             {
                 return Err("runtime allocation registry path mismatch".into());
             }
-            if record.mission_hash != mission || record.task_hash != task { roots.insert(root); }
+            if record.mission_hash != mission || record.task_hash != task {
+                roots.insert(root);
+            }
         }
     }
     // Legacy tasks have not necessarily been opened since allocation pinning
     // was introduced. Their existing evidence still defines a task boundary.
     for folder in fs::read_dir(default_base)? {
         let folder = folder?;
-        let name = folder.file_name().to_str().ok_or("invalid legacy name")?.to_owned();
+        let name = folder
+            .file_name()
+            .to_str()
+            .ok_or("invalid legacy name")?
+            .to_owned();
         // Shortened roots are trusted only through their full-hash pins above.
-        if name.len() != 64 || !is_hash(&name) { continue; }
+        if name.len() != 64 || !is_hash(&name) {
+            continue;
+        }
         guards.extend(checked_directory_chain(&folder.path(), false)?);
         for entry in fs::read_dir(folder.path())? {
             let entry = entry?;
-            let task_hash = entry.file_name().to_str().ok_or("invalid legacy task")?.to_owned();
-            if !is_hash(&task_hash) { continue; }
+            let task_hash = entry
+                .file_name()
+                .to_str()
+                .ok_or("invalid legacy task")?
+                .to_owned();
+            if !is_hash(&task_hash) {
+                continue;
+            }
             count += 1;
-            if count > 10_000 { return Err("runtime allocation registry exceeds limit".into()); }
+            if count > 10_000 {
+                return Err("runtime allocation registry exceeds limit".into());
+            }
             guards.extend(checked_directory_chain(&entry.path(), false)?);
             if name != mission || task_hash != task {
                 roots.insert(canonical_directory(&entry.path())?);
@@ -429,7 +541,12 @@ fn reject_control_base(base: &Path, allocations: &Path) -> Result<(), Box<dyn Er
     #[cfg(windows)]
     let (base, allocations) = (
         PathBuf::from(base.to_str().ok_or("invalid storage base")?.to_lowercase()),
-        PathBuf::from(allocations.to_str().ok_or("invalid allocations path")?.to_lowercase()),
+        PathBuf::from(
+            allocations
+                .to_str()
+                .ok_or("invalid allocations path")?
+                .to_lowercase(),
+        ),
     );
     if base.starts_with(allocations) {
         return Err("runtime storage base overlaps host allocation control files".into());
@@ -443,8 +560,12 @@ fn control_options(write: bool) -> Result<fs::OpenOptions, Box<dyn Error>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-        options.share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     #[cfg(unix)]
     {
@@ -464,27 +585,36 @@ fn control_options(write: bool) -> Result<fs::OpenOptions, Box<dyn Error>> {
 fn verify_control_file(file: &fs::File) -> Result<(), Box<dyn Error>> {
     let metadata = file.metadata()?;
     verify_kind(&metadata)?;
-    if !metadata.is_file() { return Err("runtime storage control path is not a file".into()); }
+    if !metadata.is_file() {
+        return Err("runtime storage control path is not a file".into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 { return Err("runtime storage control file must have one link".into()); }
+        if metadata.nlink() != 1 {
+            return Err("runtime storage control file must have one link".into());
+        }
     }
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if info.nNumberOfLinks != 1 { return Err("runtime storage control file must have one link".into()); }
+        if info.nNumberOfLinks != 1 {
+            return Err("runtime storage control file must have one link".into());
+        }
     }
     Ok(())
 }
 
 fn read_control_json<T: serde::de::DeserializeOwned>(
-    path: &Path, guards: &mut Vec<fs::File>,
+    path: &Path,
+    guards: &mut Vec<fs::File>,
 ) -> Result<Option<(T, fs::File)>, Box<dyn Error>> {
     let path = ordinary_absolute(path)?;
     // Guard every existing ancestor, even when the file/parent is absent.
@@ -498,7 +628,9 @@ fn read_control_json<T: serde::de::DeserializeOwned>(
     let mut bytes = Vec::new();
     (&file).take(16_385).read_to_end(&mut bytes)?;
     verify_control_file(&file)?;
-    if bytes.len() > 16_384 { return Err("runtime storage control file is too large".into()); }
+    if bytes.len() > 16_384 {
+        return Err("runtime storage control file is too large".into());
+    }
     // Typed serde decoding rejects duplicate fields, unknown fields and wrong types.
     Ok(Some((serde_json::from_slice(&bytes)?, file)))
 }
@@ -513,13 +645,18 @@ fn storage_lock(allocations: &Path) -> Result<StorageLock, Box<dyn Error>> {
     let path = allocations.join(".storage.lock");
     for _ in 0..200 {
         let attempt = (|| -> std::io::Result<fs::File> {
-            let file = control_options(true).map_err(|e| std::io::Error::other(e.to_string()))?
-                .create(true).open(&path)?;
+            let file = control_options(true)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .create(true)
+                .open(&path)?;
             #[cfg(unix)]
             {
                 use std::os::fd::AsRawFd;
-                unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
-                if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 { // LOCK_EX | LOCK_NB
+                unsafe extern "C" {
+                    fn flock(fd: i32, operation: i32) -> i32;
+                }
+                if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+                    // LOCK_EX | LOCK_NB
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -528,10 +665,15 @@ fn storage_lock(allocations: &Path) -> Result<StorageLock, Box<dyn Error>> {
         match attempt {
             Ok(file) => {
                 verify_control_file(&file)?;
-                return Ok(StorageLock { _file: file, _guards: guards });
+                return Ok(StorageLock {
+                    _file: file,
+                    _guards: guards,
+                });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                || cfg!(windows) && matches!(error.raw_os_error(), Some(32) | Some(33)) => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && matches!(error.raw_os_error(), Some(32) | Some(33)) =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => return Err(error.into()),
@@ -543,7 +685,9 @@ fn storage_lock(allocations: &Path) -> Result<StorageLock, Box<dyn Error>> {
 /// Same-directory temporary + atomic publication. Call only under StorageLock.
 fn control_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Box<dyn Error>> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    if bytes.len() > 16_384 { return Err("runtime storage control file is too large".into()); }
+    if bytes.len() > 16_384 {
+        return Err("runtime storage control file is too large".into());
+    }
     Ok(bytes)
 }
 
@@ -551,7 +695,11 @@ fn replace_control(temp: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
     for attempt in 0..200 {
         match fs::rename(temp, path) {
             Ok(()) => return Ok(()),
-            Err(error) if cfg!(windows) && matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33)) && attempt < 199 => {
+            Err(error)
+                if cfg!(windows)
+                    && matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+                    && attempt < 199 =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => return Err(error.into()),
@@ -560,11 +708,19 @@ fn replace_control(temp: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
     unreachable!()
 }
 
-fn atomic_control_json<T: serde::Serialize>(path: &Path, value: &T, replace: bool) -> Result<(), Box<dyn Error>> {
+fn atomic_control_json<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    replace: bool,
+) -> Result<(), Box<dyn Error>> {
     let bytes = control_bytes(value)?;
     let parent = path.parent().ok_or("control file has no parent")?;
     let _guards = checked_directory_chain(parent, false)?;
-    let temp = parent.join(format!(".storage-{}-{:016x}.tmp", std::process::id(), rand::random::<u64>()));
+    let temp = parent.join(format!(
+        ".storage-{}-{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     let mut file = control_options(true)?.create_new(true).open(&temp)?;
     verify_control_file(&file)?;
     // Remove only our own unpublished temporary, never an existing control file/evidence.
@@ -576,11 +732,16 @@ fn atomic_control_json<T: serde::Serialize>(path: &Path, value: &T, replace: boo
     })();
     drop(file);
     let result = result.and_then(|()| {
-        if replace { replace_control(&temp, path)?; }
-        else { publish_allocation(&temp, path)?; }
+        if replace {
+            replace_control(&temp, path)?;
+        } else {
+            publish_allocation(&temp, path)?;
+        }
         Ok(())
     });
-    if result.is_err() { let _ = fs::remove_file(&temp); }
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
     result
 }
 
@@ -591,10 +752,19 @@ fn publish_allocation(temp: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
         use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
         // std::fs adds the verbatim prefix for long paths; raw Win32 calls do
         // not. Keep external resource hints ordinary but publish long pins safely.
-        let temp = r"\\?\".encode_utf16().chain(temp.as_os_str().encode_wide()).chain(Some(0)).collect::<Vec<_>>();
-        let path = r"\\?\".encode_utf16().chain(path.as_os_str().encode_wide()).chain(Some(0)).collect::<Vec<_>>();
+        let temp = r"\\?\"
+            .encode_utf16()
+            .chain(temp.as_os_str().encode_wide())
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let path = r"\\?\"
+            .encode_utf16()
+            .chain(path.as_os_str().encode_wide())
+            .chain(Some(0))
+            .collect::<Vec<_>>();
         // No REPLACE_EXISTING: never overwrite an allocation, even on a race.
-        if unsafe { MoveFileExW(temp.as_ptr(), path.as_ptr(), 0x8) } == 0 { // WRITE_THROUGH
+        if unsafe { MoveFileExW(temp.as_ptr(), path.as_ptr(), 0x8) } == 0 {
+            // WRITE_THROUGH
             return Err(std::io::Error::last_os_error().into());
         }
     }
@@ -615,8 +785,13 @@ fn validate_local_disk(path: &Path) -> Result<(), Box<dyn Error>> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
         let drive = path.ancestors().last().ok_or("storage base has no drive")?;
-        let drive = drive.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
-        if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 { // DRIVE_FIXED; rejects mapped/network/removable drives.
+        let drive = drive
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
+            // DRIVE_FIXED; rejects mapped/network/removable drives.
             return Err("runtime storage requires a fixed local disk".into());
         }
     }
@@ -633,10 +808,18 @@ fn storage_capacity(path: &Path) -> Result<Value, Box<dyn Error>> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let ancestor = path.ancestors().find(|p| p.is_dir()).ok_or("storage has no existing ancestor")?;
-        let path = r"\\?\".encode_utf16().chain(ancestor.as_os_str().encode_wide()).chain(Some(0)).collect::<Vec<_>>();
+        let ancestor = path
+            .ancestors()
+            .find(|p| p.is_dir())
+            .ok_or("storage has no existing ancestor")?;
+        let path = r"\\?\"
+            .encode_utf16()
+            .chain(ancestor.as_os_str().encode_wide())
+            .chain(Some(0))
+            .collect::<Vec<_>>();
         let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
-        if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) } == 0 {
+        if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) } == 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(json!({ "available_bytes": available, "total_bytes": total, "free_bytes": free }))
@@ -654,7 +837,9 @@ fn ordinary_absolute(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => return Err("check resource path contains parent traversal".into()),
+            Component::ParentDir => {
+                return Err("check resource path contains parent traversal".into())
+            }
             Component::CurDir => {}
             #[cfg(windows)]
             Component::Prefix(prefix) => match prefix.kind() {
@@ -674,7 +859,20 @@ fn ordinary_absolute(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
                         || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
                         || ["COM", "LPT"].iter().any(|prefix| {
                             stem.strip_prefix(*prefix).is_some_and(|suffix| {
-                                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+                                matches!(
+                                    suffix,
+                                    "1" | "2"
+                                        | "3"
+                                        | "4"
+                                        | "5"
+                                        | "6"
+                                        | "7"
+                                        | "8"
+                                        | "9"
+                                        | "¹"
+                                        | "²"
+                                        | "³"
+                                )
                             })
                         })
                     {
@@ -710,8 +908,14 @@ fn resolve_future_directory(
                 return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(ancestor.file_name().ok_or("check resource path has no ancestor")?);
-                ancestor = ancestor.parent().ok_or("check resource path has no ancestor")?;
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or("check resource path has no ancestor")?,
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or("check resource path has no ancestor")?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -723,7 +927,12 @@ fn ensure_separate(root: &Path, workspace: &Path) -> Result<(), Box<dyn Error>> 
     #[cfg(windows)]
     let (root, workspace) = (
         PathBuf::from(root.to_str().ok_or("invalid resource path")?.to_lowercase()),
-        PathBuf::from(workspace.to_str().ok_or("invalid workspace path")?.to_lowercase()),
+        PathBuf::from(
+            workspace
+                .to_str()
+                .ok_or("invalid workspace path")?
+                .to_lowercase(),
+        ),
     );
     if root.starts_with(&workspace) || workspace.starts_with(&root) {
         return Err("check resource root must be independent of the workspace".into());
@@ -835,7 +1044,11 @@ pub(super) mod test_support {
             fs::create_dir(&workspace).unwrap();
             fs::write(workspace.join("source.txt"), "confirmed candidate\n").unwrap();
             let cache = root.join("host-cache");
-            Self { root, workspace, cache }
+            Self {
+                root,
+                workspace,
+                cache,
+            }
         }
 
         pub fn prepare(&self) -> CheckRuntimeResources {
@@ -867,7 +1080,11 @@ pub(super) mod test_support {
                 .creation_flags(0x08000000)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -894,30 +1111,61 @@ mod tests {
         let fixture = Fixture::new();
         let mission = "../../mission/with\\separators";
         let task = "../task:untrusted";
-        let first = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, mission, task, &fixture.cache,
-        ).unwrap();
+        let first =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         let root = first.root.clone();
-        assert_eq!(root.parent().unwrap().file_name().unwrap().to_str().unwrap().len(), RESOURCE_PATH_HASH_LEN);
-        assert_eq!(root.file_name().unwrap().to_str().unwrap().len(), RESOURCE_PATH_HASH_LEN);
-        assert!(root.file_name().unwrap().to_str().unwrap().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            root.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .len(),
+            RESOURCE_PATH_HASH_LEN
+        );
+        assert_eq!(
+            root.file_name().unwrap().to_str().unwrap().len(),
+            RESOURCE_PATH_HASH_LEN
+        );
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit()));
         let typical_node_temp = root.join("tmp").join("node-test-temporary-directory-name");
-        assert!(typical_node_temp.to_string_lossy().len() < 240, "{}", typical_node_temp.display());
+        // Bound the suffix we allocate, independently of the host's TEMP base.
+        // A packaged-app or caller-selected base can already exceed MAX_PATH.
+        let suffix = typical_node_temp.strip_prefix(&fixture.cache).unwrap();
+        assert!(suffix.to_string_lossy().len() < 96, "{}", suffix.display());
+        fs::create_dir(&typical_node_temp).unwrap();
+        fs::write(typical_node_temp.join("output.txt"), "actual temp output").unwrap();
         assert!(!root.starts_with(&fixture.workspace));
         assert!(!fixture.workspace.starts_with(&root));
         assert!(root.is_absolute());
         assert!(!root.to_str().unwrap().starts_with(r"\\?\"));
         fs::write(root.join("evidence.json"), "retained").unwrap();
-        let again = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, mission, task, &fixture.cache,
-        ).unwrap();
+        let again =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         assert_eq!(again.root, root);
         let different_task = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, mission, "other-task", &fixture.cache,
-        ).unwrap();
+            &fixture.workspace,
+            mission,
+            "other-task",
+            &fixture.cache,
+        )
+        .unwrap();
         let different_mission = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, "other-mission", task, &fixture.cache,
-        ).unwrap();
+            &fixture.workspace,
+            "other-mission",
+            task,
+            &fixture.cache,
+        )
+        .unwrap();
         assert_ne!(different_task.root, root);
         assert_ne!(different_mission.root, root);
         let input = first.input();
@@ -926,11 +1174,19 @@ mod tests {
         assert_eq!(input["authority"], "host_owned_generated_outputs");
         assert_eq!(input["mission_id"], mission);
         assert_eq!(input["task_id"], task);
-        assert!(input["allowed_operations"].to_string().contains("not business source authorization"));
-        assert!(input["retention"].as_str().unwrap().contains("no automatic deletion"));
+        assert!(input["allowed_operations"]
+            .to_string()
+            .contains("not business source authorization"));
+        assert!(input["retention"]
+            .as_str()
+            .unwrap()
+            .contains("no automatic deletion"));
         assert!(input.get("approved_absolute_paths").is_none());
         drop((first, again, different_task, different_mission));
-        assert_eq!(fs::read_to_string(root.join("evidence.json")).unwrap(), "retained");
+        assert_eq!(
+            fs::read_to_string(root.join("evidence.json")).unwrap(),
+            "retained"
+        );
     }
 
     #[test]
@@ -938,16 +1194,22 @@ mod tests {
         let fixture = Fixture::new();
         let mission = "a mission with a deliberately long identity";
         let task = "a task identity that produces a long runtime path";
-        let first = CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache).unwrap();
+        let first =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         let current_root = first.root.clone();
         let mission_hash = format!("{:x}", Sha256::digest(mission.as_bytes()));
         let task_hash = format!("{:x}", Sha256::digest(task.as_bytes()));
         let allocations = fixture.cache.join(".allocations-v1");
-        let short_record = allocations.join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+        let short_record = allocations
+            .join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
             .join(format!("{}.json", &task_hash[..RESOURCE_PATH_HASH_LEN]));
-        let legacy_record = allocations.join(&mission_hash).join(format!("{task_hash}.json"));
+        let legacy_record = allocations
+            .join(&mission_hash)
+            .join(format!("{task_hash}.json"));
         let legacy_root = fixture.cache.join(&mission_hash).join(&task_hash);
-        let mut record: StorageAllocation = serde_json::from_slice(&fs::read(&short_record).unwrap()).unwrap();
+        let mut record: StorageAllocation =
+            serde_json::from_slice(&fs::read(&short_record).unwrap()).unwrap();
         drop(first);
         fs::remove_dir_all(&current_root).unwrap();
         fs::remove_file(&short_record).unwrap();
@@ -957,7 +1219,9 @@ mod tests {
         checked_directory_chain(legacy_record.parent().unwrap(), true).unwrap();
         atomic_control_json(&legacy_record, &record, false).unwrap();
 
-        let reopened = CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache).unwrap();
+        let reopened =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         assert_eq!(reopened.root, legacy_root);
         assert!(!short_record.exists());
     }
@@ -974,21 +1238,26 @@ mod tests {
         fs::create_dir_all(legacy_root.join("npm-cache")).unwrap();
         fs::write(legacy_root.join("retained.txt"), "legacy evidence").unwrap();
 
-        let first = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, mission, task, &fixture.cache,
-        ).unwrap();
+        let first =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         assert_eq!(first.root, legacy_root);
-        let short_record = fixture.cache.join(".allocations-v1")
+        let short_record = fixture
+            .cache
+            .join(".allocations-v1")
             .join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
             .join(format!("{}.json", &task_hash[..RESOURCE_PATH_HASH_LEN]));
         assert!(short_record.is_file());
         drop(first);
 
-        let reopened = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, mission, task, &fixture.cache,
-        ).unwrap();
+        let reopened =
+            CheckRuntimeResources::prepare_at(&fixture.workspace, mission, task, &fixture.cache)
+                .unwrap();
         assert_eq!(reopened.root, legacy_root);
-        assert_eq!(fs::read_to_string(legacy_root.join("retained.txt")).unwrap(), "legacy evidence");
+        assert_eq!(
+            fs::read_to_string(legacy_root.join("retained.txt")).unwrap(),
+            "legacy evidence"
+        );
     }
 
     #[test]
@@ -997,41 +1266,71 @@ mod tests {
         let file = fixture.root.join("file");
         fs::write(&file, "not a directory").unwrap();
         let internal = fixture.workspace.join("must-not-be-created");
-        for base in [PathBuf::from("relative-cache"), fixture.root.join("../escape"), file, internal.clone()] {
-            assert!(CheckRuntimeResources::prepare_at(&fixture.workspace, "m", "t", &base).is_err());
+        for base in [
+            PathBuf::from("relative-cache"),
+            fixture.root.join("../escape"),
+            file,
+            internal.clone(),
+        ] {
+            assert!(
+                CheckRuntimeResources::prepare_at(&fixture.workspace, "m", "t", &base).is_err()
+            );
         }
         assert!(!internal.exists());
         let mission_hash = format!("{:x}", Sha256::digest(b"m"));
         let task_hash = format!("{:x}", Sha256::digest(b"t"));
-        let task_root = fixture.cache.join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
+        let task_root = fixture
+            .cache
+            .join(&mission_hash[..RESOURCE_PATH_HASH_LEN])
             .join(&task_hash[..RESOURCE_PATH_HASH_LEN]);
         let nested_workspace = task_root.join("nested-workspace");
         fs::create_dir_all(&nested_workspace).unwrap();
         for workspace in [&task_root, &nested_workspace, &fixture.root.join("missing")] {
-            assert!(CheckRuntimeResources::prepare_at(workspace, "m", "t", &fixture.cache).is_err());
+            assert!(
+                CheckRuntimeResources::prepare_at(workspace, "m", "t", &fixture.cache).is_err()
+            );
         }
         assert!(!task_root.join("tmp").exists());
-        assert!(CheckRuntimeResources::prepare_at(&fixture.workspace, "", "t", &fixture.cache).is_err());
+        assert!(
+            CheckRuntimeResources::prepare_at(&fixture.workspace, "", "t", &fixture.cache).is_err()
+        );
     }
 
     #[test]
     fn apply_overrides_child_root_hints_without_changing_parent_environment() {
         let fixture = Fixture::new();
         let keys = [
-            "HIMIND_MISSION_CHECK_ROOT", "SERVICE_UI_RUNTIME_ROOT", "TEMP", "TMP", "TMPDIR",
-            "npm_config_cache", "npm_config_update_notifier", "PYTHONDONTWRITEBYTECODE",
+            "HIMIND_MISSION_CHECK_ROOT",
+            "SERVICE_UI_RUNTIME_ROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "npm_config_cache",
+            "npm_config_update_notifier",
+            "PYTHONDONTWRITEBYTECODE",
         ];
         let before = keys.map(std::env::var_os);
         let resources = fixture.prepare();
         let mut child = Command::new("node");
-        child.env("HIMIND_MISSION_CHECK_ROOT", &fixture.workspace)
+        child
+            .env("HIMIND_MISSION_CHECK_ROOT", &fixture.workspace)
             .env("SERVICE_UI_RUNTIME_ROOT", &fixture.workspace);
-        assert!(resources.apply_for_workspace(&fixture.root, &mut child).is_err());
+        assert!(resources
+            .apply_for_workspace(&fixture.root, &mut child)
+            .is_err());
         resources.apply(&mut child).unwrap();
-        let env = child.get_envs().filter_map(|(key, value)| value.map(|value| (key, value)))
+        let env = child
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(env[std::ffi::OsStr::new("HIMIND_MISSION_CHECK_ROOT")], resources.root.as_os_str());
-        assert_eq!(env[std::ffi::OsStr::new("SERVICE_UI_RUNTIME_ROOT")], resources.root.as_os_str());
+        assert_eq!(
+            env[std::ffi::OsStr::new("HIMIND_MISSION_CHECK_ROOT")],
+            resources.root.as_os_str()
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("SERVICE_UI_RUNTIME_ROOT")],
+            resources.root.as_os_str()
+        );
         assert_eq!(before, keys.map(std::env::var_os));
     }
 
@@ -1044,7 +1343,10 @@ mod tests {
         let redirect = fixture.root.join("redirect");
         redirect_directory(&outside, &redirect);
         let result = CheckRuntimeResources::prepare_at(
-            &fixture.workspace, "m", "t", &redirect.join("missing-cache"),
+            &fixture.workspace,
+            "m",
+            "t",
+            &redirect.join("missing-cache"),
         );
         assert!(result.is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
@@ -1056,16 +1358,29 @@ mod tests {
         let mut child = Command::new("node");
         assert!(resources.apply(&mut child).is_err());
         assert!(CheckRuntimeResources::prepare_at(
-            &fixture.workspace, "mission", "task", &fixture.cache,
-        ).is_err());
+            &fixture.workspace,
+            "mission",
+            "task",
+            &fixture.cache,
+        )
+        .is_err());
         remove_redirect(&redirect);
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_paths_use_ordinary_disk_syntax_and_reject_device_aliases() {
-        assert_eq!(ordinary_absolute(Path::new(r"\\?\C:\safe\root")).unwrap(), Path::new(r"C:\safe\root"));
-        for path in [r"\\server\share\cache", r"\\.\C:\cache", r"C:\cache:stream", r"C:\cache.\root", r"C:\NUL\root"] {
+        assert_eq!(
+            ordinary_absolute(Path::new(r"\\?\C:\safe\root")).unwrap(),
+            Path::new(r"C:\safe\root")
+        );
+        for path in [
+            r"\\server\share\cache",
+            r"\\.\C:\cache",
+            r"C:\cache:stream",
+            r"C:\cache.\root",
+            r"C:\NUL\root",
+        ] {
             assert!(ordinary_absolute(Path::new(path)).is_err(), "{path}");
         }
     }
