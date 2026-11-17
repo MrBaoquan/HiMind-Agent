@@ -638,7 +638,8 @@ impl MissionStore {
         let mut runtime_retry_wait = false;
         if action == "pause" && mission.status == MissionStatus::Waiting {
             for task in &mission.tasks {
-                runtime_retry_wait |= waiting_runtime_verification_retry_on(&transaction, &mission, task)?;
+                runtime_retry_wait |= waiting_runtime_verification_retry_on(&transaction, &mission, task)?
+                    || waiting_review_retry_at_repair_cap_on(&transaction, &mission, task)?;
             }
         }
         let next = match (action, mission.status) {
@@ -5708,7 +5709,10 @@ mod tests {
             assert_eq!(waiting.status,MissionStatus::Waiting);
             let mut request=MissionVerificationRetry {request_id:format!("retry-{case}"),expected_plan_sha256:planned.plan_sha256.clone(),
                 expected_verification_run_id:"review-failed".into(),source_baseline:None,legacy_verification_override:None};
-            if case=="manual-pause" {store.append_event(id,"mission_pause","","user pause",serde_json::json!({"action":"pause"})).unwrap();}
+            if case=="manual-pause" {
+                store.control(id,"pause").unwrap();
+                assert_eq!(store.snapshot(id,0).unwrap().events.last().unwrap().event_type,"mission_pause");
+            }
             if case=="wrong-stop" {store.append_event(id,"budget_exhausted","","unrelated stop",serde_json::json!({"reason":"another stop"})).unwrap();}
             if case=="stale-verifier" {request.expected_verification_run_id="older-review".into();}
             if case=="expired" || case=="extend-time" {
