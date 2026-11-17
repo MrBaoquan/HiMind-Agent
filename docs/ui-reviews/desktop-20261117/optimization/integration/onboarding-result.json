@@ -1,0 +1,17 @@
+{
+  "passed": true,
+  "classification": "Chromium / production React components / mocked host callbacks (not installed-host or provider inference acceptance)",
+  "checks": [
+    "preset minimal path, mixed model configuration, routing unchanged and optional next step",
+    "unknown catalog needs explicit use; vision-only payload remains valid with chat disabled",
+    "multiple media models and default, save failure retains form, duplicate submission guarded",
+    "stale directory cannot overwrite connection; credential change invalidates directory source; protocol clears selection; manual fallback",
+    "edit preserves explicit disabled vision, changed endpoint never queries saved old endpoint",
+    "provider without generic catalog uses explicit template/manual configuration without inference probe",
+    "advanced endpoint validation, custom adapter and account settings remain available",
+    "closed dialog rejects a late directory response after reopening",
+    "normal and narrow viewport rendering"
+  ],
+  "errors": [],
+  "browser": "123.0.2420.20"
+}
