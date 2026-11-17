@@ -275,6 +275,7 @@ enum CapabilityHandler {
     MediaImageEditLocal,
     MediaVideoGenerateLocal,
     MediaProviderCatalogLocal,
+    MediaRoutePlanLocal,
     MediaAudioVoiceListLocal,
     MediaAudioSpeechLocal,
     MediaAudioTranscribeLocal,
@@ -3565,10 +3566,11 @@ impl CapabilityGateway {
             ),
             // 命名规则：`media.*` 属于 Agent 本机能力（用户自己的服务与 Key），
             // 工作台提供的媒体通道统一放在 `workbench.media.*` 下。
-            local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，未连接时同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
-            local_media_registration("media.image.edit", "编辑图片（本机）", "用本机配置的图片模型按参考图改图（图生图）：参考图可以是工作区内的图片路径或上一轮生成结果的 media:<id>；结果落盘并登记 media_id，便于继续多轮修改。不依赖 AI 工作台。", "local_write", media_image_edit_local_schema(), CapabilityHandler::MediaImageEditLocal),
-            local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", media_video_generate_local_schema(), CapabilityHandler::MediaVideoGenerateLocal),
-            local_media_registration("media.provider.catalog", "媒体 Provider 目录", "列出本机 AI 服务、媒体适配器、能力绑定、路由和默认服务；供领域插件按声明式能力依赖读取 Provider 元数据。", "read_only", json!({"type":"object","properties":{},"required":[],"additionalProperties":false}), CapabilityHandler::MediaProviderCatalogLocal),
+            local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，未连接时同样可用。", "local_write", crate::store::ai_selection::extend_schema(media_image_generate_local_schema()), CapabilityHandler::MediaImageGenerateLocal),
+            local_media_registration("media.image.edit", "编辑图片（本机）", "用本机配置的图片模型按参考图改图（图生图）：参考图可以是工作区内的图片路径或上一轮生成结果的 media:<id>；结果落盘并登记 media_id，便于继续多轮修改。不依赖 AI 工作台。", "local_write", crate::store::ai_selection::extend_schema(media_image_edit_local_schema()), CapabilityHandler::MediaImageEditLocal),
+            local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", crate::store::ai_selection::extend_schema(media_video_generate_local_schema()), CapabilityHandler::MediaVideoGenerateLocal),
+            local_media_registration("media.provider.catalog", "媒体 Provider 目录", "列出本机 AI 服务、媒体适配器、能力绑定、路由和默认服务；供领域插件按声明式能力依赖读取 Provider 元数据。", "read_only", media_provider_catalog_schema(), CapabilityHandler::MediaProviderCatalogLocal),
+            local_media_registration("media.route.plan", "预检媒体服务选择", "按能力、服务与模型选择生成本地路由计划，可附带 payload 预检；不发起上游请求、不产生模型费用、不修改全局默认路由。", "read_only", media_route_plan_schema(), CapabilityHandler::MediaRoutePlanLocal),
             local_media_registration(
                 "media.audio.voice.list",
                 "列出语音音色（本机）",
@@ -3589,15 +3591,15 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::MediaAudioVoiceListLocal,
             ),
-            local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", media_audio_speech_local_schema(), CapabilityHandler::MediaAudioSpeechLocal),
-            local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", media_audio_transcribe_local_schema(), CapabilityHandler::MediaAudioTranscribeLocal),
-            local_media_registration("media.ai.describe", "描述图片内容", "使用已接入的多模态模型分析一张本地图片，返回标签、描述与画面质量；用于素材打标、精选评分与 OCR 兜底。", "local_action", media_ai_describe_schema(), CapabilityHandler::MediaAIDescribe),
+            local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", crate::store::ai_selection::extend_schema(media_audio_speech_local_schema()), CapabilityHandler::MediaAudioSpeechLocal),
+            local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", crate::store::ai_selection::extend_schema(media_audio_transcribe_local_schema()), CapabilityHandler::MediaAudioTranscribeLocal),
+            local_media_registration("media.ai.describe", "描述图片内容", "使用已接入的多模态模型分析一张本地图片，返回标签、描述与画面质量；用于素材打标、精选评分与 OCR 兜底。", "local_action", crate::store::ai_selection::extend_schema(media_ai_describe_schema()), CapabilityHandler::MediaAIDescribe),
             local_media_registration("media.image.read", "读取本地图片", "仅读取工作区内图片，将像素作为 MCP image 内容返回当前模型；按文件内容识别格式，不改原始证据，不调用其他模型或网络服务。", "read_only", json!({
                 "type":"object","properties":{"workspace_root":{"type":"string","minLength":1},
                     "path":{"type":"string","minLength":1},"max_edge":{"type":"integer","minimum":128,"maximum":2048}},
                 "required":["workspace_root","path"],"additionalProperties":false
             }), CapabilityHandler::MediaImageRead),
-            local_media_registration("media.ai.tag.batch.start", "后台批量打标", "提交多条素材，Agent 在后台并发调用多模态模型；返回 job_id，可轮询状态、取消或关闭视图后继续。", "local_action", media_ai_tag_batch_start_schema(), CapabilityHandler::MediaAITagBatchStart),
+            local_media_registration("media.ai.tag.batch.start", "后台批量打标", "提交多条素材，Agent 在后台并发调用多模态模型；返回 job_id，可轮询状态、取消或关闭视图后继续。", "local_action", crate::store::ai_selection::extend_schema(media_ai_tag_batch_start_schema()), CapabilityHandler::MediaAITagBatchStart),
             local_media_registration("media.ai.tag.batch.status", "查看批量打标进度", "按 job_id 返回批量打标进度、每条结果、tokens 与错误。", "read_only", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchStatus),
             local_media_registration("media.ai.tag.batch.cancel", "取消批量打标", "取消正在运行的批量视觉打标作业。", "local_write", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchCancel),
             local_media_registration("media.ai.tag.batch.resume", "继续批量打标", "Agent 重启或作业中断后，把未完成条目重新排队继续跑。", "local_action", media_ai_tag_batch_resume_schema(), CapabilityHandler::MediaAITagBatchResume),
@@ -5779,7 +5781,10 @@ impl CapabilityGateway {
                 )
             }
             CapabilityHandler::MediaProviderCatalogLocal => {
-                crate::store::ai_services::media_provider_catalog()
+                crate::store::ai_services::filtered_media_provider_catalog(&input)
+            }
+            CapabilityHandler::MediaRoutePlanLocal => {
+                crate::app::ai_capability_bus::route_plan(&input)
             }
             CapabilityHandler::MediaAudioVoiceListLocal => {
                 crate::app::local_speech::voice_list(&input)
@@ -9696,6 +9701,24 @@ fn media_ai_describe_schema() -> Value {
     })
 }
 
+fn media_provider_catalog_schema() -> Value {
+    json!({"type":"object","properties":{
+        "capability":{"type":"string","description":"能力 ID，如 image.generate 或 media.audio.speech"},
+        "execution_mode":{"type":"string","enum":["sync","stream","async"]},
+        "required_features":{"type":"array","items":{"type":"string"},"maxItems":32},
+        "ready_only":{"type":"boolean","description":"仅返回本机配置可执行的绑定；不表示上游已测健康"}
+    },"additionalProperties":false})
+}
+
+fn media_route_plan_schema() -> Value {
+    crate::store::ai_selection::extend_schema(json!({"type":"object","properties":{
+        "capability":{"type":"string","description":"能力 ID，如 media.image.generate 或 audio.speech"},
+        "service":{"type":"string","maxLength":80},
+        "model":{"type":"string","maxLength":160},
+        "payload":{"type":"object","additionalProperties":true,"description":"可选：按解析出的模型执行本地输入预检"}
+    },"required":["capability"],"additionalProperties":false}))
+}
+
 fn media_image_generate_local_schema() -> Value {
     json!({
         "type": "object",
@@ -9709,12 +9732,12 @@ fn media_image_generate_local_schema() -> Value {
             "service": {
                 "type": "string",
                 "maxLength": 80,
-                "description": "服务源：custom:<id>；留空表示使用当前激活的本机 AI 服务"
+                "description": "服务源：custom:<id>；留空表示跟随该能力的 Agent 默认路由；指定服务时跟随其能力默认模型"
             },
             "model": {
                 "type": "string",
                 "maxLength": 160,
-                "description": "生图模型；留空表示使用服务配置的 image_model"
+                "description": "生图模型；指定后固定该模型，不会被路由默认模型覆盖"
             },
             "size": {
                 "type": "string",
@@ -11882,6 +11905,33 @@ mod tests {
         assert!(path.is_file(), "生成的图片必须落盘：{}", path.display());
         assert!(received.lock().unwrap().contains("/v1/images/generations"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_ai_public_plan_and_catalog_are_local_and_validate_selection() {
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!("himind-plugin-ai-gateway-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway = CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let context = InvocationContext::new(crate::capability::types::InvocationSource::Mcp, "plugin:selection-fixture");
+            let plan = gateway.invoke(&context, "media.route.plan", json!({"capability":"media.audio.speech","selection":{"mode":"agent_default"}}))?;
+            assert_eq!(plan["billable"], false);
+            assert_eq!(plan["state"], "missing");
+            let catalog = gateway.invoke(&context, "media.provider.catalog", json!({"capability":"media.audio.speech","execution_mode":"sync","ready_only":true}))?;
+            assert!(catalog["providers"].as_array().unwrap().is_empty());
+            assert!(gateway.invoke(&context, "media.route.plan", json!({"capability":"image.generate","selection":{"mode":"pinned","service_id":"x","model":"m"},"service":"custom:x"})).is_err());
+            assert!(gateway.invoke(&context, "media.route.plan", json!({"capability":"image.generate","selection":{"mode":"agent_default","model":"unexpected"}})).is_err());
+            assert!(gateway.invoke(&context, "media.provider.catalog", json!({"execution_mode":"imaginary"})).is_err());
+            Ok(())
+        })();
+        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        let _ = std::fs::remove_dir_all(root);
+        result.unwrap();
     }
 
     #[test]

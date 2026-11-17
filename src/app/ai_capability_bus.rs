@@ -28,24 +28,33 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 
 fn request_capability(input: &Value) -> Result<&str, Box<dyn Error>> {
     let capability = string_field(input, "capability").ok_or("capability 不能为空")?;
-    if !ai_services::SUPPORTED_AI_CAPABILITIES.contains(&capability) {
-        return Err(format!(
-            "不支持的能力：{capability}；可选 {}",
-            ai_services::SUPPORTED_AI_CAPABILITIES.join("、")
-        )
-        .into());
-    }
-    Ok(capability)
+    ai_services::normalize_ai_capability(capability)
 }
 
-fn requested_service(input: &Value) -> &str {
-    string_field(input, "service").unwrap_or_default()
-}
-
-/// Return the same explainable route model used by the settings UI.
+/// Local plan and optional payload preflight; no upstream requests.
 pub(crate) fn route_plan(input: &Value) -> Result<Value, Box<dyn Error>> {
     let capability = request_capability(input)?;
-    ai_services::capability_route_plan(capability, requested_service(input))
+    let mut plan = ai_services::capability_selection_plan(capability, input)?;
+    if let Some(payload) = input.get("payload") {
+        if !payload.is_object() {
+            return Err("payload 必须是对象".into());
+        }
+        let checks = plan["attempts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|attempt| {
+                preflight(
+                    capability,
+                    attempt["service_id"].as_str().unwrap_or_default(),
+                    attempt["model"].as_str().unwrap_or_default(),
+                    payload,
+                )
+            })
+            .collect::<Vec<_>>();
+        plan["preflight"] = json!(checks);
+    }
+    Ok(plan)
 }
 
 fn adapter_limits(adapter: &str) -> Value {
@@ -107,7 +116,12 @@ pub(crate) fn preflight(capability: &str, service_id: &str, model: &str, payload
                 checks.push(json!({"id": "binding", "ok": true, "message": binding.adapter}));
                 checks.push(json!({"id": "model", "ok": !binding.model.is_empty(), "message": binding.model}));
                 let modes = json!([binding.execution_mode]);
-                checks.push(json!({"id": "execution_mode", "ok": true, "message": modes}));
+                let supported = ai_services::binding_executable(
+                    capability,
+                    &binding.adapter,
+                    &json!(binding.execution_mode),
+                );
+                checks.push(json!({"id": "execution_mode", "ok": supported, "message": modes}));
                 checks
                     .push(json!({"id": "limits_source", "ok": true, "message": "adapter_catalog"}));
             }
@@ -318,6 +332,9 @@ fn with_attempt(input: &Value, service_id: &str, model: &str) -> Value {
     let mut object = input.as_object().cloned().unwrap_or_default();
     object.insert("service".to_string(), json!(format!("custom:{service_id}")));
     object.remove("capability");
+    object.remove("selection");
+    object.remove("selection_source");
+    object.remove("fallback");
     if model.trim().is_empty() {
         object.remove("model");
     } else {
@@ -333,6 +350,7 @@ fn invoke(capability: &str, payload: &Value) -> Result<Value, Box<dyn Error>> {
         CAP_VIDEO_GENERATE => crate::app::local_video::generate(payload),
         CAP_AUDIO_SPEECH => crate::app::local_speech::speech(payload),
         CAP_AUDIO_TRANSCRIBE => crate::app::local_speech::transcribe(payload),
+        CAP_VISION => crate::app::vision_describe::describe_attempt(payload),
         _ => Err(format!("能力 {capability} 当前没有可执行 adapter").into()),
     }
 }
@@ -361,13 +379,14 @@ fn decorate(
     fallback_used: bool,
     value: Value,
 ) -> Value {
-    let provider_request_id = value
+    let payload = value.get("structuredContent").unwrap_or(&value);
+    let provider_request_id = payload
         .get("provider_request_id")
-        .or_else(|| value.get("request_id"))
-        .or_else(|| value.get("job_id"))
+        .or_else(|| payload.get("request_id"))
+        .or_else(|| payload.get("job_id"))
         .cloned()
         .unwrap_or(Value::Null);
-    let usage = value
+    let usage = payload
         .get("usage")
         .cloned()
         .unwrap_or_else(|| json!({"state": "unknown", "source": "provider_not_reported"}));
@@ -376,6 +395,11 @@ fn decorate(
         map.insert("result".to_string(), value.clone());
         map
     });
+    if let Some(payload) = payload.as_object() {
+        for (key, value) in payload {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
     object.insert("schema_version".to_string(), json!(SCHEMA_VERSION));
     object.insert("request_id".to_string(), json!(request_id));
     object.insert("capability".to_string(), json!(capability));
@@ -383,7 +407,7 @@ fn decorate(
     object.insert("model".to_string(), json!(model));
     object.insert("provider_request_id".to_string(), provider_request_id);
     object.insert("usage".to_string(), usage);
-    object.insert("artifacts".to_string(), json!(artifacts(&value)));
+    object.insert("artifacts".to_string(), json!(artifacts(payload)));
     object.insert("attempts".to_string(), json!(attempts));
     object.insert("fallback_used".to_string(), json!(fallback_used));
     object.insert("warnings".to_string(), json!([]));
@@ -392,7 +416,11 @@ fn decorate(
 
 /// Execute one media capability with an explicit, same-capability fallback path.
 pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Box<dyn Error>> {
-    let plan = ai_services::capability_route_plan(capability, requested_service(input))?;
+    let plan = ai_services::capability_selection_plan(capability, input)?;
+    execute_plan(capability, input, &plan)
+}
+
+fn execute_plan(capability: &str, input: &Value, plan: &Value) -> Result<Value, Box<dyn Error>> {
     let attempts = plan
         .get("attempts")
         .and_then(Value::as_array)
@@ -442,15 +470,35 @@ pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Bo
                 if let Some(last) = attempt_log.last_mut() {
                     last["state"] = json!("succeeded");
                 }
-                return Ok(decorate(
+                let mut result = decorate(
                     capability,
                     service_id,
                     model,
                     &request_id,
                     &attempt_log,
-                    index > 0,
+                    attempt["role"] == "fallback",
                     result,
-                ));
+                );
+                result["requested"] = plan["requested"].clone();
+                result["selection_source"] = plan["selection_source"].clone();
+                result["fallback_policy"] = plan["fallback_policy"].clone();
+                result["selected"] = plan["selected"].clone();
+                result["actual"] = attempt.clone();
+                // Inline MCP results must expose the same envelope to SDK consumers.
+                if result.get("structuredContent").is_some() {
+                    let mut structured = result.as_object().cloned().unwrap_or_default();
+                    structured.remove("content");
+                    structured.remove("structuredContent");
+                    let structured = Value::Object(structured);
+                    if let Some(block) = result["content"]
+                        .as_array_mut()
+                        .and_then(|items| items.iter_mut().find(|block| block["type"] == "text"))
+                    {
+                        block["text"] = json!(serde_json::to_string(&structured)?);
+                    }
+                    result["structuredContent"] = structured;
+                }
+                return Ok(result);
             }
             Err(error) => {
                 last_error = error.to_string();
@@ -477,7 +525,7 @@ pub(crate) fn execute_media(capability: &str, input: &Value) -> Result<Value, Bo
 /// Capability-level self check. Billable media calls require explicit consent.
 pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
     let capability = request_capability(input)?;
-    let plan = ai_services::capability_route_plan(capability, requested_service(input))?;
+    let plan = ai_services::capability_selection_plan(capability, input)?;
     let selected = plan
         .get("selected")
         .and_then(Value::as_object)
@@ -493,35 +541,10 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
         .get("service_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    // 路由计划解析出的模型是权威值。调用方可以指定本次自检的模型，但必须落在
-    // 该服务的模型目录里；否则会绕过「显式模型失效不回落」的判定（ADR 0023）。
-    let planned_model = selected
+    let model = selected
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let requested_model = input
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let model = match requested_model {
-        Some(requested) if requested != planned_model => {
-            let service = ai_services::load_secret(service_id)?.0;
-            if ai_services::capability_models(&service, capability)
-                .iter()
-                .any(|candidate| candidate == requested)
-            {
-                requested
-            } else {
-                return Err(format!(
-                    "服务 {} 在能力 {capability} 下没有模型 {requested}",
-                    service.display_name
-                )
-                .into());
-            }
-        }
-        _ => planned_model,
-    };
+        .ok_or("所选模型不可用")?;
     let confirm_cost = input
         .get("confirm_cost")
         .and_then(Value::as_bool)
@@ -556,7 +579,7 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
             json!({"state": "needs_input", "capability": capability, "service_id": service_id, "preflight": preflight_result, "route": plan}),
         );
     }
-    let result = execute_media(capability, &with_attempt(&payload, service_id, model))?;
+    let result = execute_plan(capability, &payload, &plan)?;
     Ok(
         json!({"state": "accepted", "capability": capability, "service_id": service_id, "model": model, "result": result, "route": plan}),
     )
@@ -887,6 +910,265 @@ mod tests {
             .unwrap();
             assert_eq!(result["state"], "confirmation_required");
             assert_eq!(result["service_id"], "wan");
+        });
+    }
+
+    fn plugin_ai_service(id: &str, base_url: &str, capability: &str, adapter: &str) {
+        let media = std::collections::BTreeMap::from([(
+            capability.to_string(),
+            MediaModelBinding {
+                adapter: adapter.into(),
+                model: "default-model".into(),
+                models: vec!["selected-model".into()],
+                execution_mode: None,
+            },
+        )]);
+        ai_services::upsert(CustomAIServiceInput {
+            id: id.into(),
+            display_name: id.into(),
+            base_url: base_url.into(),
+            protocol: AIServiceProtocol::OpenaiChat,
+            model: "chat".into(),
+            models: vec!["chat".into()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media,
+            api_key: "test-key-never-leaves-localhost".into(),
+            endpoints: vec![],
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn plugin_ai_selection_modes_preserve_model_and_fallback_intent() {
+        with_isolated_home(|| {
+            plugin_ai_service(
+                "a",
+                "http://127.0.0.1:9/v1",
+                CAP_IMAGE_GENERATE,
+                "openai-images",
+            );
+            plugin_ai_service(
+                "b",
+                "http://127.0.0.1:9/v1",
+                CAP_IMAGE_GENERATE,
+                "openai-images",
+            );
+            ai_services::set_capability_routes(
+                CAP_IMAGE_GENERATE,
+                vec![
+                    CapabilityRouteEntry::new("a", "selected-model"),
+                    CapabilityRouteEntry::new("b", ""),
+                ],
+            )
+            .unwrap();
+            let before = ai_services::capability_routes(CAP_IMAGE_GENERATE).unwrap();
+            let plan = |extra: Value| {
+                let mut value = extra;
+                value["capability"] = json!("media.image.generate");
+                route_plan(&value).unwrap()
+            };
+            assert_eq!(plan(json!({}))["selected"]["model"], "selected-model");
+            assert_eq!(
+                plan(json!({"service":"custom:a"}))["selected"]["model"],
+                "default-model"
+            );
+            assert_eq!(
+                plan(json!({"service":"custom:a"}))["attempts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let pinned = plan(json!({"service":"custom:a","model":"default-model"}));
+            assert_eq!(pinned["selected"]["model"], "default-model");
+            assert_eq!(pinned["fallback_policy"], "none");
+            let opted = plan(
+                json!({"selection":{"mode":"pinned","service_id":"a","model":"default-model"},"fallback":"configured","selection_source":"project"}),
+            );
+            assert_eq!(opted["attempts"].as_array().unwrap().len(), 2);
+            assert_eq!(opted["attempts"][1]["model"], "default-model");
+            assert_eq!(opted["selection_source"], "project");
+            assert_eq!(
+                plan(json!({"model":"default-model"}))["selected"]["model"],
+                "default-model"
+            );
+            let stale = plan(json!({"service":"a","model":"deleted"}));
+            assert_eq!(stale["state"], "missing");
+            assert!(stale["attempts"].as_array().unwrap().is_empty());
+            let preview = plan(json!({"payload":{"prompt":"cat"}}));
+            assert_eq!(preview["billable"], false);
+            assert_eq!(preview["preflight"][0]["state"], "ready");
+            let catalog = ai_services::filtered_media_provider_catalog(&json!({"capability":"media.image.generate","execution_mode":"sync","required_features":["text_to_image"],"ready_only":true})).unwrap();
+            assert_eq!(catalog["providers"].as_array().unwrap().len(), 2);
+            assert_eq!(catalog["providers"][0]["health"]["state"], "unknown");
+            assert!(catalog["providers"][0].get("base_url").is_none());
+            assert!(!catalog.to_string().contains("test-key-never"));
+            let stream = ai_services::filtered_media_provider_catalog(
+                &json!({"capability":"image.generate","execution_mode":"stream"}),
+            )
+            .unwrap();
+            assert!(stream["providers"].as_array().unwrap().is_empty());
+            assert_eq!(
+                before,
+                ai_services::capability_routes(CAP_IMAGE_GENERATE).unwrap()
+            );
+        });
+    }
+
+    /// Real HTTP adapter requests against a bounded loopback provider, never a billable endpoint.
+    #[test]
+    fn plugin_ai_image_and_audio_execute_the_exact_preflighted_model() {
+        use std::io::{Read, Write};
+        with_isolated_home(|| {
+            for (capability, adapter, content_type, response) in [
+                (CAP_IMAGE_GENERATE, "openai-images", "application/json", br#"{"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}]}"#.to_vec()),
+                (CAP_AUDIO_SPEECH, "openai-speech", "audio/mpeg", b"ID3test-audio".to_vec()),
+            ] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            Err(error) => panic!("mock provider: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut buf = [0; 4096];
+                        let n = stream.read(&mut buf).unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(header_end) = bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..header_end]);
+                            let length = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())).unwrap();
+                            if bytes.len() >= header_end + 4 + length { break; }
+                        }
+                    }
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                    stream.write_all(&response).unwrap();
+                    String::from_utf8(bytes).unwrap()
+                });
+                plugin_ai_service("local", &format!("http://{address}/v1"), capability, adapter);
+                ai_services::set_capability_routes(capability, vec![CapabilityRouteEntry::new("local", "default-model")]).unwrap();
+                let output = crate::store::paths::agent_home().join(capability);
+                let payload = json!({"service":"custom:local","model":"selected-model","prompt":"cat","text":"hello","output_dir":output,"inline":capability == CAP_IMAGE_GENERATE});
+                let plan = ai_services::capability_selection_plan(capability, &payload).unwrap();
+                let result = execute_media(capability, &payload).unwrap();
+                assert_eq!(result["model"], "selected-model");
+                assert_eq!(result["actual"]["model"], plan["selected"]["model"]);
+                assert_eq!(result["requested"]["selection"]["mode"], "pinned");
+                assert_eq!(result["fallback_used"], false);
+                if capability == CAP_IMAGE_GENERATE {
+                    assert_eq!(result["structuredContent"]["actual"], result["actual"]);
+                    assert_eq!(result["structuredContent"]["artifacts"], result["artifacts"]);
+                    assert!(result["content"].as_array().unwrap().iter().any(|block| block["type"] == "image"));
+                }
+                assert!(!result["artifacts"].as_array().unwrap().is_empty());
+                let request = server.join().unwrap();
+                let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["model"], "selected-model");
+                assert!(body.get("selection").is_none());
+                let invalid = execute_media(capability, &json!({"service":"local","model":"deleted","prompt":"cat","text":"hello"}));
+                assert!(invalid.is_err());
+            }
+        });
+    }
+
+    fn plugin_ai_mock_provider(
+        status: &str,
+        body: Value,
+    ) -> (String, std::thread::JoinHandle<Value>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let payload = loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(end) = bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let size = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + size {
+                        break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + size])
+                            .unwrap();
+                    }
+                }
+            };
+            let response = body.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            payload
+        });
+        (format!("http://{address}/v1"), server)
+    }
+
+    #[test]
+    fn plugin_ai_cross_service_fallback_requires_opt_in_and_uses_its_own_model() {
+        with_isolated_home(|| {
+            let failure = json!({"error":{"message":"quota test-primary-failure"}});
+            let (url, failed) =
+                plugin_ai_mock_provider("500 Internal Server Error", failure.clone());
+            plugin_ai_service("a", &url, CAP_IMAGE_GENERATE, "openai-images");
+            plugin_ai_service(
+                "b",
+                "http://127.0.0.1:9/v1",
+                CAP_IMAGE_GENERATE,
+                "openai-images",
+            );
+            ai_services::set_capability_routes(
+                CAP_IMAGE_GENERATE,
+                vec![
+                    CapabilityRouteEntry::new("a", "default-model"),
+                    CapabilityRouteEntry::new("b", "default-model"),
+                ],
+            )
+            .unwrap();
+            let payload = json!({"selection":{"mode":"pinned","service_id":"a","model":"selected-model"},"prompt":"cat","inline":false,"output_dir":crate::store::paths::agent_home().join("outputs")});
+            let error = execute_media(CAP_IMAGE_GENERATE, &payload)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("test-primary-failure"),
+                "must stop at explicit selection: {error}"
+            );
+            assert_eq!(failed.join().unwrap()["model"], "selected-model");
+            let (url, failed) = plugin_ai_mock_provider("500 Internal Server Error", failure);
+            plugin_ai_service("a", &url, CAP_IMAGE_GENERATE, "openai-images");
+            let (url, succeeded) = plugin_ai_mock_provider(
+                "200 OK",
+                json!({"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}]}),
+            );
+            plugin_ai_service("b", &url, CAP_IMAGE_GENERATE, "openai-images");
+            let mut opted = payload;
+            opted["fallback"] = json!("configured");
+            let result = execute_media(CAP_IMAGE_GENERATE, &opted).unwrap();
+            assert_eq!(result["actual"]["service_id"], "b");
+            assert_eq!(result["actual"]["model"], "default-model");
+            assert_eq!(result["fallback_used"], true);
+            assert_eq!(result["attempts"].as_array().unwrap().len(), 2);
+            assert_eq!(failed.join().unwrap()["model"], "selected-model");
+            assert_eq!(succeeded.join().unwrap()["model"], "default-model");
         });
     }
 }

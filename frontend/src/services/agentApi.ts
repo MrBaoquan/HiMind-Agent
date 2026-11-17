@@ -3670,6 +3670,10 @@ export type MediaProviderCatalogProvider = {
         capability: string;
         adapter: string;
         model: string;
+        models: string[];
+        eligible?: boolean;
+        metadata_scope?: 'adapter' | 'protocol';
+        voice_catalog?: 'supported' | 'unsupported';
         execution_mode: MediaExecutionMode;
         features: string[];
         limits: Record<string, unknown>;

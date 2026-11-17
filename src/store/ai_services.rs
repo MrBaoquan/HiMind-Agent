@@ -764,7 +764,7 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
 /// Built-in adapter metadata. Implementations remain in their domain modules;
 /// this registry is the shared discovery surface for capability routing and UI.
 pub(crate) fn builtin_media_adapters() -> Vec<serde_json::Value> {
-    vec![
+    let mut adapters = vec![
         serde_json::json!({
             "id": "openai-images",
             "capabilities": [CAP_IMAGE_GENERATE],
@@ -846,9 +846,18 @@ pub(crate) fn builtin_media_adapters() -> Vec<serde_json::Value> {
             "pricing": {"status": "published", "source": "provider_catalog", "unit": "audio_hour"},
             "usage": {"status": "reported_in_dashboard", "source": "provider_dashboard"},
         }),
-    ]
+    ];
+    for protocol in ["openai-chat", "openai-responses", "anthropic"] {
+        adapters.push(serde_json::json!({
+            "id":protocol, "capabilities":[CAP_VISION], "execution_modes":[MediaExecutionMode::Sync],
+            "features":["image_input"], "metadata_scope":"protocol",
+            "limits":{"max_edge":1536, "max_output_tokens":2000},
+            "pricing":{"status":"unknown","source":"provider_catalog"},
+            "usage":{"status":"unknown","source":"provider_response"}
+        }));
+    }
+    adapters
 }
-
 fn adapter_for<'a>(adapters: &'a [serde_json::Value], id: &str) -> Option<&'a serde_json::Value> {
     adapters.iter().find(|adapter| adapter["id"] == id)
 }
@@ -897,6 +906,127 @@ fn adapter_execution_modes(
 
 /// A machine-readable snapshot of configured media providers. It never includes
 /// API keys or provider-specific request payloads.
+pub(crate) fn binding_executable(
+    capability: &str,
+    adapter: &str,
+    mode: &serde_json::Value,
+) -> bool {
+    if capability == CAP_CHAT || capability == CAP_VISION {
+        return true;
+    }
+    builtin_media_adapters().iter().any(|item| {
+        item["id"] == adapter
+            && item["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == capability))
+            && item["execution_modes"]
+                .as_array()
+                .is_some_and(|items| items.contains(mode))
+    })
+}
+
+/// Public plugin discovery. Filters only use known adapter metadata; they do not
+/// claim per-model certification, upstream health or a current price.
+pub(crate) fn filtered_media_provider_catalog(
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let capability = input
+        .get("capability")
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_ai_capability)
+        .transpose()?;
+    let mode = input
+        .get("execution_mode")
+        .and_then(serde_json::Value::as_str);
+    if mode.is_some_and(|mode| !["sync", "stream", "async"].contains(&mode)) {
+        return Err("无效的 execution_mode".into());
+    }
+    let features = match input.get("required_features") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().ok_or("required_features 必须是字符串数组"))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("required_features 必须是字符串数组".into()),
+    };
+    let ready_only = input
+        .get("ready_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut catalog = media_provider_catalog()?;
+    if input.as_object().is_some_and(|input| input.is_empty()) { return Ok(catalog); }
+    for provider in catalog["providers"].as_array_mut().unwrap() {
+        // Endpoints and chat model inventories are not needed by plugin media selectors.
+        provider.as_object_mut().unwrap().remove("base_url");
+        provider.as_object_mut().unwrap().remove("models");
+        provider["media_capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|binding| {
+                capability.is_none_or(|cap| binding["capability"] == cap)
+                    && mode.is_none_or(|mode| binding["execution_mode"] == mode)
+                    && (!ready_only || binding["eligible"] == true)
+                    && features.iter().all(|feature| {
+                        binding["features"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().any(|item| item == feature))
+                    })
+            });
+    }
+    catalog["providers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|provider| {
+            !provider["media_capabilities"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        });
+    catalog["routes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|route| capability.is_none_or(|cap| route["capability"] == cap));
+    catalog["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|item| capability.is_none_or(|cap| item["id"] == cap));
+    catalog["adapters"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|adapter| {
+            capability.is_none_or(|cap| {
+                adapter["capabilities"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == cap))
+            }) && mode.is_none_or(|mode| {
+                adapter["execution_modes"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == mode))
+            }) && features.iter().all(|feature| {
+                adapter["features"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == feature))
+            })
+        });
+    // Metadata for filtered entries is scoped; configured_by must not refer to removed providers.
+    let ids = catalog["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|provider| provider["id"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for item in catalog["capabilities"].as_array_mut().unwrap() {
+        item["configured_by"].as_array_mut().unwrap().retain(|id| {
+            id.as_str()
+                .is_some_and(|id| ids.iter().any(|kept| kept == id))
+        });
+        item["configured"] =
+            serde_json::json!(!item["configured_by"].as_array().unwrap().is_empty());
+    }
+    catalog["filters"] = input.clone();
+    Ok(catalog)
+}
+
 pub(crate) fn media_provider_catalog() -> Result<serde_json::Value, Box<dyn Error>> {
     let services = list()?;
     let adapters = builtin_media_adapters();
@@ -905,14 +1035,19 @@ pub(crate) fn media_provider_catalog() -> Result<serde_json::Value, Box<dyn Erro
         .map(|service| {
             let has_api_key = !service.encrypted_api_key.trim().is_empty();
             let health = if has_api_key {
-                serde_json::json!({"state": "ready", "reason": "credential_present"})
+                serde_json::json!({"state": "unknown", "reason": "not_tested"})
             } else {
                 serde_json::json!({"state": "unconfigured", "reason": "missing_credential"})
             };
             let media_capabilities = SUPPORTED_MEDIA_CAPABILITIES
                 .iter()
                 .filter_map(|capability| {
-                    binding_details_for(service, capability).map(|binding| {
+                    let binding = if *capability == CAP_VISION {
+                        capability_models(service, capability).first().map(|model| ResolvedMediaBinding {
+                            adapter: service.protocol.as_str().to_string(), model: model.clone(), execution_mode: MediaExecutionMode::Sync,
+                        })
+                    } else { binding_details_for(service, capability) };
+                    binding.map(|binding| {
                         let adapter = adapter_for(&adapters, &binding.adapter);
                         serde_json::json!({
                             "capability": capability,
@@ -920,6 +1055,10 @@ pub(crate) fn media_provider_catalog() -> Result<serde_json::Value, Box<dyn Erro
                             "model": binding.model,
                             "models": capability_models(service, capability),
                             "execution_mode": binding.execution_mode,
+                            "eligible": has_api_key && binding_executable(capability, &binding.adapter, &serde_json::to_value(binding.execution_mode).unwrap_or_default()),
+                            "eligibility_source": "local_configuration",
+                            "metadata_scope": if *capability == CAP_VISION { "protocol" } else { "adapter" },
+                            "voice_catalog": if binding.adapter == "fish-audio-tts" { "supported" } else { "unsupported" },
                             "features": adapter_field(adapter, "features", serde_json::json!([])),
                             "limits": adapter_field(adapter, "limits", serde_json::json!({})),
                             "health": health,
@@ -1648,70 +1787,98 @@ struct PlannedAttempt<'a> {
 ///
 /// 候选的原子是 (服务, 模型)（ADR 0023）：候选集合按模型目录展开，
 /// `attempts` 按路由表顺序给出真正会依次执行的项。
+pub(crate) fn normalize_ai_capability(capability: &str) -> Result<&str, Box<dyn Error>> {
+    let capability = capability.trim();
+    let capability = if capability == "media.ai.describe" {
+        CAP_VISION
+    } else {
+        capability.strip_prefix("media.").unwrap_or(capability)
+    };
+    if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
+        return Err(format!("不支持的能力：{capability}").into());
+    }
+    Ok(capability)
+}
+
 pub(crate) fn capability_route_plan(
     capability: &str,
     requested_service: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let capability = capability.trim();
-    if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
-        return Err(format!(
-            "不支持的能力：{capability}；可选 {}",
-            SUPPORTED_AI_CAPABILITIES.join("、")
-        )
-        .into());
-    }
+    capability_selection_plan(
+        capability,
+        &serde_json::json!({"service": requested_service}),
+    )
+}
+
+/// One invocation resolver shared by preflight, plugins and execution.
+pub(crate) fn capability_selection_plan(
+    capability: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    use super::ai_selection::{FallbackPolicy, Selection, SelectionRequest};
+    let capability = normalize_ai_capability(capability)?;
+    let request = SelectionRequest::parse(input)?;
     let services = list()?;
     let routes = capability_routes(capability)?;
     let supports = |service: &CustomAIService| !capability_models(service, capability).is_empty();
-    let viable_count = services.iter().filter(|service| supports(service)).count();
-    let requested = requested_service
-        .trim()
-        .strip_prefix("custom:")
-        .unwrap_or(requested_service.trim());
-
-    // 主选在前，其后是路由表里的备用顺序。
     let mut ordered: Vec<CapabilityRouteEntry> = Vec::new();
     let mut reason = "";
-    if !requested.is_empty() {
-        let entry = routes
-            .iter()
-            .find(|entry| entry.service_id == requested)
-            .cloned()
-            .unwrap_or_else(|| CapabilityRouteEntry::new(requested, ""));
-        if !services
-            .iter()
-            .any(|service| service.id == entry.service_id && supports(service))
-        {
-            return Err(format!(
-                "服务 {requested} 不存在或未配置能力 {capability}；请先在 AI 服务中绑定该能力"
-            )
-            .into());
+    match &request.selection {
+        Selection::ServiceDefault { service_id } | Selection::Pinned { service_id, .. } => {
+            if !services
+                .iter()
+                .any(|service| service.id == *service_id && supports(service))
+            {
+                return Err(format!("服务 {service_id} 不存在或未配置能力 {capability}").into());
+            }
+            let model = match &request.selection {
+                Selection::Pinned { model, .. } => model.as_str(),
+                _ => "",
+            };
+            ordered.push(CapabilityRouteEntry::new(service_id, model));
+            reason = "explicit_request";
         }
-        ordered.push(entry);
+        Selection::AgentDefault => {
+            if !routes.is_empty() {
+                ordered = routes.clone();
+                reason = if capability == CAP_CHAT {
+                    "active_service"
+                } else {
+                    "configured_default"
+                };
+            } else {
+                let viable = services
+                    .iter()
+                    .filter(|service| supports(service))
+                    .collect::<Vec<_>>();
+                if let [only] = viable.as_slice() {
+                    ordered.push(CapabilityRouteEntry::new(&only.id, ""));
+                    reason = "only_candidate";
+                }
+            }
+            // Legacy model-only requests pin the resolved primary, never a random candidate.
+            if let Some(model) = &request.legacy_model {
+                if let Some(primary) = ordered.first_mut() {
+                    primary.model = model.clone();
+                }
+                reason = "explicit_model";
+            }
+        }
+    }
+    if request.fallback == FallbackPolicy::None {
+        ordered.truncate(1);
+    } else if request.selection != Selection::AgentDefault {
+        let primary = ordered.first().cloned();
         ordered.extend(
             routes
                 .iter()
-                .filter(|entry| entry.service_id != requested)
+                .filter(|entry| {
+                    primary
+                        .as_ref()
+                        .is_none_or(|p| p.service_id != entry.service_id)
+                })
                 .cloned(),
         );
-        reason = "explicit_request";
-    } else if !routes.is_empty() {
-        ordered = routes.clone();
-        reason = if capability == CAP_CHAT {
-            "active_service"
-        } else {
-            "configured_default"
-        };
-    } else {
-        // 没有显式路由时，唯一候选可以直接用。
-        let viable = services
-            .iter()
-            .filter(|service| supports(service))
-            .collect::<Vec<_>>();
-        if let [only] = viable.as_slice() {
-            ordered.push(CapabilityRouteEntry::new(&only.id, ""));
-            reason = "only_candidate";
-        }
     }
 
     let planned = ordered
@@ -1731,7 +1898,15 @@ pub(crate) fn capability_route_plan(
     // `attempts` 只保留能真正执行的项：模型可用且有凭据。
     let attempts = planned
         .iter()
-        .filter(|attempt| attempt.model.is_some() && credential_ready(attempt.service))
+        .filter(|attempt| {
+            attempt.model.is_some()
+                && credential_ready(attempt.service)
+                && binding_executable(
+                    capability,
+                    &attempt.adapter,
+                    &serde_json::json!(attempt.execution_mode),
+                )
+        })
         .map(|attempt| {
             serde_json::json!({
                 "service_id": attempt.service.id,
@@ -1767,12 +1942,20 @@ pub(crate) fn capability_route_plan(
                     "model_unavailable"
                 } else if !credential {
                     "missing_credential"
+                } else if !binding_executable(capability, &attempt.adapter, &serde_json::json!(attempt.execution_mode)) {
+                    "unsupported_execution_mode"
                 } else if attempt.role == "primary" {
                     reason
                 } else {
                     "configured_fallback"
                 },
-                eligible && credential,
+                eligible
+                    && credential
+                    && binding_executable(
+                        capability,
+                        &attempt.adapter,
+                        &serde_json::json!(attempt.execution_mode),
+                    ),
             )
         })
         .collect::<Vec<_>>();
@@ -1798,7 +1981,8 @@ pub(crate) fn capability_route_plan(
                 } else {
                     "missing_credential"
                 },
-                credential,
+                credential
+                    && binding_executable(capability, &adapter, &serde_json::json!(execution_mode)),
             ));
         }
     }
@@ -1818,7 +2002,10 @@ pub(crate) fn capability_route_plan(
         "missing"
     };
     let plan_reason = if primary_model_ready {
-        reason
+        let primary = &planned[0];
+        if !credential_ready(primary.service) { "missing_credential" }
+        else if !binding_executable(capability, &primary.adapter, &serde_json::json!(primary.execution_mode)) { "unsupported_execution_mode" }
+        else { reason }
     } else if candidates.is_empty() {
         "no_candidate"
     } else if planned.is_empty() {
@@ -1834,6 +2021,7 @@ pub(crate) fn capability_route_plan(
             "model": attempt.model,
             "model_source": attempt.model_source,
             "execution_mode": attempt.execution_mode,
+            "eligible": attempt.model.is_some() && credential_ready(attempt.service) && binding_executable(capability, &attempt.adapter, &serde_json::json!(attempt.execution_mode)),
         })
     });
     let fallbacks = planned
@@ -1849,7 +2037,6 @@ pub(crate) fn capability_route_plan(
         })
         .collect::<Vec<_>>();
 
-    let _ = viable_count;
     Ok(serde_json::json!({
         "schema_version": "himind.ai-capability-route.v2",
         "capability": capability,
@@ -1860,7 +2047,11 @@ pub(crate) fn capability_route_plan(
         "attempts": attempts,
         "candidates": candidates,
         "requires_cost_confirmation": capability != CAP_CHAT,
-        "fallback_policy": "same_capability_only",
+        "fallback_policy": request.fallback,
+        "requested": request,
+        "selection_source": request.source,
+        "billable": false,
+        "health": {"state":"unknown", "reason":"not_tested_by_local_plan"},
     }))
 }
 
@@ -3509,7 +3700,14 @@ mod tests {
                 .iter()
                 .find(|item| item["id"] == "voice")
                 .unwrap();
-            assert_eq!(voice["health"]["state"], "ready");
+            assert_eq!(voice["health"]["state"], "unknown");
+            assert_eq!(voice["health"]["reason"], "not_tested");
+            let speech = voice["media_capabilities"].as_array().unwrap().iter().find(|binding| binding["capability"] == CAP_AUDIO_SPEECH).unwrap();
+            assert_eq!(speech["eligible"], false, "sync-only adapter cannot execute configured stream mode");
+            let filtered = super::filtered_media_provider_catalog(&serde_json::json!({"capability":"media.ai.describe","execution_mode":"sync","ready_only":true})).unwrap();
+            assert_eq!(filtered["providers"][0]["media_capabilities"][0]["model"], "chat");
+            assert_eq!(filtered["providers"][0]["media_capabilities"][0]["metadata_scope"], "protocol");
+            assert_eq!(filtered["providers"][0]["media_capabilities"][0]["eligible"], true);
             let binding = &voice["media_capabilities"][0];
             assert!(binding["features"]
                 .as_array()

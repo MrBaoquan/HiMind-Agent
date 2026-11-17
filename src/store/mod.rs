@@ -4,6 +4,7 @@ pub(crate) mod ai_capability_observations;
 pub(crate) mod ai_route_health;
 pub(crate) mod ai_service_balances;
 pub(crate) mod ai_services;
+pub(crate) mod ai_selection;
 pub(crate) mod approval_outbox;
 pub(crate) mod atomic_file;
 pub(crate) mod backup_crypto;

@@ -1494,6 +1494,19 @@ pub(crate) fn plugin_view_entry(
     Ok(Some((plugin, view, entry)))
 }
 
+/// Host-owned SDK assets do not grant capabilities; invocation still checks the view manifest.
+pub(crate) fn embedded_plugin_sdk_resource(url: &url::Url) -> Result<Option<&'static [u8]>, Box<dyn Error>> {
+    if !is_plugin_ui_origin(url) { return Err("invalid plugin UI resource origin".into()); }
+    let segments = url.path_segments().ok_or("missing plugin UI path")?.collect::<Vec<_>>();
+    if segments.len() != 5 || segments[2] != "_himind" || segments[3] != "ai-v1" { return Ok(None); }
+    if plugin_view_entry(segments[0], segments[1])?.is_none() { return Err("plugin UI view is unavailable".into()); }
+    match segments[4] {
+        "client.mjs" => Ok(Some(include_bytes!("../../integrations/plugin-ai/client.mjs"))),
+        "service-selector.mjs" => Ok(Some(include_bytes!("../../integrations/plugin-ai/service-selector.mjs"))),
+        _ => Err("unknown plugin SDK resource".into()),
+    }
+}
+
 pub(crate) fn resolve_plugin_ui_resource(
     url: &url::Url,
 ) -> Result<(PathBuf, &'static str), Box<dyn Error>> {
@@ -1519,7 +1532,7 @@ pub(crate) fn resolve_plugin_ui_resource(
     let content_type = match resource.extension().and_then(|value| value.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
@@ -4118,6 +4131,43 @@ mod view_external_capability_tests {
             entry: "ui/index.html".to_string(),
             external_capabilities: patterns.iter().map(|item| item.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn plugin_ai_embedded_sdk_requires_a_real_enabled_view() {
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!("himind-plugin-ai-assets-{}", std::process::id()));
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let plugin = root.join("plugins").join("com.test.ai-assets");
+        fs::create_dir_all(plugin.join("current/ui")).unwrap();
+        fs::write(plugin.join("current/ui/index.html"), "<html></html>").unwrap();
+        fs::write(plugin.join("current/plugin.exe"), "fixture never executed").unwrap();
+        fs::write(plugin.join("current/plugin.json"), serde_json::to_vec(&serde_json::json!({
+            "id":"com.test.ai-assets","name":"服务选择测试","author":"测试","description":"仅测试宿主资源","release_notes":"验证资源","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","capabilities":[],"permissions":[],
+            "contributes":{"views":[{"id":"main","title":"测试","entry":"ui/index.html","external_capabilities":["media.provider.catalog","media.route.plan"]}]}
+        })).unwrap()).unwrap();
+        let url = url::Url::parse("http://plugin-ui.localhost/com.test.ai-assets/main/_himind/ai-v1/client.mjs").unwrap();
+        let bytes = embedded_plugin_sdk_resource(&url).unwrap().expect("embedded SDK");
+        assert!(std::str::from_utf8(bytes).unwrap().contains("createAiClient"));
+        assert!(embedded_plugin_sdk_resource(&url::Url::parse("https://example.com/com.test.ai-assets/main/_himind/ai-v1/client.mjs").unwrap()).is_err());
+        assert!(embedded_plugin_sdk_resource(&url::Url::parse("http://plugin-ui.localhost/com.test.ai-assets/missing/_himind/ai-v1/client.mjs").unwrap()).is_err());
+        fs::write(plugin.join("disabled"), "disabled").unwrap();
+        assert!(embedded_plugin_sdk_resource(&url).is_err());
+        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_ai_discovery_permissions_do_not_grant_execution_or_management() {
+        let view = view(&["media.provider.catalog", "media.route.plan"]);
+        assert!(view_can_invoke_external(&view, "media.provider.catalog"));
+        assert!(view_can_invoke_external(&view, "media.route.plan"));
+        assert!(!view_can_invoke_external(&view, "media.image.generate"));
+        assert!(!view_can_invoke_external(&view, "ai.service.list"));
+        assert!(!view_can_invoke_external(&view, "ai.service.image.set"));
+        assert!(validate_external_capability_pattern("media.route.plan").is_ok());
+        assert!(validate_external_capability_pattern("media.provider.catalog").is_ok());
     }
 
     #[test]
