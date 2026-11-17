@@ -163,7 +163,8 @@ assert.ok(aiTabs.includes("routes: '能力路由'"), 'aiConnectionsTabs 必须�
 assert.ok(/<PageHeader title="AI 连接" description=\{AI_CONNECTIONS_DESCRIPTION\}/.test(aiPage), 'AI 连接页头要带说明，与其他设置面板一致');
 assert.ok(/AI_CONNECTIONS_TAB_LABELS\.services/.test(builtinAi), '对话页指路到 AI 服务页签时要取同一个标签常量，不能自己写死一个词');
 assert.ok(!/media\.[a-z]/.test(aiProviders), '用户可见文案里不能出现 media.* 这类内部能力 ID');
-assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有可用的 AI 服务'), '「模型」接线在一条可用来源都没有时要说明缺什么');
+assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有 Agent 模型来源'), '「模型」接线在没有 Agent 来源时要说明缺什么');
+assert.ok(aiTools.includes('可直接使用客户端原生账号'), '没有 Agent 来源时仍应说明客户端原生账号入口可用');
 assert.ok(/onOpenModelSources=\{\(\) => setActiveTab\('services'\)\}/.test(aiPage), '「新增模型来源」要能直接切到模型来源页签');
 assert.ok(/hasAnySource/.test(aiTools), '一条来源都没有时，工具接入页要在列表之前说明并给出入口');
 assert.ok(/AiServiceRoutesPanel/.test(aiPage), '能力路由必须从 AI 服务页独立出来');

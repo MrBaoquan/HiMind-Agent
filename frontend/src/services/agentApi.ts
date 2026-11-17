@@ -3528,7 +3528,25 @@ export type CustomAIService = {
     updated_at: string;
 };
 
+export type AIClientSourceStatus = {
+    capabilities: { registration_effect: string; native_account: boolean; select_default: boolean; selection_hint: string; load_hint: string };
+    registered: boolean;
+    managed: boolean;
+    configured_source: 'agent' | 'native_provider' | 'other_provider' | 'client_managed' | 'unknown';
+    default_model: string;
+    auth_status: string;
+    effective_status: string;
+    scope: string;
+    config_path: string;
+    can_restore: boolean;
+    warnings: string[];
+};
+export type AIClientSourceRequest = { target: string; action: 'native_account' | 'restore_previous' | 'set_default'; model?: string; expected_revision?: string; accept_drift?: boolean };
+export type AIClientSourcePlan = { target: string; action: AIClientSourceRequest['action']; revision: string; config_path: string; scope: string; changes: string[]; warnings: string[]; conflict: boolean; detail: string; load_hint: string };
+export type AIClientSourceResult = { ok: boolean; detail: string; load_hint: string; effective_status: string; auth_status: string; warnings: string[] };
+
 export type AIProviderImportStatus = {
+    source?: AIClientSourceStatus;
     target: string;
     state: string;
     client_detected: boolean;
@@ -4330,6 +4348,8 @@ export const agentApi = {
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
+    planAIClientSource: (input: AIClientSourceRequest) => invoke<AIClientSourcePlan>('plan_ai_client_source', { input }),
+    applyAIClientSource: (input: AIClientSourceRequest) => invoke<AIClientSourceResult>('apply_ai_client_source', { input }),
     planAIClientSync: (target: string) => invoke<AIProviderSyncPlan>('plan_ai_client_sync', { target }),
     syncAIClient: (target: string, expectedRevision?: string, acceptDrift?: boolean) => invoke<AIProviderSyncResult>('sync_ai_client', { target, expectedRevision, acceptDrift }),
     syncAIClients: () => invoke<AIProviderSyncAllResult>('sync_ai_clients'),

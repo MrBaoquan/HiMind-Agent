@@ -6265,3 +6265,9 @@ img { outline: 1px solid rgba(0, 0, 0, .1); outline-offset: -1px; }
   .mission-detail *, .collaboration-budget-dialog * { animation: none !important; transition-property: opacity !important; transition-duration: 100ms !important; }
   .mission-stage-rail > div.is-running > span::after { animation: none !important; }
 }
+
+.ai-client-source { padding: 12px; border-top: 1px solid var(--border); min-width: 0; }
+.ai-client-source-summary, .ai-client-source-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ai-client-source p { margin: 6px 0; overflow-wrap: anywhere; }
+.ai-client-source details { margin-top: 8px; color: var(--text-muted); font-size: 12px; }
+.ai-client-source select { max-width: 100%; }

@@ -19,6 +19,7 @@
     "check:extension-activation-status": "node --experimental-strip-types scripts/check-extension-activation-status.mts",
     "check:development-local-only": "node --experimental-strip-types scripts/check-development-local-only.mts",
     "check:ai-service-onboarding": "node --experimental-strip-types scripts/check-ai-service-onboarding.mts",
+    "check:ai-client-source-browser": "node scripts/check-ai-client-source.browser.mjs",
     "check:ai-service-onboarding-browser": "node scripts/check-ai-service-onboarding.browser.mjs",
     "check:ai-service-presets": "node --experimental-strip-types scripts/check-ai-service-presets.mts",
     "check:ai-balance-matching": "node --experimental-strip-types scripts/check-ai-balance-matching.mts",

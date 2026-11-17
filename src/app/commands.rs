@@ -3783,6 +3783,28 @@ pub(crate) fn remove_ai_client(
 }
 
 #[tauri::command]
+pub(crate) fn plan_ai_client_source(
+    state: State<'_, AgentState>,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state
+        .capability_gateway
+        .invoke(&InvocationContext::tauri(), "ai.client.source.plan", input)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn apply_ai_client_source(
+    state: State<'_, AgentState>,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state
+        .capability_gateway
+        .invoke(&InvocationContext::tauri(), "ai.client.source.apply", input)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn plan_ai_client_sync(
     state: State<'_, AgentState>,
     target: String,

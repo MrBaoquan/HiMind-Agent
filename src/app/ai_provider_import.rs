@@ -21,6 +21,8 @@ use url::Url;
 use std::os::windows::process::CommandExt;
 
 use crate::api::ai::{fetch_client_credential, fetch_managed_service_revision, AIClientCredential};
+
+pub(crate) mod client_source;
 use crate::app::ai_clients::{backup_and_write, workbuddy_executable_exists};
 use crate::store::ai_services::{AIServiceEndpoint, AIServiceProtocolFamily, CustomAIService};
 use crate::Options;
@@ -136,6 +138,9 @@ impl AIProviderImportRequest {
 pub(crate) trait AIClientAdapter {
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
+    fn source_capabilities(&self) -> client_source::ClientSourceCapabilities {
+        client_source::capabilities(self.id())
+    }
     fn status(&self, options: &Options) -> AIProviderImportStatus;
     fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan;
     fn import(
@@ -499,12 +504,20 @@ impl AIClientAdapter for OpenCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_opencode(options, user_id, service)
     }
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        let path = opencode_config_path();
+        if !path.exists() {
+            return Some(json!({ "model": null }));
+        }
+        let root = read_opencode_config(&path)?;
+        Some(json!({ "model": root.get("model") }))
+    }
     fn cancel(
         &self,
         _options: &Options,
-        _restore: Option<&Value>,
+        restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_opencode()
+        cancel_opencode(restore)
     }
     fn managed_fields(&self, _options: &Options) -> Option<ManagedFields> {
         opencode_current_managed_fields().ok().flatten()
@@ -876,6 +889,8 @@ pub(crate) struct AIClientBindingReport {
 
 #[derive(Debug, Serialize, Default)]
 pub(crate) struct AIProviderImportStatus {
+    /// Configuration observations are separate from account authentication and live session state.
+    pub source: client_source::ClientSourceStatus,
     pub target: String,
     pub state: String,
     pub client_detected: bool,
@@ -2898,6 +2913,11 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                         }
                     }
                 }
+                status.source = client_source::observe(
+                    adapter,
+                    &status,
+                    bindings.clients.get(status.target.as_str()),
+                );
                 status
             })
             .collect(),
@@ -4404,7 +4424,7 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         detail: if imported && models.is_empty() && catalog_configured {
             "检测到 Codex 已配置 HiMind 供应商，但缺少模型目录（himind-models.json）；重新导入可自动重建".to_string()
         } else if imported && models.is_empty() {
-            "已配置 HiMind 供应商，沿用 Codex 内置模型目录（官方模型能力保持完整）".to_string()
+            "已配置 HiMind 供应商，沿用 Codex 内置模型目录；推理由所选服务提供".to_string()
         } else if imported {
             format!(
                 "已写入 {} 个 HiMind 模型；重启 Codex 后可在 /model 选择",
@@ -4487,7 +4507,11 @@ fn read_codex_managed_models(
 /// 而不是删掉 —— 否则用户自选的模型与推理档位会被永久改成 HiMind 的默认值。
 fn codex_owned_snapshot() -> Option<Value> {
     let config_file = codex_config_path().join("config.toml");
-    let text = fs::read_to_string(&config_file).ok()?;
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return None,
+    };
     Some(json!({ "config": text }))
 }
 
@@ -4568,7 +4592,6 @@ fn strip_codex_himind(
     let mut document = config.parse::<DocumentMut>()?;
     let previous_document = previous
         .map(str::trim)
-        .filter(|text| !text.is_empty())
         .and_then(|text| text.parse::<DocumentMut>().ok());
     let Some(previous_document) = previous_document else {
         return strip_codex_himind_conservative(document, models_path);
@@ -6944,7 +6967,9 @@ fn opencode_import_status() -> AIProviderImportStatus {
     }
 }
 
-fn cancel_opencode() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+fn cancel_opencode(
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let path = opencode_config_path();
     let client_detected = opencode_client_detected(&path);
     let original = if path.is_file() {
@@ -6952,7 +6977,7 @@ fn cancel_opencode() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     } else {
         String::new()
     };
-    let (updated, removed) = strip_opencode_himind(&original)?;
+    let (updated, removed) = strip_opencode_himind_with_restore(&original, restore)?;
     let backup = if removed {
         backup_and_write(&path, updated.as_bytes())?
     } else {
@@ -6973,6 +6998,36 @@ fn cancel_opencode() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
     })
+}
+
+fn strip_opencode_himind_with_restore(
+    original: &str,
+    restore: Option<&Value>,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let (mut updated, mut removed) = strip_opencode_himind(original)?;
+    if !updated.trim().is_empty() {
+        let mut root: Value = serde_json::from_str(&updated)?;
+        if root
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model.starts_with("himind/"))
+        {
+            match restore
+                .and_then(|value| value.get("model"))
+                .filter(|value| !value.is_null())
+            {
+                Some(model) => {
+                    root["model"] = model.clone();
+                }
+                None => {
+                    root.as_object_mut().unwrap().remove("model");
+                }
+            }
+            updated = format!("{}\n", serde_json::to_string_pretty(&root)?);
+            removed = true;
+        }
+    }
+    Ok((updated, removed))
 }
 
 // 只移除 HiMind 明确写入的 provider.himind，其他供应商与用户配置原样保留。

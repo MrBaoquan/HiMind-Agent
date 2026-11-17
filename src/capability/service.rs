@@ -143,6 +143,8 @@ enum CapabilityHandler {
     AIClientSyncPlan,
     AIClientSync,
     AIClientSyncAll,
+    AIClientSourcePlan,
+    AIClientSourceApply,
     AIServiceList,
     AIServiceCustomUpsert,
     AIServiceCustomRemove,
@@ -817,6 +819,42 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::AIClientRemovePlan,
+            ),
+            registration(
+                "ai.client.source.plan",
+                "预览客户端来源切换",
+                "区分原生账号、历史恢复和默认模型；只修改选定客户端配置。账号认证与实际会话生效由客户端验证。apply 必须携带 plan 的 revision。",
+                "read_only",
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "action": { "type": "string", "enum": ["native_account", "restore_previous", "set_default"] },
+                        "model": { "type": "string" },
+                        "expected_revision": { "type": "string" },
+                        "accept_drift": { "type": "boolean", "default": false }
+                    },
+                    "required": ["target", "action"]
+                }),
+                CapabilityHandler::AIClientSourcePlan,
+            ),
+            registration(
+                "ai.client.source.apply",
+                "应用客户端来源切换",
+                "区分原生账号、历史恢复和默认模型；只修改选定客户端配置。账号认证与实际会话生效由客户端验证。apply 必须携带 plan 的 revision。",
+                "local_write",
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "action": { "type": "string", "enum": ["native_account", "restore_previous", "set_default"] },
+                        "model": { "type": "string" },
+                        "expected_revision": { "type": "string" },
+                        "accept_drift": { "type": "boolean", "default": false }
+                    },
+                    "required": ["target", "action", "expected_revision"]
+                }),
+                CapabilityHandler::AIClientSourceApply,
             ),
             registration(
                 "ai.client.sync.plan",
@@ -5096,6 +5134,16 @@ impl CapabilityGateway {
                     &request.target,
                     "remove",
                 )?)?)
+            }
+            CapabilityHandler::AIClientSourcePlan => {
+                let request = serde_json::from_value(input)?;
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::client_source::plan(&self.options, &request)?,
+                )?)
+            }
+            CapabilityHandler::AIClientSourceApply => {
+                let request = serde_json::from_value(input)?;
+                crate::app::ai_provider_import::client_source::apply(&self.options, &request)
             }
             CapabilityHandler::AIClientSyncPlan => {
                 let request: crate::app::ai_provider_import::AIProviderSyncRequest =
@@ -11739,6 +11787,31 @@ mod tests {
                 .map(|value| value.as_str().unwrap().to_string())
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "target enum drifted for {capability_id}");
+        }
+    }
+
+    #[test]
+    fn ai_client_source_operations_share_public_gateway_contract() {
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.registry().unwrap();
+        for (name, risk) in [
+            ("ai.client.source.plan", "read_only"),
+            ("ai.client.source.apply", "local_write"),
+        ] {
+            let item = &registry[name].descriptor;
+            assert_eq!(item.risk_level, risk);
+            assert_eq!(
+                item.input_schema["properties"]["action"]["enum"],
+                json!(["native_account", "restore_previous", "set_default"])
+            );
+            assert_eq!(item.input_schema["additionalProperties"], false);
+            assert_eq!(
+                item.input_schema["properties"]["target"]["enum"],
+                json!(crate::app::ai_provider_import::known_adapter_ids())
+            );
         }
     }
 

@@ -638,6 +638,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_ai_service,
             super::commands::import_ai_client,
             super::commands::remove_ai_client,
+            super::commands::plan_ai_client_source,
+            super::commands::apply_ai_client_source,
             super::commands::plan_ai_client_sync,
             super::commands::sync_ai_client,
             super::commands::sync_ai_clients,

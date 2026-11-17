@@ -7,6 +7,7 @@ import { acpPresets, acpProfileStatus, presetCommand, presetVersion, splitComman
 import { buildToolConnections, modelSourceLabel, type ToolConnection } from './aiToolConnections';
 import { primaryRouteServiceId, serviceSupportsCapability } from './aiServiceCapabilities';
 import { agentApi } from '../services/agentApi';
+import { AIClientSourceControls, configuredSourceLabel } from './AIClientSourceControls';
 import type {
   AIProviderImportStatus,
   AIProviderSyncResult,
@@ -280,7 +281,7 @@ export function AiToolsPanel({
 
       {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>不影响本机工具接入；需要工作台数据时再连接账号。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
 
-      {!hasAnySource ? <div className="blocker"><CircleAlert size={18} /><div><strong>还没有可用的 AI 服务</strong><span>先在「AI 服务」中添加一个支持对话的服务。</span></div><button className="btn" onClick={onOpenModelSources}>新增 AI 服务</button></div> : null}
+      {!hasAnySource ? <div className="blocker"><CircleAlert size={18} /><div><strong>还没有 Agent 模型来源</strong><span>可直接使用客户端原生账号；需要 Agent 提供模型时再添加服务。</span></div><button className="btn" onClick={onOpenModelSources}>新增 AI 服务</button></div> : null}
 
       <details className={`ai-advanced ai-gateway-advanced${gatewayStatus?.running ? ' is-running' : ''}`}>
         <summary>
@@ -345,6 +346,7 @@ export function AiToolsPanel({
               gatewayProfile={gatewayProfileByClient.get(item.key)}
               clientStatus={clientStatusByTarget.get(item.key)}
               onSyncClient={() => syncOneClient(item.key)}
+              onSourceChanged={onRefresh}
               gatewayProfiles={gatewayProfiles}
               defaultSource={defaultSource}
               sourceDraft={sourceDraft[item.key] ?? defaultSource}
@@ -448,7 +450,9 @@ function toolSummary(item: ToolConnection, services: CustomAIService[], managed:
   if (item.builtin) return '会话自动加载本机插件和技能';
   const parts: string[] = [];
   if (item.mcp) parts.push(`接入 ${mcpState(item.mcp).label}`);
-  if (item.model && item.model.state === 'imported') {
+  if (item.model?.source) {
+    parts.push(configuredSourceLabel(item.model));
+  } else if (item.model && item.model.state === 'imported') {
     const mode = gatewayClientSet.has(item.key) ? '经网关' : '直连';
     parts.push(`模型 ${mode} ${modelSourceLabel(item.model.service, services, managed)}`);
   } else if (item.model && item.model.client_detected) {
@@ -488,6 +492,7 @@ function ToolRow(props: {
   gatewayProfile?: InferenceGatewayStatus['gateway_clients'][number];
   clientStatus?: AIProviderImportStatus;
   onSyncClient: () => void;
+  onSourceChanged: () => void;
   gatewayProfiles: GatewayProfile[];
   defaultSource: string;
   sourceDraft: string;
@@ -511,7 +516,7 @@ function ToolRow(props: {
 }) {
   const {
     item, expanded, rowBusy, busyAction, customServices, managed, managedLabel, gatewayClientSet,
-    gatewayProfile, clientStatus, onSyncClient, gatewayProfiles, defaultSource,
+    gatewayProfile, clientStatus, onSyncClient, onSourceChanged, gatewayProfiles, defaultSource,
     sourceDraft, acpProfiles,
     onToggle, onApplyTarget, onRemoveTarget, onCopyTarget,
     onOpenDirectory, onImportAIClient, onRemoveAIClient, onOpenModelSources, onSetBindingMode, onSourceDraft,
@@ -520,7 +525,7 @@ function ToolRow(props: {
 
   const mcpPending = busyAction === `target:${item.key}` || busyAction === `remove:${item.key}`;
   const modelState = item.model?.state ?? '';
-  const modelImported = modelState === 'imported';
+  const modelImported = modelState === 'imported' && (item.model?.source?.managed ?? true);
   const gatewayMode = gatewayClientSet.has(item.key);
   const needsSync = item.model?.state === 'imported'
     && ['needs_update', 'failed', 'conflict'].includes(clientStatus?.sync_state ?? '');
@@ -619,7 +624,7 @@ function ToolRow(props: {
               <span className="ai-tool-wire-state">
                 {!hasUsableSource ? <>
                   <span className="status-dot" />
-                  <span className="muted">还没有可用的 AI 服务</span>
+                  <span className="muted">还没有 Agent 模型来源</span>
                 </> : modelImported ? <>
                   <span className={`status-dot ${gatewayMode ? 'warn' : 'success'}`} />
                   <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} title={sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? undefined : '当前绑定的来源没有记录，可在这里重新选择'} value={activeSource} disabled={rowBusy} onChange={(event) => void changeSource(event.target.value)}>
@@ -631,7 +636,7 @@ function ToolRow(props: {
                   {!gatewayMode && clientStatus?.warning ? <span className="warning-text">{clientStatus.warning}</span> : null}
                 </> : <>
                   <span className="status-dot" />
-                  <span className="muted">未分发</span>
+                  <span className="muted">未由 Agent 托管</span>
                   <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} value={sourceDraft} disabled={rowBusy} onChange={(event) => onSourceDraft(event.target.value)}>
                     {sourceOptions.map((option) => <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>)}
                   </select>
@@ -643,13 +648,15 @@ function ToolRow(props: {
                 ) : modelImported ? <>
                   {needsSync ? <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy} title={syncReasonText(clientStatus)} onClick={onSyncClient}>{rowBusy ? <BusyIndicator size={11} /> : <RefreshCw size={14} />}{isDrifted(clientStatus) ? '查看差异' : '更新配置'}</button> : null}
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：真实地址与密钥会写回工具' : '切到网关：密钥留在 Agent'} onClick={() => void switchBindingMode(gatewayMode ? 'direct' : 'gateway')}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
-                  <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '取消后该工具恢复自己的模型配置，服务仍可再分发。', confirmText: '取消分发' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}取消分发</button>
+                  <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '移除 Agent 配置；有快照时恢复原字段，无快照时仅清理可识别字段。恢复结果可能是其他第三方服务。', confirmText: '移除 Agent 来源' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}移除 Agent 来源</button>
                 </> : (
-                  <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy || !sourceDraft || (sourceDraft === 'managed' && !managed.available)} onClick={() => void distributeSource()}>{rowBusy ? <BusyIndicator size={11} /> : null}分发</button>
+                  <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={rowBusy || !sourceDraft || (sourceDraft === 'managed' && !managed.available)} onClick={() => void distributeSource()}>{rowBusy ? <BusyIndicator size={11} /> : null}{item.model?.source?.capabilities.registration_effect === 'additive' ? '添加模型来源' : '使用此服务'}</button>
                 )}
               </span>
             </div>
           ) : null}
+
+          {item.model ? <AIClientSourceControls status={clientStatus ?? item.model} disabled={rowBusy} onRun={onRunRow} onChanged={onSourceChanged} /> : null}
 
           {item.capabilities.exec ? <ExecWire item={item} acpProfiles={acpProfiles} rowBusy={rowBusy} onRunRow={onRunRow} onSaveAcpProfile={onSaveAcpProfile} onSetAcpProfileEnabled={onSetAcpProfileEnabled} onRemoveAcpProfile={onRemoveAcpProfile} confirm={confirm} /> : null}
         </div>
