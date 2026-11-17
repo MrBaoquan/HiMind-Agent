@@ -278,6 +278,9 @@ pub(crate) struct CustomAIService {
     /// `image_model` / `image_adapter` 是 `image.generate` 槽位的旧投影，二者保持一致。
     #[serde(default)]
     pub media: std::collections::BTreeMap<String, MediaModelBinding>,
+    /// None preserves legacy inference; Some explicitly limits the configured operations.
+    #[serde(default)]
+    pub enabled_capabilities: Option<Vec<String>>,
     /// Provider-specific account-balance endpoint profile, independent of the chat protocol.
     #[serde(default)]
     pub balance_profile_id: Option<String>,
@@ -308,6 +311,8 @@ struct PersistedCustomAIService {
     image_adapter: String,
     #[serde(default)]
     media: std::collections::BTreeMap<String, MediaModelBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_capabilities: Option<Vec<String>>,
     #[serde(default)]
     balance_profile_id: Option<String>,
     #[serde(default)]
@@ -375,6 +380,7 @@ impl From<PersistedCustomAIService> for CustomAIService {
             image_model: value.image_model,
             image_adapter: value.image_adapter,
             media: value.media,
+            enabled_capabilities: value.enabled_capabilities,
             balance_profile_id: value.balance_profile_id,
             balance_user_id: value.balance_user_id,
             encrypted_balance_access_token: value.encrypted_balance_access_token,
@@ -398,6 +404,7 @@ impl From<&CustomAIService> for PersistedCustomAIService {
             image_model: value.image_model.clone(),
             image_adapter: value.image_adapter.clone(),
             media: value.media.clone(),
+            enabled_capabilities: value.enabled_capabilities.clone(),
             balance_profile_id: value.balance_profile_id.clone(),
             balance_user_id: value.balance_user_id.clone(),
             encrypted_balance_access_token: value.encrypted_balance_access_token.clone(),
@@ -481,6 +488,7 @@ impl CustomAIService {
             "image_model": self.image_model,
             "image_adapter": self.image_adapter,
             "media": self.media,
+            "enabled_capabilities": self.enabled_capabilities,
             "balance_profile_id": self.balance_profile_id,
             "balance_user_id": self.balance_user_id,
             "suggested_balance_profile_id":
@@ -516,6 +524,7 @@ pub(crate) fn test_service_with_endpoints(
         image_model: String::new(),
         image_adapter: String::new(),
         media: Default::default(),
+        enabled_capabilities: None,
         balance_profile_id: None,
         balance_user_id: None,
         encrypted_balance_access_token: None,
@@ -975,7 +984,7 @@ pub(crate) fn media_provider_catalog() -> Result<serde_json::Value, Box<dyn Erro
     }))
 }
 pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box<dyn Error>> {
-    upsert_internal(input, None, None, None)
+    upsert_internal(input, None, None, None, None)
 }
 
 /// Upserts a service while explicitly selecting or clearing its balance-query profile.
@@ -986,21 +995,42 @@ pub(crate) fn upsert_with_balance_profile(
     balance_access_token: Option<&str>,
     balance_user_id: Option<&str>,
 ) -> Result<CustomAIService, Box<dyn Error>> {
-    let profile = match balance_profile_id.map(str::trim) {
-        Some("") | None => None,
-        Some(value) => Some(normalize_balance_profile_id(value)?),
-    };
-    let access_token = balance_access_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let user_id = balance_user_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    upsert_with_settings(
+        input,
+        Some(balance_profile_id.unwrap_or("")),
+        balance_access_token,
+        balance_user_id,
+        None,
+    )
+}
+
+/// UI form settings are saved under the same directory lock as models and credentials.
+/// Omitted fields preserve old clients' behavior and existing operation selections.
+pub(crate) fn upsert_with_settings(
+    input: CustomAIServiceInput,
+    balance_profile_id: Option<&str>,
+    balance_access_token: Option<&str>,
+    balance_user_id: Option<&str>,
+    enabled_capabilities: Option<Vec<String>>,
+) -> Result<CustomAIService, Box<dyn Error>> {
+    let profile = balance_profile_id
+        .map(|value| {
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                normalize_balance_profile_id(value.trim()).map(Some)
+            }
+        })
+        .transpose()?;
     upsert_internal(
         input,
-        Some(profile),
-        access_token,
-        user_id.map(str::to_string),
+        profile,
+        balance_access_token.map(str::trim).filter(|value| !value.is_empty()),
+        balance_user_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        enabled_capabilities,
     )
 }
 
@@ -1009,6 +1039,7 @@ fn upsert_internal(
     profile_override: Option<Option<String>>,
     balance_access_token: Option<&str>,
     balance_user_id: Option<String>,
+    enabled_override: Option<Vec<String>>,
 ) -> Result<CustomAIService, Box<dyn Error>> {
     let id = normalize_id(&input.id)?;
     validate_base_url_for_save(&input.base_url, &input.protocol)?;
@@ -1151,7 +1182,7 @@ fn upsert_internal(
     } else {
         protect_secret_for_current_user(input.api_key.trim())?
     };
-    let service = CustomAIService {
+    let mut service = CustomAIService {
         id: id.clone(),
         display_name: input.display_name.trim().to_string(),
         // 标量投影跟随第一条端点，避免 `protocol`/`base_url` 与 `endpoints` 分叉。
@@ -1168,6 +1199,8 @@ fn upsert_internal(
         image_model: legacy_image_model.clone(),
         image_adapter: legacy_image_adapter.clone(),
         media,
+        enabled_capabilities: enabled_override
+            .or_else(|| existing.and_then(|item| item.enabled_capabilities.clone())),
         balance_profile_id,
         balance_user_id,
         encrypted_balance_access_token,
@@ -1177,6 +1210,34 @@ fn upsert_internal(
             .unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
+    if let Some(enabled) = &mut service.enabled_capabilities {
+        for operation in enabled.iter_mut() {
+            *operation = operation.trim().to_string();
+        }
+        enabled.sort();
+        enabled.dedup();
+        if enabled.is_empty()
+            || enabled.iter().any(|op| {
+                op != CAP_CHAT && !SUPPORTED_MEDIA_CAPABILITIES.contains(&op.as_str())
+            })
+        {
+            return Err("enabled_capabilities 需要至少一个受支持的模型用途".into());
+        }
+        if !enabled.iter().any(|op| op == CAP_CHAT) {
+            service.model.clear();
+            service.models.clear();
+        }
+        service.media.retain(|op, _| enabled.contains(op));
+        if !enabled.iter().any(|op| op == CAP_IMAGE_GENERATE) {
+            service.image_model.clear();
+            service.image_adapter.clear();
+        }
+        for operation in service.enabled_capabilities.as_ref().unwrap() {
+            if capability_models(&service, operation).is_empty() {
+                return Err(format!("模型用途 {operation} 缺少模型").into());
+            }
+        }
+    }
     services.insert(id.clone(), service.clone());
     save_all(&services)?;
     if invalidate_balance {
@@ -1362,6 +1423,13 @@ fn chat_model_is_media_only(service: &CustomAIService) -> bool {
 /// 空列表意味着该服务在这个能力上没有可用模型。
 pub(crate) fn capability_models(service: &CustomAIService, capability: &str) -> Vec<String> {
     let capability = capability.trim();
+    if service
+        .enabled_capabilities
+        .as_ref()
+        .is_some_and(|enabled| !enabled.iter().any(|op| op == capability))
+    {
+        return Vec::new();
+    }
     let mut models = Vec::new();
     let mut push = |model: &str| {
         let model = model.trim();
@@ -1372,7 +1440,7 @@ pub(crate) fn capability_models(service: &CustomAIService, capability: &str) -> 
     if capability == CAP_CHAT {
         // 旧数据曾把媒体模型写进全局 `model`，且没有任何真正的对话模型。
         // 这种服务不按对话候选处理，否则会把打标模型当成聊天模型发出去。
-        if chat_model_is_media_only(service) {
+        if service.enabled_capabilities.is_none() && chat_model_is_media_only(service) {
             return models;
         }
         push(&service.model);
@@ -1390,7 +1458,7 @@ pub(crate) fn capability_models(service: &CustomAIService, capability: &str) -> 
     }
     // `vision.describe` 没有显式媒体绑定时跟随对话模型（ADR 0023 第七条）。
     if capability == CAP_VISION {
-        if chat_model_is_media_only(service) {
+        if service.enabled_capabilities.is_none() && chat_model_is_media_only(service) {
             return models;
         }
         push(&service.model);
@@ -1483,7 +1551,12 @@ pub(crate) fn binding_details_for_model(
     model_override: Option<&str>,
 ) -> Option<ResolvedMediaBinding> {
     let capability = capability.trim();
-    if !SUPPORTED_MEDIA_CAPABILITIES.contains(&capability) {
+    if !SUPPORTED_MEDIA_CAPABILITIES.contains(&capability)
+        || service
+            .enabled_capabilities
+            .as_ref()
+            .is_some_and(|enabled| !enabled.iter().any(|op| op == capability))
+    {
         return None;
     }
     let explicit = service.media.get(capability);
@@ -4186,4 +4259,53 @@ mod tests {
         assert_eq!(service.endpoints[0].base_url, "https://api.example.com/v1");
         assert_eq!(service.protocol, AIServiceProtocol::OpenaiChat);
     }
+    #[test]
+    fn onboarding_operations_roundtrip_preserves_routes_and_legacy_callers() {
+        with_isolated_home(|| {
+            let mut input = remediation_input("onboarding");
+            input.model = "shared".into();
+            input.models = vec!["shared".into()];
+            input.image_model = "shared".into();
+            let saved = super::upsert_with_settings(input.clone(), None, None, None,
+                Some(vec![CAP_CHAT.into(), CAP_IMAGE_GENERATE.into()])).unwrap();
+            assert_eq!(super::capability_models(&saved, CAP_CHAT), vec!["shared"]);
+            assert!(super::capability_models(&saved, super::CAP_VISION).is_empty());
+            super::set_capability_routes(CAP_CHAT, vec![CapabilityRouteEntry::new("onboarding", "shared")]).unwrap();
+            let routes_path = super::store_path().unwrap().with_file_name(super::SELECTION_FILE);
+            let routes_before = std::fs::read(&routes_path).unwrap();
+            let reloaded = super::load_all().unwrap().remove("onboarding").unwrap();
+            assert_eq!(reloaded.enabled_capabilities, saved.enabled_capabilities);
+            assert!(super::capability_models(&reloaded, super::CAP_VISION).is_empty());
+            let legacy_update = super::upsert(input.clone()).unwrap();
+            assert_eq!(legacy_update.enabled_capabilities, saved.enabled_capabilities);
+            assert_eq!(std::fs::read(&routes_path).unwrap(), routes_before);
+            let vision = MediaModelBinding { model: "vision-only".into(), adapter: String::new(), models: vec![], execution_mode: None };
+            input.media.insert(super::CAP_VISION.into(), vision);
+            let updated = super::upsert_with_settings(input, None, None, None,
+                Some(vec![super::CAP_VISION.into()])).unwrap();
+            assert!(updated.model.is_empty());
+            assert!(updated.models.is_empty());
+            assert!(updated.image_model.is_empty());
+            assert!(super::capability_models(&updated, CAP_CHAT).is_empty());
+            assert_eq!(super::capability_models(&updated, super::CAP_VISION), vec!["vision-only"]);
+            assert!(super::binding_details_for_model(&updated, CAP_IMAGE_GENERATE, Some("shared")).is_none());
+            assert_eq!(std::fs::read(&routes_path).unwrap(), routes_before);
+        });
+    }
+
+    #[test]
+    fn onboarding_invalid_operations_fail_without_overwriting_service() {
+        with_isolated_home(|| {
+            let input = remediation_input("onboarding-invalid");
+            let original = super::upsert(input.clone()).unwrap();
+            assert_eq!(original.enabled_capabilities, None);
+            assert_eq!(super::capability_models(&original, super::CAP_VISION), vec![original.model.clone()]);
+            let before = std::fs::read(super::store_path().unwrap()).unwrap();
+            for enabled in [vec![], vec!["unsupported".into()], vec![CAP_AUDIO_SPEECH.into()]] {
+                assert!(super::upsert_with_settings(input.clone(), None, None, None, Some(enabled)).is_err());
+                assert_eq!(std::fs::read(super::store_path().unwrap()).unwrap(), before);
+            }
+        });
+    }
+
 }

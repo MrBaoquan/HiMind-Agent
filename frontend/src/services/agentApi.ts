@@ -3521,6 +3521,8 @@ export type CustomAIService = {
     media?: Record<string, { adapter: string; model: string; models?: string[]; execution_mode?: MediaExecutionMode | null }>;
     balance_profile_id?: string | null;
     balance_user_id?: string | null;
+    /** Missing/null uses legacy inference; an explicit list limits enabled operations. */
+    enabled_capabilities?: string[] | null;
     suggested_balance_profile_id?: string | null;
     created_at: string;
     updated_at: string;
@@ -4292,7 +4294,7 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string; allow_overwrite?: boolean }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; endpoints?: AIServiceEndpoint[]; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; vision_model?: string; media_models?: Record<string, string[]>; enabled_capabilities?: string[]; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string; allow_overwrite?: boolean }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -4313,6 +4315,7 @@ export const agentApi = {
             transcribeAdapter: input.transcribe_adapter,
             visionModel: input.vision_model ?? '',
             mediaModels: input.media_models ?? {},
+            enabledCapabilities: input.enabled_capabilities,
             balanceProfileId: input.balance_profile_id,
             balanceAccessToken: input.balance_access_token,
             balanceUserId: input.balance_user_id,

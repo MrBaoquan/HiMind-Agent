@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import './ServiceUi.css';
-import { Check, ChevronDown, ChevronLeft, ChevronRight, CircleDashed, CircleX, Copy, ExternalLink, Info, Pencil, PlugZap, RefreshCw, Search, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
+import { Check, ChevronLeft, ChevronRight, CircleDashed, CircleX, Copy, ExternalLink, Info, Pencil, PlugZap, RefreshCw, Search, ShieldCheck, Trash2, X } from 'lucide-react';
 import { Pill } from '../components/Common';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { ModalSurface } from '../components/ModalSurface';
@@ -9,14 +9,14 @@ import { fallbackAiServicePresets, type AiServicePreset } from './aiServicePrese
 import { inferBalanceProfile } from './balanceProfileMatching';
 import { clientLabel } from '../utils/clientLabels';
 import { agentApi } from '../services/agentApi';
+import { AiModelCatalogEditor } from './AiModelCatalogEditor';
+import { emptyModelSetup, modelsFromPreset, modelsFromService, modelSetupError, modelConfiguration, mergeDiscoveredModels, configuredOperations } from './aiServiceOnboarding';
 import type { AIProviderImportStatus, AIServiceBalanceSnapshot, AIServiceListResult, AIServiceProtocol, AIServiceTemplateListResult, CustomAIService, ManagedAIServiceSummary, MediaProviderCatalogResult } from '../services/agentApi';
 import {
   AI_SERVICE_CAPABILITIES,
   AI_SERVICE_CAPABILITY_LABELS,
   MEDIA_CAPABILITIES,
-  capabilityAdapter,
   capabilityModel,
-  inferPresetCapabilities,
   primaryRouteServiceId,
   serviceCapabilities,
   serviceSupportsCapability,
@@ -57,20 +57,6 @@ function isVolcengineAgentPlan(baseUrl: string): boolean {
     return false;
   }
 }
-
-const mediaCapabilityLabels: Record<string, string> = {
-  'image.generate': '生图',
-  'image.edit': '改图',
-  'video.generate': '生视频',
-  'audio.speech': '语音合成',
-  'audio.transcribe': '语音转写',
-};
-
-const executionModeLabels: Record<string, string> = {
-  sync: '同步',
-  stream: '流式',
-  async: '异步',
-};
 
 const builtInMediaPresets: AiServicePreset[] = [
   {
@@ -131,10 +117,11 @@ type AiProvidersPanelProps = {
     speech_adapter: string;
     transcribe_model: string;
     transcribe_adapter: string;
-    /** 视觉理解专用模型；留空表示跟随对话模型（ADR 0023 第七条）。 */
+    /** 视觉理解专用模型；旧配置留空时跟随对话模型，新配置受 enabled_capabilities 限制。 */
     vision_model: string;
     /** 媒体能力的额外可选模型：能力 → 模型列表（不含默认模型）。 */
     media_models: Record<string, string[]>;
+    enabled_capabilities: AIServiceCapability[];
     balance_profile_id: string;
     balance_access_token: string;
     balance_user_id: string;
@@ -145,12 +132,13 @@ type AiProvidersPanelProps = {
   onRemoveAIService: (id: string) => Promise<void>;
   onCloneAIService: (id: string) => Promise<CustomAIService>;
   onOpenAccount: () => void;
+  onOpenRoutes?: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
   onFetchBalance: (id: string) => Promise<AIServiceBalanceSnapshot>;
 };
 
-type FormStep = 0 | 1 | 2;
+type FormStep = 0 | 1;
 type ConnectionCheck = { state: 'busy' | 'ok' | 'error'; message: string };
 
 const emptyDraft = {
@@ -162,25 +150,6 @@ const emptyDraft = {
   // 主 Base URL + 接口类型是第一条端点；这里只补「另一个协议族」那一条。
   secondary_protocol: '' as AIServiceProtocol | '',
   secondary_base_url: '',
-  model: '',
-  models: '',
-  image_model: '',
-  image_adapter: '',
-  image_models: '',
-  image_edit_model: '',
-  image_edit_adapter: '',
-  image_edit_models: '',
-  video_model: '',
-  video_adapter: '',
-  video_models: '',
-  speech_model: '',
-  speech_adapter: '',
-  speech_models: '',
-  transcribe_model: '',
-  transcribe_adapter: '',
-  transcribe_models: '',
-  vision_model: '',
-  vision_models: '',
   balance_profile_id: '',
   balance_access_token: '',
   balance_user_id: '',
@@ -201,6 +170,7 @@ export function AiProvidersPanel({
   onRemoveAIService,
   onCloneAIService,
   onOpenAccount,
+  onOpenRoutes,
   onFetchModels,
   onFetchSavedModels,
   onFetchBalance,
@@ -209,7 +179,9 @@ export function AiProvidersPanel({
   const [formStep, setFormStep] = useState<FormStep>(0);
   const [editingServiceId, setEditingServiceId] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyDraft);
-  const [enabledCapabilities, setEnabledCapabilities] = useState<AIServiceCapability[]>(['chat']);
+  const [modelSetup, setModelSetup] = useState(emptyModelSetup);
+  const discoveryRevision = useRef(0);
+  const [savedNotice, setSavedNotice] = useState('');
   const [saving, setSaving] = useState(false);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [formError, setFormError] = useState('');
@@ -223,7 +195,6 @@ export function AiProvidersPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [capabilityFilter, setCapabilityFilter] = useState<'all' | AIServiceCapability>('all');
   const [selectedPreset, setSelectedPreset] = useState<string>('');
-  const [presetCategory, setPresetCategory] = useState<string>('');
   const stepTitleRef = useRef<HTMLHeadingElement>(null);
   const pendingFieldFocus = useRef<string | null>(null);
   const saveLock = useRef(false);
@@ -257,7 +228,7 @@ export function AiProvidersPanel({
 
   useLayoutEffect(() => {
     if (formOpen && pendingFieldFocus.current) {
-      document.getElementById(`ai-service-${pendingFieldFocus.current}`)?.focus();
+      focusField(pendingFieldFocus.current);
       pendingFieldFocus.current = null;
     } else if (formOpen) stepTitleRef.current?.focus({ preventScroll: true });
     else setFieldError(null);
@@ -312,150 +283,73 @@ export function AiProvidersPanel({
   function applyPreset(presetId: string) {
     const preset = presetEntries.find((item) => item.id === presetId);
     if (!preset) return;
-    const inferred = inferPresetCapabilities(preset) as AIServiceCapability[];
-    const isWanVideo = preset.id === 'wan-video';
-    const enabled: AIServiceCapability[] = isWanVideo ? ['video.generate'] : inferred;
-    const videoModel = isWanVideo ? preset.models[0] ?? '' : '';
-    const imageModel = preset.models.find(model => model === 'gpt-image-1' || model === 'dall-e-3') ?? '';
-    const editModel = preset.models.find(model => model === 'gpt-image-1') ?? '';
-    const speechModel = preset.models.find(model => model === 'tts-1') ?? '';
-    const transcribeModel = preset.models.find(model => model.toLowerCase().includes('whisper')) ?? '';
+    discoveryRevision.current++;
+    setFetchingModels(false);
+    setModelSetup(modelsFromPreset(preset));
     setSelectedPreset(presetId);
-    setEnabledCapabilities(enabled);
     setFormStep(0);
     setFormError('');
     setFormNotice('');
     setDraft({
       // 预设只是模板：不能把模板 ID 当成服务 ID，否则新增会覆盖同 ID 服务，
       // 编辑态还会把保存目标切到模板对应的服务上。
+      ...emptyDraft,
       id: editingServiceId ?? draft.id,
-      display_name: draft.display_name.trim() ? draft.display_name : preset.name,
+      display_name: draft.display_name,
       base_url: preset.base_url,
       protocol: preset.protocol,
       secondary_protocol: '',
       secondary_base_url: '',
-      model: preset.default_model,
-      models: preset.models.join(', '),
-      image_model: imageModel,
-      image_adapter: imageModel ? 'openai-images' : '',
-      image_models: '',
-      image_edit_model: editModel,
-      image_edit_adapter: editModel ? 'openai-images-edit' : '',
-      image_edit_models: '',
-      video_model: videoModel,
-      video_adapter: isWanVideo ? 'wan-video' : '',
-      video_models: '',
-      speech_model: speechModel,
-      speech_adapter: speechModel ? 'openai-speech' : '',
-      speech_models: '',
-      transcribe_model: transcribeModel,
-      transcribe_adapter: transcribeModel ? 'openai-audio' : '',
-      transcribe_models: '',
-      vision_model: '',
-      vision_models: '',
       balance_profile_id: balanceProfileForPreset(preset.base_url),
       balance_access_token: '',
       balance_user_id: '',
-      // 用户已经输入的 Key 不能被模板清空；编辑态留空仍表示保留已保存 Key。
-      api_key: draft.api_key,
+      // 切换供应商时清空当前输入的密钥；编辑态留空仍表示保留已保存 Key。
+      api_key: selectedPreset === presetId ? draft.api_key : '',
     });
   }
 
-  const presetGroups = (() => {
-    const groups = new Map<string, AiServicePreset[]>();
-    for (const preset of presetEntries) {
-      const name = preset.category.trim() || '其他';
-      const items = groups.get(name);
-      if (items) items.push(preset);
-      else groups.set(name, [preset]);
-    }
-    return [...groups].map(([name, items]) => ({ name, items }));
-  })();
-  const activePresetGroup = presetGroups.find((group) => group.name === presetCategory);
-
-  function draftModelFor(capability: AIServiceCapability) {
-    switch (capability) {
-      case 'chat': return draft.model.trim();
-      case 'image.generate': return draft.image_model.trim();
-      case 'image.edit': return draft.image_edit_model.trim();
-      case 'video.generate': return draft.video_model.trim();
-      case 'audio.speech': return draft.speech_model.trim();
-      case 'audio.transcribe': return draft.transcribe_model.trim();
-      case 'vision.describe': return draft.vision_model.trim();
-    }
-  }
-
-  function draftModelsFor(capability: AIServiceCapability): string {
-    switch (capability) {
-      case 'chat': return draft.models;
-      case 'image.generate': return draft.image_models;
-      case 'image.edit': return draft.image_edit_models;
-      case 'video.generate': return draft.video_models;
-      case 'audio.speech': return draft.speech_models;
-      case 'audio.transcribe': return draft.transcribe_models;
-      case 'vision.describe': return draft.vision_models;
-    }
-  }
-
-  /** 把表单里的逗号/换行分隔列表拆成去重后的模型名，并剔除默认模型本身。 */
-  function parseExtraModels(raw: string, defaultModel: string): string[] {
-    const seen = new Set<string>();
-    const models: string[] = [];
-    for (const item of raw.split(/[\n,]/)) {
-      const model = item.trim();
-      if (!model || model === defaultModel.trim() || seen.has(model)) continue;
-      seen.add(model);
-      models.push(model);
-    }
-    return models;
-  }
-
-  function mediaModelsPayload(enabled: Set<AIServiceCapability>) {
-    const payload: Record<string, string[]> = {};
-    for (const capability of MEDIA_CAPABILITIES) {
-      if (!enabled.has(capability) || !draftModelFor(capability)) continue;
-      const extra = parseExtraModels(draftModelsFor(capability), draftModelFor(capability));
-      if (extra.length) payload[capability] = extra;
-    }
-    return payload;
-  }
-
-  function toggleCapability(capability: AIServiceCapability) {
+  function updateConnection(field: 'base_url' | 'protocol' | 'api_key', value: string) {
+    discoveryRevision.current++;
+    setFetchingModels(false);
     setFormError('');
-    setFormNotice('');
-    setEnabledCapabilities(current => {
-      if (current.includes(capability)) return current.filter(item => item !== capability);
-      return [...current, capability];
-    });
-    setDraft(current => {
-      if (capability === 'image.generate' && !current.image_adapter) return { ...current, image_adapter: 'openai-images' };
-      if (capability === 'image.edit' && !current.image_edit_adapter) return { ...current, image_edit_adapter: 'openai-images-edit' };
-      if (capability === 'video.generate' && !current.video_adapter) return { ...current, video_adapter: 'ark-video' };
-      if (capability === 'audio.speech' && !current.speech_adapter) return { ...current, speech_adapter: 'openai-speech' };
-      if (capability === 'audio.transcribe' && !current.transcribe_adapter) return { ...current, transcribe_adapter: 'openai-audio' };
-      return current;
-    });
+    setDraft(current => ({ ...current, [field]: value }));
+    if (field === 'api_key') {
+      setModelSetup(current => ({ ...current, entries: current.entries.filter(entry => entry.source !== 'discovered' || entry.selected)
+        .map(entry => entry.source === 'discovered' ? { ...entry, source: 'retained' as const } : entry) }));
+      setFormNotice('凭据已修改；请重新获取目录。已选模型保留，仍需实际调用验证。');
+    } else {
+      setSelectedPreset('');
+      setModelSetup(emptyModelSetup());
+      setFormNotice('连接已修改，请重新获取目录或添加模型。');
+    }
+  }
+
+  function serviceName() {
+    if (draft.display_name.trim()) return draft.display_name.trim();
+    const presetName = presetEntries.find(item => item.id === selectedPreset)?.name;
+    if (presetName) return presetName;
+    try { return new URL(draft.base_url).hostname; } catch { return ''; }
   }
 
   function connectionStepError() {
-    if (!draft.display_name.trim()) return '请先填写「服务名称」。';
     if (!editing && !draft.api_key.trim()) return '请先填写「API Key」。';
     if (!draft.base_url.trim()) return '请先填写「Base URL」。';
+    try {
+      const url = new URL(draft.base_url.trim());
+      if (!['http:', 'https:'].includes(url.protocol) || url.search || url.hash || url.username || url.password) return 'Base URL 需为不含查询参数或账号的 HTTP/HTTPS API 地址。';
+    } catch { return 'Base URL 不是有效的 API 地址。'; }
+    if (draft.secondary_base_url.trim()) {
+      try {
+        const url = new URL(draft.secondary_base_url.trim());
+        if (!['http:', 'https:'].includes(url.protocol) || url.search || url.hash || url.username || url.password) return '第二接入端点需为不含查询参数或账号的 HTTP/HTTPS API 地址。';
+      } catch { return '第二接入端点不是有效的 API 地址。'; }
+    }
+    if (Boolean(draft.secondary_protocol) !== Boolean(draft.secondary_base_url.trim())) return '第二接入端点需要同时填写地址和接口类型。';
+    if (draft.secondary_protocol && protocolFamily(draft.secondary_protocol) === protocolFamily(draft.protocol)) return '第二接入端点需使用不同的接口协议族。';
     return '';
   }
 
-  function capabilityStepError() {
-    if (!enabledCapabilities.length) return '请至少启用一项能力。';
-    for (const capability of enabledCapabilities) {
-      if (draftModelFor(capability)) continue;
-      // 视觉理解没有显式绑定时跟随服务的对话模型（ADR 0023 第七条），
-      // 后端 capability_models / vision_describe / binding_shape 都按这个顺序解析。
-      // 所以它只在「连对话模型都没有」时才真的缺模型，不能当成必填媒体能力。
-      if (capability === 'vision.describe' && draft.model.trim()) continue;
-      return `请为「${AI_SERVICE_CAPABILITY_LABELS[capability]}」填写模型。`;
-    }
-    return '';
-  }
+  function capabilityStepError() { return modelSetupError(modelSetup); }
 
   function goNext() {
     const error = formStep === 0 ? connectionStepError() : capabilityStepError();
@@ -465,7 +359,8 @@ export function AiProvidersPanel({
     }
     setFormError('');
     setFieldError(null);
-    setFormStep(current => Math.min(2, current + 1) as FormStep);
+    setFormStep(1);
+    void fetchModels();
   }
 
   function goBack() {
@@ -475,11 +370,12 @@ export function AiProvidersPanel({
   }
 
   function showValidation(message: string, sourceField?: string) {
-    const capability = enabledCapabilities.find(item => message.includes(`「${AI_SERVICE_CAPABILITY_LABELS[item]}」`));
-    const field = sourceField ?? (message.includes('服务名称') ? 'display_name' : message.includes('API Key') ? 'api_key'
-      : message.includes('Base URL') ? 'base_url' : message.includes('User ID') ? 'balance_user_id'
-      : capability ? ({ chat: 'model', 'image.generate': 'image_model', 'image.edit': 'image_edit_model', 'video.generate': 'video_model', 'audio.speech': 'speech_model', 'audio.transcribe': 'transcribe_model', 'vision.describe': 'vision_model' }[capability]) : 'capabilities');
-    const step: FormStep = ['display_name', 'api_key', 'base_url'].includes(field) ? 0 : field === 'balance_user_id' ? 2 : 1;
+    const requestedField = sourceField ?? (message.includes('API Key') ? 'api_key'
+      : message.includes('第二接入端点') ? 'secondary_base_url'
+      : message.includes('Base URL') ? 'base_url'
+      : message.includes('User ID') ? 'balance_user_id' : 'capabilities');
+    const field = requestedField === 'model' || requestedField.endsWith('_model') ? 'capabilities' : requestedField;
+    const step: FormStep = ['display_name', 'api_key', 'base_url', 'secondary_base_url'].includes(field) ? 0 : 1;
     setFieldError({ field, step, message });
     setFormError(message);
   }
@@ -489,9 +385,17 @@ export function AiProvidersPanel({
       'aria-describedby': fieldError?.field === field ? 'ai-service-field-error' : undefined };
   }
 
+  function focusField(field: string) {
+    const element = document.getElementById(`ai-service-${field}`);
+    for (let parent = element?.parentElement; parent; parent = parent.parentElement) {
+      if (parent instanceof HTMLDetailsElement) parent.open = true;
+    }
+    element?.focus();
+  }
+
   function locateError() {
     if (!fieldError) return;
-    if (formStep === fieldError.step) document.getElementById(`ai-service-${fieldError.field}`)?.focus();
+    if (formStep === fieldError.step) focusField(fieldError.field);
     else { pendingFieldFocus.current = fieldError.field; setFormStep(fieldError.step); }
   }
 
@@ -511,11 +415,15 @@ export function AiProvidersPanel({
       showValidation('New API 余额查询需要填写 User ID。');
       return;
     }
-    const enabled = new Set(enabledCapabilities);
+    const configuration = modelConfiguration(modelSetup);
     // 编辑态永远保存回当前服务；新增态才按用户填写/自动生成的 ID 落库。
-    const targetId = editingServiceId ?? (draft.id.trim() || suggestedServiceId(draft.display_name));
+    let targetId = editingServiceId ?? (draft.id.trim() || suggestedServiceId(serviceName()));
+    if (!editingServiceId && !draft.id.trim()) {
+      const stem = targetId; let suffix = 2;
+      while (customServices.some(service => service.id === targetId)) targetId = `${stem}-${suffix++}`;
+    }
     const existingById = !editingServiceId && customServices.some(service => service.id === targetId);
-    const normalizedName = draft.display_name.trim().toLowerCase();
+    const normalizedName = serviceName().toLowerCase();
     const nameCollision = normalizedName.length > 0 && customServices.some(service =>
       service.id !== targetId && service.display_name.trim().toLowerCase() === normalizedName
     );
@@ -541,7 +449,7 @@ export function AiProvidersPanel({
     try {
       await onSaveAIService({
         id: targetId,
-        display_name: draft.display_name.trim(),
+        display_name: serviceName(),
         base_url: draft.base_url.trim(),
         protocol: draft.protocol,
         // 只提交「另一个协议族」的端点；主端点由 protocol + base_url 表达，
@@ -552,20 +460,7 @@ export function AiProvidersPanel({
               { protocol: draft.secondary_protocol, base_url: draft.secondary_base_url.trim() },
             ]
           : undefined,
-        model: enabled.has('chat') ? draft.model.trim() : '',
-        models: enabled.has('chat') ? draft.models.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) : [],
-        image_model: enabled.has('image.generate') ? draft.image_model.trim() : '',
-        image_adapter: enabled.has('image.generate') ? (draft.image_adapter || 'openai-images') : '',
-        image_edit_model: enabled.has('image.edit') ? draft.image_edit_model.trim() : '',
-        image_edit_adapter: enabled.has('image.edit') ? (draft.image_edit_adapter || 'openai-images-edit') : '',
-        video_model: enabled.has('video.generate') ? draft.video_model.trim() : '',
-        video_adapter: enabled.has('video.generate') ? (draft.video_adapter || 'ark-video') : '',
-        speech_model: enabled.has('audio.speech') ? draft.speech_model.trim() : '',
-        speech_adapter: enabled.has('audio.speech') ? (draft.speech_adapter || 'openai-speech') : '',
-        transcribe_model: enabled.has('audio.transcribe') ? draft.transcribe_model.trim() : '',
-        transcribe_adapter: enabled.has('audio.transcribe') ? (draft.transcribe_adapter || 'openai-audio') : '',
-        vision_model: enabled.has('vision.describe') ? draft.vision_model.trim() : '',
-        media_models: mediaModelsPayload(enabled),
+        ...configuration,
         balance_profile_id: draft.balance_profile_id,
         balance_access_token: draft.balance_access_token.trim(),
         balance_user_id: draft.balance_user_id.trim(),
@@ -573,15 +468,16 @@ export function AiProvidersPanel({
         allow_overwrite: allowOverwrite,
       });
       setDraft(emptyDraft);
-      setEnabledCapabilities(['chat']);
+      setModelSetup(emptyModelSetup());
+      setSavedNotice('服务配置已保存，尚未验证全部模型。全局默认路由保持原设置；未指定默认时仍按现有自动规则选择。');
+      discoveryRevision.current++;
       setFormStep(0);
       setEditingServiceId(null);
       setSelectedPreset('');
-      setPresetCategory('');
       setFormOpen(false);
     } catch (error) {
       const message = formatAIServiceError(error, '保存 AI 服务失败，请检查连接信息后重试。');
-      const sourceField = ['display_name', 'api_key', 'base_url', 'balance_user_id', 'image_edit_model', 'image_model', 'video_model', 'speech_model', 'transcribe_model', 'vision_model', 'model']
+      const sourceField = ['id', 'display_name', 'api_key', 'base_url', 'balance_user_id', 'image_edit_model', 'image_model', 'video_model', 'speech_model', 'transcribe_model', 'vision_model', 'model']
         .find(field => new RegExp(`\\b${field}\\b`).test(message));
       if (sourceField) showValidation(message, sourceField);
       else { setFieldError(null); setFormError(message); }
@@ -609,32 +505,34 @@ export function AiProvidersPanel({
 
   async function fetchModels() {
     if (!draft.base_url.trim() || (!draft.api_key.trim() && !editing)) return;
-    setFormError('');
-    setFormNotice('');
-    if (isVolcengineAgentPlan(draft.base_url)) {
-      setFormNotice(draft.models.trim()
-        ? 'Agent Plan 无 /models 接口，已保留现有模型。保存后点“检查连接”验证 Key。'
-        : 'Agent Plan 不提供 /models 模型列表接口，请手动填写模型。保存后可用“检查连接”验证 Key。');
+    const turn = ++discoveryRevision.current;
+    setFormError(''); setFormNotice('');
+    if (isVolcengineAgentPlan(draft.base_url) || selectedPreset === 'wan-video') {
+      setFormNotice('此接入方式未提供通用模型目录，已显示预设建议；也可手动添加。模型尚未验证。');
+      return;
+    }
+    const saved = customServices.find(service => service.id === editingServiceId);
+    if (!draft.api_key.trim() && saved && (saved.base_url !== draft.base_url.trim() || saved.protocol !== draft.protocol)) {
+      setFormNotice('连接地址或接口已修改；请填写 API Key 后获取新目录，避免使用旧连接的模型列表。');
       return;
     }
     setFetchingModels(true);
     try {
       const models = draft.api_key.trim()
         ? await onFetchModels({ base_url: draft.base_url.trim(), api_key: draft.api_key.trim(), protocol: draft.protocol })
-        : await onFetchSavedModels(draft.id.trim(), draft.base_url.trim());
-      setDraft((current) => ({ ...current, models: models.join(', ') }));
+        : await onFetchSavedModels(editingServiceId!, draft.base_url.trim());
+      if (turn !== discoveryRevision.current) return;
+      setModelSetup(current => mergeDiscoveredModels(current, models));
+      setFormNotice(`已获取 ${models.length} 个目录模型。`);
     } catch (error) {
-      setFormError(formatAIServiceError(error, '获取模型失败，请检查 Base URL 和 API Key。'));
+      if (turn !== discoveryRevision.current) return;
+      setFormNotice(formatAIServiceError(error, '无法获取模型目录。可重试，或按供应商说明手动添加模型。') + ' 可重试或手动添加。');
     } finally {
-      setFetchingModels(false);
+      if (turn === discoveryRevision.current) setFetchingModels(false);
     }
   }
 
   async function checkServiceConnection(service: CustomAIService) {
-    if (!capabilityModel(service, 'chat')) {
-      setConnectionChecks(current => ({ ...current, [service.id]: { state: 'error', message: '媒体服务需在能力路由中实际调用验证' } }));
-      return;
-    }
     setConnectionChecks(current => ({ ...current, [service.id]: { state: 'busy', message: '检查中…' } }));
     try {
       const models = await onFetchSavedModels(service.id, service.base_url);
@@ -691,10 +589,12 @@ export function AiProvidersPanel({
 
   function openNewService() {
     setSelectedPreset('');
-    setPresetCategory('');
     setEditingServiceId(null);
     setDraft(emptyDraft);
-    setEnabledCapabilities(['chat']);
+    setModelSetup(emptyModelSetup());
+    setSavedNotice('');
+    discoveryRevision.current++;
+    setFetchingModels(false);
     setFormStep(0);
     setFormError('');
     setFormNotice('');
@@ -703,7 +603,6 @@ export function AiProvidersPanel({
 
   function openEditService(service: CustomAIService) {
     setSelectedPreset('');
-    setPresetCategory('');
     setEditingServiceId(service.id);
     setDraft({
       id: service.id,
@@ -721,39 +620,24 @@ export function AiProvidersPanel({
           secondary_base_url: secondary?.base_url ?? '',
         };
       })(),
-      model: service.model,
-      models: service.models.join(', '),
-      image_model: service.image_model ?? '',
-      image_adapter: service.image_adapter ?? '',
-      image_models: (service.media?.['image.generate']?.models ?? []).join(', '),
-      image_edit_model: service.media?.['image.edit']?.model ?? '',
-      image_edit_adapter: service.media?.['image.edit']?.adapter ?? '',
-      image_edit_models: (service.media?.['image.edit']?.models ?? []).join(', '),
-      video_model: service.media?.['video.generate']?.model ?? '',
-      video_adapter: service.media?.['video.generate']?.adapter ?? '',
-      video_models: (service.media?.['video.generate']?.models ?? []).join(', '),
-      speech_model: service.media?.['audio.speech']?.model ?? '',
-      speech_adapter: service.media?.['audio.speech']?.adapter ?? '',
-      speech_models: (service.media?.['audio.speech']?.models ?? []).join(', '),
-      transcribe_model: service.media?.['audio.transcribe']?.model ?? '',
-      transcribe_adapter: service.media?.['audio.transcribe']?.adapter ?? '',
-      transcribe_models: (service.media?.['audio.transcribe']?.models ?? []).join(', '),
-      vision_model: service.media?.['vision.describe']?.model ?? '',
-      vision_models: (service.media?.['vision.describe']?.models ?? []).join(', '),
       balance_profile_id: service.balance_profile_id ?? '',
       balance_access_token: '',
       balance_user_id: service.balance_user_id ?? '',
       api_key: '',
     });
-    const capabilities = serviceCapabilities(service);
-    setEnabledCapabilities(capabilities.length ? capabilities : ['chat']);
+    setModelSetup(modelsFromService(service));
+    discoveryRevision.current++;
+    setFetchingModels(false);
     setFormStep(0);
     setFormError('');
+    setFormNotice('');
     setFormOpen(true);
   }
 
   function closeForm() {
     if (saving) return;
+    discoveryRevision.current++;
+    setFetchingModels(false);
     setFormOpen(false);
     setEditingServiceId(null);
     setFormStep(0);
@@ -761,6 +645,7 @@ export function AiProvidersPanel({
   }
   return (
     <div className="ai-providers-view">
+      {savedNotice ? <div className="ai-save-result" role="status"><span>{savedNotice}</span>{onOpenRoutes ? <button type="button" className="btn" onClick={onOpenRoutes}>设置默认与备用</button> : null}<button type="button" className="btn" onClick={() => setSavedNotice('')}>知道了</button></div> : null}
       <div className="ai-catalog-state" role={catalogState === 'error' || catalogState === 'denied' ? 'alert' : 'status'} aria-busy={catalogState === 'loading'}>
         {catalogState === 'loading' ? '正在读取健康目录，AI 服务配置仍可操作。' : catalogState === 'denied' ? '无权限读取健康目录；请联系管理员授权，配置列表不受影响。' : catalogState === 'error' ? '健康目录读取失败；健康状态未知，配置列表不受影响。' : providerCatalog?.providers.some(provider => provider.health.state === 'degraded' || provider.health.state === 'unavailable') ? '健康目录已更新，部分 AI 服务不可用；请检查对应连接。' : '健康目录已更新；可逐项检查 AI 服务连接。'}
         <span>{catalogTime ? `最近成功快照：${catalogTime}` : '尚无成功快照'}</span>
@@ -772,7 +657,7 @@ export function AiProvidersPanel({
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">AI 服务</span>
             <strong>{serviceCount ? `${serviceCount} 个本机 AI 服务` : '还没有可用的 AI 服务'}</strong>
-            <span>一个服务可承载对话或媒体能力；默认路由在「能力路由」查看。</span>
+            <span>一个服务可同时提供对话、图像、视频和音频模型；默认路由在「能力路由」查看。</span>
           </div>
         </div>
         <div className="ai-overview-actions">
@@ -837,7 +722,7 @@ export function AiProvidersPanel({
           <div aria-busy={saving}>
             <div className="modal-header">
               <div>
-                <h3 id="ai-service-modal-title" ref={stepTitleRef} tabIndex={-1} data-initial-focus>{editing ? '编辑 AI 服务' : '新增 AI 服务'} · {['连接', '能力与模型', '高级与用量'][formStep]}</h3>
+                <h3 id="ai-service-modal-title" ref={stepTitleRef} tabIndex={-1} data-initial-focus>{editing ? '编辑 AI 服务' : '新增 AI 服务'} · {['连接服务', '选择模型'][formStep]}</h3>
                 <p>连接信息和密钥只保存在本机。</p>
               </div>
               <button className="btn btn-icon" title="关闭" aria-label="关闭" disabled={saving} onClick={closeForm}><X size={16} /></button>
@@ -846,7 +731,7 @@ export function AiProvidersPanel({
               {formError ? <div className="ai-service-form-error" role="alert"><CircleX size={15} /><span id="ai-service-field-error">{formError}{fieldError ? <a id="ai-service-error-link" href={`#ai-service-${fieldError.field}`} onClick={event => { event.preventDefault(); locateError(); }}>定位并修正字段</a> : null}</span></div> : null}
               {formNotice ? <div className="ai-service-form-notice" role="status"><Info size={15} /><span>{formNotice}</span></div> : null}
               <div className="ai-service-steps" aria-label="配置步骤">
-                {['连接', '能力与模型', '高级与用量'].map((label, index) => (
+                {['连接服务', '选择模型'].map((label, index) => (
                   <span key={label} aria-current={formStep === index ? 'step' : undefined} className={`ai-service-step${formStep === index ? ' active' : ''}${formStep > index ? ' complete' : ''}`}>
                     <b>{formStep > index ? <Check size={12} /> : index + 1}</b>{label}
                   </span>
@@ -854,142 +739,48 @@ export function AiProvidersPanel({
               </div>
 
               {formStep === 0 ? <>
-                <div className="ai-service-presets">
-                  <div className="ai-service-presets-head">
-                    <div className="ai-service-group-label">常用服务</div>
-                    {usingFallbackPresets ? <span className="ai-service-preset-source" title="连接 AI 工作台后会改用工作台目录里的服务与模型">未连接 AI 工作台，使用内置预设</span> : null}
-                  </div>
-                  <div className="ai-service-preset-tabs">
-                    <button type="button" aria-pressed={!presetCategory} className={`ai-service-preset-tab${!presetCategory ? ' active' : ''}`} onClick={() => { setPresetCategory(''); setSelectedPreset(''); }}>
-                      <Pencil size={13} />手动配置
-                    </button>
-                    {presetGroups.map((group) => (
-                      <button key={group.name} type="button" aria-pressed={presetCategory === group.name} className={`ai-service-preset-tab${presetCategory === group.name ? ' active' : ''}`} onClick={() => setPresetCategory(group.name)}>
-                        <Sparkles size={13} />{group.name}
-                      </button>
-                    ))}
-                  </div>
-                  {activePresetGroup ? <div className="ai-service-preset-list" role="group" aria-label="AI 服务预设">
-                    {activePresetGroup.items.map((preset) => (
-                      <label key={preset.id} className={`ai-service-preset-chip${selectedPreset === preset.id ? ' active' : ''}`} title={preset.description}>
-                        <input type="radio" name="ai-service-preset" value={preset.id} checked={selectedPreset === preset.id} onChange={() => applyPreset(preset.id)} />
-                        <strong>{preset.name}</strong><span>{preset.description}</span>
-                      </label>
-                    ))}
-                  </div> : <div className="ai-service-preset-hint"><Sparkles size={13} />选择常用服务后会自动填入连接信息、能力和推荐模型。</div>}
+                <div className="ai-service-form-group">
+                  <label className="field-label ai-service-field"><span>服务供应商</span><select value={selectedPreset} onChange={event => {
+                    if (event.target.value) applyPreset(event.target.value);
+                    else { discoveryRevision.current++; setFetchingModels(false); setSelectedPreset(''); setDraft({ ...emptyDraft, id: editingServiceId ?? '', display_name: draft.display_name }); setModelSetup(emptyModelSetup()); setFormNotice(''); }
+                  }}><option value="">自定义 / OpenAI 兼容服务</option>{[...new Set(presetEntries.map(item => item.category))].map(category => <optgroup key={category} label={category}>{presetEntries.filter(item => item.category === category).map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</optgroup>)}</select></label>
+                  <small className="ai-service-hint">同一个服务可提供对话、图像、视频和音频模型。</small>
                 </div>
-
                 <div className="ai-service-form-group">
                   <div className="ai-service-group-label">连接</div>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>服务名称</span><input {...fieldProps('display_name')} value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder="例如：公司模型 / Fish Audio" /></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input {...fieldProps('api_key')} type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
-                    <label className="field-label ai-service-field"><span>Base URL</span><input {...fieldProps('base_url')} value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://api.example.com/v1" /></label>
-                    <label className="field-label ai-service-field"><span>接口类型</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>服务名称（可选）</span><input {...fieldProps('display_name')} value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder={presetEntries.find(item => item.id === selectedPreset)?.name || '默认使用连接地址的主机名'} /></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input {...fieldProps('api_key')} type="password" value={draft.api_key} onChange={event => updateConnection('api_key', event.target.value)} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
+                    {selectedPreset ? <div className="ai-connection-summary">{draft.base_url}<br />{protocolLabels[draft.protocol]}</div> : null}
+                    <details className="ai-onboarding-details ai-service-field-wide" open={!selectedPreset}><summary>连接地址与接口</summary>
+                    <label className="field-label ai-service-field"><span>Base URL</span><input {...fieldProps('base_url')} value={draft.base_url} onChange={event => updateConnection('base_url', event.target.value)} placeholder="https://api.example.com/v1" /></label>
+                    <label className="field-label ai-service-field"><span>接口类型</span><select aria-label="接口类型" value={draft.protocol} onChange={event => updateConnection('protocol', event.target.value)}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    </details>
                   </div>
-                  <small className="ai-service-hint">主协议用于服务连接；媒体适配器在下一步选择。</small>
+                  <small className="ai-service-hint">接口按供应商说明填写；获取目录不会发起模型推理。高级媒体调用方式可在下一步调整。</small>
                 </div>
 
-                <div className="ai-service-form-group">
-                  <div className="ai-service-group-label">第二接入端点（可选）</div>
+                <details className="ai-onboarding-details">
+                  <summary>高级连接：第二接入端点</summary>
                   <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>第二 Base URL</span><input value={draft.secondary_base_url} onChange={(event) => setDraft((current) => ({ ...current, secondary_base_url: event.target.value }))} placeholder="https://api.example.com/anthropic" /></label>
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>第二 Base URL</span><input {...fieldProps('secondary_base_url')} value={draft.secondary_base_url} onChange={(event) => setDraft((current) => ({ ...current, secondary_base_url: event.target.value }))} placeholder="https://api.example.com/anthropic" /></label>
                     <label className="field-label ai-service-field"><span>第二接口类型</span><select value={draft.secondary_protocol} onChange={(event) => setDraft((current) => ({ ...current, secondary_protocol: event.target.value as AIServiceProtocol | '' }))}><option value="">不配置</option>{secondaryProtocolOptions(draft.protocol).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
                   </div>
-                  <small className="ai-service-hint">同一账号的另一种协议地址；留空时只使用主端点。</small>
-                </div>
+                  <small className="ai-service-hint">同一账号和凭据的另一种协议地址；留空时只使用主端点。</small>
+                </details>
               </> : null}
 
               {formStep === 1 ? <>
-                <div className="ai-service-form-group">
-                  <div className="ai-service-group-label">启用能力</div>
-                  <div className="ai-capability-picker" tabIndex={-1} {...fieldProps('capabilities')}>
-                    {AI_SERVICE_CAPABILITIES.map(capability => (
-                      <label key={capability} className={`ai-capability-option${enabledCapabilities.includes(capability) ? ' selected' : ''}`}>
-                        <input type="checkbox" checked={enabledCapabilities.includes(capability)} onChange={() => toggleCapability(capability)} />
-                        <span><strong>{AI_SERVICE_CAPABILITY_LABELS[capability]}</strong><small>{capability === 'chat' ? '文本、推理与工具调用' : '单次媒体 Provider 调用'}</small></span>
-                      </label>
-                    ))}
-                  </div>
+                <div className="ai-model-catalog-heading"><div><strong>选择此服务的模型</strong><p className="ai-service-hint">目录只表示模型已列出；用途是配置选择，实际可用性需调用验证。</p></div>
+                  <button type="button" className="btn" disabled={fetchingModels || saving} onClick={() => void fetchModels()}>{fetchingModels ? <><BusyIndicator size={14} />正在获取目录…</> : '从服务获取模型'}</button>
                 </div>
-
-                {enabledCapabilities.includes('chat') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>对话</strong><span>HiMind 对话和工具分发使用</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>对话默认模型</span><input {...fieldProps('model')} value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-4.1 / deepseek-chat" /></label>
-                    <label className="field-label ai-service-field"><span>可用模型</span><input value={draft.models} onChange={(event) => setDraft((current) => ({ ...current, models: event.target.value }))} placeholder="多个模型用逗号分隔" /></label>
-                  </div>
-                  <button className="btn ai-service-fetch-models" title={isVolcengineAgentPlan(draft.base_url) ? 'Agent Plan 不提供 /models；模型由目录提供' : !draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
-                    {fetchingModels ? <BusyIndicator size={14} /> : isVolcengineAgentPlan(draft.base_url) ? <Info size={14} /> : <RefreshCw size={14} />}{fetchingModels ? '获取中' : isVolcengineAgentPlan(draft.base_url) ? '使用目录模型' : '从服务获取模型'}
-                  </button>
-                  {isVolcengineAgentPlan(draft.base_url) ? <small className="ai-service-hint">Agent Plan 不提供模型列表；模型来自目录。保存后的“检查连接”会发送 1 Token 的 Messages 探测。</small> : null}
-                </div> : null}
-
-                {enabledCapabilities.includes('image.generate') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>生图</strong><span>文本生成图片</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>生图模型</span><input {...fieldProps('image_model')} value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
-                    <label className="field-label ai-service-field"><span>生图适配器</span><select value={draft.image_adapter || 'openai-images'} onChange={(event) => setDraft((current) => ({ ...current, image_adapter: event.target.value }))}><option value="openai-images">OpenAI Images</option><option value="ark-images">火山方舟</option></select></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它生图模型</span><input value={draft.image_models} onChange={(event) => setDraft((current) => ({ ...current, image_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                </div> : null}
-
-                {enabledCapabilities.includes('image.edit') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>改图</strong><span>参考图编辑 / 图生图</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>改图模型</span><input {...fieldProps('image_edit_model')} value={draft.image_edit_model} onChange={(event) => setDraft((current) => ({ ...current, image_edit_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seededit" /></label>
-                    <label className="field-label ai-service-field"><span>改图适配器</span><select value={draft.image_edit_adapter || 'openai-images-edit'} onChange={(event) => setDraft((current) => ({ ...current, image_edit_adapter: event.target.value }))}><option value="openai-images-edit">OpenAI Images Edits</option><option value="ark-images">火山方舟</option></select></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它改图模型</span><input value={draft.image_edit_models} onChange={(event) => setDraft((current) => ({ ...current, image_edit_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                </div> : null}
-
-                {enabledCapabilities.includes('video.generate') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>视频</strong><span>文生视频 / 图生视频</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>生视频模型</span><input {...fieldProps('video_model')} value={draft.video_model} onChange={(event) => setDraft((current) => ({ ...current, video_model: event.target.value }))} placeholder="如 doubao-seedance-2-5-…" /></label>
-                    <label className="field-label ai-service-field"><span>视频适配器</span><select value={draft.video_adapter || 'ark-video'} onChange={(event) => setDraft((current) => ({ ...current, video_adapter: event.target.value }))}><option value="ark-video">火山方舟 Seedance</option><option value="wan-video">阿里云百炼万相</option></select></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它视频模型</span><input value={draft.video_models} onChange={(event) => setDraft((current) => ({ ...current, video_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                  <small className="ai-service-hint">视频是异步任务，提交后通过媒体任务查询结果。</small>
-                </div> : null}
-
-                {enabledCapabilities.includes('audio.speech') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>语音合成</strong><span>单次 TTS Provider 调用</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>语音合成模型</span><input {...fieldProps('speech_model')} value={draft.speech_model} onChange={(event) => setDraft((current) => ({ ...current, speech_model: event.target.value }))} placeholder="如 tts-1 / s2.1-pro-free" /></label>
-                    <label className="field-label ai-service-field"><span>语音合成适配器</span><select value={draft.speech_adapter || 'openai-speech'} onChange={(event) => setDraft((current) => ({ ...current, speech_adapter: event.target.value }))}><option value="openai-speech">OpenAI 兼容</option><option value="fish-audio-tts">Fish Audio</option></select></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音合成模型</span><input value={draft.speech_models} onChange={(event) => setDraft((current) => ({ ...current, speech_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                </div> : null}
-
-                {enabledCapabilities.includes('audio.transcribe') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>语音转写</strong><span>单次 ASR Provider 调用</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>语音转写模型</span><input {...fieldProps('transcribe_model')} value={draft.transcribe_model} onChange={(event) => setDraft((current) => ({ ...current, transcribe_model: event.target.value }))} placeholder="如 whisper-1 / transcribe-1-pro" /></label>
-                    <label className="field-label ai-service-field"><span>语音转写适配器</span><select value={draft.transcribe_adapter || 'openai-audio'} onChange={(event) => setDraft((current) => ({ ...current, transcribe_adapter: event.target.value }))}><option value="openai-audio">OpenAI 兼容</option><option value="fish-audio-asr">Fish Audio</option></select></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>其它语音转写模型</span><input value={draft.transcribe_models} onChange={(event) => setDraft((current) => ({ ...current, transcribe_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                </div> : null}
-                {enabledCapabilities.includes('vision.describe') ? <div className="ai-capability-card">
-                  <div className="ai-capability-card-head"><strong>视觉理解</strong><span>看图打标、OCR 与画面理解</span></div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>视觉理解模型（可留空）</span><input {...fieldProps('vision_model')} value={draft.vision_model} onChange={(event) => setDraft((current) => ({ ...current, vision_model: event.target.value }))} placeholder={draft.model.trim() ? `留空则跟随对话模型：${draft.model.trim()}` : '留空则跟随对话模型'} /></label>
-                    <label className="field-label ai-service-field"><span>其它视觉理解模型</span><input value={draft.vision_models} onChange={(event) => setDraft((current) => ({ ...current, vision_models: event.target.value }))} placeholder="能力路由里可选的模型，逗号分隔" /></label>
-                  </div>
-                  <small className="ai-service-hint">与对话同一协议，不需要适配器；留空则跟随对话模型。</small>
-                </div> : null}
-              </> : null}
-
-              {formStep === 2 ? <>
-                <div className="ai-service-form-group">
-                  <div className="ai-service-group-label">高级</div>
-                  <div className="ai-service-form-grid">
-                    <label className="field-label ai-service-field"><span>服务 ID</span><input value={draft.id} disabled={editing} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} placeholder={`自动生成：${suggestedServiceId(draft.display_name)}`} /></label>
-                    <label className="field-label ai-service-field ai-service-field-wide"><span>接口类型</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-                  </div>
-                  <small className="ai-service-hint">服务 ID 用于内部引用；新建时留空会自动生成。</small>
-                </div>
-
+                <AiModelCatalogEditor value={modelSetup} onChange={setModelSetup} disabled={saving} />
+                <details className="ai-onboarding-details"><summary>高级：调用方式与账户用量</summary>
+                  <label className="field-label"><span>服务 ID</span><input {...fieldProps('id')} value={draft.id} disabled={editing} onChange={event => setDraft(current => ({ ...current, id: event.target.value }))} placeholder={`自动生成：${suggestedServiceId(serviceName())}`} /></label>
+                  <p className="ai-service-hint">同一用途的多个模型共用调用方式。仅在供应商接口不兼容时调整。</p>
+                  {configuredOperations(modelSetup).filter(op => op !== 'chat' && op !== 'vision.describe').map(op => <label key={op} className="field-label"><span>{AI_SERVICE_CAPABILITY_LABELS[op]}调用方式</span><select value={modelSetup.adapters[op] || ({ 'image.generate': 'openai-images', 'image.edit': 'openai-images-edit', 'video.generate': 'ark-video', 'audio.speech': 'openai-speech', 'audio.transcribe': 'openai-audio' } as Record<string, string>)[op]} onChange={event => setModelSetup(current => ({ ...current, adapters: { ...current.adapters, [op]: event.target.value } }))}>
+                    {({ 'image.generate': [['openai-images', 'OpenAI 兼容'], ['ark-images', '火山方舟']], 'image.edit': [['openai-images-edit', 'OpenAI 兼容'], ['ark-images', '火山方舟']], 'video.generate': [['ark-video', '火山方舟'], ['wan-video', '阿里云百炼万相']], 'audio.speech': [['openai-speech', 'OpenAI 兼容'], ['fish-audio-tts', 'Fish Audio']], 'audio.transcribe': [['openai-audio', 'OpenAI 兼容'], ['fish-audio-asr', 'Fish Audio']] } as Record<string, string[][]>)[op].map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+                  </select></label>)}
                 <div className="ai-service-form-group">
                   <div className="ai-service-group-label">用量与计费</div>
                   <div className="ai-service-form-grid">
@@ -1008,11 +799,12 @@ export function AiProvidersPanel({
                   </div> : null}
                   <small className="ai-service-hint">仅手动查询；请求留在服务同源。</small>
                 </div>
+                </details>
               </> : null}
 
               <div className="modal-actions">
                 <button className="btn" disabled={saving} onClick={formStep === 0 ? closeForm : goBack}>{formStep === 0 ? '取消' : <><ChevronLeft size={14} />上一步</>}</button>
-                {formStep < 2 ? <button className="btn btn-primary" disabled={saving} onClick={goNext}>下一步<ChevronRight size={14} /></button> : <button className="btn btn-primary" disabled={saving} onClick={() => void saveService()}>{saving ? '保存中...' : editing ? '保存修改' : '保存服务'}</button>}
+                {formStep === 0 ? <button className="btn btn-primary" disabled={saving} onClick={goNext}>选择模型<ChevronRight size={14} /></button> : <button className="btn btn-primary" disabled={saving} onClick={() => void saveService()}>{saving ? '保存中...' : editing ? '保存修改' : '保存服务'}</button>}
               </div>
             </div>
           </div>
@@ -1067,7 +859,7 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
   const confirm = useConfirm();
   const canDelete = clientStatuses.length === 0;
   const hasChat = capabilities.includes('chat');
-  const summary = `${service.base_url} · ${protocolLabels[service.protocol] ?? service.protocol} · ${hasChat ? `对话模型 ${service.model}` : '媒体服务'}`;
+  const summary = `${service.base_url} · ${protocolLabels[service.protocol] ?? service.protocol} · ${hasChat ? `对话模型 ${service.model}` : '已配置模型用途'}`;
   // 一行元信息替代原先两排药丸：能力、默认路由、分发都只是「读一眼」的事实，
   // 药丸的底色会把它们抬成和标题同级的信息，行里就只剩下色块。
   const capabilityText = capabilities.map(capability => AI_SERVICE_CAPABILITY_LABELS[capability]).join(' / ');
@@ -1114,7 +906,7 @@ function CustomSourceRow({ service, active, capabilities, routeBadges, health, c
         ) : null}
       </div>
       <div className="ai-client-registration-actions ai-service-row-actions" role="group" aria-label={`${service.display_name} 操作`}>
-        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={connectionCheck?.state === 'busy' || !hasChat} title={hasChat ? '检查对话模型列表接口' : '媒体服务需通过能力路由实际调用验证'} aria-label={`检查 ${service.display_name}`} onClick={onCheckConnection}>
+        <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={connectionCheck?.state === 'busy'} title="检查服务模型目录；不代表全部模型已验证" aria-label={`检查 ${service.display_name}`} onClick={onCheckConnection}>
           {connectionCheck?.state === 'busy' ? <BusyIndicator size={12} /> : <RefreshCw size={14} />}
         </button>
         <button type="button" className="btn btn-icon ai-service-icon-btn" disabled={cloneBusy} title="复制连接、模型、能力和加密凭据，创建独立 AI 服务" aria-label={`复制 AI 服务 ${service.display_name}`} onClick={onClone}>{cloneBusy ? <BusyIndicator size={12} /> : <Copy size={14} />}</button>

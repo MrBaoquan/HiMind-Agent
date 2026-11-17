@@ -65,13 +65,14 @@ function chatModelIsMediaOnly(service: CustomAIService): boolean {
 /** 某服务在某能力下的模型目录：默认模型在前，其余按声明顺序去重。
  *  必须与后端 `capability_models` 保持一致，否则界面会给出路由实际不会用的模型。 */
 export function capabilityModels(service: CustomAIService, capability: AIServiceCapability): string[] {
+  if (service.enabled_capabilities && !service.enabled_capabilities.includes(capability)) return [];
   const models: string[] = [];
   const push = (model: string | undefined | null) => {
     const value = model?.trim() ?? '';
     if (value && !models.includes(value)) models.push(value);
   };
   if (capability === 'chat') {
-    if (chatModelIsMediaOnly(service)) return models;
+    if (service.enabled_capabilities == null && chatModelIsMediaOnly(service)) return models;
     push(service.model);
     for (const model of service.models ?? []) push(model);
     return models;
@@ -84,7 +85,7 @@ export function capabilityModels(service: CustomAIService, capability: AIService
   }
   if (capability === 'vision.describe') {
     // 没有显式 vision 绑定时跟随对话模型（ADR 0023 第七条）。
-    if (chatModelIsMediaOnly(service)) return models;
+    if (service.enabled_capabilities == null && chatModelIsMediaOnly(service)) return models;
     push(service.model);
     for (const model of service.models ?? []) push(model);
     return models;

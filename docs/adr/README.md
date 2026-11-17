@@ -34,6 +34,7 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0026](0026-local-ui-read-audit-sampling.md) | Local UI reads stay out of the Agent Core run ledger | accepted | 2026-11-03 |
 | [0027](0027-application-capability-source.md) | Application capabilities use an explicit source without entering Agent Core | accepted | 2026-11-05 |
 | [0028](0028-host-owned-collaboration-mission-handoff.md) | Cross-client collaboration handoff creates a host-owned Mission | accepted | 2026-11-10 |
+| [0030](0030-unified-ai-service-onboarding.md) | One service connection, one model catalog, explicit operations | accepted | 2026-11-17 |
 
 ## How these relate
 
