@@ -1300,12 +1300,25 @@ mod tests {
 
     #[test]
     fn actual_untracked_binary_files_are_integrated_without_using_task_index() {
-        let repo = Repo::new();
+        let mut repo = Repo::new();
+        #[cfg(windows)]
+        {
+            repo.storage = repo.storage.join("long-index-fixture-".repeat(9));
+        }
         let a = repo.prepare("a").unwrap();
         let bytes = [0, 255, 1, 0, 13, 10, 128];
         fs::write(a.isolated_root.join("src/new.bin"), bytes).unwrap();
-        // The task's staged state is never used as an integration authority.
-        git(&a.isolated_root, &["add", "src/new.bin"], None).unwrap();
+        // Stage deliberately different bytes using metadata operations. Git for
+        // Windows 2.32 cannot chdir to these long worktrees even with longpaths;
+        // the host helper therefore runs metadata commands from the Git dir.
+        let staged_blob = git(&a.isolated_root, &["rev-parse", "HEAD:src/a.txt"], None).unwrap();
+        let staged_entry = format!("100644,{},src/new.bin", text(&staged_blob).unwrap().trim());
+        git(
+            &a.isolated_root,
+            &["update-index", "--add", "--cacheinfo", &staged_entry],
+            None,
+        )
+        .unwrap();
         fs::write(
             a.isolated_root.join("src/new.bin"),
             [bytes.as_slice(), &[7]].concat(),
@@ -1490,7 +1503,11 @@ mod tests {
 
     #[test]
     fn symlink_or_junction_candidate_is_rejected() {
-        let repo = Repo::new();
+        let mut repo = Repo::new();
+        #[cfg(windows)]
+        {
+            repo.storage = repo.storage.join("long-junction-fixture-".repeat(9));
+        }
         let a = repo.prepare("a").unwrap();
         let outside = repo.root.join("outside");
         fs::create_dir(&outside).unwrap();
@@ -1500,8 +1517,15 @@ mod tests {
         #[cfg(windows)]
         {
             let status = crate::runtime::process::hidden_command("cmd.exe")
-                .current_dir(a.isolated_root.join("src"))
-                .args(["/D", "/C", "mklink", "/J", "link"])
+                .current_dir(&repo.source)
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(
+                    a.isolated_root
+                        .join("src")
+                        .canonicalize()
+                        .unwrap()
+                        .join("link"),
+                )
                 .arg(&outside)
                 .output()
                 .unwrap();
