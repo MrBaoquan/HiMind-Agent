@@ -3916,8 +3916,8 @@ pub(crate) fn read_skill_document(skill_id: String) -> Result<serde_json::Value,
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("技能不存在：{skill_id}"))?;
     let path = record.version_root.join("SKILL.md");
-    let metadata = std::fs::metadata(&path)
-        .map_err(|_| format!("技能包中没有 SKILL.md：{skill_id}"))?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|_| format!("技能包中没有 SKILL.md：{skill_id}"))?;
     if !metadata.is_file() {
         return Err(format!("技能包中没有 SKILL.md：{skill_id}"));
     }
@@ -3926,8 +3926,8 @@ pub(crate) fn read_skill_document(skill_id: String) -> Result<serde_json::Value,
     if metadata.len() > MAX_DOCUMENT_BYTES {
         return Err("SKILL.md 超过 1 MB，暂不支持在应用内预览".to_string());
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取 SKILL.md 失败：{error}"))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|error| format!("读取 SKILL.md 失败：{error}"))?;
     Ok(json!({
         "skill_id": record.manifest.id,
         "name": record.manifest.name,
@@ -8225,13 +8225,19 @@ pub(crate) fn save_notification_channel(
     if id.is_empty() {
         return Err("通知通道需要 id".to_string());
     }
-    let supported = ["dingtalk", "feishu", "lark", "wecom", "slack", "discord", "generic"];
+    let supported = [
+        "dingtalk", "feishu", "lark", "wecom", "slack", "discord", "generic",
+    ];
     let kind = kind.trim().to_ascii_lowercase();
     if !supported.contains(&kind.as_str()) {
         return Err(format!("不支持的通知通道类型：{kind}"));
     }
     let handle = format!("cred://notification/{id}");
-    if let Some(webhook) = webhook.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+    if let Some(webhook) = webhook
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
         crate::notification_channels::set_webhook(&handle, webhook)
             .map_err(|error| error.to_string())?;
     }
@@ -8282,9 +8288,7 @@ pub(crate) fn pause_workflow_run(run_id: String) -> Result<serde_json::Value, St
 /// 与 `resume_workflow_run` 分开：那个走「带反馈继续」，会重新进入调度；
 /// 这个只是把 `pause_kind` 清掉并重新入队，等待调度器接手。
 #[tauri::command]
-pub(crate) fn resume_paused_workflow_run(
-    run_id: String,
-) -> Result<serde_json::Value, String> {
+pub(crate) fn resume_paused_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
     let runner =
         crate::workflow::WorkflowRunner::open_default().map_err(|error| error.to_string())?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()
@@ -8522,8 +8526,11 @@ fn workflow_resume_interaction(
     let interaction = ledger
         .get_interaction(&run.interaction_id)?
         .ok_or("workflow run interaction is missing")?;
-    let workflow_id = interaction.business_context.pointer("/workflow/id")
-        .and_then(Value::as_str).unwrap_or_default();
+    let workflow_id = interaction
+        .business_context
+        .pointer("/workflow/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     // Namespace identity also protects old/orphaned attempts after their claim
     // or current task binding is gone. Caller-supplied mission_id alone is not
     // ownership: ordinary workflows may carry similarly named business data.
@@ -8536,25 +8543,41 @@ fn workflow_resume_interaction(
         let path = crate::store::paths::agent_home().join("mission-runs.sqlite3");
         if path.try_exists()? {
             let connection = rusqlite::Connection::open_with_flags(
-                path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
             connection.busy_timeout(Duration::from_secs(30))?;
-            connection.query_row(
-                "SELECT mission_id, task_id FROM mission_tasks
+            connection
+                .query_row(
+                    "SELECT mission_id, task_id FROM mission_tasks
                  WHERE attempt_run_id=?1 OR verification_run_id=?1
                  UNION ALL SELECT mission_id, task_id FROM mission_workspace_claims
                  WHERE run_id=?1 LIMIT 1",
-                [&run.run_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ).optional()?
-        } else { None }
+                    [&run.run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+        } else {
+            None
+        }
     };
     if host_mission_package || binding.is_some() {
-        let (mission_id, task_id) = binding.unwrap_or_else(|| (
-            interaction.business_context.pointer("/input/mission_id")
-                .and_then(Value::as_str).unwrap_or_default().to_string(),
-            interaction.business_context.pointer("/input/task_id")
-                .and_then(Value::as_str).unwrap_or_default().to_string(),
-        ));
+        let (mission_id, task_id) = binding.unwrap_or_else(|| {
+            (
+                interaction
+                    .business_context
+                    .pointer("/input/mission_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                interaction
+                    .business_context
+                    .pointer("/input/task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        });
         return Err(format!(
             "Mission-owned LocalRun {} ({mission_id}/{task_id}) cannot execute through generic Workflow resume or feedback. 请在 Mission 页面继续，由 Mission 调度器检查状态、占用和授权后执行；暂停的 Mission 使用 mission.control resume，审查意见使用 mission.feedback.submit。",
             run.run_id,
@@ -9228,8 +9251,14 @@ pub(crate) fn list_workflow_runs(
         }
     }
     items.sort_by(|left, right| {
-        let l = left.get("created_at").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let r = right.get("created_at").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let l = left
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let r = right
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         r.cmp(l)
     });
     let total = items.len();
@@ -9297,8 +9326,7 @@ pub(crate) fn workflow_run_snapshot(
         })
         .transpose()?;
     // 结构化证据按步骤归拢后一并给出：前端不必再从事件流里自己拼。
-    let evidence = crate::workflow::collect_step_evidence(run_id, &ledger)
-        .unwrap_or_default();
+    let evidence = crate::workflow::collect_step_evidence(run_id, &ledger).unwrap_or_default();
     Ok(json!({
         "run": run,
         "interaction": interaction,
@@ -9363,7 +9391,15 @@ pub(crate) async fn list_workspace_session_history(
     include_children: Option<bool>,
 ) -> Result<crate::session_history::SessionHistorySnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        workspace_history_snapshot_scoped(project_id, cursor, query, source, sort, 50, include_children.unwrap_or(false))
+        workspace_history_snapshot_scoped(
+            project_id,
+            cursor,
+            query,
+            source,
+            sort,
+            50,
+            include_children.unwrap_or(false),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -9417,7 +9453,9 @@ pub(crate) async fn start_workspace_session_inspection(
     include_children: Option<bool>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let revision = crate::workspace_registry::Registry::load().map_err(|e| e.to_string())?.revision();
+        let revision = crate::workspace_registry::Registry::load()
+            .map_err(|e| e.to_string())?
+            .revision();
         let mut snapshot = workspace_history_snapshot_scoped(
             project_id.clone(),
             None,
@@ -9440,10 +9478,21 @@ pub(crate) async fn start_workspace_session_inspection(
                             | crate::session_history::SessionSource::Codex
                     ))
         });
-        if crate::workspace_registry::Registry::load().map_err(|e| e.to_string())?.revision() != revision {
+        if crate::workspace_registry::Registry::load()
+            .map_err(|e| e.to_string())?
+            .revision()
+            != revision
+        {
             return Err("WORKSPACE_REGISTRY_CHANGED".into());
         }
-        crate::session_history_inspect::start_scoped(project_id, snapshot, session_id, query, mode, Some(revision))
+        crate::session_history_inspect::start_scoped(
+            project_id,
+            snapshot,
+            session_id,
+            query,
+            mode,
+            Some(revision),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -9456,10 +9505,15 @@ pub(crate) async fn step_workspace_session_inspection(
 ) -> Result<crate::session_history_inspect::InspectBatch, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let registry = crate::workspace_registry::Registry::load().map_err(|e| e.to_string())?;
-        crate::session_history_inspect::step_scoped(&project_id, &token, &registry.revision(), |session, cursor| {
-            let owner = session.project_id.clone().ok_or("SESSION_NOT_FOUND")?;
-            workspace_transcript_page(owner, session.id.clone(), cursor)
-        })
+        crate::session_history_inspect::step_scoped(
+            &project_id,
+            &token,
+            &registry.revision(),
+            |session, cursor| {
+                let owner = session.project_id.clone().ok_or("SESSION_NOT_FOUND")?;
+                workspace_transcript_page(owner, session.id.clone(), cursor)
+            },
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -9482,20 +9536,36 @@ pub(crate) async fn upsert_workspace_project(
     input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let initial_path = input.get("initial_path").and_then(serde_json::Value::as_str).unwrap_or_default().trim().to_string();
-        let create_only = input.get("create_only").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let initial_path = input
+            .get("initial_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let create_only = input
+            .get("create_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let project_input: crate::workspace_registry::ProjectInput =
             serde_json::from_value(input).map_err(|error| error.to_string())?;
         let mut saved = None;
         crate::workspace_registry::Registry::update(|registry| {
-            if create_only && project_input.id.is_empty() && registry.find_project(&project_input.name).is_some() {
+            if create_only
+                && project_input.id.is_empty()
+                && registry.find_project(&project_input.name).is_some()
+            {
                 return Err("ALIAS_CONFLICT: 项目名已存在，请更换名称".into());
             }
             let project = crate::workspace_registry::upsert_project(registry, project_input)?;
             if !initial_path.is_empty() {
-                crate::workspace_registry::bind_path(registry, crate::workspace_registry::BindInput {
-                    project_ref: project.id.clone(), path: initial_path, ..Default::default()
-                })?;
+                crate::workspace_registry::bind_path(
+                    registry,
+                    crate::workspace_registry::BindInput {
+                        project_ref: project.id.clone(),
+                        path: initial_path,
+                        ..Default::default()
+                    },
+                )?;
             }
             saved = Some(project);
             Ok(())
@@ -9508,25 +9578,49 @@ pub(crate) async fn upsert_workspace_project(
 }
 
 #[tauri::command]
-pub(crate) async fn plan_workspace_subprojects(input: crate::workspace_registry::hierarchy::SubprojectInput) -> Result<crate::workspace_registry::hierarchy::SubprojectPreview, String> {
+pub(crate) async fn plan_workspace_subprojects(
+    input: crate::workspace_registry::hierarchy::SubprojectInput,
+) -> Result<crate::workspace_registry::hierarchy::SubprojectPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let registry = crate::workspace_registry::Registry::load().map_err(|e| e.to_string())?;
-        crate::workspace_registry::hierarchy::plan(&registry, &input).map(|(_, preview)| preview).map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?
+        crate::workspace_registry::hierarchy::plan(&registry, &input)
+            .map(|(_, preview)| preview)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub(crate) async fn apply_workspace_subprojects(input: crate::workspace_registry::hierarchy::SubprojectInput) -> Result<crate::workspace_registry::hierarchy::SubprojectPreview, String> {
+pub(crate) async fn apply_workspace_subprojects(
+    input: crate::workspace_registry::hierarchy::SubprojectInput,
+) -> Result<crate::workspace_registry::hierarchy::SubprojectPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::workspace_registry::hierarchy::apply_at(&crate::workspace_registry::registry_path(), &input).map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?
+        crate::workspace_registry::hierarchy::apply_at(
+            &crate::workspace_registry::registry_path(),
+            &input,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub(crate) async fn restore_workspace_subprojects(before_revision: String, expected_revision: String) -> Result<(), String> {
+pub(crate) async fn restore_workspace_subprojects(
+    before_revision: String,
+    expected_revision: String,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::workspace_registry::hierarchy::restore_at(&crate::workspace_registry::registry_path(), &before_revision, &expected_revision).map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?
+        crate::workspace_registry::hierarchy::restore_at(
+            &crate::workspace_registry::registry_path(),
+            &before_revision,
+            &expected_revision,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -9546,7 +9640,9 @@ pub(crate) async fn delete_workspace_project(
 }
 
 #[tauri::command]
-pub(crate) async fn bind_workspace_path(input: serde_json::Value) -> Result<serde_json::Value, String> {
+pub(crate) async fn bind_workspace_path(
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let bind_input: crate::workspace_registry::BindInput =
             serde_json::from_value(input).map_err(|error| error.to_string())?;
@@ -9568,7 +9664,9 @@ pub(crate) async fn bind_workspace_path(input: serde_json::Value) -> Result<serd
 }
 
 #[tauri::command]
-pub(crate) async fn list_workspace_candidates(status: Option<String>) -> Result<serde_json::Value, String> {
+pub(crate) async fn list_workspace_candidates(
+    status: Option<String>,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let registry =
             crate::workspace_registry::Registry::load().map_err(|error| error.to_string())?;
@@ -9653,7 +9751,8 @@ mod tests {
 
     impl WorkflowResumeHome {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("workflow-resume-owner-{}", rand::random::<u64>()));
+            let root = std::env::temp_dir()
+                .join(format!("workflow-resume-owner-{}", rand::random::<u64>()));
             std::fs::create_dir_all(&root).unwrap();
             let previous = std::env::var_os("HIMIND_AGENT_HOME");
             std::env::set_var("HIMIND_AGENT_HOME", &root);
@@ -9687,11 +9786,22 @@ mod tests {
         })).unwrap()
     }
 
-    fn install_workflow_resume_package(root: &Path, package: &crate::workflow::WorkflowPackage) -> crate::workflow::WorkflowPackage {
+    fn install_workflow_resume_package(
+        root: &Path,
+        package: &crate::workflow::WorkflowPackage,
+    ) -> crate::workflow::WorkflowPackage {
         let source = root.join(&package.id);
         std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("workflow.json"), serde_json::to_vec(package).unwrap()).unwrap();
-        crate::workflow::WorkflowStore::open_default().unwrap().install_from_directory(&source).unwrap().package
+        std::fs::write(
+            source.join("workflow.json"),
+            serde_json::to_vec(package).unwrap(),
+        )
+        .unwrap();
+        crate::workflow::WorkflowStore::open_default()
+            .unwrap()
+            .install_from_directory(&source)
+            .unwrap()
+            .package
     }
 
     fn assert_workflow_resume_rejected(
@@ -9701,7 +9811,8 @@ mod tests {
     ) {
         let before_run = serde_json::to_value(ledger.get_run(&run.run_id).unwrap()).unwrap();
         let before_events = serde_json::to_value(ledger.list_events(&run.run_id).unwrap()).unwrap();
-        let before_interaction = serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap();
+        let before_interaction =
+            serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap();
         for feedback in [None, Some("change scope and continue")] {
             for scheduled in [false, true] {
                 let result = if scheduled {
@@ -9711,12 +9822,24 @@ mod tests {
                 };
                 let error = result.unwrap_err().to_string();
                 assert!(error.contains("Mission-owned LocalRun"), "{error}");
-                assert!(error.contains("mission.control") && error.contains("mission.feedback.submit"), "{error}");
+                assert!(
+                    error.contains("mission.control") && error.contains("mission.feedback.submit"),
+                    "{error}"
+                );
             }
         }
-        assert_eq!(serde_json::to_value(ledger.get_run(&run.run_id).unwrap()).unwrap(), before_run);
-        assert_eq!(serde_json::to_value(ledger.list_events(&run.run_id).unwrap()).unwrap(), before_events);
-        assert_eq!(serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap(), before_interaction);
+        assert_eq!(
+            serde_json::to_value(ledger.get_run(&run.run_id).unwrap()).unwrap(),
+            before_run
+        );
+        assert_eq!(
+            serde_json::to_value(ledger.list_events(&run.run_id).unwrap()).unwrap(),
+            before_events
+        );
+        assert_eq!(
+            serde_json::to_value(ledger.get_interaction(&run.interaction_id).unwrap()).unwrap(),
+            before_interaction
+        );
     }
 
     #[test]
@@ -9728,12 +9851,24 @@ mod tests {
         let gateway = env.gateway();
         // Opaque request ids and missing business input cannot turn a host
         // implementation or saved verifier into an ordinary Workflow run.
-        for (index, id) in ["com.himind.mission.fixture", "com.himind.mission.verify.fixture"].iter().enumerate() {
+        for (index, id) in [
+            "com.himind.mission.fixture",
+            "com.himind.mission.verify.fixture",
+        ]
+        .iter()
+        .enumerate()
+        {
             // Install an executable package: rejection cannot be attributed to
             // missing package metadata or an unavailable Runtime provider.
             let package = install_workflow_resume_package(&env.root, &workflow_resume_package(id));
-            let input = if index == 0 {json!({"mission_id":"fixture", "task_id":"work"})} else {json!({})};
-            let run = runner.start("local-agent", &package, &format!("opaque-{index}"), &input).unwrap();
+            let input = if index == 0 {
+                json!({"mission_id":"fixture", "task_id":"work"})
+            } else {
+                json!({})
+            };
+            let run = runner
+                .start("local-agent", &package, &format!("opaque-{index}"), &input)
+                .unwrap();
             let paused = runner.pause(run).unwrap();
             assert_workflow_resume_rejected(&gateway, &ledger, &paused);
             // The safe user-pause operation only requeues. Generic execution
@@ -9753,38 +9888,80 @@ mod tests {
         let _lock = crate::store::paths::test_env_lock();
         let env = WorkflowResumeHome::new();
         let store = crate::mission::MissionStore::open_default().unwrap();
-        let created = store.create(&serde_json::from_value(json!({"title":"Resume owner",
-            "workspace":{"root":env.root, "read_scope":["."], "write_scope":[]}})).unwrap()).unwrap();
+        let created = store
+            .create(
+                &serde_json::from_value(json!({"title":"Resume owner",
+            "workspace":{"root":env.root, "read_scope":["."], "write_scope":[]}}))
+                .unwrap(),
+            )
+            .unwrap();
         let proposal = serde_json::from_value(json!({"summary":"Read-only task", "tasks":[{
             "id":"work", "title":"Inspect", "read_paths":["."], "write_paths":[],
             "acceptance_criteria":["evidence"], "required_checks":["node --test"],
             "execution":{"executor":"himind.builtin", "role_id":"reviewer"}}],
             "required_acceptance":[], "budget":{"max_rounds":8, "max_minutes":10, "max_repair_attempts":2}})).unwrap();
         let planned = store.propose_plan(&created.mission_id, &proposal).unwrap();
-        let mission = store.confirm_plan(&created.mission_id, &planned.plan_sha256,
-            &["work".into()], &[], &[], &[], "fixture").unwrap();
+        let mission = store
+            .confirm_plan(
+                &created.mission_id,
+                &planned.plan_sha256,
+                &["work".into()],
+                &[],
+                &[],
+                &[],
+                "fixture",
+            )
+            .unwrap();
         let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
         let runner = crate::workflow::WorkflowRunner::with_ledger(ledger.clone());
         let package = workflow_resume_package("com.example.legacy-worker");
         let gateway = env.gateway();
-        let implementation = runner.start("local-agent", &package, "opaque-implementation", &json!({})).unwrap();
-        store.begin_task_attempt(&mission.mission_id, "work", &implementation.run_id).unwrap();
+        let implementation = runner
+            .start("local-agent", &package, "opaque-implementation", &json!({}))
+            .unwrap();
+        store
+            .begin_task_attempt(&mission.mission_id, "work", &implementation.run_id)
+            .unwrap();
         let before = store.snapshot(&mission.mission_id, 0).unwrap();
         assert_workflow_resume_rejected(&gateway, &ledger, &implementation);
         assert_eq!(store.snapshot(&mission.mission_id, 0).unwrap(), before);
-        assert_eq!(store.attempt_workspace(&implementation.run_id).unwrap(), Some(mission.workspace.root.clone()));
-        store.await_task_verification(&mission.mission_id, "work", &implementation.run_id, "fixture").unwrap();
-        let verifier = runner.start("local-agent", &package, "opaque-verifier", &json!({})).unwrap();
-        store.begin_verification_attempt(&mission.mission_id, "work", &verifier.run_id).unwrap();
+        assert_eq!(
+            store.attempt_workspace(&implementation.run_id).unwrap(),
+            Some(mission.workspace.root.clone())
+        );
+        store
+            .await_task_verification(
+                &mission.mission_id,
+                "work",
+                &implementation.run_id,
+                "fixture",
+            )
+            .unwrap();
+        let verifier = runner
+            .start("local-agent", &package, "opaque-verifier", &json!({}))
+            .unwrap();
+        store
+            .begin_verification_attempt(&mission.mission_id, "work", &verifier.run_id)
+            .unwrap();
         let before = store.snapshot(&mission.mission_id, 0).unwrap();
         assert_workflow_resume_rejected(&gateway, &ledger, &verifier);
         assert_eq!(store.snapshot(&mission.mission_id, 0).unwrap(), before);
-        assert_eq!(store.attempt_workspace(&implementation.run_id).unwrap(), Some(mission.workspace.root.clone()));
+        assert_eq!(
+            store.attempt_workspace(&implementation.run_id).unwrap(),
+            Some(mission.workspace.root.clone())
+        );
 
         // A real Mission id in unrelated business data is insufficient to
         // reserve this run. Preserve ordinary Workflow recovery semantics.
-        let ordinary = runner.start("local-agent", &package, "unrelated", &json!({
-            "mission_id":mission.mission_id, "task_id":"work"})).unwrap();
+        let ordinary = runner
+            .start(
+                "local-agent",
+                &package,
+                "unrelated",
+                &json!({
+            "mission_id":mission.mission_id, "task_id":"work"}),
+            )
+            .unwrap();
         assert!(workflow_resume_interaction(&ledger, &ordinary).is_ok());
     }
 
@@ -9803,19 +9980,28 @@ mod tests {
             "execution_mode":"long_running", "loop":{"max_iterations":2, "pause_for_feedback":true,
                 "exit_when":{"operator":"equals", "path":"loops.REVIEW.iteration", "value":2},
                 "steps":[body]}
-        }])).unwrap();
+        }]))
+        .unwrap();
         let package = install_workflow_resume_package(&env.root, &package);
         let ledger = crate::store::local_runs::LocalRunLedger::open_default().unwrap();
         let runner = crate::workflow::WorkflowRunner::with_ledger(ledger.clone());
         let input = json!({});
-        let run = runner.start("local-agent", &package, "ordinary-loop", &input).unwrap();
+        let run = runner
+            .start("local-agent", &package, "ordinary-loop", &input)
+            .unwrap();
         let gateway = env.gateway();
         let waiting = resume_workflow_with_gateway(gateway.clone(), &run.run_id, None).unwrap();
         assert_eq!(waiting["run"]["status"], "waiting");
-        let result = resume_workflow_with_gateway(gateway, &run.run_id, Some("continue ordinary loop")).unwrap();
+        let result =
+            resume_workflow_with_gateway(gateway, &run.run_id, Some("continue ordinary loop"))
+                .unwrap();
         assert_eq!(result["run"]["status"], "succeeded");
-        assert!(ledger.list_events(&run.run_id).unwrap().iter().any(|event|
-            event.event_type == crate::agent_core_contracts::RuntimeEventType::QuestionResolved
+        assert!(ledger
+            .list_events(&run.run_id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type
+                == crate::agent_core_contracts::RuntimeEventType::QuestionResolved
                 && event.payload["feedback"] == "continue ordinary loop"));
         assert!(!env.root.join("mission-runs.sqlite3").exists());
     }

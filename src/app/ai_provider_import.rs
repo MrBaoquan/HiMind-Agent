@@ -763,7 +763,11 @@ fn managed_field_drift(
 }
 
 /// 生成「差在哪」的可读说明。只列键名与两侧取值，不打印凭据（两侧都是占位符）。
-fn describe_drift(applied: &ManagedFields, current: &ManagedFields, verdict: DriftVerdict) -> String {
+fn describe_drift(
+    applied: &ManagedFields,
+    current: &ManagedFields,
+    verdict: DriftVerdict,
+) -> String {
     match verdict {
         DriftVerdict::Intact | DriftVerdict::Unknown => String::new(),
         DriftVerdict::Drifted(DriftKind::SegmentRemoved) => {
@@ -1509,7 +1513,9 @@ fn desired_state_for_binding(
                 "客户端配置中由 HiMind 写入的段落已不存在（可能被其它工具覆盖或手工删除）"
                     .to_string()
             }
-            DriftKind::Unparseable => "客户端配置文件无法解析，无法判断是否仍指向 HiMind".to_string(),
+            DriftKind::Unparseable => {
+                "客户端配置文件无法解析，无法判断是否仍指向 HiMind".to_string()
+            }
         };
         result.desired_revision = projection_digest(&json!({
             "schema": BINDING_PROJECTION_SCHEMA_VERSION,
@@ -1677,11 +1683,7 @@ fn apply_desired_state(binding: &mut AIProviderImportBinding, desired: &BindingD
 ///
 /// 必须在**同一次写入之后**立刻调用：延迟采集会让快照反映到别人的改动上去，
 /// 之后就无法区分漂移。适配器未实现时保持 `None`（不参与漂移检测）。
-fn record_applied_fields(
-    options: &Options,
-    target: &str,
-    binding: &mut AIProviderImportBinding,
-) {
+fn record_applied_fields(options: &Options, target: &str, binding: &mut AIProviderImportBinding) {
     binding.applied_fields = adapter_for(target)
         .and_then(|adapter| adapter.managed_fields(options))
         .and_then(|fields| serde_json::to_value(fields).ok());
@@ -3300,17 +3302,32 @@ pub(crate) fn cancel(
 ///
 /// `service` 为 `managed`（默认）时走 HiMind Dashboard 分发；
 /// 为 `custom:<id>` 时从本机自定义服务读取（API Key 经 DPAPI 解密）。
-pub(crate) fn custom_service_model_metadata(service_id: &str) -> Result<BTreeMap<String, crate::api::ai::AIModelMetadata>, Box<dyn Error>> {
-    let credential = resolve_credential(&Options::from_env(), "", "himind-runtime", &format!("custom:{service_id}"))?;
+pub(crate) fn custom_service_model_metadata(
+    service_id: &str,
+) -> Result<BTreeMap<String, crate::api::ai::AIModelMetadata>, Box<dyn Error>> {
+    let credential = resolve_credential(
+        &Options::from_env(),
+        "",
+        "himind-runtime",
+        &format!("custom:{service_id}"),
+    )?;
     let mut metadata = credential.model_metadata;
-    if let Some(service) = crate::store::ai_services::list()?.into_iter().find(|service| service.id == service_id) {
+    if let Some(service) = crate::store::ai_services::list()?
+        .into_iter()
+        .find(|service| service.id == service_id)
+    {
         let path = image_observations_path();
         if let Ok(bytes) = std::fs::read(path) {
             if let Ok(observations) = serde_json::from_slice::<BTreeMap<String, Value>>(&bytes) {
                 for model in std::iter::once(&service.model).chain(service.models.iter()) {
-                    if observations.get(&image_observation_key(&service, model)).is_some() {
+                    if observations
+                        .get(&image_observation_key(&service, model))
+                        .is_some()
+                    {
                         let entry = metadata.entry(model.clone()).or_default();
-                        if !entry.supports_image() { entry.input_modalities.push("image".into()); }
+                        if !entry.supports_image() {
+                            entry.input_modalities.push("image".into());
+                        }
                     }
                 }
             }
@@ -3323,23 +3340,46 @@ fn image_observations_path() -> PathBuf {
     crate::store::paths::agent_home().join("data/model-image-observations.json")
 }
 
-fn image_observation_key(service: &crate::store::ai_services::CustomAIService, model: &str) -> String {
+fn image_observation_key(
+    service: &crate::store::ai_services::CustomAIService,
+    model: &str,
+) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(format!("{}\n{}\n{}\n{}\n{}", service.id,
-        service.base_url, service.protocol.as_str(), service.updated_at, model).as_bytes()))
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\n{}\n{}\n{}\n{}",
+                service.id,
+                service.base_url,
+                service.protocol.as_str(),
+                service.updated_at,
+                model
+            )
+            .as_bytes()
+        )
+    )
 }
 
 /// Only a successful image request records this fact. It is scoped to the
 /// service configuration and model, so it cannot enable every GPT alias or
 /// survive an unrelated provider configuration change.
-pub(crate) fn record_image_input_observed(service: &crate::store::ai_services::CustomAIService, model: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn record_image_input_observed(
+    service: &crate::store::ai_services::CustomAIService,
+    model: &str,
+) -> Result<(), Box<dyn Error>> {
     let path = image_observations_path();
     let _lock = crate::store::atomic_file::lock(&path)?;
-    let mut observations: BTreeMap<String, Value> = std::fs::read(&path).ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-    observations.insert(image_observation_key(service, model), json!({"service_id":service.id,
+    let mut observations: BTreeMap<String, Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    observations.insert(
+        image_observation_key(service, model),
+        json!({"service_id":service.id,
         "model":model,"input":"image","source":"successful_image_request",
-        "observed_at":chrono::Utc::now().to_rfc3339()}));
+        "observed_at":chrono::Utc::now().to_rfc3339()}),
+    );
     crate::store::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&observations)?)?;
     Ok(())
 }
@@ -6134,13 +6174,11 @@ fn claude_desktop_managed_fields() -> Option<ManagedFields> {
     claude_desktop_entry_managed_fields().ok().flatten()
 }
 
-fn current_claude_desktop_managed_fields(
-) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+fn current_claude_desktop_managed_fields() -> Result<Option<ManagedFields>, ManagedFieldsError> {
     claude_desktop_entry_managed_fields()
 }
 
-fn claude_desktop_entry_managed_fields(
-) -> Result<Option<ManagedFields>, ManagedFieldsError> {
+fn claude_desktop_entry_managed_fields() -> Result<Option<ManagedFields>, ManagedFieldsError> {
     let meta_path = claude_desktop_library_meta_path();
     let meta = match read_json_object(&meta_path) {
         Ok(Some(meta)) => meta,
@@ -6149,12 +6187,18 @@ fn claude_desktop_entry_managed_fields(
     };
     // 条目 id 由 `_meta.json` 的 note 标记定位：客户端用户重命名档案不影响它。
     let Some(entry_id) = claude_desktop_owned_entry_id(&meta) else {
-        return Ok(Some(ManagedFields::default().with_segment("configLibrary.entry")));
+        return Ok(Some(
+            ManagedFields::default().with_segment("configLibrary.entry"),
+        ));
     };
     let entry_path = claude_desktop_library_dir().join(format!("{entry_id}.json"));
     let entry = match read_json_object(&entry_path) {
         Ok(Some(entry)) => entry,
-        Ok(None) => return Ok(Some(ManagedFields::default().with_segment("configLibrary.entry"))),
+        Ok(None) => {
+            return Ok(Some(
+                ManagedFields::default().with_segment("configLibrary.entry"),
+            ))
+        }
         Err(error) => return Err(ManagedFieldsError::Unparseable(error.to_string())),
     };
     let mut fields = ManagedFields::default()
@@ -6179,7 +6223,10 @@ fn claude_desktop_entry_managed_fields(
     if entry.contains_key("inferenceGatewayApiKey") {
         fields = fields.with_key("entry.inferenceGatewayApiKey", secret_placeholder());
     }
-    if let Some(headers) = entry.get("inferenceCustomHeaders").and_then(Value::as_object) {
+    if let Some(headers) = entry
+        .get("inferenceCustomHeaders")
+        .and_then(Value::as_object)
+    {
         if let Some(surface) = headers.get(CLAUDE_DESKTOP_SURFACE_HEADER) {
             fields = fields.with_key(
                 "entry.inferenceCustomHeaders.surface",
@@ -6900,8 +6947,9 @@ fn opencode_current_managed_fields() -> Result<Option<ManagedFields>, ManagedFie
     if content.trim().is_empty() {
         return Ok(None);
     }
-    let root: Value = serde_json::from_str(&crate::app::mcp_targets::strip_jsonc_comments(&content))
-        .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
+    let root: Value =
+        serde_json::from_str(&crate::app::mcp_targets::strip_jsonc_comments(&content))
+            .map_err(|error| ManagedFieldsError::Unparseable(error.to_string()))?;
     let Some(provider) = root
         .get("provider")
         .and_then(Value::as_object)
@@ -8686,10 +8734,8 @@ fn provider_config_managed_fields(
                         merged = merged.with_key("zcode.provider.himind.baseURL", base_url);
                     }
                     if options.contains_key("apiKey") {
-                        merged = merged.with_key(
-                            "zcode.provider.himind.apiKey",
-                            secret_placeholder(),
-                        );
+                        merged =
+                            merged.with_key("zcode.provider.himind.apiKey", secret_placeholder());
                     }
                 }
                 let models = provider
@@ -8733,7 +8779,8 @@ fn provider_config_managed_fields(
                 if let Some(api) = api {
                     for key in ["type", "baseUrl"] {
                         if let Some(value) = api.get(key).and_then(Value::as_str) {
-                            merged = merged.with_key(format!("zcode.providerRules.api.{key}"), value);
+                            merged =
+                                merged.with_key(format!("zcode.providerRules.api.{key}"), value);
                         }
                     }
                 }
@@ -14096,11 +14143,15 @@ experimental_bearer_token = "tok"
             assert!(fields.keys.contains_key(key), "missing managed key: {key}");
         }
         assert_eq!(
-            fields.keys.get("model_providers.himind.experimental_bearer_token"),
+            fields
+                .keys
+                .get("model_providers.himind.experimental_bearer_token"),
             Some(&super::secret_placeholder()),
             "token must be recorded as a placeholder, never as the value"
         );
-        assert!(fields.segments.contains(&"model_providers.himind".to_string()));
+        assert!(fields
+            .segments
+            .contains(&"model_providers.himind".to_string()));
     }
 
     /// Claude Code 的托管面只有 env 里那五个键；`env` 之外的设置不受影响。
