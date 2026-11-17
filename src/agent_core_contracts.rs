@@ -700,7 +700,8 @@ mod tests {
     fn serialized_runtime_runs_match_published_schema() {
         let schema: Value = serde_json::from_str(include_str!(
             "../contracts/agent-core/v1/local-run.schema.json"
-        )).unwrap();
+        ))
+        .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         // Serialize the actual runtime DTO, including defaulted fields and
         // null usage, rather than an older hand-written JSON fixture.
@@ -714,8 +715,11 @@ mod tests {
         assigned.steps[0].model = "cli:codex:gpt-6.1-sol".into();
         assigned.steps[0].role_id = "remediation.frontend".into();
         assigned.usage = Some(LocalRunUsage {
-            input_tokens: 13, output_tokens: 5, estimated_cost: 0.0,
-            currency: String::new(), billing_owner: "personal".into(),
+            input_tokens: 13,
+            output_tokens: 5,
+            estimated_cost: 0.0,
+            currency: String::new(),
+            billing_owner: "personal".into(),
         });
         for (index, runtime_run) in [legacy, assigned].into_iter().enumerate() {
             runtime_run.validate().unwrap();
@@ -732,9 +736,14 @@ mod tests {
                 assert_eq!(value["steps"][0]["model"], "cli:codex:gpt-6.1-sol");
                 assert_eq!(value["steps"][0]["role_id"], "remediation.frontend");
             }
-            let errors = validator.iter_errors(&value)
-                .map(|error| error.to_string()).collect::<Vec<_>>();
-            assert!(errors.is_empty(), "serialized runtime/schema drift: {errors:?}");
+            let errors = validator
+                .iter_errors(&value)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                errors.is_empty(),
+                "serialized runtime/schema drift: {errors:?}"
+            );
             let mut unknown = value.clone();
             unknown["undeclared_runtime_field"] = json!(true);
             assert!(!validator.is_valid(&unknown));
@@ -754,10 +763,10 @@ mod tests {
         for source in [
             include_str!("../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"),
             include_str!("../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"),
-            include_str!("../workflows/wechat-experience-upload/workflow.json"),
-            include_str!("../workflows/engine-build/workflow.json"),
-            include_str!("../workflows/software-delivery/workflow.json"),
-            include_str!("../workflows/ui-craft-team/workflow.json"),
+            include_str!("../tests/fixtures/workflows/wechat-experience-upload/workflow.json"),
+            include_str!("../tests/fixtures/workflows/engine-build/workflow.json"),
+            include_str!("../tests/fixtures/workflows/software-delivery/workflow.json"),
+            include_str!("../tests/fixtures/workflows/ui-craft-team/workflow.json"),
         ] {
             let fixture: Value = serde_json::from_str(source).unwrap();
             assert!(

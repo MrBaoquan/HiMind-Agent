@@ -177,14 +177,14 @@ fn create_with_stores(
     let experts = crate::expert::list_team_candidates()?;
     let recommendation = super::team::recommend_team(&input.objective, &experts);
     let package = recommended_team_package(&recommendation)?;
-    // Use a unique staging directory. The ordinary WorkflowStore atomically
-    // compares same-version content when two clients create the same method.
+    // Generated definitions live in the Mission-private method store. They
+    // become ordinary capabilities only after an explicit reusable export.
     let staging = crate::store::paths::agent_home()
         .join("mission-team-drafts")
         .join(format!("{}-{}", std::process::id(), rand::random::<u64>()));
     let result = (|| {
         super::export::write_package(&staging, &package)?;
-        let installed = workflows.install_from_directory(&staging)?;
+        let installed = workflows.install_mission_method(&staging)?;
         store.create_handoff_with_fingerprint(
             &MissionHandoffInput {
                 idempotency_key: input.idempotency_key.clone(),
@@ -366,11 +366,10 @@ mod tests {
             workflows.list().unwrap().is_empty(),
             "a missing reviewer must not install a partial method"
         );
-        let review_root =
-            root.join("experts/com.himind.expert.senior-test-engineer/versions/1.0.0");
+        let review_root = root.join("experts/com.himind.expert.quality-engineer/versions/1.0.0");
         fs::create_dir_all(&review_root).unwrap();
         fs::write(review_root.join("expert.json"),serde_json::to_vec(&json!({
-            "schema_version":"expert.v1","id":"com.himind.expert.senior-test-engineer","version":"1.0.0",
+            "schema_version":"expert.v1","id":"com.himind.expert.quality-engineer","version":"1.0.0",
             "name":"测试工程师","instructions":"独立复核交付与检查证据"
         })).unwrap()).unwrap();
         let first = create_with_stores(&input, &store, &workflows).unwrap();
@@ -380,6 +379,10 @@ mod tests {
         );
         assert!(first.confirmation.is_none());
         assert!(first.tasks.is_empty());
+        assert!(
+            workflows.list().unwrap().is_empty(),
+            "generated methods must stay out of capabilities"
+        );
         assert!(first.assignment.is_none());
         let pin = first.workflow.as_ref().unwrap();
         let (method, _) = workflows

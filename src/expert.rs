@@ -631,7 +631,7 @@ pub(crate) fn dsh_preset_document() -> Result<String, Box<dyn Error>> {
 
 pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
     let active = active()?;
-    let definitions = stored_definitions()?;
+    let definitions = selectable_definitions(stored_definitions()?)?;
     let mut result = definitions
         .into_iter()
         .map(|definition| summary(&definition, active.as_ref(), false))
@@ -646,6 +646,9 @@ pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
 
 pub(crate) fn get(id: &str, version: Option<&str>) -> Result<ExpertDefinition, Box<dyn Error>> {
     let id = validate_id(id)?;
+    if is_retired(&id)? {
+        return Err(format!("未找到专家（身份已退役）: {id}").into());
+    }
     if let Some(definition) = development_definition(&id)? {
         if version
             .map(|value| value == definition.version)
@@ -672,11 +675,22 @@ pub(crate) fn list_versions() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
     let mut definitions = installed_version_definitions()?;
     definitions.extend(development_definitions()?);
     definitions.extend(archived_development_definitions()?);
-    definitions.sort_by(|left, right| left.id.cmp(&right.id)
-        .then_with(|| compare_versions(&right.version, &left.version))
-        .then_with(|| digest(left).unwrap_or_default().cmp(&digest(right).unwrap_or_default())));
+    let mut definitions = selectable_definitions(definitions)?;
+    definitions.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| compare_versions(&right.version, &left.version))
+            .then_with(|| {
+                digest(left)
+                    .unwrap_or_default()
+                    .cmp(&digest(right).unwrap_or_default())
+            })
+    });
     definitions.dedup();
-    Ok(definitions.iter().map(|definition| summary(definition, active.as_ref(), false)).collect())
+    Ok(definitions
+        .iter()
+        .map(|definition| summary(definition, active.as_ref(), false))
+        .collect())
 }
 
 /// New-team candidates retain every installed release and the live development
@@ -686,27 +700,149 @@ pub(crate) fn list_versions() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
 pub(crate) fn list_team_candidates() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
     let mut definitions = installed_version_definitions()?;
     definitions.extend(development_definitions()?);
-    let mut candidates = definitions.iter()
-        .map(|definition| summary(definition, None, false)).collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.id.cmp(&right.id)
-        .then_with(|| compare_versions(&right.version, &left.version))
-        .then_with(|| left.digest.cmp(&right.digest)));
-    candidates.dedup_by(|left, right| left.id == right.id
-        && left.version == right.version && left.digest == right.digest);
+    let definitions = selectable_definitions(definitions)?;
+    let mut candidates = definitions
+        .iter()
+        .map(|definition| summary(definition, None, false))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| compare_versions(&right.version, &left.version))
+            .then_with(|| left.digest.cmp(&right.digest))
+    });
+    candidates.dedup_by(|left, right| {
+        left.id == right.id && left.version == right.version && left.digest == right.digest
+    });
     Ok(candidates)
+}
+
+/// Retirement changes availability for new work, never immutable Mission pins.
+/// The installation metadata is separate from the portable expert.v1 document.
+pub(crate) fn retire(id: &str) -> Result<Value, Box<dyn Error>> {
+    let id = validate_id(id)?;
+    let _lock = crate::store::atomic_file::lock(&retirement_path(&id))?;
+    let mut definitions = installed_version_definitions()?;
+    definitions.extend(development_definitions()?);
+    // An external development override hides the Agent-owned projection from
+    // discovery, but retirement still removes it. Archive both before cleanup.
+    let owned_development = store_root().join("development");
+    if development_root() != owned_development {
+        definitions.extend(development_definitions_at(&owned_development)?);
+    }
+    definitions.extend(archived_development_definitions()?);
+    definitions.extend(archived_definitions(
+        &store_root().join(".mission-experts"),
+    )?);
+    definitions.retain(|item| item.id == id);
+    definitions.sort_by_key(|item| digest(item).unwrap_or_default());
+    definitions.dedup();
+    let preserved = definitions
+        .iter()
+        .map(|item| Ok(json!({"version": item.version, "digest": digest(item)?})))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    if preserved.is_empty() && !is_retired(&id)? {
+        return Err(format!("未找到专家: {id}").into());
+    }
+    // Verify every archive before making the identity unavailable. These
+    // definitions are execution inputs only and are never listed for new work.
+    for definition in &definitions {
+        let definition_digest = digest(definition)?;
+        let archive = store_root()
+            .join(".mission-experts")
+            .join(&id)
+            .join(definition_digest.trim_start_matches("sha256:"));
+        let manifest = archive.join("expert.json");
+        if !manifest.exists() {
+            crate::store::atomic_file::atomic_write(
+                &manifest,
+                &serde_json::to_vec_pretty(definition)?,
+            )?;
+            crate::store::atomic_file::atomic_write(
+                &archive.join("EXPERT.md"),
+                definition.instructions.as_bytes(),
+            )?;
+        }
+        let archived: ExpertDefinition = serde_json::from_slice(&fs::read(&manifest)?)?;
+        validate(&archived)?;
+        if digest(&archived)? != definition_digest {
+            return Err("退役专家的私有副本摘要不符，未移除活动身份".into());
+        }
+    }
+    let path = retirement_path(&id);
+    if !path.exists() {
+        crate::store::atomic_file::atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&json!({
+                "schema_version": "expert_retirement.v1", "id": id,
+                "retired_at": now_stamp(), "preserved_pins": preserved,
+            }))?,
+        )?;
+    }
+    // Source workspaces are never removed, including an explicit development
+    // override. Only the Agent-owned installations are cleaned up.
+    for root in [
+        store_root().join(&id),
+        store_root().join("development").join(&id),
+        store_root().join("development-versions").join(&id),
+    ] {
+        if root.try_exists()? {
+            fs::remove_dir_all(root)?;
+        }
+    }
+    if active()?.is_some_and(|item| item.expert_id == id) {
+        fs::remove_file(active_path())?;
+    }
+    crate::app::extension_lock::remove("expert", &id)?;
+    crate::app::extension_source::remove_provenance_at(
+        &crate::store::paths::agent_home().join("data"),
+        "expert",
+        &id,
+    );
+    Ok(json!({"retired": true, "id": id, "preserved_pins": preserved}))
+}
+
+fn retirement_path(id: &str) -> PathBuf {
+    store_root().join(".retired").join(format!("{id}.json"))
+}
+
+fn is_retired(id: &str) -> Result<bool, Box<dyn Error>> {
+    Ok(retirement_path(id).try_exists()?)
+}
+
+fn selectable_definitions(
+    definitions: Vec<ExpertDefinition>,
+) -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
+    let mut result = Vec::new();
+    for definition in definitions {
+        if !is_retired(&definition.id)? {
+            result.push(definition);
+        }
+    }
+    Ok(result)
 }
 
 /// Resolve an immutable Mission pin by content, never by the current default
 /// persona. Activating a new development definition cannot replace a published
 /// version already bound to a Mission.
-pub(crate) fn get_pinned(id: &str, version: &str, expected_digest: &str) -> Result<ExpertDefinition, Box<dyn Error>> {
+pub(crate) fn get_pinned(
+    id: &str,
+    version: &str,
+    expected_digest: &str,
+) -> Result<ExpertDefinition, Box<dyn Error>> {
     let id = validate_id(id)?;
     let version = validate_version(version)?;
     let mut definitions = installed_version_definitions()?;
     definitions.extend(development_definitions()?);
     definitions.extend(archived_development_definitions()?);
+    definitions.extend(archived_definitions(
+        &store_root().join(".mission-experts"),
+    )?);
     for definition in definitions {
-        if definition.id == id && definition.version == version && digest(&definition)? == expected_digest {
+        if definition.id == id
+            && definition.version == version
+            && digest(&definition)? == expected_digest
+        {
             return Ok(definition);
         }
     }
@@ -714,15 +850,24 @@ pub(crate) fn get_pinned(id: &str, version: &str, expected_digest: &str) -> Resu
 }
 
 fn archived_development_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
-    let root = store_root().join("development-versions");
+    archived_definitions(&store_root().join("development-versions"))
+}
+
+fn archived_definitions(root: &Path) -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
     let mut definitions = Vec::new();
-    if !root.is_dir() { return Ok(definitions); }
+    if !root.is_dir() {
+        return Ok(definitions);
+    }
     for identity in fs::read_dir(root)? {
         let identity = identity?;
-        if !identity.file_type()?.is_dir() { continue; }
+        if !identity.file_type()?.is_dir() {
+            continue;
+        }
         for revision in fs::read_dir(identity.path())? {
             let revision = revision?;
-            if !revision.file_type()?.is_dir() { continue; }
+            if !revision.file_type()?.is_dir() {
+                continue;
+            }
             let path = revision.path().join("expert.json");
             if path.is_file() {
                 let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
@@ -769,6 +914,9 @@ pub(crate) fn save(input: ExpertDraftInput) -> Result<ExpertSummary, Box<dyn Err
         harness: input.harness,
     };
     validate(&definition)?;
+    if is_retired(&definition.id)? {
+        return Err("专家身份已退役，请使用新的专业身份".into());
+    }
     let root = store_version_root(&definition.id, &definition.version);
     if root.exists() {
         let existing: ExpertDefinition =
@@ -798,6 +946,9 @@ pub(crate) fn install_local_definition(
     definition: ExpertDefinition,
 ) -> Result<ExpertSummary, Box<dyn Error>> {
     validate(&definition)?;
+    if is_retired(&definition.id)? {
+        return Err("专家身份已退役，请使用新的专业身份".into());
+    }
     let root = store_version_root(&definition.id, &definition.version);
     if root.exists() {
         let existing: ExpertDefinition =
@@ -814,6 +965,67 @@ pub(crate) fn install_local_definition(
     )?;
     fs::write(root.join("EXPERT.md"), definition.instructions.as_bytes())?;
     Ok(summary(&definition, active()?.as_ref(), false))
+}
+
+/// Use the normal immutable package installer so local-source installs include
+/// the declared icon and enforce the same byte/content checks as imports.
+pub(crate) fn install_local_directory(
+    source: &Path,
+    id: &str,
+    version: &str,
+) -> Result<ExpertSummary, Box<dyn Error>> {
+    let definition: ExpertDefinition =
+        serde_json::from_slice(&fs::read(source.join("expert.json"))?)?;
+    validate(&definition)?;
+    if definition.id != id || definition.version != version {
+        return Err("专家源码身份已变化，请刷新来源并重新安装".into());
+    }
+    if fs::read(source.join("EXPERT.md"))? != definition.instructions.as_bytes() {
+        return Err("expert.json 与 EXPERT.md 内容不一致".into());
+    }
+    let staging =
+        store_root()
+            .join(".installing")
+            .join(format!("{}-{}", std::process::id(), now_stamp()));
+    fs::create_dir_all(&staging)?;
+    let result = (|| {
+        let package = staging.join("source.hmexpert");
+        export_definition_package(&definition, source, &package)?;
+        import_package(&package)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+pub(crate) fn use_installed(id: &str) -> Result<ExpertSummary, Box<dyn Error>> {
+    let id = validate_id(id)?;
+    if is_retired(&id)? {
+        return Err("专家身份已退役".into());
+    }
+    let installed = installed_version_definitions()?
+        .into_iter()
+        .filter(|item| item.id == id)
+        .max_by(|left, right| compare_versions(&left.version, &right.version))
+        .ok_or("没有可恢复的已安装专家版本")?;
+    let owned_development = store_root().join("development");
+    if development_root() != owned_development {
+        return Err("开发目录由外部工作区提供，请先解除该显式覆盖".into());
+    }
+    if let Some(definition) = development_definition(&id)? {
+        let archive =
+            development_version_root(&id, digest(&definition)?.trim_start_matches("sha256:"));
+        let manifest = archive.join("expert.json");
+        if manifest.exists() {
+            let previous: ExpertDefinition = serde_json::from_slice(&fs::read(&manifest)?)?;
+            if previous != definition {
+                return Err("专家历史副本不符，未解除开发覆盖".into());
+            }
+        } else {
+            copy_development_tree(&owned_development.join(&id), &archive)?;
+        }
+        fs::remove_dir_all(owned_development.join(&id))?;
+    }
+    Ok(summary(&installed, active()?.as_ref(), false))
 }
 
 pub(crate) fn build_workspace_candidate(
@@ -1355,6 +1567,9 @@ pub(crate) fn import_package(package_path: &Path) -> Result<ExpertSummary, Box<d
         return Err("expert.json 与 EXPERT.md 内容不一致".into());
     }
     validate(&definition)?;
+    if is_retired(&definition.id)? {
+        return Err("专家身份已退役，请使用新的专业身份".into());
+    }
     let declared_icon = definition.icon.trim().replace('\\', "/");
     for name in files.keys() {
         if matches!(name.as_str(), "expert.json" | "EXPERT.md") {
@@ -1562,8 +1777,9 @@ fn summary(
 fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
     let mut items = std::collections::BTreeMap::<String, ExpertDefinition>::new();
     for definition in installed_version_definitions()? {
-        let replace = items.get(&definition.id).is_none_or(|previous|
-            compare_versions(&definition.version, &previous.version).is_gt());
+        let replace = items.get(&definition.id).is_none_or(|previous| {
+            compare_versions(&definition.version, &previous.version).is_gt()
+        });
         if replace {
             items.insert(definition.id.clone(), definition);
         }
@@ -1586,7 +1802,12 @@ fn installed_version_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Erro
         .flatten()
         .filter(|entry| entry.path().is_dir())
     {
-        if matches!(id_dir.file_name().to_str(), Some("development" | "development-versions" | "projections" | "workspaces")) {
+        if id_dir.file_name().to_string_lossy().starts_with('.')
+            || matches!(
+                id_dir.file_name().to_str(),
+                Some("development" | "development-versions" | "projections" | "workspaces")
+            )
+        {
             continue;
         }
         // Versioned experts are stored under `<id>/versions/<version>`. Keep
@@ -1597,30 +1818,36 @@ fn installed_version_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Erro
             roots.push(id_dir.path().join("versions"));
         }
         for versions_root in roots {
-        for version_dir in fs::read_dir(versions_root)?
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-        {
-            let path = version_dir.path().join("expert.json");
-            if path.is_file() {
-                let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
-                validate(&definition)?;
-                items.push(definition);
+            for version_dir in fs::read_dir(versions_root)?
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+            {
+                let path = version_dir.path().join("expert.json");
+                if path.is_file() {
+                    let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
+                    validate(&definition)?;
+                    items.push(definition);
+                }
             }
-        }
         }
     }
     // read_dir order is platform dependent. Stable order also gives legacy
     // duplicate paths deterministic behavior; pins still select exact digests.
-    items.sort_by(|left, right| left.id.cmp(&right.id)
-        .then_with(|| compare_versions(&left.version, &right.version))
-        .then(left.instructions.cmp(&right.instructions)));
+    items.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| compare_versions(&left.version, &right.version))
+            .then(left.instructions.cmp(&right.instructions))
+    });
     items.dedup();
     Ok(items)
 }
 
 fn development_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
-    let root = development_root();
+    development_definitions_at(&development_root())
+}
+
+fn development_definitions_at(root: &Path) -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
     if !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -1810,14 +2037,199 @@ mod tests {
     }
 
     #[test]
-    fn expert_directory_preserves_old_pins_and_uses_semantic_latest_version() {
+    fn retirement_hides_identity_but_preserves_exact_history_and_rejects_corrupt_archive() {
         let _guard = test_env_lock();
-        let root = std::env::temp_dir().join(format!("expert-versions-{}-{}", std::process::id(), now_stamp()));
+        let root = std::env::temp_dir().join(format!(
+            "expert-retirement-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
         let old = std::env::var_os("HIMIND_AGENT_HOME");
         let old_development = std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
-        let mut original = test_definition("com.himind.expert.versioned", "Versioned", "Original instructions");
+        let original =
+            test_definition("com.himind.expert.retire-test", "旧专业", "Original method");
+        let pin = digest(&original).unwrap();
+        store_test_definition(&original);
+        let mut newer = original.clone();
+        newer.version = "2.0.0".into();
+        newer.instructions = "New release".into();
+        store_test_definition(&newer);
+        let mut development = original.clone();
+        development.instructions = "Explicit former development method".into();
+        let development_path = development_root().join(&original.id);
+        fs::create_dir_all(&development_path).unwrap();
+        fs::write(
+            development_path.join("expert.json"),
+            serde_json::to_vec(&development).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            development_path.join("EXPERT.md"),
+            development.instructions.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(get(&original.id, None).unwrap(), development);
+        assert_eq!(use_installed(&original.id).unwrap().version, "2.0.0");
+        assert_eq!(get(&original.id, None).unwrap(), newer);
+        assert_eq!(
+            get_pinned(&original.id, "1.0.0", &digest(&development).unwrap()).unwrap(),
+            development
+        );
+        activate(&original.id, None, None).unwrap();
+        let archive = store_root()
+            .join(".mission-experts")
+            .join(&original.id)
+            .join(pin.trim_start_matches("sha256:"));
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("expert.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        assert!(retire(&original.id).is_err());
+        assert_eq!(get(&original.id, Some("1.0.0")).unwrap(), original);
+        assert!(!retirement_path(&original.id).exists());
+        fs::remove_dir_all(&archive).unwrap();
+
+        retire(&original.id).unwrap();
+        assert!(list().unwrap().is_empty());
+        assert!(list_versions().unwrap().is_empty());
+        assert!(list_team_candidates().unwrap().is_empty());
+        assert!(get(&original.id, None).is_err());
+        assert!(activate(&original.id, None, None).is_err());
+        assert!(active().unwrap().is_none());
+        assert!(!store_root().join(&original.id).exists());
+        assert_eq!(get_pinned(&original.id, "1.0.0", &pin).unwrap(), original);
+        assert_eq!(
+            get_pinned(&newer.id, "2.0.0", &digest(&newer).unwrap()).unwrap(),
+            newer
+        );
+        assert!(get_pinned(&original.id, "1.0.0", "sha256:wrong").is_err());
+        assert!(install_local_definition(original.clone()).is_err());
+        let first_marker = fs::read(retirement_path(&original.id)).unwrap();
+        retire(&original.id).unwrap();
+        assert_eq!(
+            fs::read(retirement_path(&original.id)).unwrap(),
+            first_marker
+        );
+        assert_eq!(get_pinned(&original.id, "1.0.0", &pin).unwrap(), original);
+        match old {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        match old_development {
+            Some(value) => std::env::set_var("HIMIND_EXPERT_DEVELOPMENT_DIR", value),
+            None => std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retirement_preserves_default_and_external_development_pins_without_removing_source() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "expert-retirement-override-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in [
+                    ("HIMIND_AGENT_HOME", &self.0),
+                    ("HIMIND_EXPERT_DEVELOPMENT_DIR", &self.1),
+                ] {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            std::env::var_os("HIMIND_AGENT_HOME"),
+            std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR"),
+        );
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+
+        let owned = test_definition(
+            "com.himind.expert.retire-override",
+            "默认开发专家",
+            "Agent-owned historical method",
+        );
+        let owned_pin = digest(&owned).unwrap();
+        let owned_path = development_root().join(&owned.id);
+        fs::create_dir_all(&owned_path).unwrap();
+        fs::write(
+            owned_path.join("expert.json"),
+            serde_json::to_vec(&owned).unwrap(),
+        )
+        .unwrap();
+        fs::write(owned_path.join("EXPERT.md"), &owned.instructions).unwrap();
+        assert_eq!(
+            get_pinned(&owned.id, &owned.version, &owned_pin).unwrap(),
+            owned
+        );
+
+        let mut external = owned.clone();
+        external.instructions = "Different external working method".into();
+        let external_pin = digest(&external).unwrap();
+        assert_ne!(owned_pin, external_pin);
+        let external_root = root.join("external-source");
+        let external_path = external_root.join(&external.id);
+        fs::create_dir_all(&external_path).unwrap();
+        let external_manifest = serde_json::to_vec(&external).unwrap();
+        fs::write(external_path.join("expert.json"), &external_manifest).unwrap();
+        fs::write(external_path.join("EXPERT.md"), &external.instructions).unwrap();
+        std::env::set_var("HIMIND_EXPERT_DEVELOPMENT_DIR", &external_root);
+        assert_eq!(get(&external.id, None).unwrap(), external);
+
+        let result = retire(&owned.id).unwrap();
+        assert_eq!(result["preserved_pins"].as_array().unwrap().len(), 2);
+        assert!(!owned_path.exists());
+        assert_eq!(
+            fs::read(external_path.join("expert.json")).unwrap(),
+            external_manifest
+        );
+        assert_eq!(
+            fs::read_to_string(external_path.join("EXPERT.md")).unwrap(),
+            external.instructions
+        );
+        assert!(list().unwrap().is_empty());
+
+        // Resolve only through the retirement archives, so the surviving
+        // external source cannot mask a missing archived definition.
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        for (definition, pin) in [(&owned, &owned_pin), (&external, &external_pin)] {
+            assert_eq!(
+                get_pinned(&definition.id, &definition.version, pin).unwrap(),
+                *definition
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expert_directory_preserves_old_pins_and_uses_semantic_latest_version() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "expert-versions-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        let old = std::env::var_os("HIMIND_AGENT_HOME");
+        let old_development = std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        let mut original = test_definition(
+            "com.himind.expert.versioned",
+            "Versioned",
+            "Original instructions",
+        );
         original.version = "1.9.0".into();
         let original_digest = digest(&original).unwrap();
         store_test_definition(&original);
@@ -1829,35 +2241,73 @@ mod tests {
         assert_eq!(list().unwrap()[0].version, "1.10.0");
         assert_eq!(get(&original.id, None).unwrap(), newer);
         assert_eq!(get(&original.id, Some("1.9.0")).unwrap(), original);
-        assert_eq!(get_pinned(&original.id, "1.9.0", &original_digest).unwrap(), original);
+        assert_eq!(
+            get_pinned(&original.id, "1.9.0", &original_digest).unwrap(),
+            original
+        );
         assert_eq!(list_versions().unwrap().len(), 2);
 
         let development = development_root().join(&original.id);
         fs::create_dir_all(&development).unwrap();
         let mut override_definition = original.clone();
         override_definition.instructions = "Explicit development projection".into();
-        fs::write(development.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
+        fs::write(
+            development.join("expert.json"),
+            serde_json::to_vec(&override_definition).unwrap(),
+        )
+        .unwrap();
         assert_eq!(get(&original.id, None).unwrap(), override_definition);
-        assert_eq!(list().unwrap()[0].digest, digest(&override_definition).unwrap());
-        assert_eq!(get_pinned(&original.id, "1.9.0", &original_digest).unwrap(), original);
-        assert_eq!(list_versions().unwrap().len(), 3, "exact digests distinguish published and development content");
+        assert_eq!(
+            list().unwrap()[0].digest,
+            digest(&override_definition).unwrap()
+        );
+        assert_eq!(
+            get_pinned(&original.id, "1.9.0", &original_digest).unwrap(),
+            original
+        );
+        assert_eq!(
+            list_versions().unwrap().len(),
+            3,
+            "exact digests distinguish published and development content"
+        );
         assert!(get_pinned(&original.id, "1.9.0", "sha256:missing").is_err());
 
         let development_digest = digest(&override_definition).unwrap();
         let archive = development_version_root(&original.id, "previous-package-sha");
         fs::create_dir_all(&archive).unwrap();
-        fs::write(archive.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
+        fs::write(
+            archive.join("expert.json"),
+            serde_json::to_vec(&override_definition).unwrap(),
+        )
+        .unwrap();
         override_definition.instructions = "Next development build".into();
-        fs::write(development.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
-        assert_eq!(get_pinned(&original.id, "1.9.0", &development_digest).unwrap().instructions, "Explicit development projection");
-        assert_eq!(list_versions().unwrap().len(), 4, "archived development pins survive activation changes");
+        fs::write(
+            development.join("expert.json"),
+            serde_json::to_vec(&override_definition).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_pinned(&original.id, "1.9.0", &development_digest)
+                .unwrap()
+                .instructions,
+            "Explicit development projection"
+        );
+        assert_eq!(
+            list_versions().unwrap().len(),
+            4,
+            "archived development pins survive activation changes"
+        );
 
         // A legacy version remains resolvable when the newer layout also exists.
         let mut legacy = original.clone();
         legacy.version = "0.9.0".into();
         let legacy_root = store_root().join(&original.id).join(&legacy.version);
         fs::create_dir_all(&legacy_root).unwrap();
-        fs::write(legacy_root.join("expert.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(
+            legacy_root.join("expert.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         assert_eq!(get(&original.id, Some("0.9.0")).unwrap(), legacy);
 
         match old {
@@ -1884,20 +2334,37 @@ mod tests {
     #[test]
     fn team_candidates_do_not_hide_new_releases_or_recommend_archived_projections() {
         let _guard = test_env_lock();
-        let root = std::env::temp_dir().join(format!("expert-team-{}-{}", std::process::id(), rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "expert-team-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
-                for (key, value) in [("HIMIND_AGENT_HOME", &self.0), ("HIMIND_EXPERT_DEVELOPMENT_DIR", &self.1)] {
-                    if let Some(value) = value { std::env::set_var(key, value); }
-                    else { std::env::remove_var(key); }
+                for (key, value) in [
+                    ("HIMIND_AGENT_HOME", &self.0),
+                    ("HIMIND_EXPERT_DEVELOPMENT_DIR", &self.1),
+                ] {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
                 }
             }
         }
-        let _restore = Restore(std::env::var_os("HIMIND_AGENT_HOME"), std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR"));
+        let _restore = Restore(
+            std::env::var_os("HIMIND_AGENT_HOME"),
+            std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR"),
+        );
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
-        let mut older = test_definition("com.himind.expert.software-engineer", "软件工程师", "Old release");
+        let mut older = test_definition(
+            "com.himind.expert.software-engineer",
+            "软件工程师",
+            "Old release",
+        );
         older.version = "1.9.0".into();
         store_test_definition(&older);
         let mut newer = older.clone();
@@ -1908,25 +2375,44 @@ mod tests {
         live.instructions = "Live development projection".into();
         let development = development_root().join(&live.id);
         fs::create_dir_all(&development).unwrap();
-        fs::write(development.join("expert.json"), serde_json::to_vec(&live).unwrap()).unwrap();
+        fs::write(
+            development.join("expert.json"),
+            serde_json::to_vec(&live).unwrap(),
+        )
+        .unwrap();
         let mut archived = newer.clone();
         archived.version = "9.0.0".into();
         archived.instructions = "Historical development content".into();
         let archive = development_version_root(&archived.id, "archived-package");
         fs::create_dir_all(&archive).unwrap();
-        fs::write(archive.join("expert.json"), serde_json::to_vec(&archived).unwrap()).unwrap();
+        fs::write(
+            archive.join("expert.json"),
+            serde_json::to_vec(&archived).unwrap(),
+        )
+        .unwrap();
 
         let candidates = list_team_candidates().unwrap();
         assert_eq!(candidates.len(), 3);
         assert!(!candidates.iter().any(|expert| expert.version == "9.0.0"));
         let recommendation = crate::mission::team::recommend_team("实现接口", &candidates);
-        let pin = &recommendation.roles.iter().find(|role| role.role_id == "implementer").unwrap().expert;
+        let pin = &recommendation
+            .roles
+            .iter()
+            .find(|role| role.role_id == "implementer")
+            .unwrap()
+            .expert;
         assert_eq!(pin.expert_version, "1.10.0");
         assert_eq!(pin.expert_digest, digest(&newer).unwrap());
         assert_eq!(get(&older.id, None).unwrap(), live);
         assert_eq!(list().unwrap()[0].digest, digest(&live).unwrap());
-        assert_eq!(get_pinned(&archived.id, &archived.version, &digest(&archived).unwrap()).unwrap(), archived);
-        assert_eq!(get_pinned(&older.id, &older.version, &digest(&older).unwrap()).unwrap(), older);
+        assert_eq!(
+            get_pinned(&archived.id, &archived.version, &digest(&archived).unwrap()).unwrap(),
+            archived
+        );
+        assert_eq!(
+            get_pinned(&older.id, &older.version, &digest(&older).unwrap()).unwrap(),
+            older
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

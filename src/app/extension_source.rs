@@ -2457,6 +2457,9 @@ pub(crate) fn install_expert_bound(
     if source.kind != ExtensionSourceKind::Local {
         return Err("远端来源的专家请从市场安装".into());
     }
+    if !source.enabled {
+        return Err("专家来源已停用".into());
+    }
     let catalog = build_local_catalog(source)?;
     let item = catalog
         .experts
@@ -2464,9 +2467,7 @@ pub(crate) fn install_expert_bound(
         .find(|item| item.expert_id == expert_id && item.version == version)
         .ok_or_else(|| format!("本地来源中未找到专家: {expert_id}@{version}"))?;
     let dir = local_item_dir(&item.download_url)?;
-    let definition: crate::expert::ExpertDefinition =
-        serde_json::from_slice(&fs::read(dir.join("expert.json"))?)?;
-    crate::expert::install_local_definition(definition)
+    crate::expert::install_local_directory(&dir, expert_id, version)
 }
 
 fn record_install_failure(

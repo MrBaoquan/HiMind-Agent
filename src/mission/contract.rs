@@ -105,6 +105,51 @@ pub(crate) struct MissionExpertPin {
     pub expert_id: String,
     pub expert_version: String,
     pub expert_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_pins: Vec<MissionSkillPin>,
+}
+
+/// Exact installed Skill package content reviewed with the expert assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissionSkillPin {
+    pub skill_id: String,
+    pub skill_version: String,
+    pub skill_digest: String,
+}
+
+pub(super) fn validate_skill_pin_format(pin: &MissionExpertPin) -> Result<(), Box<dyn Error>> {
+    if pin.skill_pins.len() > 16 {
+        return Err("expert may pin at most 16 skills".into());
+    }
+    let mut ids = HashSet::new();
+    for skill in &pin.skill_pins {
+        require_id("skill_pin.skill_id", &skill.skill_id)?;
+        crate::skill::manifest::validate_skill_id(&skill.skill_id)?;
+        if !ids.insert(&skill.skill_id) {
+            return Err("duplicate pinned skill dependency".into());
+        }
+        require_text(
+            "skill_pin.skill_version",
+            &skill.skill_version,
+            MAX_ID_BYTES,
+        )?;
+        if skill.skill_version != skill.skill_version.trim()
+            || !skill
+                .skill_version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+            || !crate::path_guard::is_safe_dir_name(&skill.skill_version)
+        {
+            return Err("invalid skill_pin.skill_version".into());
+        }
+        let digest = skill
+            .skill_digest
+            .strip_prefix("sha256:")
+            .ok_or("skill_pin.skill_digest must be sha256:<64 hex characters>")?;
+        require_sha256(digest)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,15 +257,26 @@ impl MissionFeedbackInput {
         let mut seen = HashSet::new();
         for id in &self.target_task_ids {
             require_id("target_task_ids", id)?;
-            if !seen.insert(id) { return Err("target_task_ids must be unique".into()); }
+            if !seen.insert(id) {
+                return Err("target_task_ids must be unique".into());
+            }
         }
         // Review notes may contain line breaks; preserve the exact payload.
-        if self.message.trim().is_empty() || self.message.chars().count() > 8_000
-            || self.message.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        if self.message.trim().is_empty()
+            || self.message.chars().count() > 8_000
+            || self
+                .message
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
             return Err("message must contain 1..8000 characters of review text".into());
         }
-        if self.evidence_refs.len() > 16 { return Err("evidence_refs exceeds 16 items".into()); }
-        for reference in &self.evidence_refs { require_text("evidence_refs", reference, 1_024)?; }
+        if self.evidence_refs.len() > 16 {
+            return Err("evidence_refs exceeds 16 items".into());
+        }
+        for reference in &self.evidence_refs {
+            require_text("evidence_refs", reference, 1_024)?;
+        }
         Ok(())
     }
 }
@@ -230,8 +286,13 @@ mod feedback_tests {
     use super::*;
 
     fn input() -> MissionFeedbackInput {
-        MissionFeedbackInput { request_id: "review".into(), expected_plan_sha256: "a".repeat(64),
-            target_task_ids: vec!["task-1".into()], message: "待核实\nsecond line".into(), evidence_refs: vec![] }
+        MissionFeedbackInput {
+            request_id: "review".into(),
+            expected_plan_sha256: "a".repeat(64),
+            target_task_ids: vec!["task-1".into()],
+            message: "待核实\nsecond line".into(),
+            evidence_refs: vec![],
+        }
     }
 
     #[test]
@@ -242,7 +303,20 @@ mod feedback_tests {
         maximum.target_task_ids = (0..8).map(|n| format!("task-{n}")).collect();
         maximum.evidence_refs = vec!["界".repeat(1_024); 16];
         maximum.validate().unwrap();
-        for field in ["request", "message", "targets", "refs", "reference", "duplicate", "empty_targets", "empty_message", "blank_message", "blank_request", "hash", "control"] {
+        for field in [
+            "request",
+            "message",
+            "targets",
+            "refs",
+            "reference",
+            "duplicate",
+            "empty_targets",
+            "empty_message",
+            "blank_message",
+            "blank_request",
+            "hash",
+            "control",
+        ] {
             let mut invalid = maximum.clone();
             match field {
                 "request" => invalid.request_id.push('界'),
@@ -267,9 +341,11 @@ mod feedback_tests {
     fn mission_feedback_contract_rejects_unknown_envelope_and_input_fields() {
         let valid = serde_json::json!({"mission_id":"mission-test","input":input()});
         serde_json::from_value::<MissionFeedbackSubmit>(valid.clone()).unwrap();
-        let mut invalid = valid.clone(); invalid["approve_paths"] = serde_json::json!(["C:/private"]);
+        let mut invalid = valid.clone();
+        invalid["approve_paths"] = serde_json::json!(["C:/private"]);
         assert!(serde_json::from_value::<MissionFeedbackSubmit>(invalid).is_err());
-        let mut invalid = valid; invalid["input"]["passed"] = serde_json::json!(true);
+        let mut invalid = valid;
+        invalid["input"]["passed"] = serde_json::json!(true);
         assert!(serde_json::from_value::<MissionFeedbackSubmit>(invalid).is_err());
     }
 }
@@ -323,7 +399,10 @@ pub(crate) enum MissionPlanMode {
 
 impl MissionPlanMode {
     pub(crate) fn as_str(self) -> &'static str {
-        match self { Self::Imported => "imported", Self::Generated => "generated" }
+        match self {
+            Self::Imported => "imported",
+            Self::Generated => "generated",
+        }
     }
     pub(crate) fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
         match value {
@@ -498,7 +577,9 @@ pub(crate) struct MissionEffectiveWait {
     pub can_resume: bool,
 }
 
-fn default_plan_mode() -> MissionPlanMode { MissionPlanMode::Generated }
+fn default_plan_mode() -> MissionPlanMode {
+    MissionPlanMode::Generated
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -562,9 +643,15 @@ pub(crate) struct MissionEvent {
 pub(crate) fn validate_workflow_pin(pin: &MissionWorkflowPin) -> Result<(), Box<dyn Error>> {
     require_id("workflow.workflow_id", &pin.workflow_id)?;
     if pin.workflow_version.trim().is_empty() || pin.workflow_version.chars().count() > 80 {
-        return Err("workflow.workflow_version is required and must be at most 80 characters".into());
+        return Err(
+            "workflow.workflow_version is required and must be at most 80 characters".into(),
+        );
     }
-    if !pin.workflow_version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')) {
+    if !pin
+        .workflow_version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
         return Err("workflow.workflow_version contains unsupported characters".into());
     }
     require_sha256(&pin.workflow_sha256)?;
@@ -612,7 +699,9 @@ pub(crate) struct MissionAssignmentOptions {
     pub source: String,
 }
 
-pub(crate) fn validate_assignment(assignment: &MissionAssignmentInput) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_assignment(
+    assignment: &MissionAssignmentInput,
+) -> Result<(), Box<dyn Error>> {
     require_text("assignment.applied_by", &assignment.applied_by, 160)?;
     if assignment.roles.is_empty() {
         return Err("assignment must contain at least one role".into());
@@ -623,6 +712,9 @@ pub(crate) fn validate_assignment(assignment: &MissionAssignmentInput) -> Result
     let mut ids = HashSet::new();
     for role in &assignment.roles {
         require_id("assignment.role_id", &role.role_id)?;
+        if let Some(pin) = &role.expert {
+            validate_skill_pin_format(pin)?;
+        }
         if !ids.insert(role.role_id.as_str()) {
             return Err(format!("duplicate assigned role: {}", role.role_id).into());
         }
@@ -631,10 +723,17 @@ pub(crate) fn validate_assignment(assignment: &MissionAssignmentInput) -> Result
         let fixture_enabled = executor == "himind.fixture"
             && std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1");
         let supported = fixture_enabled
-            || matches!(executor, "himind.builtin" | "personal.codex" | "personal.github-copilot")
+            || matches!(
+                executor,
+                "himind.builtin" | "personal.codex" | "personal.github-copilot"
+            )
             || crate::runtime::acp::is_provider(executor);
         if !supported {
-            return Err(format!("assigned role {} uses unsupported executor: {executor}", role.role_id).into());
+            return Err(format!(
+                "assigned role {} uses unsupported executor: {executor}",
+                role.role_id
+            )
+            .into());
         }
         if !role.service_id.trim().is_empty() {
             require_id("assignment.service_id", &role.service_id)?;
@@ -642,13 +741,21 @@ pub(crate) fn validate_assignment(assignment: &MissionAssignmentInput) -> Result
         if !role.model.trim().is_empty() {
             crate::workflow::validate_model_alias(&role.model)
                 .map_err(|error| format!("assigned role {} model: {error}", role.role_id))?;
-            crate::workflow::model_alias_matches_provider(executor, &role.model)
-                .map_err(|error| format!("assigned role {} model/provider: {error}", role.role_id))?;
+            crate::workflow::model_alias_matches_provider(executor, &role.model).map_err(
+                |error| format!("assigned role {} model/provider: {error}", role.role_id),
+            )?;
             let alias_service = crate::workflow::model_alias_parts(&role.model)
                 .map(|(_, service, _)| service.to_string())
                 .unwrap_or_default();
-            if !role.service_id.trim().is_empty() && !alias_service.is_empty() && alias_service != role.service_id.trim() {
-                return Err(format!("assigned role {} service_id does not match model alias", role.role_id).into());
+            if !role.service_id.trim().is_empty()
+                && !alias_service.is_empty()
+                && alias_service != role.service_id.trim()
+            {
+                return Err(format!(
+                    "assigned role {} service_id does not match model alias",
+                    role.role_id
+                )
+                .into());
             }
         }
     }
@@ -657,7 +764,11 @@ pub(crate) fn validate_assignment(assignment: &MissionAssignmentInput) -> Result
         require_id("assignment.task_roles.task_id", &mapping.task_id)?;
         require_id("assignment.task_roles.role_id", &mapping.role_id)?;
         if !ids.contains(mapping.role_id.as_str()) {
-            return Err(format!("task role mapping references unassigned role: {}", mapping.role_id).into());
+            return Err(format!(
+                "task role mapping references unassigned role: {}",
+                mapping.role_id
+            )
+            .into());
         }
         if !task_ids.insert(mapping.task_id.as_str()) {
             return Err(format!("duplicate task role mapping: {}", mapping.task_id).into());
@@ -674,16 +785,24 @@ pub(crate) fn validate_handoff_input(input: &MissionHandoffInput) -> Result<(), 
         return Err("handoff may reference at most 200 source messages".into());
     }
     if input.context_summary.chars().count() > MAX_SUMMARY_CHARS {
-        return Err(format!("handoff.context_summary exceeds {MAX_SUMMARY_CHARS} characters").into());
+        return Err(
+            format!("handoff.context_summary exceeds {MAX_SUMMARY_CHARS} characters").into(),
+        );
     }
     validate_create(&MissionCreateInput {
-        title: input.title.clone(), objective: input.objective.clone(),
-        workspace: input.workspace.clone(), acceptance_criteria: input.acceptance_criteria.clone(),
+        title: input.title.clone(),
+        objective: input.objective.clone(),
+        workspace: input.workspace.clone(),
+        acceptance_criteria: input.acceptance_criteria.clone(),
     })?;
     validate_workflow_pin(&input.workflow)?;
     match (input.plan_mode, input.imported_plan.as_ref()) {
-        (MissionPlanMode::Imported, None) => return Err("imported plan mode requires imported_plan".into()),
-        (MissionPlanMode::Generated, Some(_)) => return Err("generated plan mode must not include imported_plan".into()),
+        (MissionPlanMode::Imported, None) => {
+            return Err("imported plan mode requires imported_plan".into())
+        }
+        (MissionPlanMode::Generated, Some(_)) => {
+            return Err("generated plan mode must not include imported_plan".into())
+        }
         (MissionPlanMode::Imported, Some(proposal)) => validate_proposal(proposal)?,
         (MissionPlanMode::Generated, None) => {}
     }
@@ -695,16 +814,25 @@ pub(crate) fn apply_assignment_to_plan(
     assignment: &MissionAssignmentInput,
 ) -> Result<MissionPlanProposal, Box<dyn Error>> {
     validate_assignment(assignment)?;
-    let by_role = assignment.roles.iter().map(|role| (role.role_id.as_str(), role)).collect::<HashMap<_, _>>();
-    let mapped_roles = assignment.task_roles.iter()
+    let by_role = assignment
+        .roles
+        .iter()
+        .map(|role| (role.role_id.as_str(), role))
+        .collect::<HashMap<_, _>>();
+    let mapped_roles = assignment
+        .task_roles
+        .iter()
         .map(|mapping| (mapping.task_id.as_str(), mapping.role_id.as_str()))
         .collect::<HashMap<_, _>>();
     let mut next = proposal.clone();
     for task in &mut next.tasks {
-        let role_id = mapped_roles.get(task.id.as_str()).copied().unwrap_or(task.execution.role_id.as_str());
-        let role = by_role.get(role_id).ok_or_else(|| {
-            format!("task {} uses unassigned role {}", task.id, role_id)
-        })?;
+        let role_id = mapped_roles
+            .get(task.id.as_str())
+            .copied()
+            .unwrap_or(task.execution.role_id.as_str());
+        let role = by_role
+            .get(role_id)
+            .ok_or_else(|| format!("task {} uses unassigned role {}", task.id, role_id))?;
         task.execution.role_id = role.role_id.trim().to_string();
         task.execution.executor = role.executor.trim().to_string();
         task.execution.service_id = role.service_id.trim().to_string();
@@ -716,7 +844,10 @@ pub(crate) fn apply_assignment_to_plan(
 }
 
 pub(crate) fn validate_create(input: &MissionCreateInput) -> Result<(), Box<dyn Error>> {
-    if !matches!(input.workspace.permission_mode.as_str(), "" | "workspace_write" | "full_access") {
+    if !matches!(
+        input.workspace.permission_mode.as_str(),
+        "" | "workspace_write" | "full_access"
+    ) {
         return Err("permission_mode must be workspace_write or full_access".into());
     }
     require_text("title", &input.title, MAX_TITLE_CHARS)?;
@@ -734,14 +865,24 @@ pub(crate) fn validate_create(input: &MissionCreateInput) -> Result<(), Box<dyn 
 pub(crate) fn validate_proposal(proposal: &MissionPlanProposal) -> Result<(), Box<dyn Error>> {
     if let Some(scheduling) = &proposal.scheduling {
         if !(1..=16).contains(&scheduling.max_active_tasks)
-            || scheduling.executor_limits.values().any(|limit| !(1..=16).contains(limit)) {
+            || scheduling
+                .executor_limits
+                .values()
+                .any(|limit| !(1..=16).contains(limit))
+        {
             return Err("scheduling limits must be in 1..=16".into());
         }
         for (task_id, resources) in &scheduling.task_resources {
-            if !proposal.tasks.iter().any(|task| &task.id == task_id) { return Err("scheduling references an unknown task".into()); }
-            for resource in resources { require_text("exclusive resource", resource, 160)?; }
+            if !proposal.tasks.iter().any(|task| &task.id == task_id) {
+                return Err("scheduling references an unknown task".into());
+            }
+            for resource in resources {
+                require_text("exclusive resource", resource, 160)?;
+            }
         }
-        for executor in scheduling.executor_limits.keys() { require_text("executor limit", executor, 160)?; }
+        for executor in scheduling.executor_limits.keys() {
+            require_text("executor limit", executor, 160)?;
+        }
     }
     require_text("plan.summary", &proposal.summary, MAX_SUMMARY_CHARS)?;
     if proposal.tasks.is_empty() {
@@ -760,7 +901,11 @@ pub(crate) fn validate_proposal(proposal: &MissionPlanProposal) -> Result<(), Bo
     if proposal.budget.max_total_tokens == Some(0) {
         return Err("max_total_tokens must be positive when declared".into());
     }
-    if proposal.budget.max_cost.is_some_and(|cost| !cost.is_finite() || cost <= 0.0) {
+    if proposal
+        .budget
+        .max_cost
+        .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+    {
         return Err("max_cost must be a positive finite number when declared".into());
     }
     validate_task_graph(&proposal.tasks)
@@ -782,16 +927,16 @@ pub(crate) fn validate_task_graph(tasks: &[MissionTaskSpec]) -> Result<(), Box<d
         if task.required_checks.is_empty() || task.required_checks.len() > 32 {
             return Err("each task must declare 1 to 32 executable required checks".into());
         }
-        for check in &task.required_checks { super::checks::validate_required_check(check)?; }
+        for check in &task.required_checks {
+            super::checks::validate_required_check(check)?;
+        }
     }
     for task in tasks {
         for dependency in &task.depends_on {
             if !ids.contains(dependency.as_str()) {
-                return Err(format!(
-                    "task {} depends on unknown task {}",
-                    task.id, dependency
-                )
-                .into());
+                return Err(
+                    format!("task {} depends on unknown task {}", task.id, dependency).into(),
+                );
             }
         }
     }
@@ -808,6 +953,9 @@ pub(crate) fn validate_task_graph(tasks: &[MissionTaskSpec]) -> Result<(), Box<d
 }
 
 pub(crate) fn validate_execution_binding(task: &MissionTaskSpec) -> Result<(), Box<dyn Error>> {
+    if let Some(pin) = &task.execution.expert {
+        validate_skill_pin_format(pin)?;
+    }
     let executor = task.execution.executor.trim();
     require_text("task.execution.executor", executor, MAX_ID_BYTES)?;
     require_id("task.execution.role_id", &task.execution.role_id)?;
@@ -817,7 +965,10 @@ pub(crate) fn validate_execution_binding(task: &MissionTaskSpec) -> Result<(), B
     let fixture_enabled = executor == "himind.fixture"
         && std::env::var("HIMIND_WORKFLOW_RUNTIME_FIXTURE").as_deref() == Ok("1");
     let supported = fixture_enabled
-        || matches!(executor, "himind.builtin" | "personal.codex" | "personal.github-copilot")
+        || matches!(
+            executor,
+            "himind.builtin" | "personal.codex" | "personal.github-copilot"
+        )
         || crate::runtime::acp::is_provider(executor);
     if !supported {
         return Err(format!("task {} uses unsupported executor: {executor}", task.id).into());
@@ -839,7 +990,10 @@ pub(crate) fn validate_task_paths(
     _workspace_root: &str,
 ) -> Result<(), Box<dyn Error>> {
     for task in tasks {
-        for (label, paths) in [("read_paths", &task.read_paths), ("write_paths", &task.write_paths)] {
+        for (label, paths) in [
+            ("read_paths", &task.read_paths),
+            ("write_paths", &task.write_paths),
+        ] {
             for raw in paths {
                 require_text(label, raw, MAX_PATH_CHARS)?;
                 let path = Path::new(raw.trim());
@@ -847,15 +1001,21 @@ pub(crate) fn validate_task_paths(
                     return Err(format!(
                         "task {} {label} contains a path escape or dangerous path: {raw}",
                         task.id
-                    ).into());
+                    )
+                    .into());
                 }
                 if is_absolute_path(raw) {
                     if !has_normal_component(path) {
-                        return Err(format!("task {} {label} cannot target a filesystem root: {raw}", task.id).into());
+                        return Err(format!(
+                            "task {} {label} cannot target a filesystem root: {raw}",
+                            task.id
+                        )
+                        .into());
                     }
-                } else if path.components().any(|component| {
-                    matches!(component, Component::RootDir | Component::Prefix(_))
-                }) {
+                } else if path
+                    .components()
+                    .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+                {
                     return Err(format!(
                         "task {} {label} must be workspace-relative or a fully qualified absolute path: {raw}",
                         task.id
@@ -904,28 +1064,59 @@ pub(crate) fn validate_selection_with_scopes(
     if let Some(unknown) = selected.iter().find(|id| !all_ids.contains(id.as_str())) {
         return Err(format!("selected task is not in plan: {unknown}").into());
     }
+    for task in proposal
+        .tasks
+        .iter()
+        .filter(|task| selected.contains(&task.id))
+    {
+        if let Some(pin) = &task.execution.expert {
+            super::validate_expert_pin(pin)?;
+        }
+    }
     validate_approved_paths("approved_paths", approved_write_paths)?;
-    if approved_write_paths.iter().any(|path| is_absolute_path(path)) {
+    if approved_write_paths
+        .iter()
+        .any(|path| is_absolute_path(path))
+    {
         return Err("approved_paths only accepts workspace-relative write scopes; use approved_absolute_write_paths for absolute paths".into());
     }
     validate_approved_paths("approved_absolute_read_paths", approved_absolute_read_paths)?;
-    validate_approved_paths("approved_absolute_write_paths", approved_absolute_write_paths)?;
-    if approved_absolute_read_paths.iter().any(|path| !is_absolute_path(path))
-        || approved_absolute_write_paths.iter().any(|path| !is_absolute_path(path))
+    validate_approved_paths(
+        "approved_absolute_write_paths",
+        approved_absolute_write_paths,
+    )?;
+    if approved_absolute_read_paths
+        .iter()
+        .any(|path| !is_absolute_path(path))
+        || approved_absolute_write_paths
+            .iter()
+            .any(|path| !is_absolute_path(path))
     {
         return Err("absolute path approvals must contain only absolute paths".into());
     }
     validate_absolute_approvals(
         "approved_absolute_read_paths",
-        proposal.tasks.iter().filter(|task| selected.contains(&task.id)).flat_map(|task| task.read_paths.iter()),
+        proposal
+            .tasks
+            .iter()
+            .filter(|task| selected.contains(&task.id))
+            .flat_map(|task| task.read_paths.iter()),
         approved_absolute_read_paths,
     )?;
     validate_absolute_approvals(
         "approved_absolute_write_paths",
-        proposal.tasks.iter().filter(|task| selected.contains(&task.id)).flat_map(|task| task.write_paths.iter()),
+        proposal
+            .tasks
+            .iter()
+            .filter(|task| selected.contains(&task.id))
+            .flat_map(|task| task.write_paths.iter()),
         approved_absolute_write_paths,
     )?;
-    for task in proposal.tasks.iter().filter(|task| selected.contains(&task.id)) {
+    for task in proposal
+        .tasks
+        .iter()
+        .filter(|task| selected.contains(&task.id))
+    {
         for dependency in &task.depends_on {
             if !selected.contains(dependency) {
                 return Err(format!(
@@ -936,7 +1127,8 @@ pub(crate) fn validate_selection_with_scopes(
             }
         }
         for path in &task.read_paths {
-            if is_absolute_path(path) && !absolute_path_approved(path, approved_absolute_read_paths) {
+            if is_absolute_path(path) && !absolute_path_approved(path, approved_absolute_read_paths)
+            {
                 return Err(format!(
                     "selected task {} reads outside approved paths: {path}",
                     task.id
@@ -973,7 +1165,10 @@ fn validate_absolute_approvals<'a>(
         .collect::<HashSet<_>>();
     for path in approved_paths.iter().filter(|path| is_absolute_path(path)) {
         if !planned.contains(&path_key(path)) {
-            return Err(format!("{name} cannot authorize an absolute path absent from selected tasks: {path}").into());
+            return Err(format!(
+                "{name} cannot authorize an absolute path absent from selected tasks: {path}"
+            )
+            .into());
         }
     }
     Ok(())
@@ -1002,13 +1197,21 @@ pub(crate) fn plan_hash(
 }
 
 pub(crate) fn plan_hash_for_workspace(
-    mission_id: &str, workspace: &MissionWorkspace, mission_acceptance: &[String], proposal: &MissionPlanProposal,
+    mission_id: &str,
+    workspace: &MissionWorkspace,
+    mission_acceptance: &[String],
+    proposal: &MissionPlanProposal,
 ) -> Result<String, Box<dyn Error>> {
     let original = plan_hash(mission_id, &workspace.root, mission_acceptance, proposal)?;
-    if workspace.permission_mode != "full_access" { return Ok(original); }
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&serde_json::json!({
-        "schema_version":"mission_plan_hash.v2", "plan_sha256":original, "permission_mode":"full_access"
-    }))?)))
+    if workspace.permission_mode != "full_access" {
+        return Ok(original);
+    }
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&serde_json::json!({
+            "schema_version":"mission_plan_hash.v2", "plan_sha256":original, "permission_mode":"full_access"
+        }))?)
+    ))
 }
 
 pub(crate) fn normalized_paths(paths: &[String]) -> Vec<String> {
@@ -1032,9 +1235,9 @@ pub(crate) fn path_allowed(path: &str, approved: &[String]) -> bool {
 
 pub(crate) fn absolute_path_approved(path: &str, approved: &[String]) -> bool {
     is_absolute_path(path)
-        && approved.iter().any(|root| {
-            is_absolute_path(root) && path_key(path) == path_key(root)
-        })
+        && approved
+            .iter()
+            .any(|root| is_absolute_path(root) && path_key(path) == path_key(root))
 }
 
 pub(crate) fn validate_approved_paths(name: &str, paths: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1048,10 +1251,14 @@ pub(crate) fn validate_approved_paths(name: &str, paths: &[String]) -> Result<()
             if !has_normal_component(path) {
                 return Err(format!("{name} cannot authorize a filesystem root: {raw}").into());
             }
-        } else if path.components().any(|component| {
-            matches!(component, Component::RootDir | Component::Prefix(_))
-        }) {
-            return Err(format!("{name} must contain workspace-relative paths or workspace absolute paths: {raw}").into());
+        } else if path
+            .components()
+            .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+        {
+            return Err(format!(
+                "{name} must contain workspace-relative paths or workspace absolute paths: {raw}"
+            )
+            .into());
         }
     }
     Ok(())
@@ -1075,7 +1282,11 @@ pub(crate) fn require_id(name: &str, value: &str) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-pub(crate) fn require_text(name: &str, value: &str, max_chars: usize) -> Result<(), Box<dyn Error>> {
+pub(crate) fn require_text(
+    name: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<(), Box<dyn Error>> {
     if value.trim().is_empty() {
         return Err(format!("{name} is required").into());
     }
@@ -1136,9 +1347,9 @@ fn is_dangerous_path(raw: &str) -> bool {
 }
 
 fn has_normal_component(path: &Path) -> bool {
-    path.components().any(|component| matches!(component, Component::Normal(_)))
+    path.components()
+        .any(|component| matches!(component, Component::Normal(_)))
 }
-
 
 fn normalize_path(path: &str) -> String {
     let mut normalized = path.trim().replace('\\', "/");

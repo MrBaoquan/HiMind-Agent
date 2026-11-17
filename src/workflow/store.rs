@@ -15,6 +15,7 @@ use crate::store::atomic_file;
 const INSTALLATION_FILE: &str = "installation.json";
 const DEVELOPMENT_DIR: &str = "development";
 const DEVELOPMENT_PACKAGE_DIR: &str = "package";
+const MISSION_METHODS_DIR: &str = ".mission-methods";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -199,6 +200,22 @@ impl WorkflowStore {
         source: &Path,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
         self.install_from_directory_with_policy(source, false)
+    }
+
+    /// Generated Mission methods are execution definitions, not published
+    /// reusable capabilities. Only an exact Mission pin can resolve them.
+    pub(crate) fn install_mission_method(
+        &self,
+        source: &Path,
+    ) -> Result<InstalledWorkflow, Box<dyn Error>> {
+        self.mission_methods().install_from_directory(source)
+    }
+
+    fn mission_methods(&self) -> Self {
+        Self {
+            root: self.root.join(MISSION_METHODS_DIR),
+            extension_state_root: self.extension_state_root.clone(),
+        }
     }
 
     pub(crate) fn install_from_directory_with_policy(
@@ -453,6 +470,9 @@ impl WorkflowStore {
                 continue;
             }
             let package_id = entry.file_name().to_string_lossy().to_string();
+            if package_id.starts_with('.') {
+                continue;
+            }
             let installation = match self.load_installation(&package_id) {
                 Ok(Some(installation)) => installation,
                 Ok(None) => continue,
@@ -538,12 +558,23 @@ impl WorkflowStore {
         if expected_digest.trim().is_empty() {
             return Err("pinned workflow digest is required".into());
         }
-        let package = self.load_version(package_id, version)?;
+        // Select storage by existence, not by validation success: a damaged
+        // public version must fail rather than fall back to another definition.
+        let public_version = self
+            .product_root(package_id)?
+            .join("versions")
+            .join(safe_segment(version)?);
+        let package = if public_version.try_exists()? {
+            self.load_version(package_id, version)?
+        } else {
+            self.mission_methods().load_version(package_id, version)?
+        };
         let actual_digest = package_digest(&package.source_root)?;
         if actual_digest != expected_digest.trim().to_ascii_lowercase() {
             return Err(format!(
                 "workflow package content differs from the Mission pin: {package_id}@{version}"
-            ).into());
+            )
+            .into());
         }
         Ok((package, actual_digest))
     }
@@ -738,6 +769,54 @@ impl WorkflowStore {
         Ok(restored)
     }
 
+    /// Preserve every Mission pin before removing the public installation.
+    pub(crate) fn retire_with_pins(
+        &self,
+        package_id: &str,
+        pins: &[(String, String)],
+    ) -> Result<bool, Box<dyn Error>> {
+        // Validate the entire input before migrating anything. Public copies
+        // take precedence, so private copies cannot hide public corruption.
+        let mut pinned = Vec::with_capacity(pins.len());
+        for (version, digest) in pins {
+            let (package, digest) = self.load_pinned_version(package_id, version, digest)?;
+            if package.id != package_id || package.version != *version {
+                return Err(format!(
+                    "workflow package identity differs from the Mission pin: {package_id}@{version}"
+                )
+                .into());
+            }
+            pinned.push((package, digest));
+        }
+
+        let methods = self.mission_methods();
+        for (package, digest) in &pinned {
+            let private_version = methods
+                .product_root(package_id)?
+                .join("versions")
+                .join(safe_segment(&package.version)?);
+            // Reinstalling replaces packaging metadata and installation state.
+            // An existing private version must only be verified, never changed.
+            if !private_version.try_exists()? {
+                self.install_mission_method(&package.source_root)?;
+            }
+            // Read private storage directly: the still-installed public copy
+            // must not mask a failed migration or a conflicting private copy.
+            let private = methods.load_version(package_id, &package.version)?;
+            if private.id != package_id
+                || private.version != package.version
+                || package_digest(&private.source_root)? != *digest
+            {
+                return Err(format!(
+                    "private workflow package differs from the Mission pin: {package_id}@{}",
+                    package.version
+                )
+                .into());
+            }
+        }
+        self.remove(package_id)
+    }
+
     pub(crate) fn remove(&self, package_id: &str) -> Result<bool, Box<dyn Error>> {
         let root = self.product_root(package_id)?;
         if !root.exists() {
@@ -819,7 +898,13 @@ impl WorkflowStore {
     }
 
     fn product_root(&self, package_id: &str) -> Result<PathBuf, Box<dyn Error>> {
-        Ok(self.root.join(safe_segment(package_id)?))
+        let package_id = safe_segment(package_id)?;
+        // Dot-prefixed directories belong to the store, including private
+        // Mission methods and extension state; they are never public packages.
+        if package_id.starts_with('.') {
+            return Err(format!("reserved workflow package identifier: {package_id}").into());
+        }
+        Ok(self.root.join(package_id))
     }
 
     fn load_installation(
@@ -1239,8 +1324,22 @@ fn collect_files(
 }
 
 fn safe_segment(value: &str) -> Result<String, Box<dyn Error>> {
+    // Windows normalizes trailing dots/spaces and reserves device basenames
+    // even with an extension. Reject aliases on every platform so the same ID
+    // or version always names one directory. The character check rejects spaces.
+    let basename = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved_device = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (basename.len() == 4
+            && (basename.starts_with("COM") || basename.starts_with("LPT"))
+            && matches!(basename.as_bytes()[3], b'1'..=b'9'));
     if value.trim().is_empty()
         || value.len() > 200
+        || value.ends_with('.')
+        || reserved_device
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -1290,7 +1389,7 @@ mod tests {
     use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
     fn source_package() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload")
     }
 
@@ -1323,6 +1422,344 @@ mod tests {
         }
         rows.sort();
         fs::write(root.join("checksums.sha256"), rows.concat()).unwrap();
+    }
+
+    fn directory_contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = Vec::new();
+        collect_files(root, root, &mut files).unwrap();
+        files
+            .into_iter()
+            .map(|relative| {
+                let contents = fs::read(root.join(&relative)).unwrap();
+                (relative, contents)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn safe_segments_reject_windows_aliases_and_preserve_dotted_names() {
+        let store = store();
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "...",
+            "version.",
+            "version..",
+            "version ",
+            "version. ",
+            " version",
+            "../version",
+            "version/other",
+            "version:stream",
+            "CON",
+            "con.txt",
+            "PRN",
+            "aux.json",
+            "NUL",
+            "COM1",
+            "com9.version",
+            "LPT1",
+            "lpt9.txt",
+        ] {
+            assert!(
+                safe_segment(invalid).is_err(),
+                "accepted segment: {invalid:?}"
+            );
+        }
+        for valid in [
+            "com.himind.workflow.example",
+            "workflow-v1",
+            "1.0.0",
+            "1.0.0-beta.1",
+            "1.2.3.4",
+            "segment..name",
+            "COM10",
+            "LPT0",
+            "v1.0.CON",
+        ] {
+            assert_eq!(safe_segment(valid).unwrap(), valid);
+            assert_eq!(store.product_root(valid).unwrap(), store.root.join(valid));
+        }
+    }
+
+    #[test]
+    fn retire_with_empty_pins_rejects_shared_storage_and_windows_aliases() {
+        // Keep the parent inside the test sandbox, so a regression involving
+        // ".." can never target the system temporary directory.
+        let sandbox = store().root;
+        let store = WorkflowStore::new(sandbox.join("workflows"));
+        fs::create_dir_all(&store.extension_state_root).unwrap();
+        fs::write(sandbox.join("outside-workflows.txt"), "keep parent content").unwrap();
+        fs::write(store.extension_state_root.join("state.json"), "keep state").unwrap();
+        let installed = store.install_mission_method(&source_package()).unwrap();
+        store.install_from_directory(&source_package()).unwrap();
+        let original = directory_contents(&sandbox);
+        let id = &installed.package.id;
+        let aliases = [format!("{id}."), format!("{id} "), format!("{id}. ")];
+        for invalid in [
+            ".",
+            "..",
+            "...",
+            ".mission-methods",
+            ".MISSION-METHODS",
+            ".mission-methods.",
+            ".mission-methods..",
+            ".mission-methods ",
+            ".mission-methods. ",
+            ".extension-state",
+            ".EXTENSION-STATE",
+            ".extension-state.",
+            ".extension-state ",
+            ".hidden",
+            "CON",
+            "con.txt",
+            "AUX",
+            "NUL",
+            "COM1",
+            "lpt9.txt",
+        ]
+        .into_iter()
+        .chain(aliases.iter().map(String::as_str))
+        {
+            assert!(
+                store.retire_with_pins(invalid, &[]).is_err(),
+                "retired unsafe identifier: {invalid:?}"
+            );
+            assert_eq!(directory_contents(&sandbox), original);
+            assert_eq!(store.list().unwrap().len(), 1);
+            assert!(store
+                .load_pinned_version(id, &installed.package.version, &installed.package_digest)
+                .is_ok());
+        }
+        fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[test]
+    fn retire_with_pins_preserves_multiple_versions_and_is_idempotent() {
+        let store = store();
+        let source = package_copy();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(source.join("workflow.json")).unwrap()).unwrap();
+        let mut pins = Vec::new();
+        for version in ["1.0.0", "2.0.0"] {
+            manifest["version"] = serde_json::json!(version);
+            fs::write(
+                source.join("workflow.json"),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            write_checksums(&source);
+            let installed = store.install_from_directory(&source).unwrap();
+            pins.push((installed.package.version, installed.package_digest));
+        }
+        let id = manifest["id"].as_str().unwrap();
+        let public_root = store.product_root(id).unwrap();
+        let original = directory_contents(&public_root.join("versions"));
+        let methods = store.mission_methods();
+        let private_root = methods.product_root(id).unwrap();
+
+        assert!(store.retire_with_pins(id, &pins).unwrap());
+        assert!(!public_root.exists());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(directory_contents(&private_root.join("versions")), original);
+        for (version, digest) in &pins {
+            assert!(store.load_version(id, version).is_err());
+            let (package, actual) = store.load_pinned_version(id, version, digest).unwrap();
+            assert_eq!(package.id, id);
+            assert_eq!(package.version, *version);
+            assert_eq!(actual, *digest);
+            assert_eq!(
+                package.source_root,
+                private_root
+                    .join("versions")
+                    .join(version)
+                    .canonicalize()
+                    .unwrap()
+            );
+        }
+
+        let retired = directory_contents(&methods.root);
+        assert!(!store.retire_with_pins(id, &pins).unwrap());
+        assert_eq!(directory_contents(&methods.root), retired);
+        let invalid = vec![(pins[0].0.clone(), "0".repeat(64))];
+        assert!(store.retire_with_pins(id, &invalid).is_err());
+        assert_eq!(directory_contents(&methods.root), retired);
+
+        // Repeated retirement must also detect damage to preserved content.
+        fs::write(
+            private_root
+                .join("versions")
+                .join(&pins[0].0)
+                .join("README.md"),
+            "tampered",
+        )
+        .unwrap();
+        let damaged = directory_contents(&methods.root);
+        assert!(store.retire_with_pins(id, &pins).is_err());
+        assert_eq!(directory_contents(&methods.root), damaged);
+        assert!(!public_root.exists());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn retire_with_pins_checks_all_pins_before_migrating() {
+        let store = store();
+        let installed = store.install_from_directory(&source_package()).unwrap();
+        let id = &installed.package.id;
+        let valid = (
+            installed.package.version.clone(),
+            installed.package_digest.clone(),
+        );
+        let public_root = store.product_root(id).unwrap();
+        let original = directory_contents(&public_root);
+        for invalid in [
+            ("9.9.9".to_string(), installed.package_digest.clone()),
+            (String::new(), installed.package_digest.clone()),
+            (installed.package.version.clone(), String::new()),
+            (installed.package.version.clone(), "0".repeat(64)),
+        ] {
+            assert!(store
+                .retire_with_pins(id, &[valid.clone(), invalid])
+                .is_err());
+            assert_eq!(directory_contents(&public_root), original);
+            assert_eq!(store.list().unwrap().len(), 1);
+            assert!(!store.mission_methods().root.exists());
+        }
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn retire_with_pins_keeps_existing_private_content_unchanged() {
+        let store = store();
+        let source = package_copy();
+        let installed = store.install_mission_method(&source).unwrap();
+        let id = &installed.package.id;
+        let methods = store.mission_methods();
+        let original = directory_contents(&methods.root);
+        // Equal content digests can still have different packaging metadata.
+        write_checksums(&source);
+        let published = store.install_from_directory(&source).unwrap();
+        assert_eq!(published.package_digest, installed.package_digest);
+        let pins = vec![(
+            installed.package.version.clone(),
+            installed.package_digest.clone(),
+        )];
+        assert!(store.retire_with_pins(id, &pins).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(directory_contents(&methods.root), original);
+        assert!(!store.retire_with_pins(id, &pins).unwrap());
+        assert_eq!(directory_contents(&methods.root), original);
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn retire_with_pins_does_not_mask_corrupt_public_content() {
+        let store = store();
+        let installed = store.install_mission_method(&source_package()).unwrap();
+        let id = &installed.package.id;
+        store.install_from_directory(&source_package()).unwrap();
+        let public_root = store.product_root(id).unwrap();
+        let version_root = public_root
+            .join("versions")
+            .join(&installed.package.version);
+        let methods = store.mission_methods();
+        let original = directory_contents(&methods.root);
+        let pins = vec![(
+            installed.package.version.clone(),
+            installed.package_digest.clone(),
+        )];
+        for file in ["README.md", "workflow.json"] {
+            let path = version_root.join(file);
+            let contents = fs::read(&path).unwrap();
+            fs::write(&path, "tampered").unwrap();
+            let damaged = directory_contents(&public_root);
+            assert!(store.retire_with_pins(id, &pins).is_err());
+            assert_eq!(directory_contents(&public_root), damaged);
+            assert_eq!(directory_contents(&methods.root), original);
+            fs::write(path, contents).unwrap();
+        }
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn retire_with_pins_preserves_public_installation_on_private_conflict() {
+        let store = store();
+        let source = package_copy();
+        let installed = store.install_from_directory(&source).unwrap();
+        let id = &installed.package.id;
+        fs::write(source.join("README.md"), "different private content").unwrap();
+        let private = store.install_mission_method(&source).unwrap();
+        assert_ne!(private.package_digest, installed.package_digest);
+        let methods = store.mission_methods();
+        let original_private = directory_contents(&methods.root);
+        let public_root = store.product_root(id).unwrap();
+        let original_public = directory_contents(&public_root);
+        let pins = vec![(
+            installed.package.version.clone(),
+            installed.package_digest.clone(),
+        )];
+        assert!(store.retire_with_pins(id, &pins).is_err());
+        assert_eq!(directory_contents(&methods.root), original_private);
+        assert_eq!(directory_contents(&public_root), original_public);
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let private_root = methods.product_root(id).unwrap();
+        fs::write(
+            private_root
+                .join("versions")
+                .join(&installed.package.version)
+                .join("workflow.json"),
+            "invalid",
+        )
+        .unwrap();
+        let damaged = directory_contents(&methods.root);
+        assert!(store.retire_with_pins(id, &pins).is_err());
+        assert_eq!(directory_contents(&methods.root), damaged);
+        assert_eq!(directory_contents(&public_root), original_public);
+        assert_eq!(store.list().unwrap().len(), 1);
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn mission_methods_require_a_pin_and_do_not_pollute_capabilities() {
+        let store = store();
+        let installed = store.install_mission_method(&source_package()).unwrap();
+        let id = &installed.package.id;
+        let version = &installed.package.version;
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.load_enabled_for_run(id).is_err());
+        assert!(store.load_version(id, version).is_err());
+        let (pinned, _) = store
+            .load_pinned_version(id, version, &installed.package_digest)
+            .unwrap();
+        assert_eq!(pinned.id, *id);
+        assert!(store
+            .load_pinned_version(id, version, &"0".repeat(64))
+            .is_err());
+
+        // Explicit publication remains visible; a corrupt public copy must
+        // not be masked by the valid private definition.
+        store.install_from_directory(&source_package()).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        let public_root = store
+            .product_root(id)
+            .unwrap()
+            .join("versions")
+            .join(version);
+        fs::write(public_root.join("workflow.json"), "invalid").unwrap();
+        assert!(store
+            .load_pinned_version(id, version, &installed.package_digest)
+            .is_err());
+        store.remove(id).unwrap();
+        fs::write(pinned.source_root.join("workflow.json"), "invalid").unwrap();
+        assert!(store
+            .load_pinned_version(id, version, &installed.package_digest)
+            .is_err());
+        fs::remove_dir_all(store.root).unwrap();
     }
 
     #[test]
@@ -2002,17 +2439,31 @@ mod tests {
         // Key generation is expensive and variable in debug builds. The worker
         // may prepare a test-only key in its generated resource root; signature
         // creation and the real install/verifier still run on every invocation.
-        let private_key = if let Some(path)=std::env::var_os("HIMIND_EXECUTOR_TEST_RSA_KEY") {
-            let path=PathBuf::from(path);
-            let root=PathBuf::from(std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("test resource root")).canonicalize().unwrap();
-            assert!(path.parent().unwrap().canonicalize().unwrap().starts_with(&root));
-            if path.is_file() {RsaPrivateKey::read_pkcs8_pem_file(&path).unwrap()} else {
-                let key=RsaPrivateKey::new(&mut rng,2048).unwrap();
-                fs::write(&path,key.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes()).unwrap();key
+        let private_key = if let Some(path) = std::env::var_os("HIMIND_EXECUTOR_TEST_RSA_KEY") {
+            let path = PathBuf::from(path);
+            let root = PathBuf::from(
+                std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("test resource root"),
+            )
+            .canonicalize()
+            .unwrap();
+            assert!(path
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .starts_with(&root));
+            if path.is_file() {
+                RsaPrivateKey::read_pkcs8_pem_file(&path).unwrap()
+            } else {
+                let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+                fs::write(&path, key.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes()).unwrap();
+                key
             }
-        } else {RsaPrivateKey::new(&mut rng,2048).unwrap()};
+        } else {
+            RsaPrivateKey::new(&mut rng, 2048).unwrap()
+        };
         private_key.validate().unwrap();
-        assert_eq!(rsa::traits::PublicKeyParts::n(&private_key).bits(),2048);
+        assert_eq!(rsa::traits::PublicKeyParts::n(&private_key).bits(), 2048);
         let public_key = RsaPublicKey::from(&private_key);
         fs::write(
             trusted_root.join(format!("{key_id}.pem")),

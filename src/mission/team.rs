@@ -1,8 +1,8 @@
 //! Deterministic, advisory team selection from an explicitly supplied directory.
 //!
 //! This module does not resolve assets, inspect the environment, create runs or
-//! grant access. Summary metadata describes a specialty, not verified tool access
-//! or measured expertise. Unknown objectives and missing specialties stay visible.
+//! grant access. Only the fixed professional identities qualify; summary text
+//! cannot substitute for them or prove tool access. Missing specialties stay visible.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -42,9 +42,7 @@ struct RoleSpec {
     label: &'static str,
     brief: &'static str,
     objective_terms: &'static [&'static str],
-    // Audited professional families, in preference order, not built-in assets.
-    reviewed_ids: &'static [&'static str],
-    declaration_terms: &'static [&'static str],
+    expert_id: &'static str,
 }
 
 const ROLES: &[RoleSpec] = &[
@@ -62,17 +60,9 @@ const ROLES: &[RoleSpec] = &[
             "prd",
             "requirements",
             "product planning",
+            "product design",
         ],
-        reviewed_ids: &[],
-        declaration_terms: &[
-            "需求分析",
-            "需求澄清",
-            "产品设计",
-            "产品经理",
-            "requirements analysis",
-            "product designer",
-            "product manager",
-        ],
+        expert_id: "com.himind.expert.product-designer",
     },
     RoleSpec {
         id: "architect",
@@ -84,20 +74,10 @@ const ROLES: &[RoleSpec] = &[
             "技术方案",
             "architecture",
             "architectural",
+            "technical architect",
             "system design",
         ],
-        reviewed_ids: &[
-            "com.himind.expert.senior-system-architect",
-            "com.himind.expert.project-architect",
-        ],
-        declaration_terms: &[
-            "系统架构",
-            "技术架构",
-            "系统架构师",
-            "system architect",
-            "software architect",
-            "system architecture",
-        ],
+        expert_id: "com.himind.expert.technical-architect",
     },
     RoleSpec {
         id: "designer",
@@ -105,26 +85,17 @@ const ROLES: &[RoleSpec] = &[
         brief: "设计界面结构、交互状态与视觉取值，交付可复核的界面规范。",
         objective_terms: &[
             "界面",
-            "交互",
+            "交互设计",
+            "界面交互",
             "页面",
             "前端",
-            "视觉",
             "ui",
             "ux",
             "frontend",
             "front-end",
-        ],
-        reviewed_ids: &["com.himind.expert.senior-ui-designer"],
-        declaration_terms: &[
-            "界面设计",
-            "交互设计",
-            "ui 设计",
-            "ui设计",
-            "ui designer",
-            "ui design",
-            "ux designer",
             "interaction design",
         ],
+        expert_id: "com.himind.expert.interaction-designer",
     },
     RoleSpec {
         id: "implementer",
@@ -148,14 +119,7 @@ const ROLES: &[RoleSpec] = &[
             "fix",
             "refactor",
         ],
-        reviewed_ids: &["com.himind.expert.software-engineer"],
-        declaration_terms: &[
-            "软件实现",
-            "软件开发",
-            "软件工程师",
-            "software engineer",
-            "software development",
-        ],
+        expert_id: "com.himind.expert.software-engineer",
     },
     RoleSpec {
         id: "reviewer",
@@ -168,6 +132,8 @@ const ROLES: &[RoleSpec] = &[
             "复核",
             "审查",
             "评审",
+            "审核",
+            "检查",
             "回归",
             "test",
             "testing",
@@ -176,16 +142,104 @@ const ROLES: &[RoleSpec] = &[
             "review",
             "qa",
             "quality",
+            "audit",
         ],
-        reviewed_ids: &["com.himind.expert.senior-test-engineer"],
-        declaration_terms: &[
-            "测试工程师",
-            "质量验证",
-            "软件测试",
-            "test engineer",
-            "quality assurance",
-            "software testing",
+        expert_id: "com.himind.expert.quality-engineer",
+    },
+    RoleSpec {
+        id: "game-designer",
+        label: "游戏设计",
+        brief: "定义玩法、规则、关卡与数值反馈，给出可验证的游戏设计。",
+        objective_terms: &[
+            "游戏",
+            "玩法",
+            "关卡",
+            "数值平衡",
+            "game",
+            "games",
+            "gameplay",
+            "level design",
         ],
+        expert_id: "com.himind.expert.game-designer",
+    },
+    RoleSpec {
+        id: "realtime-engineer",
+        label: "实时引擎工程",
+        brief: "处理 Unity 等实时引擎的运行逻辑、场景、性能与构建证据。",
+        objective_terms: &[
+            "unity",
+            "unreal",
+            "实时引擎",
+            "实时渲染",
+            "实时三维",
+            "实时交互",
+            "realtime",
+            "real-time",
+            "real time",
+            "ue4",
+            "ue5",
+        ],
+        expert_id: "com.himind.expert.realtime-engineer",
+    },
+    RoleSpec {
+        id: "technical-artist",
+        label: "技术美术",
+        brief: "处理着色器、材质、特效与美术管线，核对视觉质量及性能预算。",
+        objective_terms: &[
+            "技术美术",
+            "着色器",
+            "材质",
+            "特效",
+            "美术管线",
+            "渲染管线",
+            "shader",
+            "shaders",
+            "material",
+            "materials",
+            "vfx",
+            "technical art",
+            "art pipeline",
+        ],
+        expert_id: "com.himind.expert.technical-artist",
+    },
+    RoleSpec {
+        id: "exhibit-experience-designer",
+        label: "展项体验设计",
+        brief: "设计展项叙事、观众动线与现场反馈，明确体验及现场验收条件。",
+        objective_terms: &[
+            "展项",
+            "展陈",
+            "展览",
+            "展馆",
+            "观众动线",
+            "exhibit",
+            "exhibits",
+            "exhibition",
+        ],
+        expert_id: "com.himind.expert.exhibit-experience-designer",
+    },
+    RoleSpec {
+        id: "device-integration-engineer",
+        label: "设备集成工程",
+        brief: "界定设备协议、通信、联调与故障恢复，交付设备验收证据。",
+        objective_terms: &[
+            "设备",
+            "硬件",
+            "传感器",
+            "串口",
+            "物联网",
+            "plc",
+            "modbus",
+            "mqtt",
+            "device",
+            "devices",
+            "hardware",
+            "sensor",
+            "sensors",
+            "serial port",
+            "iot",
+        ],
+        expert_id: "com.himind.expert.device-integration-engineer",
     },
 ];
 
@@ -193,7 +247,8 @@ const ROLES: &[RoleSpec] = &[
 ///
 /// Conservative Chinese/English keyword rules make this a reviewable suggestion,
 /// not a semantic planner. Implementation also requests independent quality
-/// review; architecture, product and UI roles otherwise require objective signals.
+/// review; all other specialties require objective signals. Review objectives use
+/// the requested specialty's independent instance instead of production duties.
 /// Latest versions are chosen per identity before specialty matching. Active
 /// personas and reference counts never give older versions or capabilities rank.
 pub(crate) fn recommend_team(objective: &str, experts: &[ExpertSummary]) -> TeamRecommendation {
@@ -226,52 +281,62 @@ pub(crate) fn recommend_team(objective: &str, experts: &[ExpertSummary]) -> Team
             ));
         }
     }
+    let objective = affirmative_objective(&objective);
     let implementation = ROLES
         .iter()
         .find(|role| role.id == "implementer")
         .and_then(|role| keyword(&objective, role.objective_terms));
     let review_only = is_review_only(&objective);
+    let specialty_requested = ROLES.iter().any(|role| {
+        !matches!(role.id, "implementer" | "reviewer")
+            && keyword(&objective, role.objective_terms).is_some()
+    });
+    let code_review = keyword(&objective, &["代码", "软件", "code", "software"]).or(implementation);
+    let quality_review = keyword(
+        &objective,
+        &[
+            "质量", "测试", "回归", "quality", "qa", "test", "tests", "testing",
+        ],
+    );
+    let mut requested = false;
     for role in ROLES {
-        if review_only && role.id != "reviewer" {
-            continue;
-        }
-        let trigger = keyword(&objective, role.objective_terms).or_else(|| {
-            if role.id == "reviewer" {
-                implementation
-            } else {
-                None
+        let trigger = if review_only {
+            match role.id {
+                "implementer" => {
+                    if specialty_requested {
+                        None
+                    } else {
+                        code_review
+                    }
+                }
+                "reviewer" => quality_review.or_else(|| {
+                    if !specialty_requested && code_review.is_none() {
+                        keyword(&objective, role.objective_terms)
+                    } else {
+                        None
+                    }
+                }),
+                _ => keyword(&objective, role.objective_terms),
             }
-        });
+        } else {
+            keyword(&objective, role.objective_terms).or_else(|| {
+                if role.id == "reviewer" {
+                    implementation
+                } else {
+                    None
+                }
+            })
+        };
         let Some(trigger) = trigger else { continue };
-        let selected = role
-            .reviewed_ids
-            .iter()
-            .filter_map(|id| catalog.get(*id).copied())
-            .find(|expert| has_pin(expert))
-            .map(|expert| (expert, "已审查的专业家族".to_string()))
-            .or_else(|| {
-                catalog
-                    .values()
-                    .copied()
-                    .filter(|expert| has_pin(expert))
-                    // Known identities retain their audited boundary, even if
-                    // generic wording mentions another stage such as verification.
-                    .filter(|expert| {
-                        !ROLES
-                            .iter()
-                            .any(|spec| spec.reviewed_ids.contains(&expert.id.as_str()))
-                    })
-                    .find_map(|expert| {
-                        let declaration =
-                            format!("{} {}", expert.name, expert.description).to_lowercase();
-                        keyword(&declaration, role.declaration_terms)
-                            .map(|term| (expert, format!("摘要明确声明「{term}」")))
-                    })
-            });
-        let Some((expert, evidence)) = selected else {
+        requested = true;
+        let selected = catalog
+            .get(role.expert_id)
+            .copied()
+            .filter(|expert| has_pin(expert));
+        let Some(expert) = selected else {
             let reason = format!(
-                "缺少职责 {}（{}）：目标包含「{}」，当前目录没有可固定且明确匹配的专家；不以其他专业替代。",
-                role.id, role.label, trigger,
+                "缺少职责 {}（{}）：目标包含「{}」，需要可固定的专家 {}；不以其他专业或摘要后备替代。",
+                role.id, role.label, trigger, role.expert_id,
             );
             result.warnings.push(reason.clone());
             result.missing_required_roles.push(MissingTeamRole {
@@ -281,38 +346,38 @@ pub(crate) fn recommend_team(objective: &str, experts: &[ExpertSummary]) -> Team
             });
             continue;
         };
-        let independent_instance = role.id == "reviewer";
+        let independent_instance = review_only || role.id == "reviewer";
         let mut reason = format!(
-            "目标包含「{trigger}」，需要{}；{evidence}。同一专家身份优先最新语义版本；摘要不证明工具可用性或实际能力质量。",
+            "目标包含「{trigger}」，需要{}；仅匹配固定专家身份。同一专家身份优先最新语义版本；摘要不证明工具可用性或实际能力质量。",
             role.label,
         );
-        if role.id == "architect" {
-            reason.push_str("项目架构师与系统架构师归为同一专业家族，只推荐一个架构职责；目录中可用时优先系统架构师，职级名称不构成认证。");
-        }
-        if independent_instance {
+        if review_only {
+            reason.push_str("本目标为专业审查，命中专业是被审查对象；仅推荐该专业的独立审查实例，不增加生产职责。审查必须使用与原交付不同的运行实例和上下文，本建议不创建实例。");
+        } else if independent_instance {
             reason.push_str("软件交付需要独立复核；复核必须使用与交付不同的运行实例和上下文，本建议不创建实例。");
-            if review_only {
-                reason.push_str("本目标为仅复核，界面、架构或实现是被审查对象，不增加生产职责。");
-            }
         }
         result.roles.push(TeamRoleRecommendation {
             role_id: role.id.into(),
-            label: role.label.into(),
-            brief: role.brief.into(),
+            label: if review_only && role.id != "reviewer" {
+                format!("{}专业审查", role.label)
+            } else { role.label.into() },
+            brief: if review_only {
+                format!("使用独立运行实例审查{}的现有交付、风险与证据；报告缺陷和未覆盖范围，不承担原交付实现。", role.label)
+            } else { role.brief.into() },
             expert: MissionExpertPin {
                 expert_id: expert.id.clone(),
                 expert_version: expert.version.clone(),
                 expert_digest: expert.digest.clone(),
+                skill_pins: Vec::new(),
             },
             reason,
             independent_instance,
         });
     }
-    if !ROLES
-        .iter()
-        .any(|role| keyword(&objective, role.objective_terms).is_some())
-    {
-        result.warnings.push("目标未明确命中需求、技术架构、界面交互、软件实现或质量复核职责；请明确产物，不默认拼凑团队。".into());
+    if !requested {
+        result
+            .warnings
+            .push("目标未明确命中支持的专业职责；请明确产物，不默认拼凑团队。".into());
     }
     result
 }
@@ -329,7 +394,10 @@ fn is_review_only(objective: &str) -> bool {
     let first = objective
         .split(['，', ',', '。', '.', ';', '；', '\n'])
         .next()
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("请")
+        .trim_start_matches("please ");
     let starts_with_review = [
         "只审查",
         "仅审查",
@@ -337,6 +405,8 @@ fn is_review_only(objective: &str) -> bool {
         "仅复核",
         "只评审",
         "仅评审",
+        "只审核",
+        "仅审核",
         "只验证",
         "仅验证",
         "只测试",
@@ -347,9 +417,17 @@ fn is_review_only(objective: &str) -> bool {
         "仅做复核",
         "只读",
         "review",
+        "only audit",
+        "only verify",
         "审查",
         "复核",
         "评审",
+        "审核",
+        "检查",
+        "验收",
+        "audit",
+        "对现有",
+        "对已有",
         "验证",
         "测试",
         "only review",
@@ -379,7 +457,7 @@ fn is_review_only(objective: &str) -> bool {
         .split(['，', ',', '。', '.', ';', '；', '\n'])
         .skip(1)
         .any(|clause| {
-            keyword(
+            starts_production(
                 clause.trim(),
                 &[
                     "实现",
@@ -400,8 +478,87 @@ fn is_review_only(objective: &str) -> bool {
                     "design",
                 ],
             )
-            .is_some()
         })
+}
+
+fn starts_production(clause: &str, terms: &[&str]) -> bool {
+    let clause = clause
+        .trim_start_matches("请")
+        .trim_start_matches("please ");
+    // A repair/design noun in a review object or a suggestion is not an action.
+    terms
+        .iter()
+        .any(|term| clause.starts_with(*term) && keyword(clause, &[*term]).is_some())
+}
+
+/// Keep positive clauses before matching specialties or production actions.
+/// A negated list stays excluded through its conjunctions ("无需 Unity 开发和设备接入").
+/// Punctuation and an explicit change of direction begin a new positive clause.
+fn affirmative_objective(objective: &str) -> String {
+    let clauses = objective
+        .replace("不但", "")
+        .replace("不仅", "")
+        .replace("not only ", "")
+        .replace("但是", "，")
+        .replace("但", "，")
+        .replace("而是", "，")
+        .replace("不过", "，")
+        .replace("然后", "，")
+        .replace(" but ", ",")
+        .replace(" then ", ",");
+    clauses
+        .split(['，', ',', '。', '.', ';', '；', '\n'])
+        .map(|clause| {
+            let end = [
+                "不需要",
+                "不涉及",
+                "不进行",
+                "不包含",
+                "不要",
+                "不做",
+                "无需",
+                "无须",
+                "不必",
+                "不用",
+                "排除",
+                "禁止",
+                "避免",
+                "勿",
+                "不",
+                "no",
+                "not",
+                "without",
+                "do not",
+                "don't",
+                "never",
+                "excluding",
+            ]
+            .iter()
+            .flat_map(|negation| {
+                clause
+                    .match_indices(*negation)
+                    .filter_map(move |(start, _)| {
+                        let before = &clause[..start];
+                        let after = &clause[start + negation.len()..];
+                        let boundary = !negation.is_ascii()
+                            || (!before
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_ascii_alphanumeric())
+                                && !after
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_ascii_alphanumeric()));
+                        boundary.then_some(start)
+                    })
+            })
+            .min()
+            .unwrap_or(clause.len());
+            &clause[..end]
+        })
+        .filter(|clause| !clause.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("，")
 }
 
 fn has_pin(expert: &ExpertSummary) -> bool {
@@ -432,8 +589,8 @@ fn latest_by_identity(experts: &[ExpertSummary]) -> BTreeMap<&str, &ExpertSummar
     catalog
 }
 
-/// ASCII terms match whole words (so `build` does not imply `ui`). Common direct
-/// negations are ignored; complex intent remains the caller's review decision.
+/// ASCII terms match whole words (so `build` does not imply `ui`).
+/// Negation has already been handled at the objective clause boundary.
 fn keyword<'a>(text: &str, terms: &'a [&str]) -> Option<&'a str> {
     terms.iter().copied().find(|term| {
         text.match_indices(*term).any(|(start, _)| {
@@ -449,32 +606,6 @@ fn keyword<'a>(text: &str, terms: &'a [&str]) -> Option<&'a str> {
                         .next()
                         .is_some_and(|c| c.is_ascii_alphanumeric()));
             word_boundary
-                && ![
-                    "不",
-                    "不要",
-                    "无需",
-                    "不需要",
-                    "不做",
-                    "不涉及",
-                    "不进行",
-                    "不包含",
-                    "no",
-                    "not",
-                    "without",
-                    "do not",
-                    "don't",
-                ]
-                .iter()
-                .any(|negation| {
-                    let prefix = before.trim_end();
-                    prefix.strip_suffix(*negation).is_some_and(|rest| {
-                        !negation.is_ascii()
-                            || !rest
-                                .chars()
-                                .next_back()
-                                .is_some_and(|c| c.is_ascii_alphanumeric())
-                    })
-                })
         })
     })
 }
@@ -503,47 +634,48 @@ mod tests {
     }
 
     fn library() -> Vec<ExpertSummary> {
-        [
-            "project-architect",
-            "senior-system-architect",
-            "senior-ui-designer",
-            "software-engineer",
-            "senior-test-engineer",
-        ]
-        .iter()
-        .map(|slug| expert(slug, "1.0.0"))
-        .collect()
+        ROLES
+            .iter()
+            .map(|role| {
+                expert(
+                    role.expert_id.strip_prefix("com.himind.expert.").unwrap(),
+                    "1.0.0",
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn overlapping_architects_share_one_responsibility_and_project_remains_usable() {
+    fn fixed_identities_do_not_use_aliases_or_summary_fallbacks() {
         let mut experts = library();
         let result = recommend_team("设计系统架构", &experts);
         assert_eq!(result.roles.len(), 1);
         assert_eq!(result.roles[0].role_id, "architect");
         assert_eq!(
             result.roles[0].expert.expert_id,
-            "com.himind.expert.senior-system-architect"
+            "com.himind.expert.technical-architect"
         );
-        assert!(result.roles[0].reason.contains("同一专业家族"));
-        experts.retain(|expert| !expert.id.ends_with("senior-system-architect"));
-        assert_eq!(
-            recommend_team("设计系统架构", &experts).roles[0]
-                .expert
-                .expert_id,
-            "com.himind.expert.project-architect"
-        );
+        experts.retain(|expert| !expert.id.ends_with("technical-architect"));
+        let mut alias = expert("custom-architect", "9.0.0");
+        alias.description = "技术架构 系统架构师 system architect".into();
+        experts.push(alias);
+        let missing = recommend_team("设计系统架构", &experts);
+        assert!(missing.roles.is_empty());
+        assert_eq!(missing.missing_required_roles[0].role_id, "architect");
+        assert!(missing.missing_required_roles[0]
+            .reason
+            .contains("com.himind.expert.technical-architect"));
     }
 
     #[test]
     fn latest_semantic_version_wins_over_active_persona_and_reference_counts() {
-        let mut old = expert("senior-ui-designer", "1.9.0");
+        let mut old = expert("interaction-designer", "1.9.0");
         old.active = true;
         old.skill_count = 100;
-        let current = expert("senior-ui-designer", "1.10.0");
+        let current = expert("interaction-designer", "1.10.0");
         let experts = vec![
             old,
-            expert("senior-ui-designer", "1.10.0-rc.1"),
+            expert("interaction-designer", "1.10.0-rc.1"),
             current.clone(),
         ];
         let result = recommend_team("设计 UI 界面", &experts);
@@ -618,7 +750,7 @@ mod tests {
         assert_eq!(design.roles[0].role_id, "designer");
         let review = recommend_team("review existing code", &experts);
         assert_eq!(review.roles.len(), 1);
-        assert_eq!(review.roles[0].role_id, "reviewer");
+        assert_eq!(review.roles[0].role_id, "implementer");
         assert!(review.roles[0].independent_instance);
         let build = recommend_team("build a service", &experts);
         assert_eq!(build.roles.len(), 2);
@@ -633,30 +765,29 @@ mod tests {
     }
 
     #[test]
-    fn declarations_can_fill_a_gap_but_counts_and_old_metadata_cannot() {
+    fn declarations_and_counts_cannot_replace_the_fixed_product_expert() {
         let mut empty = expert("placeholder", "1.0.0");
         empty.categories = vec!["software-engineering".into()];
         empty.capability_count = 99;
         assert!(recommend_team("需求分析", &[empty]).roles.is_empty());
         let mut product = expert("product", "1.0.0");
         product.description = "需求分析与产品设计".into();
-        let result = recommend_team("需求分析", &[product.clone()]);
-        assert_eq!(result.roles.len(), 1);
-        assert_eq!(result.roles[0].expert.expert_digest, product.digest);
-        assert!(result.roles[0].reason.contains("摘要明确声明"));
-        let mut changed = product.clone();
-        changed.version = "2.0.0".into();
-        changed.digest = "sha256:changed".into();
-        changed.description.clear();
-        assert!(recommend_team("需求分析", &[product, changed])
-            .roles
-            .is_empty());
+        let result = recommend_team("需求分析", &[product]);
+        assert!(result.roles.is_empty());
+        assert_eq!(result.missing_required_roles[0].role_id, "requirements");
+        let fixed = expert("product-designer", "1.0.0");
+        assert_eq!(
+            recommend_team("需求分析", &[fixed.clone()]).roles[0]
+                .expert
+                .expert_digest,
+            fixed.digest
+        );
     }
 
     #[test]
     fn missing_pin_is_not_replaced_by_an_older_version_and_ties_are_deterministic() {
-        let old = expert("senior-ui-designer", "1.0.0");
-        let mut latest = expert("senior-ui-designer", "1.1.0");
+        let old = expert("interaction-designer", "1.0.0");
+        let mut latest = expert("interaction-designer", "1.1.0");
         latest.digest.clear();
         let result = recommend_team("UI设计", &[old.clone(), latest]);
         assert!(result.roles.is_empty());
@@ -684,13 +815,22 @@ mod tests {
     #[test]
     fn read_only_review_treats_ui_implementation_as_input_and_keeps_mixed_repairs() {
         let experts = library();
-        for objective in [
-            "只审查现有 UI 实现，不修改代码",
-            "只读审查现有 UI 实现",
-            "只读审查现有 UI 实现并提出修复建议",
-            "review existing UI implementation, do not modify code",
-            "read-only review UI implementation and suggest fixes",
-            "only review the system architecture and UI implementation",
+        for (objective, expected) in [
+            ("只审查现有 UI 实现，不修改代码", vec!["designer"]),
+            ("只读审查现有 UI 实现", vec!["designer"]),
+            ("只读审查现有 UI 实现并提出修复建议", vec!["designer"]),
+            (
+                "review existing UI implementation, do not modify code",
+                vec!["designer"],
+            ),
+            (
+                "read-only review UI implementation and suggest fixes",
+                vec!["designer"],
+            ),
+            (
+                "only review the system architecture and UI implementation",
+                vec!["architect", "designer"],
+            ),
         ] {
             let result = recommend_team(objective, &experts);
             assert_eq!(
@@ -699,10 +839,10 @@ mod tests {
                     .iter()
                     .map(|role| role.role_id.as_str())
                     .collect::<Vec<_>>(),
-                ["reviewer"],
+                expected,
                 "{objective}"
             );
-            assert!(result.roles[0].independent_instance);
+            assert!(result.roles.iter().all(|role| role.independent_instance));
             assert!(result.roles[0].reason.contains("被审查对象"));
             assert!(result.missing_required_roles.is_empty());
         }
@@ -724,7 +864,7 @@ mod tests {
             "实现 UI 页面",
             &[
                 expert("software-engineer", "1.0.0"),
-                expert("senior-ui-designer", "1.0.0"),
+                expert("interaction-designer", "1.0.0"),
             ],
         );
         assert_eq!(result.missing_required_roles.len(), 1);
@@ -735,5 +875,150 @@ mod tests {
         let restored: TeamRecommendation =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert_eq!(restored, result);
+    }
+
+    fn role_ids(result: &TeamRecommendation) -> Vec<&str> {
+        result
+            .roles
+            .iter()
+            .map(|role| role.role_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn domain_delivery_requests_only_the_relevant_specialists_and_quality() {
+        for (objective, expected) in [
+            (
+                "开发 Unity 游戏玩法及 shader 特效",
+                vec![
+                    "implementer",
+                    "reviewer",
+                    "game-designer",
+                    "realtime-engineer",
+                    "technical-artist",
+                ],
+            ),
+            (
+                "设计展项叙事与设备联调方案",
+                vec!["exhibit-experience-designer", "device-integration-engineer"],
+            ),
+            (
+                "修复 Unity 场景加载",
+                vec!["implementer", "reviewer", "realtime-engineer"],
+            ),
+            (
+                "实现串口传感器接入",
+                vec!["implementer", "reviewer", "device-integration-engineer"],
+            ),
+            ("实现普通接口", vec!["implementer", "reviewer"]),
+        ] {
+            let result = recommend_team(objective, &library());
+            assert_eq!(role_ids(&result), expected, "{objective}");
+            assert!(result.missing_required_roles.is_empty(), "{objective}");
+        }
+    }
+
+    #[test]
+    fn domain_gaps_remain_required_even_when_generic_development_is_available() {
+        let result = recommend_team(
+            "实现 Unity 游戏展项，接入设备并编写 shader",
+            &[
+                expert("software-engineer", "1.0.0"),
+                expert("quality-engineer", "1.0.0"),
+            ],
+        );
+        assert_eq!(role_ids(&result), ["implementer", "reviewer"]);
+        assert_eq!(
+            result
+                .missing_required_roles
+                .iter()
+                .map(|role| role.role_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "game-designer",
+                "realtime-engineer",
+                "technical-artist",
+                "exhibit-experience-designer",
+                "device-integration-engineer",
+            ]
+        );
+        for missing in &result.missing_required_roles {
+            assert!(result.warnings.contains(&missing.reason));
+        }
+    }
+
+    #[test]
+    fn specialty_reviews_use_only_independent_professional_instances() {
+        for (objective, expected) in [
+            (
+                "审核 Unity 展项设备协议与 shader",
+                vec![
+                    "realtime-engineer",
+                    "technical-artist",
+                    "exhibit-experience-designer",
+                    "device-integration-engineer",
+                ],
+            ),
+            (
+                "audit existing gameplay and suggest design improvements",
+                vec!["game-designer"],
+            ),
+            ("对现有产品需求进行评审", vec!["requirements"]),
+            ("review existing code", vec!["implementer"]),
+            ("仅测试回归质量", vec!["reviewer"]),
+        ] {
+            let result = recommend_team(objective, &library());
+            assert_eq!(role_ids(&result), expected, "{objective}");
+            assert!(result.roles.iter().all(|role| role.independent_instance));
+        }
+        let missing = recommend_team("审核 Unity 实现", &[expert("quality-engineer", "1.0.0")]);
+        assert!(missing.roles.is_empty());
+        assert_eq!(
+            missing.missing_required_roles[0].role_id,
+            "realtime-engineer"
+        );
+    }
+
+    #[test]
+    fn negated_domains_and_production_lists_do_not_request_experts() {
+        for objective in [
+            "只设计 UI，无需游戏开发与设备接入",
+            "不需要游戏设计、Unity开发及技术美术；只设计 UI",
+            "UI design without Unity development and shaders",
+            "UI design, do not implement games or devices",
+            "只设计 UI 但不要实现设备接入",
+        ] {
+            let result = recommend_team(objective, &library());
+            assert_eq!(role_ids(&result), ["designer"], "{objective}");
+        }
+        assert!(recommend_team("不需要 Unity 游戏设备开发", &library())
+            .roles
+            .is_empty());
+        assert_eq!(
+            role_ids(&recommend_team("不要实现，审查 Unity", &library())),
+            ["realtime-engineer"]
+        );
+        assert_eq!(
+            role_ids(&recommend_team("实现接口，无需测试", &library())),
+            ["implementer", "reviewer"]
+        );
+    }
+
+    #[test]
+    fn mixed_domain_review_and_repair_retains_implementation_quality_gate() {
+        for objective in [
+            "审查 Unity 并修复缺陷",
+            "review shaders and implement fixes",
+        ] {
+            let result = recommend_team(objective, &library());
+            assert!(result
+                .roles
+                .iter()
+                .any(|role| role.role_id == "implementer" && !role.independent_instance));
+            assert!(result
+                .roles
+                .iter()
+                .any(|role| role.role_id == "reviewer" && role.independent_instance));
+        }
     }
 }

@@ -156,6 +156,10 @@ enum CapabilityHandler {
     ExtensionWorkspaceClear,
     ExtensionRevisionCreate,
     ExtensionLock,
+    ExtensionExpertList,
+    ExtensionExpertInstall,
+    ExtensionExpertRetire,
+    ExtensionWorkflowRetire,
     ExtensionDistributionTargetGet,
     ExtensionDistributionTargetSet,
     ExtensionDistributionPreview,
@@ -1415,6 +1419,61 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::ExtensionLock,
+            ),
+            registration(
+                "extension.expert.list",
+                "列出本机专家",
+                "列出本机可用于新 Mission 的专家及其精确版本、摘要与激活状态；已退役专家保留旧 Mission 引用。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::ExtensionExpertList,
+            ),
+            registration(
+                "extension.expert.install",
+                "安装指定版本专家",
+                "从 source_id 指定的本地来源安装 expert_id 的精确 version；三项必须明确提供，旧 Mission 保留原有版本与摘要引用。写入须经宿主审批，模型不得代为批准。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "expert_id": { "type": "string", "minLength": 1 },
+                        "version": { "type": "string", "minLength": 1 },
+                        "source_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["expert_id", "version", "source_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionExpertInstall,
+            ),
+            registration(
+                "extension.expert.retire",
+                "退役本机专家",
+                "将专家移出新 Mission 的可选范围，保留旧 Mission 引用的精确版本与摘要。写入须经宿主审批，模型不得代为批准。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "expert_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["expert_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionExpertRetire,
+            ),
+            registration(
+                "extension.workflow.retire",
+                "退役本机工作流",
+                "收集所有 Mission 引用的精确工作流版本与摘要，迁入私有存储后移除公开包，保留旧 Mission 执行所需内容。写入须经宿主审批，模型不得代为批准。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workflow_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["workflow_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionWorkflowRetire,
             ),
             registration(
                 "extension.distribution.target.get",
@@ -4296,10 +4355,12 @@ impl CapabilityGateway {
                 Ok(value)
             }
             CapabilityHandler::MissionIntentCreate => {
-                let request: crate::mission::entry::MissionIntentInput = serde_json::from_value(input)?;
+                let request: crate::mission::entry::MissionIntentInput =
+                    serde_json::from_value(input)?;
                 let mission = crate::mission::entry::create(&request)?;
                 let mut value = serde_json::to_value(&mission)?;
-                value["assignment_deep_link"] = json!(crate::mission::assignment_deep_link(&mission.mission_id));
+                value["assignment_deep_link"] =
+                    json!(crate::mission::assignment_deep_link(&mission.mission_id));
                 Ok(value)
             }
             CapabilityHandler::MissionGet => {
@@ -4383,10 +4444,20 @@ impl CapabilityGateway {
                 )?)
             }
             CapabilityHandler::MissionPlanGenerate => {
-                let mission_id=input["mission_id"].as_str().ok_or("mission_id is required")?;
-                let revision=input["expected_plan_revision"].as_u64().ok_or("expected_plan_revision is required")?;
-                Ok(serde_json::to_value(crate::app::mission_commands::generate_mission_plan_sync(&self.options,mission_id,Some(revision))
-                    .map_err(std::io::Error::other)?)?)
+                let mission_id = input["mission_id"]
+                    .as_str()
+                    .ok_or("mission_id is required")?;
+                let revision = input["expected_plan_revision"]
+                    .as_u64()
+                    .ok_or("expected_plan_revision is required")?;
+                Ok(serde_json::to_value(
+                    crate::app::mission_commands::generate_mission_plan_sync(
+                        &self.options,
+                        mission_id,
+                        Some(revision),
+                    )
+                    .map_err(std::io::Error::other)?,
+                )?)
             }
             CapabilityHandler::MissionPlanConfirm => {
                 let mission_id = input
@@ -4831,7 +4902,9 @@ impl CapabilityGateway {
                     context.source,
                 )?)
             }
-            CapabilityHandler::WorkspaceSession(operation) => crate::session_service::invoke(operation, &input),
+            CapabilityHandler::WorkspaceSession(operation) => {
+                crate::session_service::invoke(operation, &input)
+            }
             // ---- 工作区登记表 ----
             //
             // `resolve` / `context.get` 会在未命中时产出候选，所以它们不只是读：
@@ -5138,6 +5211,52 @@ impl CapabilityGateway {
             CapabilityHandler::ExtensionRevisionCreate => self.create_extension_revision(input),
             CapabilityHandler::ExtensionLock => {
                 Ok(serde_json::to_value(crate::app::extension_lock::load()?)?)
+            }
+            CapabilityHandler::ExtensionExpertList => {
+                Ok(serde_json::to_value(crate::expert::list()?)?)
+            }
+            CapabilityHandler::ExtensionExpertInstall => {
+                let expert_id = input
+                    .get("expert_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("extension.expert.install requires expert_id")?;
+                let version = input
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("extension.expert.install requires version")?;
+                let source_id = input
+                    .get("source_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("extension.expert.install requires source_id")?;
+                Ok(serde_json::to_value(
+                    crate::app::extension_source::install_expert_bound(
+                        expert_id, version, source_id,
+                    )?,
+                )?)
+            }
+            CapabilityHandler::ExtensionExpertRetire => {
+                let expert_id = input
+                    .get("expert_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("extension.expert.retire requires expert_id")?;
+                crate::expert::retire(expert_id)
+            }
+            CapabilityHandler::ExtensionWorkflowRetire => {
+                let workflow_id = input
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("extension.workflow.retire requires workflow_id")?;
+                crate::workflow::retire_workflow(workflow_id)
             }
             CapabilityHandler::ExtensionDistributionTargetGet => {
                 self.read_distribution_targets(input)
@@ -8137,6 +8256,9 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
                     // 从市场装能力会写入本机磁盘，属于"改变我这台机器"的操作，
                     // 必须有人确认，不能由模型单方面批准。
                     | CapabilityHandler::MarketInstall
+                    | CapabilityHandler::ExtensionExpertInstall
+                    | CapabilityHandler::ExtensionExpertRetire
+                    | CapabilityHandler::ExtensionWorkflowRetire
             );
     descriptor.idempotency = if descriptor.risk_level == "read_only" {
         "safe"
@@ -8796,6 +8918,10 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::ExtensionWorkspaceClear
         | CapabilityHandler::ExtensionRevisionCreate
         | CapabilityHandler::ExtensionLock
+        | CapabilityHandler::ExtensionExpertList
+        | CapabilityHandler::ExtensionExpertInstall
+        | CapabilityHandler::ExtensionExpertRetire
+        | CapabilityHandler::ExtensionWorkflowRetire
         | CapabilityHandler::ExtensionDistributionTargetGet
         | CapabilityHandler::ExtensionDistributionTargetSet
         | CapabilityHandler::ExtensionDistributionPreview
@@ -10161,25 +10287,153 @@ mod tests {
     use crate::capability::types::{InvocationSource, InvocationTransport};
 
     #[test]
-    fn workspace_session_capabilities_are_read_only_and_have_strict_schemas() {
-        let gateway=CapabilityGateway::new(Options::from_env(),Arc::new(Mutex::new(LocalWorkerStatus::default())));
-        let registry=gateway.build_registry_scoped(false).unwrap();
-        for operation in ["sources","list","messages","activity"] {
-            let id=format!("workspace.session.{operation}");let item=registry.get(&id).unwrap();
-            assert!(matches!(item.handler,CapabilityHandler::WorkspaceSession(_)));
-            assert_eq!(item.descriptor.risk_level,"read_only");
-            let valid=match operation {
-                "messages"=>json!({"scope":"unassigned","session_id":"codex:synthetic","limit":1}),
-                "activity"=>json!({"scope":"all","from":"2026-11-16T00:00:00-07:00","to":"2026-11-17T00:00:00-07:00"}),
-                _=>json!({"scope":"project","project_id":"synthetic","include_children":true})
-            };
-            validate_capability_input_schema(&item.descriptor.input_schema,&valid).unwrap();
-            let mut invalid=valid.clone();invalid["arbitrary_path"]=json!("private-store");
-            assert!(validate_capability_input_schema(&item.descriptor.input_schema,&invalid).is_err());
-            invalid=valid.clone();invalid["limit"]=json!(201);
-            assert!(validate_capability_input_schema(&item.descriptor.input_schema,&invalid).is_err());
+    fn extension_library_capabilities_are_local_and_use_host_approval() {
+        let gateway = CapabilityGateway::new(
+            Options::from_env(),
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+        );
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        for (id, handler, risk_level, approval_required) in [
+            (
+                "extension.expert.list",
+                CapabilityHandler::ExtensionExpertList,
+                "read_only",
+                false,
+            ),
+            (
+                "extension.expert.install",
+                CapabilityHandler::ExtensionExpertInstall,
+                "local_write",
+                true,
+            ),
+            (
+                "extension.expert.retire",
+                CapabilityHandler::ExtensionExpertRetire,
+                "local_write",
+                true,
+            ),
+            (
+                "extension.workflow.retire",
+                CapabilityHandler::ExtensionWorkflowRetire,
+                "local_write",
+                true,
+            ),
+        ] {
+            let item = registry.get(id).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&item.handler),
+                std::mem::discriminant(&handler),
+                "{id}"
+            );
+            assert_eq!(
+                item.descriptor.availability,
+                CapabilityAvailability::Local,
+                "{id}"
+            );
+            assert_eq!(item.descriptor.risk_level, risk_level, "{id}");
+            assert_eq!(item.descriptor.approval_required, approval_required, "{id}");
+            assert!(item.descriptor.required_scope.is_none(), "{id}");
         }
-        assert!(crate::session_service::invoke("activity",&json!({"from":"2026-11-16","to":"2026-11-17"})).is_err());
+    }
+
+    #[test]
+    fn extension_library_schemas_require_exact_identity_and_deny_unknown_fields() {
+        let gateway = CapabilityGateway::new(
+            Options::from_env(),
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+        );
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        for (id, valid) in [
+            ("extension.expert.list", json!({})),
+            (
+                "extension.expert.install",
+                json!({
+                    "expert_id": "com.example.expert",
+                    "version": "1.2.3",
+                    "source_id": "local-experts"
+                }),
+            ),
+            (
+                "extension.expert.retire",
+                json!({ "expert_id": "com.example.expert" }),
+            ),
+            (
+                "extension.workflow.retire",
+                json!({ "workflow_id": "com.example.workflow" }),
+            ),
+        ] {
+            let schema = &registry.get(id).unwrap().descriptor.input_schema;
+            validate_capability_input_schema(schema, &valid).unwrap();
+            assert!(
+                validate_capability_input_schema(schema, &Value::Null).is_err(),
+                "{id}"
+            );
+            let mut invalid = valid.clone();
+            invalid["approved"] = json!(true);
+            assert!(
+                validate_capability_input_schema(schema, &invalid).is_err(),
+                "{id}"
+            );
+            for field in valid.as_object().unwrap().keys() {
+                let mut missing = valid.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    validate_capability_input_schema(schema, &missing).is_err(),
+                    "{id}: missing {field}"
+                );
+                for value in [json!(""), Value::Null, json!(1)] {
+                    let mut invalid = valid.clone();
+                    invalid[field] = value;
+                    assert!(
+                        validate_capability_input_schema(schema, &invalid).is_err(),
+                        "{id}: invalid {field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_session_capabilities_are_read_only_and_have_strict_schemas() {
+        let gateway = CapabilityGateway::new(
+            Options::from_env(),
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+        );
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        for operation in ["sources", "list", "messages", "activity"] {
+            let id = format!("workspace.session.{operation}");
+            let item = registry.get(&id).unwrap();
+            assert!(matches!(
+                item.handler,
+                CapabilityHandler::WorkspaceSession(_)
+            ));
+            assert_eq!(item.descriptor.risk_level, "read_only");
+            let valid = match operation {
+                "messages" => {
+                    json!({"scope":"unassigned","session_id":"codex:synthetic","limit":1})
+                }
+                "activity" => {
+                    json!({"scope":"all","from":"2026-11-16T00:00:00-07:00","to":"2026-11-17T00:00:00-07:00"})
+                }
+                _ => json!({"scope":"project","project_id":"synthetic","include_children":true}),
+            };
+            validate_capability_input_schema(&item.descriptor.input_schema, &valid).unwrap();
+            let mut invalid = valid.clone();
+            invalid["arbitrary_path"] = json!("private-store");
+            assert!(
+                validate_capability_input_schema(&item.descriptor.input_schema, &invalid).is_err()
+            );
+            invalid = valid.clone();
+            invalid["limit"] = json!(201);
+            assert!(
+                validate_capability_input_schema(&item.descriptor.input_schema, &invalid).is_err()
+            );
+        }
+        assert!(crate::session_service::invoke(
+            "activity",
+            &json!({"from":"2026-11-16","to":"2026-11-17"})
+        )
+        .is_err());
     }
 
     #[test]
@@ -10438,15 +10692,28 @@ mod tests {
 
     #[test]
     fn mission_plan_generation_mcp_requires_current_revision_and_never_accepts_grants() {
-        let gateway = CapabilityGateway::new(Options::from_env(), Arc::new(Mutex::new(LocalWorkerStatus::default())));
-        let registry=gateway.build_registry_scoped(false).unwrap();
-        let registration=registry.get("mission.plan.generate").unwrap();
-        assert!(matches!(registration.handler,CapabilityHandler::MissionPlanGenerate));
-        let schema=&registration.descriptor.input_schema;
-        validate_capability_input_schema(schema,&json!({"mission_id":"mission_test","expected_plan_revision":0})).unwrap();
-        for invalid in [json!({"mission_id":"mission_test"}),json!({"mission_id":"mission_test","expected_plan_revision":-1}),
-            json!({"mission_id":"mission_test","expected_plan_revision":0,"confirmed_by":"model","approved_paths":["."]})] {
-            assert!(validate_capability_input_schema(schema,&invalid).is_err());
+        let gateway = CapabilityGateway::new(
+            Options::from_env(),
+            Arc::new(Mutex::new(LocalWorkerStatus::default())),
+        );
+        let registry = gateway.build_registry_scoped(false).unwrap();
+        let registration = registry.get("mission.plan.generate").unwrap();
+        assert!(matches!(
+            registration.handler,
+            CapabilityHandler::MissionPlanGenerate
+        ));
+        let schema = &registration.descriptor.input_schema;
+        validate_capability_input_schema(
+            schema,
+            &json!({"mission_id":"mission_test","expected_plan_revision":0}),
+        )
+        .unwrap();
+        for invalid in [
+            json!({"mission_id":"mission_test"}),
+            json!({"mission_id":"mission_test","expected_plan_revision":-1}),
+            json!({"mission_id":"mission_test","expected_plan_revision":0,"confirmed_by":"model","approved_paths":["."]}),
+        ] {
+            assert!(validate_capability_input_schema(schema, &invalid).is_err());
         }
     }
 
@@ -11938,26 +12205,44 @@ mod tests {
     #[test]
     fn plugin_ai_public_plan_and_catalog_are_local_and_validate_selection() {
         let _guard = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!("himind-plugin-ai-gateway-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("himind-plugin-ai-gateway-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let previous = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         let mut options = crate::Options::from_env();
         options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
-        let gateway = CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let result = (|| -> Result<(), Box<dyn Error>> {
-            let context = InvocationContext::new(crate::capability::types::InvocationSource::Mcp, "plugin:selection-fixture");
-            let plan = gateway.invoke(&context, "media.route.plan", json!({"capability":"media.audio.speech","selection":{"mode":"agent_default"}}))?;
+            let context = InvocationContext::new(
+                crate::capability::types::InvocationSource::Mcp,
+                "plugin:selection-fixture",
+            );
+            let plan = gateway.invoke(
+                &context,
+                "media.route.plan",
+                json!({"capability":"media.audio.speech","selection":{"mode":"agent_default"}}),
+            )?;
             assert_eq!(plan["billable"], false);
             assert_eq!(plan["state"], "missing");
             let catalog = gateway.invoke(&context, "media.provider.catalog", json!({"capability":"media.audio.speech","execution_mode":"sync","ready_only":true}))?;
             assert!(catalog["providers"].as_array().unwrap().is_empty());
             assert!(gateway.invoke(&context, "media.route.plan", json!({"capability":"image.generate","selection":{"mode":"pinned","service_id":"x","model":"m"},"service":"custom:x"})).is_err());
             assert!(gateway.invoke(&context, "media.route.plan", json!({"capability":"image.generate","selection":{"mode":"agent_default","model":"unexpected"}})).is_err());
-            assert!(gateway.invoke(&context, "media.provider.catalog", json!({"execution_mode":"imaginary"})).is_err());
+            assert!(gateway
+                .invoke(
+                    &context,
+                    "media.provider.catalog",
+                    json!({"execution_mode":"imaginary"})
+                )
+                .is_err());
             Ok(())
         })();
-        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = std::fs::remove_dir_all(root);
         result.unwrap();
     }

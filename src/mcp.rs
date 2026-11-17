@@ -1561,7 +1561,8 @@ mod tests {
 
         let package_source = root.join("fixture-workflow");
         copy_directory(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows/ui-craft-team"),
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/workflows/ui-craft-team"),
             &package_source,
         )
         .unwrap();
@@ -2148,79 +2149,184 @@ mod tests {
 
     #[test]
     fn workspace_session_mcp_reads_synthetic_native_history_end_to_end() {
-        let _lock=crate::store::paths::test_env_lock();
-        let root=std::env::current_dir().unwrap().join(".himind").join(format!("session-mcp-fixture-{}",std::process::id()));
-        let codex=root.join("codex");std::fs::create_dir_all(codex.join("sessions")).unwrap();
-        let _agent=EnvironmentRestore::set("HIMIND_AGENT_HOME",root.join("agent"));
-        let _source=EnvironmentRestore::set("CODEX_HOME",&codex);
-        let records=[
+        let _lock = crate::store::paths::test_env_lock();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".himind")
+            .join(format!("session-mcp-fixture-{}", std::process::id()));
+        let codex = root.join("codex");
+        std::fs::create_dir_all(codex.join("sessions")).unwrap();
+        let _agent = EnvironmentRestore::set("HIMIND_AGENT_HOME", root.join("agent"));
+        let _source = EnvironmentRestore::set("CODEX_HOME", &codex);
+        let records = [
             json!({"type":"session_meta","timestamp":"2026-11-16T10:00:00Z","payload":{"id":"synthetic-mcp","cwd":"G:/synthetic-unregistered"}}),
             json!({"type":"response_item","timestamp":"2026-11-16T10:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"实现合成配置"}]}}),
             json!({"type":"response_item","timestamp":"2026-11-16T10:10:00Z","payload":{"type":"message","role":"assistant","phase":"final","content":[{"type":"output_text","text":"合成配置已完成"}]}}),
         ];
-        let path=codex.join("sessions/synthetic.jsonl");
-        let bytes=records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");std::fs::write(&path,&bytes).unwrap();
-        let gateway=test_gateway();let mut session=initialize_client(&gateway,"history-fixture");
-        activate_for_client(&gateway,&mut session,"workspace.session.");
-        let result=call_tool(&gateway,&mut session,"workspace.session.list",json!({"scope":"unassigned","sources":["codex"]}));
-        assert_eq!(result["isError"],false,"{result}");assert_eq!(result["structuredContent"]["total"],1);
-        let request=json!({"sources":["codex"],"scope":"unassigned","from":"2026-11-16T00:00:00Z","to":"2026-11-17T00:00:00Z","limit":1});
-        let one=call_tool(&gateway,&mut session,"workspace.session.activity",request.clone());
-        assert_eq!(one["isError"],false,"{one}");assert_eq!(one["structuredContent"]["activities"][0]["session"]["native_id"],"synthetic-mcp");
-        let mut next=request;next["cursor"]=one["structuredContent"]["next_cursor"].clone();
-        let two=call_tool(&gateway,&mut session,"workspace.session.activity",next);
-        assert_eq!(two["isError"],false,"{two}");assert!(two["structuredContent"]["next_cursor"].is_null());
-        assert_ne!(one["structuredContent"]["activities"][0]["message"]["id"],two["structuredContent"]["activities"][0]["message"]["id"]);
-        assert_eq!(std::fs::read_to_string(path).unwrap(),bytes);
-        if let Some(extension_root)=std::env::var_os("HIMIND_HISTORY_EXTENSIONS_FIXTURE") {
-            let extension_root=PathBuf::from(extension_root);
-            let collector=std::env::var_os("HIMIND_HISTORY_COLLECTOR_FIXTURE").expect("collector fixture binary required");
-            let worklog=std::env::var_os("HIMIND_HISTORY_WORKLOG_FIXTURE").expect("worklog fixture binary required");
-            let dispatch_gateway=Arc::new(test_gateway());
-            let dispatch=Arc::new(move |id:&str,input:Value| {
-                let context=crate::capability::types::InvocationContext::new(crate::capability::types::InvocationSource::Plugin,"synthetic-worklog");
-                dispatch_gateway.invoke(&context,id,input).map_err(|e|e.to_string())
+        let path = codex.join("sessions/synthetic.jsonl");
+        let bytes = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let gateway = test_gateway();
+        let mut session = initialize_client(&gateway, "history-fixture");
+        activate_for_client(&gateway, &mut session, "workspace.session.");
+        let result = call_tool(
+            &gateway,
+            &mut session,
+            "workspace.session.list",
+            json!({"scope":"unassigned","sources":["codex"]}),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["total"], 1);
+        let request = json!({"sources":["codex"],"scope":"unassigned","from":"2026-11-16T00:00:00Z","to":"2026-11-17T00:00:00Z","limit":1});
+        let one = call_tool(
+            &gateway,
+            &mut session,
+            "workspace.session.activity",
+            request.clone(),
+        );
+        assert_eq!(one["isError"], false, "{one}");
+        assert_eq!(
+            one["structuredContent"]["activities"][0]["session"]["native_id"],
+            "synthetic-mcp"
+        );
+        let mut next = request;
+        next["cursor"] = one["structuredContent"]["next_cursor"].clone();
+        let two = call_tool(&gateway, &mut session, "workspace.session.activity", next);
+        assert_eq!(two["isError"], false, "{two}");
+        assert!(two["structuredContent"]["next_cursor"].is_null());
+        assert_ne!(
+            one["structuredContent"]["activities"][0]["message"]["id"],
+            two["structuredContent"]["activities"][0]["message"]["id"]
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+        if let Some(extension_root) = std::env::var_os("HIMIND_HISTORY_EXTENSIONS_FIXTURE") {
+            let extension_root = PathBuf::from(extension_root);
+            let collector = std::env::var_os("HIMIND_HISTORY_COLLECTOR_FIXTURE")
+                .expect("collector fixture binary required");
+            let worklog = std::env::var_os("HIMIND_HISTORY_WORKLOG_FIXTURE")
+                .expect("worklog fixture binary required");
+            let dispatch_gateway = Arc::new(test_gateway());
+            let dispatch = Arc::new(move |id: &str, input: Value| {
+                let context = crate::capability::types::InvocationContext::new(
+                    crate::capability::types::InvocationSource::Plugin,
+                    "synthetic-worklog",
+                );
+                dispatch_gateway
+                    .invoke(&context, id, input)
+                    .map_err(|e| e.to_string())
             });
-            let broker=crate::capability::capability_broker::CapabilityBrokerSession::start(
-                "com.himind.work-log-collector","work-log.session.scan",&["workspace.session.activity".into()],vec![],Duration::from_secs(60),dispatch
-            ).unwrap().unwrap();
-            let run=|binary:&std::ffi::OsStr,method:&str,params:Value| {
-                let mut process=Command::new(binary).env("HIMIND_CAPABILITY_BROKER_URL",&broker.url).env("HIMIND_CAPABILITY_BROKER_TOKEN",&broker.token)
-                    .env("HIMIND_PLUGIN_DATA_ROOT",root.join("plugin-data")).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-                let request=json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-                writeln!(process.stdin.take().unwrap(),"{request}").unwrap();
-                let output=process.wait_with_output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-                let response:Value=serde_json::from_slice(&output.stdout).unwrap();assert!(response.get("error").is_none(),"{response}");response["result"].clone()
+            let broker = crate::capability::capability_broker::CapabilityBrokerSession::start(
+                "com.himind.work-log-collector",
+                "work-log.session.scan",
+                &["workspace.session.activity".into()],
+                vec![],
+                Duration::from_secs(60),
+                dispatch,
+            )
+            .unwrap()
+            .unwrap();
+            let run = |binary: &std::ffi::OsStr, method: &str, params: Value| {
+                let mut process = Command::new(binary)
+                    .env("HIMIND_CAPABILITY_BROKER_URL", &broker.url)
+                    .env("HIMIND_CAPABILITY_BROKER_TOKEN", &broker.token)
+                    .env("HIMIND_PLUGIN_DATA_ROOT", root.join("plugin-data"))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let request = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+                writeln!(process.stdin.take().unwrap(), "{request}").unwrap();
+                let output = process.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(response.get("error").is_none(), "{response}");
+                response["result"].clone()
             };
-            let material=run(&collector,"work-log.session.scan",json!({"backend":"agent","source":"codex","date":"2026-11-16","home":root.join("fixture-home"),"material_root":root.join("material")}));
-            let digest_schema:Value=serde_json::from_slice(&std::fs::read(extension_root.join("workflows/daily-work-log/artifacts/session-digest.schema.json")).unwrap()).unwrap();
-            jsonschema::validator_for(&digest_schema).unwrap().validate(&material).unwrap();
-            assert_eq!(material["total"],1);assert_eq!(material["entries"][0]["minutes"],10);
-            assert_eq!(material["entries"][0]["provider"],"agent");assert!(material["entries"][0]["evidence"].is_array());
-            let params=json!({"log_root":root.join("worklog"),"resolve_projects":false,"entries":material["entries"]});
-            let manifest:Value=serde_json::from_slice(&std::fs::read(extension_root.join("plugins/work-log/plugin.json")).unwrap()).unwrap();
-            let schema=&manifest["capabilities"].as_array().unwrap().iter().find(|v|v["id"]=="work-log.entry.upsert").unwrap()["input_schema"];
-            jsonschema::validator_for(schema).unwrap().validate(&params).unwrap();
-            run(&worklog,"work-log.entry.upsert",params.clone());run(&worklog,"work-log.entry.upsert",params);
-            let read=run(&worklog,"work-log.entry.read",json!({"log_root":root.join("worklog"),"date":"2026-11-16"}));
-            assert_eq!(read["entries"].as_array().unwrap().len(),1);assert_eq!(read["entries"][0]["minutes_method"],"message_intervals_v1");
+            let material = run(
+                &collector,
+                "work-log.session.scan",
+                json!({"backend":"agent","source":"codex","date":"2026-11-16","home":root.join("fixture-home"),"material_root":root.join("material")}),
+            );
+            let digest_schema: Value = serde_json::from_slice(
+                &std::fs::read(
+                    extension_root
+                        .join("workflows/daily-work-log/artifacts/session-digest.schema.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            jsonschema::validator_for(&digest_schema)
+                .unwrap()
+                .validate(&material)
+                .unwrap();
+            assert_eq!(material["total"], 1);
+            assert_eq!(material["entries"][0]["minutes"], 10);
+            assert_eq!(material["entries"][0]["provider"], "agent");
+            assert!(material["entries"][0]["evidence"].is_array());
+            let params = json!({"log_root":root.join("worklog"),"resolve_projects":false,"entries":material["entries"]});
+            let manifest: Value = serde_json::from_slice(
+                &std::fs::read(extension_root.join("plugins/work-log/plugin.json")).unwrap(),
+            )
+            .unwrap();
+            let schema = &manifest["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == "work-log.entry.upsert")
+                .unwrap()["input_schema"];
+            jsonschema::validator_for(schema)
+                .unwrap()
+                .validate(&params)
+                .unwrap();
+            run(&worklog, "work-log.entry.upsert", params.clone());
+            run(&worklog, "work-log.entry.upsert", params);
+            let read = run(
+                &worklog,
+                "work-log.entry.read",
+                json!({"log_root":root.join("worklog"),"date":"2026-11-16"}),
+            );
+            assert_eq!(read["entries"].as_array().unwrap().len(), 1);
+            assert_eq!(read["entries"][0]["minutes_method"], "message_intervals_v1");
             drop(broker);
         }
-        drop(session);drop(gateway);let _=std::fs::remove_dir_all(root);
+        drop(session);
+        drop(gateway);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn workspace_session_tools_activate_for_history_consumers() {
-        let gateway=test_gateway();let mut session=initialize_client(&gateway,"history-consumer");
-        activate_for_client(&gateway,&mut session,"workspace.session.");
-        let listing=handle_request_with_session(&gateway,"tools/list",json!({}),&mut session).unwrap();
-        for operation in ["sources","list","messages","activity"] {
-            let name=format!("workspace.session.{operation}");
-            let tool=listing["tools"].as_array().unwrap().iter().find(|v|v["name"]==name).unwrap();
-            assert_eq!(tool["annotations"]["readOnlyHint"],true);
+        let gateway = test_gateway();
+        let mut session = initialize_client(&gateway, "history-consumer");
+        activate_for_client(&gateway, &mut session, "workspace.session.");
+        let listing =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        for operation in ["sources", "list", "messages", "activity"] {
+            let name = format!("workspace.session.{operation}");
+            let tool = listing["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap();
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
         }
-        let invalid=call_tool(&gateway,&mut session,"workspace.session.activity",json!({"from":"invalid","to":"invalid"}));
-        assert_eq!(invalid["isError"],true);
+        let invalid = call_tool(
+            &gateway,
+            &mut session,
+            "workspace.session.activity",
+            json!({"from":"invalid","to":"invalid"}),
+        );
+        assert_eq!(invalid["isError"], true);
     }
 
     #[test]

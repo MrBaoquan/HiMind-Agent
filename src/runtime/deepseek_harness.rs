@@ -581,9 +581,16 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
     let ready = cli_compatible && compatible_with_agent;
     RuntimeInstallationReport {
         provider: PROVIDER_BUILTIN.to_string(),
-        version: runtime_state.as_ref().filter(|state| executable.as_ref().is_some_and(|path|
-            Path::new(path).canonicalize().ok() == Path::new(&state.executable_path).canonicalize().ok()))
-            .map(|state| state.version.clone()).unwrap_or(version.clone()),
+        version: runtime_state
+            .as_ref()
+            .filter(|state| {
+                executable.as_ref().is_some_and(|path| {
+                    Path::new(path).canonicalize().ok()
+                        == Path::new(&state.executable_path).canonicalize().ok()
+                })
+            })
+            .map(|state| state.version.clone())
+            .unwrap_or(version.clone()),
         status: if ready { "ready" } else { "unavailable" }.to_string(),
         capabilities: json!({
             "managed_execution": true,
@@ -730,8 +737,16 @@ fn installed_runtime_identity(expected: &ExpectedRuntimeManifest) -> (String, bo
     (state.version, version_matches)
 }
 
-fn runtime_engine_version_matches(expected: &ExpectedRuntimeManifest, actual: Option<&str>) -> bool {
-    actual == Some(if expected.engine_version.is_empty() { expected.version.as_str() } else { expected.engine_version.as_str() })
+fn runtime_engine_version_matches(
+    expected: &ExpectedRuntimeManifest,
+    actual: Option<&str>,
+) -> bool {
+    actual
+        == Some(if expected.engine_version.is_empty() {
+            expected.version.as_str()
+        } else {
+            expected.engine_version.as_str()
+        })
 }
 
 /// Ensure the installed Runtime is exactly the release embedded into this Agent.
@@ -870,9 +885,16 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
             .err()
     });
     let compatible_with_agent = compatibility_error.is_none();
-    let installed_version = runtime_state.as_ref().filter(|state| executable.as_ref().is_some_and(|path|
-        Path::new(path).canonicalize().ok() == Path::new(&state.executable_path).canonicalize().ok()))
-        .map(|state| state.version.clone()).unwrap_or_default();
+    let installed_version = runtime_state
+        .as_ref()
+        .filter(|state| {
+            executable.as_ref().is_some_and(|path| {
+                Path::new(path).canonicalize().ok()
+                    == Path::new(&state.executable_path).canonicalize().ok()
+            })
+        })
+        .map(|state| state.version.clone())
+        .unwrap_or_default();
     let status = if cli_compatible && compatible_with_agent {
         "ready"
     } else if cli_compatible {
@@ -1072,6 +1094,7 @@ pub(crate) fn prepare_interactive_launch(
         ControlPlaneFallback::Fail,
         LaunchHome::Interactive,
         None,
+        ActivePersonaPolicy::Include,
     )
 }
 
@@ -1091,6 +1114,7 @@ pub(crate) fn prepare_interactive_launch_allow_degraded(
         ControlPlaneFallback::Degrade,
         LaunchHome::Interactive,
         None,
+        ActivePersonaPolicy::Include,
     )
 }
 
@@ -1100,6 +1124,14 @@ enum ControlPlaneFallback {
     Fail,
     /// 控制面凭据不可用时按本机 Runtime 配置启动。
     Degrade,
+}
+
+/// Ordinary session activation is optional context, never a Mission binding.
+/// Every headless entry explicitly excludes both global and workspace selections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePersonaPolicy {
+    Include,
+    Exclude,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1112,7 +1144,10 @@ enum LaunchHome<'a> {
     /// 两个 DSH 进程，而 home 下的 profile / settings / overlay 都是写入型的。
     /// 共用一个 home 时两边会互相覆盖 `agent-default-model`，表现为「这一步
     /// 用了另一步声明的模型」——这是并发下才会出现的串模型故障。
-    Run { run_id: &'a str, step_id: &'a str },
+    Run {
+        run_id: &'a str,
+        step_id: &'a str,
+    },
 }
 
 /// Resolve the DSH home used by one launch.
@@ -1151,6 +1186,7 @@ fn prepare_interactive_launch_with(
     fallback: ControlPlaneFallback,
     home_mode: LaunchHome<'_>,
     requested_model: Option<&str>,
+    active_persona: ActivePersonaPolicy,
 ) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
@@ -1168,6 +1204,7 @@ fn prepare_interactive_launch_with(
             workspace,
             home_mode,
             requested_model,
+            active_persona,
         );
     }
     if !crate::app::control_plane_provider::available(options) {
@@ -1178,6 +1215,7 @@ fn prepare_interactive_launch_with(
             workspace,
             home_mode,
             requested_model,
+            active_persona,
         );
     }
     // The Dashboard is an optional control plane. A live OAuth token is not
@@ -1196,12 +1234,8 @@ fn prepare_interactive_launch_with(
                 .map_err(|error| error.to_string())?;
         let home = launch_home(&version, &workspace, home_mode)?;
         let models = managed_model_catalog(&credential.access)?;
-        let model = resolve_requested_model(
-            requested_model,
-            &models,
-            "HiMind AI (managed)",
-        )?
-        .unwrap_or_else(|| credential.access.model.trim().to_string());
+        let model = resolve_requested_model(requested_model, &models, "HiMind AI (managed)")?
+            .unwrap_or_else(|| credential.access.model.trim().to_string());
         let sync_snapshot =
             crate::app::builtin_ai_model_sync::snapshot(&delegated.user_id, &credential);
         let invocation = Invocation {
@@ -1219,8 +1253,8 @@ fn prepare_interactive_launch_with(
             step_id: step_id.clone(),
             route_source: ModelRouteSource::Managed,
         };
-        let agent_patch =
-            ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
+        let agent_patch = ensure_home_config(&invocation, options, active_persona)
+            .map_err(|error| error.to_string())?;
         Ok(InteractiveLaunch {
             executable: PathBuf::from(executable.clone()),
             home,
@@ -1250,6 +1284,7 @@ fn prepare_interactive_launch_with(
                 workspace,
                 home_mode,
                 requested_model,
+                active_persona,
             )?;
             launch.control_plane_notice = degraded_notice(&error, &launch);
             eprintln!("{}", launch.control_plane_notice);
@@ -1287,7 +1322,9 @@ pub(crate) struct WorkflowRuntimeFailure {
 }
 
 impl std::fmt::Display for WorkflowRuntimeFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 impl Error for WorkflowRuntimeFailure {}
 
@@ -1335,8 +1372,19 @@ pub(crate) fn execute_workflow_in_run_home(
     access: WorkflowAccess,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
-    execute_workflow_in_run_home_with_resources(options, workspace, prompt, timeout_seconds,
-        disable_tools, run_id, step_id, model_alias, access, is_canceled, None)
+    execute_workflow_in_run_home_with_resources(
+        options,
+        workspace,
+        prompt,
+        timeout_seconds,
+        disable_tools,
+        run_id,
+        step_id,
+        model_alias,
+        access,
+        is_canceled,
+        None,
+    )
 }
 
 pub(crate) fn execute_workflow_in_run_home_with_resources(
@@ -1454,6 +1502,7 @@ fn execute_workflow_with(
         fallback,
         home_mode,
         requested_model.as_deref(),
+        ActivePersonaPolicy::Exclude,
     )
     .map_err(std::io::Error::other)?;
     // `tool_policy=none` 的步骤用一份把工具行全部禁用的 overlay：模型看不到任何
@@ -1463,16 +1512,20 @@ fn execute_workflow_with(
         write_no_tools_overlay(&launch.agent_patch)?
     } else if matches!(access, WorkflowAccess::Read | WorkflowAccess::FilesOnly) {
         write_read_only_overlay(&launch.agent_patch)?
-    } else if matches!(home_mode, LaunchHome::Run { run_id, .. } if run_id.starts_with("workflow_run_mission_")) {
+    } else if matches!(home_mode, LaunchHome::Run { run_id, .. } if run_id.starts_with("workflow_run_mission_"))
+    {
         write_mission_methods_overlay(&launch.agent_patch)?
     } else {
         launch.agent_patch.clone()
     };
 
     let mut command = dsh_command(launch.executable.as_os_str());
-    let prompt = if !disable_tools && matches!(access, WorkflowAccess::Write | WorkflowAccess::Full) {
+    let prompt = if !disable_tools && matches!(access, WorkflowAccess::Write | WorkflowAccess::Full)
+    {
         format!("{prompt}\n\nHiMind image evidence: if read_image refuses an authorized image because its extension differs from its bytes, preserve the original. Activate MCP capability media.image.read using system.capability.activate, then call system.capability.invoke with id=media.image.read and arguments={{workspace_root: the assigned workspace, path: the original image path}}. This returns image pixels to your current model; it does not call another service or modify evidence. If unavailable, state the observation limit honestly.")
-    } else { prompt.to_string() };
+    } else {
+        prompt.to_string()
+    };
     command
         .args(headless_args(&patch))
         .current_dir(&launch.workspace)
@@ -1493,7 +1546,9 @@ fn execute_workflow_with(
         command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     }
     process::remove_himind_secret_environment(&mut command);
-    if let Some(resources) = resources { resources.apply(&mut command)?; }
+    if let Some(resources) = resources {
+        resources.apply(&mut command)?;
+    }
     command.env("DEEPSEEK_API_KEY", &launch.api_key);
     command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     let lease_session = match home_mode {
@@ -1501,14 +1556,26 @@ fn execute_workflow_with(
         _ => format!("workflow-{}-{}", std::process::id(), rand::random::<u64>()),
     };
     let _workspace_lease = if !disable_tools && access != WorkflowAccess::Read {
-        let lease = crate::workspace_lease::RuntimeLeaseGuard::acquire(&workspace, &lease_session, timeout_seconds)?;
+        let lease = crate::workspace_lease::RuntimeLeaseGuard::acquire(
+            &workspace,
+            &lease_session,
+            timeout_seconds,
+        )?;
         lease.configure_child(&mut command);
         Some(lease)
-    } else { None };
+    } else {
+        None
+    };
     process::configure_hidden_process(&mut command);
     let (mut child, tree) = crate::runtime::owned_tree::OwnedTree::spawn(&mut command)?;
-    let stdout = child.stdout.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
-    let stderr = child.stderr.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| process::capture_runtime_output(pipe, false, |_| true));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| process::capture_runtime_output(pipe, false, |_| true));
     let status_result = process::wait_for_child_with_timeout_and_cancel(
         &mut child,
         "HIMIND_DSH_TIMEOUT_SECONDS",
@@ -1518,28 +1585,52 @@ fn execute_workflow_with(
     );
     // The root may have exited while a worker still owns inherited pipes.
     drop(tree);
-    let drain=std::time::Instant::now();
-    while stdout.as_ref().is_some_and(|pipe|!pipe.finished()) || stderr.as_ref().is_some_and(|pipe|!pipe.finished()) {
-        if drain.elapsed()>=std::time::Duration::from_secs(2) {break;}
+    let drain = std::time::Instant::now();
+    while stdout.as_ref().is_some_and(|pipe| !pipe.finished())
+        || stderr.as_ref().is_some_and(|pipe| !pipe.finished())
+    {
+        if drain.elapsed() >= std::time::Duration::from_secs(2) {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let captured=stdout.map(|pipe|pipe.finish_complete()).transpose()
-        .and_then(|stdout|Ok((stdout.unwrap_or_default(),stderr.map(|pipe|pipe.finish()).transpose()?.unwrap_or_default())));
+    let captured = stdout
+        .map(|pipe| pipe.finish_complete())
+        .transpose()
+        .and_then(|stdout| {
+            Ok((
+                stdout.unwrap_or_default(),
+                stderr
+                    .map(|pipe| pipe.finish())
+                    .transpose()?
+                    .unwrap_or_default(),
+            ))
+        });
     let usage_home = match home_mode {
         LaunchHome::Run { step_id, .. } if !step_id.trim().is_empty() => launch
-            .home.parent().and_then(Path::parent).unwrap_or(&launch.home),
+            .home
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&launch.home),
         _ => &launch.home,
     };
     let usage_result = crate::mission::read_projection_usage(usage_home);
-    let (stdout,stderr)=captured.map_err(|error|Box::new(WorkflowRuntimeFailure {
-        provenance:None,
-        message:error.to_string(),usage:usage_result.as_ref().ok().cloned().flatten(),report:None,
-    }) as Box<dyn Error>)?;
-    let status = status_result.map_err(|error| Box::new(WorkflowRuntimeFailure {
-        provenance:None,
-        message: error.to_string(), usage: usage_result.as_ref().ok().cloned().flatten(),
-        report: None,
-    }) as Box<dyn Error>)?;
+    let (stdout, stderr) = captured.map_err(|error| {
+        Box::new(WorkflowRuntimeFailure {
+            provenance: None,
+            message: error.to_string(),
+            usage: usage_result.as_ref().ok().cloned().flatten(),
+            report: None,
+        }) as Box<dyn Error>
+    })?;
+    let status = status_result.map_err(|error| {
+        Box::new(WorkflowRuntimeFailure {
+            provenance: None,
+            message: error.to_string(),
+            usage: usage_result.as_ref().ok().cloned().flatten(),
+            report: None,
+        }) as Box<dyn Error>
+    })?;
     if !status.success() {
         // 以前只拼 stderr（空则回落到 stdout）。两者都为空时错误就变成
         // "DSH workflow runtime failed: " —— 排查时完全无信息可用。
@@ -1557,16 +1648,18 @@ fn execute_workflow_with(
             .unwrap_or_else(|| "terminated by signal".to_string());
         let summarized = process::summarize_output(&detail, OUTPUT_CAPTURE_LIMIT);
         let message = if summarized.trim().is_empty() {
-            format!(
-                "DSH workflow runtime failed (exit {exit}) with no output on stdout or stderr"
-            )
+            format!("DSH workflow runtime failed (exit {exit}) with no output on stdout or stderr")
         } else {
             format!("DSH workflow runtime failed (exit {exit}): {summarized}")
         };
-        return Err(Box::new(WorkflowRuntimeFailure { message,
-            provenance:Some(json!({"provider":"himind.builtin","exit_code":status.code(),"model":launch.default_model,"service_source":launch.service_source})),
+        return Err(Box::new(WorkflowRuntimeFailure {
+            message,
+            provenance: Some(
+                json!({"provider":"himind.builtin","exit_code":status.code(),"model":launch.default_model,"service_source":launch.service_source}),
+            ),
             usage: usage_result.as_ref().ok().cloned().flatten(),
-            report: workflow_failure_report(&stdout, &stderr) }));
+            report: workflow_failure_report(&stdout, &stderr),
+        }));
     }
     Ok(WorkflowRuntimeOutcome {
         text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
@@ -1580,7 +1673,8 @@ fn execute_workflow_with(
 fn workflow_failure_report(stdout: &str, stderr: &str) -> Option<Value> {
     [stdout, stderr].into_iter().find_map(|text| {
         let report: Value = serde_json::from_str(text.trim()).ok()?;
-        (report.is_object() && report.get("passed").is_some_and(Value::is_boolean)).then_some(report)
+        (report.is_object() && report.get("passed").is_some_and(Value::is_boolean))
+            .then_some(report)
     })
 }
 
@@ -1602,6 +1696,7 @@ fn prepare_independent_interactive_launch(
     workspace: PathBuf,
     home_mode: LaunchHome<'_>,
     requested_model: Option<&str>,
+    active_persona: ActivePersonaPolicy,
 ) -> Result<InteractiveLaunch, String> {
     let shared_home = native_dsh_home(&version)?;
     let home = launch_home(&version, &workspace, home_mode)?;
@@ -1618,7 +1713,10 @@ fn prepare_independent_interactive_launch(
                 let provider_config = native_dsh_provider_config(&shared_home);
                 if provider_config.base_url.trim().is_empty()
                     || provider_config.model.trim().is_empty()
-                    || provider_config.api_key_env.as_deref().is_none_or(|name| env::var(name).unwrap_or_default().trim().is_empty())
+                    || provider_config
+                        .api_key_env
+                        .as_deref()
+                        .is_none_or(|name| env::var(name).unwrap_or_default().trim().is_empty())
                 {
                     return Err(
                         "未选择可用的本机 AI 模型路由，且 DSH 原生路由未配置。请先在「设置 → AI 连接 → 模型服务」选择服务，或配置 Runtime 的原生模型凭据。"
@@ -1652,8 +1750,8 @@ fn prepare_independent_interactive_launch(
         step_id: step_id.clone(),
         route_source,
     };
-    let agent_patch =
-        ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
+    let agent_patch = ensure_home_config(&invocation, options, active_persona)
+        .map_err(|error| error.to_string())?;
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
@@ -2493,12 +2591,19 @@ fn execute_claimed(
     let invocation = build_invocation(options, claim)?;
     let mut cancel_guard = crate::api::client::TaskCancelGuard::new();
     let cancel = std::cell::RefCell::new(&mut cancel_guard);
-    process::verify_command_with_cancel(&invocation.executable, &["--version"],
-        std::time::Duration::from_secs(5), &|| {
-            cancel.borrow_mut().check(client,options,agent_id,&task.id)?; Ok(false)
-        })
-        .map_err(|error| format!("DeepSeek Harness CLI is unavailable: {error}"))?;
-    ensure_home_config(&invocation, options)?;
+    process::verify_command_with_cancel(
+        &invocation.executable,
+        &["--version"],
+        std::time::Duration::from_secs(5),
+        &|| {
+            cancel
+                .borrow_mut()
+                .check(client, options, agent_id, &task.id)?;
+            Ok(false)
+        },
+    )
+    .map_err(|error| format!("DeepSeek Harness CLI is unavailable: {error}"))?;
+    ensure_home_config(&invocation, options, ActivePersonaPolicy::Exclude)?;
     let instruction_snapshot =
         crate::workspace_instructions::load_dsh_snapshot(&invocation.home, &invocation.workspace)?;
     update_agent_run_status(
@@ -2514,8 +2619,14 @@ fn execute_claimed(
     )?;
     let _renewal = process::start_run_lease_renewal(client, options, agent_id, claim);
     let (mut child, tree) = spawn(&invocation)?;
-    let stdout = child.stdout.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
-    let stderr = child.stderr.take().map(|pipe|process::capture_runtime_output(pipe,false,|_|true));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| process::capture_runtime_output(pipe, false, |_| true));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| process::capture_runtime_output(pipe, false, |_| true));
     let status_result = process::wait_for_child(
         client,
         options,
@@ -2527,24 +2638,48 @@ fn execute_claimed(
         "DeepSeek Harness",
     );
     drop(tree);
-    let drain=std::time::Instant::now();
-    while stdout.as_ref().is_some_and(|pipe|!pipe.finished()) || stderr.as_ref().is_some_and(|pipe|!pipe.finished()) {
-        if drain.elapsed()>=std::time::Duration::from_secs(2) {break;}
+    let drain = std::time::Instant::now();
+    while stdout.as_ref().is_some_and(|pipe| !pipe.finished())
+        || stderr.as_ref().is_some_and(|pipe| !pipe.finished())
+    {
+        if drain.elapsed() >= std::time::Duration::from_secs(2) {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let usage=crate::mission::read_projection_usage(&invocation.home).ok().flatten();
-    let failure=|message:String| -> Box<dyn Error> {Box::new(WorkflowRuntimeFailure {
-        message,usage:usage.clone(),report:None,provenance:Some(json!({"provider":"himind.builtin","model":invocation.model})),
-    })};
-    let status=status_result.map_err(|error|failure(error.to_string()))?;
-    let failure=|message:String| -> Box<dyn Error> {Box::new(WorkflowRuntimeFailure {
-        message,usage:usage.clone(),report:None,provenance:Some(json!({
-            "provider":"himind.builtin","model":invocation.model,"exit_code":status.code(),
-            "model_source":"claim_scoped_himind_service",
-        })),
-    })};
-    let stdout=stdout.map(|pipe|pipe.finish_complete()).transpose().map_err(|error|failure(error.to_string()))?.unwrap_or_default();
-    let stderr=stderr.map(|pipe|pipe.finish()).transpose().map_err(|error|failure(error.to_string()))?.unwrap_or_default();
+    let usage = crate::mission::read_projection_usage(&invocation.home)
+        .ok()
+        .flatten();
+    let failure = |message: String| -> Box<dyn Error> {
+        Box::new(WorkflowRuntimeFailure {
+            message,
+            usage: usage.clone(),
+            report: None,
+            provenance: Some(json!({"provider":"himind.builtin","model":invocation.model})),
+        })
+    };
+    let status = status_result.map_err(|error| failure(error.to_string()))?;
+    let failure = |message: String| -> Box<dyn Error> {
+        Box::new(WorkflowRuntimeFailure {
+            message,
+            usage: usage.clone(),
+            report: None,
+            provenance: Some(json!({
+                "provider":"himind.builtin","model":invocation.model,"exit_code":status.code(),
+                "model_source":"claim_scoped_himind_service",
+            })),
+        })
+    };
+    let stdout = stdout
+        .map(|pipe| pipe.finish_complete())
+        .transpose()
+        .map_err(|error| failure(error.to_string()))?
+        .unwrap_or_default();
+    let stderr = stderr
+        .map(|pipe| pipe.finish())
+        .transpose()
+        .map_err(|error| failure(error.to_string()))?
+        .unwrap_or_default();
     if !status.success() {
         let detail = if stderr.trim().is_empty() {
             stdout
@@ -2559,14 +2694,24 @@ fn execute_claimed(
     }
     let final_message = stdout.trim().to_string();
     if final_message.is_empty() {
-        return Err(failure("DeepSeek Harness returned an empty final response".into()));
+        return Err(failure(
+            "DeepSeek Harness returned an empty final response".into(),
+        ));
     }
-    let report=crate::workflow::parse_runtime_payload(&final_message);
-    if report.as_ref().is_some_and(|report|report.get("passed").and_then(Value::as_bool)==Some(false))
-        || ((final_message.starts_with('{') || final_message.starts_with("```")) && report.is_none()) {
+    let report = crate::workflow::parse_runtime_payload(&final_message);
+    if report
+        .as_ref()
+        .is_some_and(|report| report.get("passed").and_then(Value::as_bool) == Some(false))
+        || ((final_message.starts_with('{') || final_message.starts_with("```"))
+            && report.is_none())
+    {
         return Err(Box::new(WorkflowRuntimeFailure {
-            message:"HiMind AgentRun returned negative or incomplete structured delivery".into(),
-            report, usage, provenance:Some(json!({"provider":"himind.builtin","model":invocation.model,"exit_code":0})),
+            message: "HiMind AgentRun returned negative or incomplete structured delivery".into(),
+            report,
+            usage,
+            provenance: Some(
+                json!({"provider":"himind.builtin","model":invocation.model,"exit_code":0}),
+            ),
         }));
     }
     Ok(json!({
@@ -2649,7 +2794,9 @@ fn effective_access_mode(claim: &AgentRunClaim) -> Result<&str, Box<dyn Error>> 
     }
 }
 
-fn spawn(invocation: &Invocation) -> Result<(Child, crate::runtime::owned_tree::OwnedTree), Box<dyn Error>> {
+fn spawn(
+    invocation: &Invocation,
+) -> Result<(Child, crate::runtime::owned_tree::OwnedTree), Box<dyn Error>> {
     let mut command = dsh_command(&invocation.executable);
     process::remove_himind_secret_environment(&mut command);
     command
@@ -2662,7 +2809,10 @@ fn spawn(invocation: &Invocation) -> Result<(Child, crate::runtime::owned_tree::
         .env("DSH_PERMISSION_MODE", invocation.permission_mode)
         .env("HIMIND_AGENT_RUN_ID", &invocation.run_id)
         .env("NO_COLOR", "1")
-        .stdin(Stdio::from(headless_prompt_input(&invocation.home, &invocation.prompt)?))
+        .stdin(Stdio::from(headless_prompt_input(
+            &invocation.home,
+            &invocation.prompt,
+        )?))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.env_remove("OPENAI_API_KEY");
@@ -2674,8 +2824,13 @@ fn spawn(invocation: &Invocation) -> Result<(Child, crate::runtime::owned_tree::
 }
 
 fn headless_args(patch: &Path) -> [OsString; 5] {
-    ["--profile".into(), HIMIND_HEADLESS_PROFILE.into(), "--patch".into(),
-        patch.as_os_str().to_owned(), "-".into()]
+    [
+        "--profile".into(),
+        HIMIND_HEADLESS_PROFILE.into(),
+        "--patch".into(),
+        patch.as_os_str().to_owned(),
+        "-".into(),
+    ]
 }
 
 /// DSH's headless `-` reads the complete UTF-8 task from standard input.
@@ -2683,13 +2838,19 @@ fn headless_args(patch: &Path) -> [OsString; 5] {
 /// blocking pipe write before timeout/cancellation supervision starts. The
 /// file is host-owned (outside the candidate) and removed on last handle close.
 fn headless_prompt_input(home: &Path, prompt: &str) -> std::io::Result<File> {
-    let path = home.join(format!(".headless-input-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    let path = home.join(format!(
+        ".headless-input-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+        };
         options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY);
     }
     #[cfg(unix)]
@@ -2714,10 +2875,16 @@ mod headless_input_tests {
     fn fixture() -> &'static Path {
         static EXE: OnceLock<PathBuf> = OnceLock::new();
         EXE.get_or_init(|| {
-            let root = env::temp_dir().join(format!("himind-stdin-fixture-{}-{}", std::process::id(), rand::random::<u64>()));
+            let root = env::temp_dir().join(format!(
+                "himind-stdin-fixture-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
             fs::create_dir_all(&root).unwrap();
             let source = root.join("fixture.rs");
-            fs::write(&source, r#"
+            fs::write(
+                &source,
+                r#"
 use std::{env,io::{Read,Write},thread,time::Duration};
 fn main() {
  if env::args().any(|a|a=="--hang") {thread::sleep(Duration::from_secs(30));return;}
@@ -2725,17 +2892,31 @@ fn main() {
  assert_eq!(env::args().last().unwrap(),"-");
  std::io::stdout().write_all(&data).unwrap();
 }
-"#).unwrap();
+"#,
+            )
+            .unwrap();
             let exe = root.join("input-fixture.exe");
-            let result = process::hidden_command("rustc").arg(source)
-                .args(["--edition=2021", "-C", "debuginfo=0", "-o"]).arg(&exe).output().unwrap();
-            assert!(result.status.success(), "fixture compile: {}", String::from_utf8_lossy(&result.stderr));
+            let result = process::hidden_command("rustc")
+                .arg(source)
+                .args(["--edition=2021", "-C", "debuginfo=0", "-o"])
+                .arg(&exe)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "fixture compile: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
             exe
         })
     }
 
     fn home() -> PathBuf {
-        let root = env::temp_dir().join(format!("himind-headless-input-{}-{}", std::process::id(), rand::random::<u64>()));
+        let root = env::temp_dir().join(format!(
+            "himind-headless-input-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         fs::create_dir_all(&root).unwrap();
         root
     }
@@ -2746,14 +2927,20 @@ fn main() {
         let prompt = "完整失败证据 🧪 \"quoted\" \\path\\ $(literal) `literal`\r\n".repeat(20_000);
         assert!(prompt.encode_utf16().count() > 32_767);
         let mut command = process::hidden_command(fixture());
-        command.args(headless_args(Path::new("non-secret.patch.yml")))
+        command
+            .args(headless_args(Path::new("non-secret.patch.yml")))
             .stdin(Stdio::from(headless_prompt_input(&root, &prompt).unwrap()))
-            .stdout(Stdio::piped()).stderr(Stdio::piped());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let output = command.spawn().unwrap().wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, prompt.as_bytes());
         drop(command);
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "temporary input must not persist");
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            0,
+            "temporary input must not persist"
+        );
         fs::remove_dir(&root).unwrap();
     }
 
@@ -2762,7 +2949,8 @@ fn main() {
         let root = home();
         let prompt = "private failure evidence".repeat(10_000);
         let mut command = process::hidden_command(root.join("missing.exe"));
-        command.args(headless_args(Path::new("overlay.yml")))
+        command
+            .args(headless_args(Path::new("overlay.yml")))
             .stdin(Stdio::from(headless_prompt_input(&root, &prompt).unwrap()));
         let error = command.spawn().unwrap_err();
         assert!(!error.to_string().contains("private failure evidence"));
@@ -2774,15 +2962,30 @@ fn main() {
     fn stop_unread_input(cancel: bool) {
         let root = home();
         let mut command = process::hidden_command(fixture());
-        command.arg("--hang").stdin(Stdio::from(headless_prompt_input(&root, &"unread".repeat(300_000)).unwrap()))
-            .stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .arg("--hang")
+            .stdin(Stdio::from(
+                headless_prompt_input(&root, &"unread".repeat(300_000)).unwrap(),
+            ))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = command.spawn().unwrap();
         let started = Instant::now();
-        let error = process::wait_for_child_until_with_cancel(&mut child, Duration::from_millis(150),
-            "headless input fixture", &mut || Ok(cancel)).unwrap_err();
-        assert!(error.to_string().contains(if cancel { "canceled" } else { "exceeded" }));
+        let error = process::wait_for_child_until_with_cancel(
+            &mut child,
+            Duration::from_millis(150),
+            "headless input fixture",
+            &mut || Ok(cancel),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(if cancel { "canceled" } else { "exceeded" }));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(child.try_wait().unwrap().is_some(), "unread stdin must not prevent child reaping");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "unread stdin must not prevent child reaping"
+        );
         drop(child);
         drop(command);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
@@ -2790,10 +2993,14 @@ fn main() {
     }
 
     #[test]
-    fn headless_stdin_unread_large_request_remains_cancelable() { stop_unread_input(true); }
+    fn headless_stdin_unread_large_request_remains_cancelable() {
+        stop_unread_input(true);
+    }
 
     #[test]
-    fn headless_stdin_unread_large_request_remains_timeout_bounded() { stop_unread_input(false); }
+    fn headless_stdin_unread_large_request_remains_timeout_bounded() {
+        stop_unread_input(false);
+    }
 }
 
 /// Build the command used by an interactive DSH session.
@@ -2842,18 +3049,30 @@ pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &
     #[cfg(windows)]
     {
         let temp = crate::store::paths::agent_home().join("cache/dsh-temp");
-        if fs::create_dir_all(&temp).is_ok() { command.env("TEMP", &temp).env("TMP", &temp); }
+        if fs::create_dir_all(&temp).is_ok() {
+            command.env("TEMP", &temp).env("TMP", &temp);
+        }
     }
     // Only runtimes carrying the signed pipe-compatibility patch select their
     // bundled Node for shell tools. Otherwise `node --test` would still resolve
     // an unpatched global Node and fail despite a successful runtime self-test.
-    let patched_node = fs::read(runtime_root.join("runtime.json")).ok()
+    let patched_node = fs::read(runtime_root.join("runtime.json"))
+        .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|manifest| manifest["node_patches"].as_array()
-            .is_some_and(|patches| patches.iter().any(|patch| patch == "restricted-pipe-dacl")));
+        .is_some_and(|manifest| {
+            manifest["node_patches"]
+                .as_array()
+                .is_some_and(|patches| patches.iter().any(|patch| patch == "restricted-pipe-dacl"))
+        });
     if patched_node {
-        let paths = std::iter::once(runtime_root.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())).collect::<Vec<_>>();
-        if let Ok(path) = std::env::join_paths(paths) { command.env("PATH", path); }
+        let paths = std::iter::once(runtime_root.clone())
+            .chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ))
+            .collect::<Vec<_>>();
+        if let Ok(path) = std::env::join_paths(paths) {
+            command.env("PATH", path);
+        }
     }
 
     command.env("NO_PROXY", loopback_no_proxy());
@@ -2917,9 +3136,12 @@ fn windows_node_command(executable: &std::ffi::OsStr) -> Option<Command> {
 fn ensure_home_config(
     invocation: &Invocation,
     options: &Options,
+    active_persona: ActivePersonaPolicy,
 ) -> Result<PathBuf, Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
-    if !executor_native_metadata_only() {ensure_himind_skill_adapter(&invocation.home, options)?;}
+    if !executor_native_metadata_only() {
+        ensure_himind_skill_adapter(&invocation.home, options)?;
+    }
     migrate_legacy_managed_settings(&invocation.home)?;
     // 这次会话用不上工作台路由（未授权 / 授权过期 / 用户关掉对接）时，用户
     // 文档里若还留着 Agent 自有的 `himind-proxy`，Runtime 只会拿它去解析
@@ -2938,7 +3160,7 @@ fn ensure_home_config(
         Some(Path::new(invocation.executable.as_os_str())),
         HIMIND_HEADLESS_PROFILE,
     )?;
-    ensure_agent_overlay(&invocation.home, options, invocation)
+    ensure_agent_overlay(&invocation.home, options, invocation, active_persona)
 }
 
 fn ensure_himind_profile(
@@ -2962,12 +3184,14 @@ fn ensure_himind_profile(
     // Runtime 的普通对话能力。
     let supports_agent_preset_v2 =
         runtime_supports_agent_preset_v2(Path::new(invocation.executable.as_os_str()));
-    if !executor_native_metadata_only() {if let Err(error) = sync_expert_presets(
-        &home.join("profiles").join(HIMIND_PROFILE),
-        supports_agent_preset_v2,
-    ) {
-        eprintln!("同步 DSH 专家预设失败：{error}");
-    }}
+    if !executor_native_metadata_only() {
+        if let Err(error) = sync_expert_presets(
+            &home.join("profiles").join(HIMIND_PROFILE),
+            supports_agent_preset_v2,
+        ) {
+            eprintln!("同步 DSH 专家预设失败：{error}");
+        }
+    }
     Ok(())
 }
 
@@ -3524,10 +3748,23 @@ const NO_TOOLS_DISABLED_ROWS: &[&str] = &[
 // and search, but no shell, skills, delegation or external mutation tools that
 // can request an escalation and trap the model in an endless retry loop.
 const READ_ONLY_DISABLED_ROWS: &[&str] = &[
-    "tool-pwsh", "tool-bash", "tool-web", "tool-skill", "tool-todo", "tool-goal",
-    "tool-jobs", "tool-workflow", "tool-ralph", "tool-subagent", "tool-subagent-fork",
-    "tool-subagent-control", "tool-subagent-list-agents", "tool-present", "plan-mode",
-    "user-questions", "himind-agent-mcp",
+    "tool-pwsh",
+    "tool-bash",
+    "tool-web",
+    "tool-skill",
+    "tool-todo",
+    "tool-goal",
+    "tool-jobs",
+    "tool-workflow",
+    "tool-ralph",
+    "tool-subagent",
+    "tool-subagent-fork",
+    "tool-subagent-control",
+    "tool-subagent-list-agents",
+    "tool-present",
+    "plan-mode",
+    "user-questions",
+    "himind-agent-mcp",
 ];
 
 fn write_read_only_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -3536,8 +3773,14 @@ fn write_read_only_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>>
     for row in READ_ONLY_DISABLED_ROWS {
         overlay.push_str(&format!("\n- id: {row}\n  disabled: true\n"));
     }
-    let name = base_patch.file_name().and_then(|name| name.to_str()).unwrap_or("agent.patch.yml");
-    let path = base_patch.with_file_name(format!("{}-read-only.patch.yml", name.trim_end_matches(".patch.yml")));
+    let name = base_patch
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent.patch.yml");
+    let path = base_patch.with_file_name(format!(
+        "{}-read-only.patch.yml",
+        name.trim_end_matches(".patch.yml")
+    ));
     fs::write(&path, overlay)?;
     Ok(path)
 }
@@ -3550,7 +3793,13 @@ fn write_mission_methods_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn E
     // Keep the assigned model, file tools, Shell and MCP image/lease tools.
     let base = fs::read_to_string(base_patch)?;
     let path = base_patch.with_extension("mission-methods.yml");
-    fs::write(&path, format!("{}\n- id: tool-skill\n  disabled: true\n- id: tool-goal\n  disabled: true\n", base.trim_end()))?;
+    fs::write(
+        &path,
+        format!(
+            "{}\n- id: tool-skill\n  disabled: true\n- id: tool-goal\n  disabled: true\n",
+            base.trim_end()
+        ),
+    )?;
     Ok(path)
 }
 
@@ -3611,6 +3860,7 @@ fn ensure_agent_overlay(
     home: &Path,
     options: &Options,
     invocation: &Invocation,
+    active_persona: ActivePersonaPolicy,
 ) -> Result<PathBuf, Box<dyn Error>> {
     validate_agent_mcp_namespace(home)?;
     let directory = home.join(HIMIND_AGENT_OVERLAY_DIR);
@@ -3623,6 +3873,7 @@ fn ensure_agent_overlay(
         &invocation.base_url,
         &invocation.models,
         &invocation.workspace,
+        active_persona,
     )?;
     // home 级基线：无工具 overlay 从它派生，外部工具也按这个固定路径阅读。
     write_if_changed(
@@ -3776,6 +4027,7 @@ fn render_himind_agent_overlay(
     base_url: &str,
     models: &[String],
     workspace: &Path,
+    active_persona: ActivePersonaPolicy,
 ) -> Result<String, Box<dyn Error>> {
     let mut patch = render_himind_profile_patch_from_base(
         home,
@@ -3787,6 +4039,9 @@ fn render_himind_agent_overlay(
         "",
         Some(workspace),
     )?;
+    if active_persona == ActivePersonaPolicy::Include {
+        append_active_expert_persona(&mut patch, Some(workspace))?;
+    }
     patch.push_str(DSH_SHARED_RAIL_PATCH);
     patch.push_str(
         "\n\n# The interactive DSH surface is embedded by HiMind Agent and must never hand off to the default browser.\n- id: web-runtime\n  config:\n    openBrowser: false\n",
@@ -3821,7 +4076,6 @@ fn render_himind_profile_patch_from_base(
         }
         ModelRouteSource::Native => append_native_route_comment(&mut patch),
     }
-    append_active_expert_persona(&mut patch, workspace)?;
     patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
     patch.push_str(&format!(
         "    - id: {HIMIND_MCP_ROW_ID}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n"
@@ -4098,23 +4352,39 @@ fn append_local_gateway_profile(
     let mut seen = HashSet::new();
     catalog.retain(|model| seen.insert(model.clone()));
     let mut metadata_by_service = std::collections::BTreeMap::new();
-    let selected_service = default_model.strip_prefix("himind:").and_then(|value| value.split_once(':')).map(|(service, _)| service);
+    let selected_service = default_model
+        .strip_prefix("himind:")
+        .and_then(|value| value.split_once(':'))
+        .map(|(service, _)| service);
     for model in catalog {
         let mut parts = model.splitn(3, ':');
         let metadata = if parts.next() == Some("himind") {
             let service = parts.next().unwrap_or_default();
             let upstream = parts.next().unwrap_or_default();
-            let metadata = metadata_by_service.entry(service.to_string()).or_insert_with(||
-                if Some(service) == selected_service && !executor_native_metadata_only() {
-                    crate::app::ai_provider_import::custom_service_model_metadata(service).unwrap_or_default()
-                } else { std::collections::BTreeMap::new() });
-            metadata.get(upstream).cloned().unwrap_or_else(|| crate::api::ai::known_model_metadata(upstream))
-        } else { crate::api::ai::known_model_metadata(&model) };
+            let metadata = metadata_by_service
+                .entry(service.to_string())
+                .or_insert_with(|| {
+                    if Some(service) == selected_service && !executor_native_metadata_only() {
+                        crate::app::ai_provider_import::custom_service_model_metadata(service)
+                            .unwrap_or_default()
+                    } else {
+                        std::collections::BTreeMap::new()
+                    }
+                });
+            metadata
+                .get(upstream)
+                .cloned()
+                .unwrap_or_else(|| crate::api::ai::known_model_metadata(upstream))
+        } else {
+            crate::api::ai::known_model_metadata(&model)
+        };
         let model = yaml_scalar(&model);
         patch.push_str(&format!(
             "          - id: {model}\n            name: {model}\n"
         ));
-        if metadata.supports_image() { patch.push_str("            input: [text, image]\n"); }
+        if metadata.supports_image() {
+            patch.push_str("            input: [text, image]\n");
+        }
         if let Some(context) = metadata.context_window {
             patch.push_str(&format!("            contextWindow: {context}\n"));
         }
@@ -4127,9 +4397,15 @@ fn append_local_gateway_profile(
 
 // The opt-in integration producer must not initialize workbench sync merely
 // to render model metadata. Ordinary runtime behavior retains its catalog.
-fn executor_native_metadata_only()->bool {
-    #[cfg(all(test,windows))] {return crate::runtime::executor_live::native_active();}
-    #[cfg(not(all(test,windows)))] {false}
+fn executor_native_metadata_only() -> bool {
+    #[cfg(all(test, windows))]
+    {
+        return crate::runtime::executor_live::native_active();
+    }
+    #[cfg(not(all(test, windows)))]
+    {
+        false
+    }
 }
 
 fn read_user_model_selection(home: &Path) -> Result<Option<UserModelSelection>, Box<dyn Error>> {
@@ -5074,15 +5350,19 @@ pub(crate) fn interactive_executable() -> Result<PathBuf, String> {
 }
 
 #[cfg(test)]
-pub(crate) fn executor_installed_runtime_only()->Result<PathBuf,Box<dyn Error>> {
+pub(crate) fn executor_installed_runtime_only() -> Result<PathBuf, Box<dyn Error>> {
     // The fixed-route producer accepts the installed managed package only;
     // an arbitrary executable override cannot become an inference entry.
-    let state=load_runtime_state()?.ok_or("installed runtime state missing")?;
-    validate_runtime_agent_compatibility(&state.min_agent_version,&state.max_agent_version)?;
-    let executable=PathBuf::from(state.executable_path);
-    if !managed_executable_path(&executable) {return Err("installed runtime identity invalid".into());}
-    if let Some(explicit)=env::var_os("HIMIND_DSH_EXECUTABLE") {
-        if PathBuf::from(explicit).canonicalize()?!=executable.canonicalize()? {return Err("runtime override is not the installed package".into());}
+    let state = load_runtime_state()?.ok_or("installed runtime state missing")?;
+    validate_runtime_agent_compatibility(&state.min_agent_version, &state.max_agent_version)?;
+    let executable = PathBuf::from(state.executable_path);
+    if !managed_executable_path(&executable) {
+        return Err("installed runtime identity invalid".into());
+    }
+    if let Some(explicit) = env::var_os("HIMIND_DSH_EXECUTABLE") {
+        if PathBuf::from(explicit).canonicalize()? != executable.canonicalize()? {
+            return Err("runtime override is not the installed package".into());
+        }
     }
     Ok(executable)
 }
@@ -5148,19 +5428,28 @@ fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
         .join(safe_run_segment(run_id)?))
 }
 
-pub(crate) fn recorded_workflow_usage(run_id: &str) -> Result<Option<crate::agent_core_contracts::LocalRunUsage>, Box<dyn Error>> {
+pub(crate) fn recorded_workflow_usage(
+    run_id: &str,
+) -> Result<Option<crate::agent_core_contracts::LocalRunUsage>, Box<dyn Error>> {
     let root = dsh_runs_root()?;
-    if !root.is_dir() { return Ok(None); }
+    if !root.is_dir() {
+        return Ok(None);
+    }
     let segment = safe_run_segment(run_id)?;
     let mut total: Option<crate::agent_core_contracts::LocalRunUsage> = None;
     for version in fs::read_dir(root)?.take(32) {
         let version = version?;
-        if !version.file_type()?.is_dir() { continue; }
-        if let Some(usage) = crate::mission::read_projection_usage(&version.path().join(&segment))? {
+        if !version.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(usage) = crate::mission::read_projection_usage(&version.path().join(&segment))?
+        {
             if let Some(total) = &mut total {
                 total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
                 total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-            } else { total = Some(usage); }
+            } else {
+                total = Some(usage);
+            }
         }
     }
     Ok(total)
@@ -5418,7 +5707,11 @@ mod tests {
         // 同一个目录的写法差异（大小写 / 分隔符）必须归一成同一份 overlay。
         assert_eq!(
             alpha_overlay,
-            super::interactive_overlay_path(home, Path::new("F:/WebProjects/DSH-Live-WS-Alpha"), "")
+            super::interactive_overlay_path(
+                home,
+                Path::new("F:/WebProjects/DSH-Live-WS-Alpha"),
+                ""
+            )
         );
         let name = alpha_overlay
             .file_name()
@@ -5471,35 +5764,65 @@ mod tests {
 
     #[test]
     fn read_only_overlay_preserves_file_readers_and_removes_escalating_tools() {
-        let root = std::env::temp_dir().join(format!("himind-read-only-overlay-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "himind-read-only-overlay-{}",
+            rand::random::<u64>()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let base = root.join("agent.review.patch.yml");
-        std::fs::write(&base, "- id: agent-default-model\n  config:\n    model: demo\n").unwrap();
+        std::fs::write(
+            &base,
+            "- id: agent-default-model\n  config:\n    model: demo\n",
+        )
+        .unwrap();
         let path = super::write_read_only_overlay(&base).unwrap();
-        assert_eq!(path.file_name().unwrap(), "agent.review-read-only.patch.yml");
-        let overlay: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            path.file_name().unwrap(),
+            "agent.review-read-only.patch.yml"
+        );
+        let overlay: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let rows = overlay.as_sequence().unwrap();
-        for id in ["tool-pwsh", "tool-bash", "tool-skill", "himind-agent-mcp", "tool-subagent"] {
-            assert!(rows.iter().any(|row| row["id"] == id && row["disabled"] == true));
+        for id in [
+            "tool-pwsh",
+            "tool-bash",
+            "tool-skill",
+            "himind-agent-mcp",
+            "tool-subagent",
+        ] {
+            assert!(rows
+                .iter()
+                .any(|row| row["id"] == id && row["disabled"] == true));
         }
         for id in ["tool-fs", "tool-fs-search"] {
-            assert!(!rows.iter().any(|row| row["id"] == id && row["disabled"] == true));
+            assert!(!rows
+                .iter()
+                .any(|row| row["id"] == id && row["disabled"] == true));
         }
-        assert!(std::fs::read_to_string(base).unwrap().contains("model: demo"));
+        assert!(std::fs::read_to_string(base)
+            .unwrap()
+            .contains("model: demo"));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn mission_methods_overlay_keeps_assigned_model_shell_files_and_mcp() {
-        let root = std::env::temp_dir().join(format!("himind-mission-methods-{}", rand::random::<u64>()));
+        let root =
+            std::env::temp_dir().join(format!("himind-mission-methods-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&root).unwrap();
         let base = root.join("agent.patch.yml");
         let source = "- id: agent-default-model\n  config:\n    model: pinned\n- id: tool-pwsh\n  disabled: false\n- id: tool-bash\n  disabled: false\n- id: tool-fs\n  disabled: false\n- id: tool-fs-search\n  disabled: false\n- id: himind-agent-mcp\n  disabled: false\n- id: tool-goal\n  disabled: false\n- id: tool-skill\n  disabled: false\n";
         std::fs::write(&base, source).unwrap();
-        let overlay = std::fs::read_to_string(super::write_mission_methods_overlay(&base).unwrap()).unwrap();
+        let overlay =
+            std::fs::read_to_string(super::write_mission_methods_overlay(&base).unwrap()).unwrap();
         let rows: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
-        let disabled = rows.as_sequence().unwrap().iter().filter(|row| row["disabled"] == true)
-            .map(|row| row["id"].as_str().unwrap()).collect::<Vec<_>>();
+        let disabled = rows
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter(|row| row["disabled"] == true)
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(disabled, vec!["tool-skill", "tool-goal"]);
         // Apply rows in overlay order, as the runtime patch does: an earlier
         // explicit enabled row must not re-enable either scheduling method.
@@ -5507,18 +5830,30 @@ mod tests {
         for row in rows.as_sequence().unwrap() {
             effective.insert(row["id"].as_str().unwrap(), row.clone());
         }
-        for id in ["tool-skill", "tool-goal"] { assert_eq!(effective[id]["disabled"], true); }
-        for id in ["tool-pwsh", "tool-bash", "tool-fs", "tool-fs-search", "himind-agent-mcp"] {
+        for id in ["tool-skill", "tool-goal"] {
+            assert_eq!(effective[id]["disabled"], true);
+        }
+        for id in [
+            "tool-pwsh",
+            "tool-bash",
+            "tool-fs",
+            "tool-fs-search",
+            "himind-agent-mcp",
+        ] {
             assert_eq!(effective[id]["disabled"], false);
         }
-        assert_eq!(effective["agent-default-model"]["config"]["model"], "pinned");
+        assert_eq!(
+            effective["agent-default-model"]["config"]["model"],
+            "pinned"
+        );
         assert_eq!(std::fs::read_to_string(&base).unwrap(), source);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn mission_methods_overlay_does_not_change_native_goal_or_other_sessions() {
-        let root = std::env::temp_dir().join(format!("himind-mission-goal-{}", rand::random::<u64>()));
+        let root =
+            std::env::temp_dir().join(format!("himind-mission-goal-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&root).unwrap();
         let native = "- id: tool-goal\n  disabled: false\n- id: tool-skill\n  disabled: false\n";
         let base = root.join("native.patch.yml");
@@ -5531,11 +5866,165 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&other).unwrap(), native);
         // Reapplying a Mission patch still ends with both methods disabled.
         let repeated = super::write_mission_methods_overlay(&mission).unwrap();
-        let rows: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(repeated).unwrap()).unwrap();
+        let rows: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(repeated).unwrap()).unwrap();
         for id in ["tool-goal", "tool-skill"] {
-            assert_eq!(rows.as_sequence().unwrap().iter().rev().find(|r| r["id"] == id).unwrap()["disabled"], true);
+            assert_eq!(
+                rows.as_sequence()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|r| r["id"] == id)
+                    .unwrap()["disabled"],
+                true
+            );
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn headless_mission_and_verify_exclude_active_session_personas() {
+        let _env_guard = crate::store::paths::test_env_lock();
+        struct Fixture {
+            root: PathBuf,
+            previous_home: Option<std::ffi::OsString>,
+            previous_development: Option<std::ffi::OsString>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for (key, value) in [
+                    ("HIMIND_AGENT_HOME", &self.previous_home),
+                    ("HIMIND_EXPERT_DEVELOPMENT_DIR", &self.previous_development),
+                ] {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let fixture = Fixture {
+            root: std::env::temp_dir().join(format!(
+                "himind-persona-boundary-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            )),
+            previous_home: std::env::var_os("HIMIND_AGENT_HOME"),
+            previous_development: std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR"),
+        };
+        std::env::set_var("HIMIND_AGENT_HOME", fixture.root.join("agent-home"));
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        let workspace = fixture.root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for (slug, marker) in [
+            ("game-designer", "UNRELATED_GLOBAL_GAME_PERSONA"),
+            (
+                "device-integration-engineer",
+                "UNRELATED_WORKSPACE_DEVICE_PERSONA",
+            ),
+        ] {
+            crate::expert::save(
+                serde_json::from_value(json!({
+                    "id": format!("com.himind.expert.{slug}"), "name": slug,
+                    "version": "99.0.0", "instructions": marker,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut options = crate::Options::from_env();
+        options.state_path = fixture.root.join("state.json");
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let mut invocation = super::Invocation {
+            executable: fixture.root.join("runtime/bin/dsh.cmd").into_os_string(),
+            args: Vec::new(),
+            prompt: String::new(),
+            workspace: workspace.clone(),
+            home: fixture.root.join("run-home"),
+            api_key: String::new(),
+            base_url: "http://127.0.0.1:1234/v1".into(),
+            model: "himind:fixture:pinned-model".into(),
+            models: vec!["himind:fixture:pinned-model".into()],
+            permission_mode: "read-only",
+            run_id: "workflow_run_mission_fixture".into(),
+            step_id: "VERIFY".into(),
+            route_source: ModelRouteSource::LocalGateway,
+        };
+        let baseline_path =
+            super::ensure_home_config(&invocation, &options, super::ActivePersonaPolicy::Exclude)
+                .unwrap();
+        let baseline = std::fs::read_to_string(baseline_path).unwrap();
+        crate::expert::activate("com.himind.expert.game-designer", Some("99.0.0"), None).unwrap();
+        for workspace_selection in [false, true] {
+            if workspace_selection {
+                crate::expert::activate(
+                    "com.himind.expert.device-integration-engineer",
+                    Some("99.0.0"),
+                    Some(&workspace),
+                )
+                .unwrap();
+            }
+            let activation = serde_json::to_value(
+                crate::expert::active_for_workspace(Some(&workspace)).unwrap(),
+            )
+            .unwrap();
+            for step in ["IMPLEMENT", "VERIFY"] {
+                invocation.step_id = step.into();
+                let ordinary_path = super::ensure_agent_overlay(
+                    &invocation.home,
+                    &options,
+                    &invocation,
+                    super::ActivePersonaPolicy::Include,
+                )
+                .unwrap();
+                let ordinary = std::fs::read_to_string(&ordinary_path).unwrap();
+                assert!(ordinary.contains(if workspace_selection {
+                    "UNRELATED_WORKSPACE_DEVICE_PERSONA"
+                } else {
+                    "UNRELATED_GLOBAL_GAME_PERSONA"
+                }));
+                let headless_path = super::ensure_agent_overlay(
+                    &invocation.home,
+                    &options,
+                    &invocation,
+                    super::ActivePersonaPolicy::Exclude,
+                )
+                .unwrap();
+                assert_eq!(ordinary_path, headless_path);
+                let headless = std::fs::read_to_string(&headless_path).unwrap();
+                // Regeneration, including a previously persona-bearing overlay,
+                // equals the clean configuration: model and tool rows are unchanged.
+                assert_eq!(
+                    headless, baseline,
+                    "{step}, workspace selection={workspace_selection}"
+                );
+                assert!(!headless.contains("UNRELATED_"));
+                assert!(headless.contains("himind:fixture:pinned-model"));
+                let derived = if step == "VERIFY" {
+                    super::write_read_only_overlay(&headless_path).unwrap()
+                } else {
+                    super::write_mission_methods_overlay(&headless_path).unwrap()
+                };
+                assert!(!std::fs::read_to_string(derived)
+                    .unwrap()
+                    .contains("UNRELATED_"));
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    crate::expert::active_for_workspace(Some(&workspace)).unwrap()
+                )
+                .unwrap(),
+                activation
+            );
+        }
+        // The full configuration entry also excludes both selections, rather
+        // than relying on a derived Mission/read-only patch to strip text.
+        let path =
+            super::ensure_home_config(&invocation, &options, super::ActivePersonaPolicy::Exclude)
+                .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), baseline);
     }
 
     #[test]
@@ -5544,34 +6033,72 @@ mod tests {
         use rsa::pkcs8::DecodePublicKey;
         use sha2::{Digest, Sha256};
         let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-        let root = PathBuf::from(std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("own test root"))
-            .canonicalize().unwrap();
+        let root =
+            PathBuf::from(std::env::var_os("HIMIND_MISSION_CHECK_ROOT").expect("own test root"))
+                .canonicalize()
+                .unwrap();
         for (public_env, id_env, compiled_public, compiled_id) in [
-            ("HIMIND_SIGNING_PUBLIC_KEY_PATH", "HIMIND_SIGNING_KEY_ID",
+            (
+                "HIMIND_SIGNING_PUBLIC_KEY_PATH",
+                "HIMIND_SIGNING_KEY_ID",
                 include_str!(concat!(env!("OUT_DIR"), "/embedded-update-public-key.pem")),
-                include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"))),
-            ("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", "HIMIND_EXTENSION_SIGNING_KEY_ID",
-                include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-public-key.pem")),
-                include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-key-id.txt"))),
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt")),
+            ),
+            (
+                "HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH",
+                "HIMIND_EXTENSION_SIGNING_KEY_ID",
+                include_str!(concat!(
+                    env!("OUT_DIR"),
+                    "/embedded-extension-public-key.pem"
+                )),
+                include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-key-id.txt")),
+            ),
         ] {
-            let path = PathBuf::from(std::env::var_os(public_env).expect("explicit test public material"))
-                .canonicalize().unwrap();
-            assert!(path.starts_with(&root), "test public material ownership mismatch");
+            let path =
+                PathBuf::from(std::env::var_os(public_env).expect("explicit test public material"))
+                    .canonicalize()
+                    .unwrap();
+            assert!(
+                path.starts_with(&root),
+                "test public material ownership mismatch"
+            );
             let public = std::fs::read(&path).unwrap();
-            assert_eq!(hash(compiled_public.as_bytes()), hash(&public), "{public_env} material mismatch");
+            assert_eq!(
+                hash(compiled_public.as_bytes()),
+                hash(&public),
+                "{public_env} material mismatch"
+            );
             let id = std::env::var(id_env).expect("explicit test key ID");
-            assert!(id.starts_with("executor-test-"), "only TEST signing configuration allowed");
-            assert_eq!(hash(compiled_id.as_bytes()), hash(id.as_bytes()), "{id_env} configuration mismatch");
-            assert!(rsa::RsaPublicKey::from_public_key_pem(compiled_public).is_ok(), "TEST public material must use product RSA format");
+            assert!(
+                id.starts_with("executor-test-"),
+                "only TEST signing configuration allowed"
+            );
+            assert_eq!(
+                hash(compiled_id.as_bytes()),
+                hash(id.as_bytes()),
+                "{id_env} configuration mismatch"
+            );
+            assert!(
+                rsa::RsaPublicKey::from_public_key_pem(compiled_public).is_ok(),
+                "TEST public material must use product RSA format"
+            );
         }
     }
 
     #[test]
     fn failed_cli_report_preserves_negative_output_without_accepting_log_fragments() {
         let report = r#"{"passed":false,"reasons":["missing evidence"]}"#;
-        assert_eq!(super::workflow_failure_report(report, "diagnostic").unwrap()["passed"], false);
-        assert_eq!(super::workflow_failure_report("", report).unwrap()["reasons"][0], "missing evidence");
-        assert!(super::workflow_failure_report("diagnostic {\"passed\":false}", "timeout").is_none());
+        assert_eq!(
+            super::workflow_failure_report(report, "diagnostic").unwrap()["passed"],
+            false
+        );
+        assert_eq!(
+            super::workflow_failure_report("", report).unwrap()["reasons"][0],
+            "missing evidence"
+        );
+        assert!(
+            super::workflow_failure_report("diagnostic {\"passed\":false}", "timeout").is_none()
+        );
         assert!(super::workflow_failure_report(r#"{"passed":"false"}"#, "").is_none());
     }
 
@@ -6069,7 +6596,10 @@ mod tests {
         let home = super::launch_home(
             "0.1.0",
             std::path::Path::new("C:/workspace/project"),
-            super::LaunchHome::Run { run_id: "run-123", step_id: "" },
+            super::LaunchHome::Run {
+                run_id: "run-123",
+                step_id: "",
+            },
         )
         .unwrap();
         let normalized = home.to_string_lossy().replace('\\', "/");
@@ -6078,7 +6608,10 @@ mod tests {
         assert!(super::launch_home(
             "0.1.0",
             std::path::Path::new("C:/workspace/project"),
-            super::LaunchHome::Run { run_id: "  ", step_id: "" },
+            super::LaunchHome::Run {
+                run_id: "  ",
+                step_id: ""
+            },
         )
         .is_err());
     }
@@ -6104,13 +6637,19 @@ mod tests {
         let alpha = super::launch_home(
             "0.1.0",
             workspace,
-            super::LaunchHome::Run { run_id: "run-999", step_id: "AUDIT:CHECKS" },
+            super::LaunchHome::Run {
+                run_id: "run-999",
+                step_id: "AUDIT:CHECKS",
+            },
         )
         .unwrap();
         let beta = super::launch_home(
             "0.1.0",
             workspace,
-            super::LaunchHome::Run { run_id: "run-999", step_id: "AUDIT:LAYOUT" },
+            super::LaunchHome::Run {
+                run_id: "run-999",
+                step_id: "AUDIT:LAYOUT",
+            },
         )
         .unwrap();
         assert_ne!(alpha, beta, "同一次运行的不同 step 必须各有 home");
@@ -6126,8 +6665,15 @@ mod tests {
             super::interactive_overlay_path(&alpha, workspace, "AUDIT:CHECKS")
         );
         // 文件名里不能出现路径分隔符或冒号。
-        let name = alpha_overlay.file_name().unwrap().to_string_lossy().to_string();
-        assert!(!name.contains(':') && !name.contains('/') && !name.contains('\\'), "{name}");
+        let name = alpha_overlay
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !name.contains(':') && !name.contains('/') && !name.contains('\\'),
+            "{name}"
+        );
     }
 
     /// 不声明 step 的调用（交互会话、托管 Agent Run）保持历史路径不变。
@@ -6199,7 +6745,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("himind:svc-a:does-not-exist"), "{error}");
-        assert!(error.contains("himind:svc-a:deepseek-chat"), "必须列出可用别名：{error}");
+        assert!(
+            error.contains("himind:svc-a:deepseek-chat"),
+            "必须列出可用别名：{error}"
+        );
         assert!(error.contains("himind:svc-b:qwen-max"), "{error}");
     }
 
@@ -6216,7 +6765,10 @@ mod tests {
         let legacy = super::launch_home(
             "0.1.0",
             Path::new("C:/workspace/project"),
-            super::LaunchHome::Run { run_id: "run-999", step_id: "" },
+            super::LaunchHome::Run {
+                run_id: "run-999",
+                step_id: "",
+            },
         )
         .unwrap();
         assert_eq!(legacy, super::dsh_run_home("0.1.0", "run-999").unwrap());
@@ -6305,6 +6857,7 @@ mod tests {
             "https://gateway.example/v1",
             &["model-default".to_string()],
             workspace,
+            super::ActivePersonaPolicy::Include,
         )
         .unwrap();
 
@@ -7641,6 +8194,7 @@ mod tests {
             "https://gateway.example/v1",
             &["model-default".to_string()],
             std::path::Path::new("C:/HiMind/runtime-home/workspace"),
+            super::ActivePersonaPolicy::Include,
         )
         .unwrap();
         assert!(overlay.contains("- id: web-runtime\n  config:\n    openBrowser: false"));
@@ -7813,8 +8367,14 @@ mod tests {
         );
         assert_eq!(manifest.sha256.len(), 64);
         assert!(manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(super::runtime_engine_version_matches(&manifest, Some("0.2.2-rc.1")));
-        assert!(!super::runtime_engine_version_matches(&manifest, Some("0.2.1")));
+        assert!(super::runtime_engine_version_matches(
+            &manifest,
+            Some("0.2.2-rc.1")
+        ));
+        assert!(!super::runtime_engine_version_matches(
+            &manifest,
+            Some("0.2.1")
+        ));
         assert!(!super::runtime_engine_version_matches(&manifest, None));
     }
 
@@ -7822,14 +8382,17 @@ mod tests {
     #[test]
     #[ignore = "requires the signed Runtime revision installed outside a Low integrity build directory"]
     fn installed_runtime_revision_identity_and_status_use_package_version() {
-        let expected=super::expected_runtime_manifest().unwrap();
-        let (version,matches)=super::installed_runtime_identity(&expected);
-        assert_eq!(version,expected.version);
-        assert!(matches,"installed package and engine identities differ from the pinned release");
-        let report=super::status();
-        assert!(report.cli_compatible,"{}",report.message);
-        assert_eq!(report.version,expected.version);
-        assert_eq!(super::probe().version,expected.version);
+        let expected = super::expected_runtime_manifest().unwrap();
+        let (version, matches) = super::installed_runtime_identity(&expected);
+        assert_eq!(version, expected.version);
+        assert!(
+            matches,
+            "installed package and engine identities differ from the pinned release"
+        );
+        let report = super::status();
+        assert!(report.cli_compatible, "{}", report.message);
+        assert_eq!(report.version, expected.version);
+        assert_eq!(super::probe().version, expected.version);
     }
 
     #[test]
@@ -7864,19 +8427,35 @@ mod tests {
     #[test]
     fn runtime_environment_selects_patched_node_only_when_declared() {
         use std::fs;
-        let root = std::env::temp_dir().join(format!("himind-patched-node-path-{}-{}", std::process::id(), rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "himind-patched-node-path-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("bin/dsh.cmd");
         let mut ordinary = std::process::Command::new("dsh");
         configure_runtime_environment(&mut ordinary, &executable);
         assert!(!ordinary.get_envs().any(|(key, _)| key == "PATH"));
-        fs::write(root.join("runtime.json"), r#"{"node_patches":["restricted-pipe-dacl"]}"#).unwrap();
+        fs::write(
+            root.join("runtime.json"),
+            r#"{"node_patches":["restricted-pipe-dacl"]}"#,
+        )
+        .unwrap();
         let mut patched = std::process::Command::new("dsh");
         configure_runtime_environment(&mut patched, &executable);
-        let selected = patched.get_envs().find(|(key, _)| *key == "PATH").and_then(|(_, value)| value).unwrap();
+        let selected = patched
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .unwrap();
         let paths = std::env::split_paths(selected).collect::<Vec<_>>();
         assert_eq!(paths.first(), Some(&root));
-        assert_eq!(&paths[1..], std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>());
+        assert_eq!(
+            &paths[1..],
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .collect::<Vec<_>>()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

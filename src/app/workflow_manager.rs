@@ -801,8 +801,8 @@ mod tests {
     // 制品，因此不再重复要求包内 manifest.sig；本地目录安装的签名要求保持不变。
     #[test]
     fn remote_install_accepts_package_without_manifest_signature() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workflows/wechat-experience-upload");
         let package = crate::workflow::load_from_directory(&fixture).unwrap();
         let staging =
             std::env::temp_dir().join(format!("himind-remote-signature-test-{}", unique_suffix()));
@@ -840,8 +840,8 @@ mod tests {
 
     #[test]
     fn development_archive_installs_without_a_release_record() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workflows/wechat-experience-upload");
         let staging = std::env::temp_dir().join(format!(
             "himind-development-archive-test-{}",
             unique_suffix()
@@ -874,8 +874,8 @@ mod tests {
             std::env::temp_dir().join(format!("himind-workflow-artifact-test-{}", unique_suffix()));
         let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", staging.join("home"));
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workflows/wechat-experience-upload");
         let package_root = staging.join("package");
         copy_dir(&fixture, &package_root);
         write_checksums(&package_root);
@@ -932,8 +932,8 @@ mod tests {
 
     #[test]
     fn local_archive_accepts_matching_companion_extension_lock() {
-        let package_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let package_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workflows/wechat-experience-upload");
         let package = crate::workflow::load_from_directory(&package_root).unwrap();
         let archive_path = std::env::temp_dir().join(format!(
             "himind-workflow-lock-match-{}.hmwf",
@@ -966,8 +966,8 @@ mod tests {
 
     #[test]
     fn local_archive_rejects_companion_lock_for_different_artifact() {
-        let package_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let package_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workflows/wechat-experience-upload");
         let package = crate::workflow::load_from_directory(&package_root).unwrap();
         let archive_path = std::env::temp_dir().join(format!(
             "himind-workflow-lock-mismatch-{}.hmwf",

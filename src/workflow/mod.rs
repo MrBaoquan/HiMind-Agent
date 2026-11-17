@@ -69,6 +69,17 @@ pub(crate) use runtime::execute_runtime_step;
 pub(crate) use runtime::execute_runtime_step_with_resources;
 pub(crate) use store::{package_digest, InstalledWorkflow, WorkflowStore};
 
+/// Remove a method from the reusable library only after preserving all exact
+/// Mission references. Both MCP and the headless CLI share this operation.
+pub(crate) fn retire_workflow(workflow_id: &str) -> Result<Value, Box<dyn Error>> {
+    let missions = crate::mission::MissionStore::open_default()?;
+    let pins = missions.workflow_pins(workflow_id)?;
+    let store = WorkflowStore::open_default_read_only()?;
+    let removed = store.retire_with_pins(workflow_id, &pins)?;
+    crate::app::extension_lock::remove("workflow", workflow_id)?;
+    Ok(serde_json::json!({"workflow_id": workflow_id, "removed": removed, "preserved_pins": pins}))
+}
+
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
 
 /// 运行期步参数覆盖在 `input` 里的键。
@@ -112,10 +123,9 @@ pub(crate) fn apply_execution_overrides(
             }
             if approval {
                 if step.risk_level.trim().is_empty() {
-                    return Err(format!(
-                        "workflow step {step_id} approval requires a risk level"
-                    )
-                    .into());
+                    return Err(
+                        format!("workflow step {step_id} approval requires a risk level").into(),
+                    );
                 }
                 step.approval_required = true;
             }
@@ -123,7 +133,9 @@ pub(crate) fn apply_execution_overrides(
         if let Some(rounds) = spec.get("max_iterations").and_then(Value::as_u64) {
             let rounds = u32::try_from(rounds).unwrap_or(u32::MAX);
             if rounds == 0 {
-                return Err(format!("execution override max_iterations must be >= 1: {step_id}").into());
+                return Err(
+                    format!("execution override max_iterations must be >= 1: {step_id}").into(),
+                );
             }
             let loop_config = step.loop_config.as_mut().ok_or_else(|| {
                 format!("execution override max_iterations requires a loop step: {step_id}")
@@ -177,7 +189,10 @@ pub(crate) fn apply_execution_overrides(
                     )
                     .into());
                 }
-                if runtime.tool_policy.trim() == "files_only" && provider != "himind.builtin" && provider != "auto" {
+                if runtime.tool_policy.trim() == "files_only"
+                    && provider != "himind.builtin"
+                    && provider != "auto"
+                {
                     return Err(format!("execution override cannot move {step_id} to {provider}: that provider cannot enforce tool_policy=files_only").into());
                 }
                 runtime.provider = provider.to_string();
@@ -192,10 +207,12 @@ pub(crate) fn apply_execution_overrides(
                     runtime.model = String::new();
                     runtime.model_fallbacks.clear();
                 } else {
-                    validate_model_alias(model)
-                        .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
-                    model_alias_matches_provider(&runtime.provider, model)
-                        .map_err(|error| format!("execution override model on {step_id}: {error}"))?;
+                    validate_model_alias(model).map_err(|error| {
+                        format!("execution override model on {step_id}: {error}")
+                    })?;
+                    model_alias_matches_provider(&runtime.provider, model).map_err(|error| {
+                        format!("execution override model on {step_id}: {error}")
+                    })?;
                     runtime.model = model.to_string();
                     // 换了主模型，旧降级序列（可能属于另一命名空间）就不再成立。
                     runtime.model_fallbacks.clear();
@@ -305,7 +322,9 @@ pub(crate) fn validate_model_alias(value: &str) -> Result<(), String> {
         return Err(format!("model alias is too long: {} chars", value.len()));
     }
     if value.chars().any(char::is_control) || value.contains(char::is_whitespace) {
-        return Err(format!("model alias cannot contain whitespace or control chars: {value}"));
+        return Err(format!(
+            "model alias cannot contain whitespace or control chars: {value}"
+        ));
     }
     if let Some(rest) = value.strip_prefix(MODEL_ALIAS_HIMIND_PREFIX) {
         let (service, model) = rest
@@ -320,7 +339,10 @@ pub(crate) fn validate_model_alias(value: &str) -> Result<(), String> {
         let (provider, model) = rest
             .split_once(':')
             .ok_or_else(|| format!("acp model alias requires <provider>:<model>: {value}"))?;
-        let provider = provider.trim().strip_prefix("acp.").unwrap_or(provider.trim());
+        let provider = provider
+            .trim()
+            .strip_prefix("acp.")
+            .unwrap_or(provider.trim());
         if provider.is_empty() || model.trim().is_empty() {
             return Err(format!("acp model alias has an empty segment: {value}"));
         }
@@ -377,7 +399,11 @@ pub(crate) fn model_alias_parts(alias: &str) -> Option<(&'static str, &str, &str
     }
     if let Some(rest) = alias.strip_prefix(MODEL_ALIAS_ACP_PREFIX) {
         let (scope, model) = rest.split_once(':')?;
-        return Some(("acp", scope.trim().strip_prefix("acp.").unwrap_or(scope.trim()), model.trim()));
+        return Some((
+            "acp",
+            scope.trim().strip_prefix("acp.").unwrap_or(scope.trim()),
+            model.trim(),
+        ));
     }
     if let Some(rest) = alias.strip_prefix(MODEL_ALIAS_CLI_PREFIX) {
         let (scope, model) = rest.split_once(':')?;
@@ -1091,13 +1117,18 @@ impl WorkflowPackage {
         for (role_id, role) in &self.roles {
             validate_workflow_id(role_id)
                 .map_err(|error| format!("workflow role {role_id}: {error}"))?;
-            if !matches!(role.tool_policy.trim(), "" | "default" | "none" | "files_only") {
+            if !matches!(
+                role.tool_policy.trim(),
+                "" | "default" | "none" | "files_only"
+            ) {
                 return Err(format!(
                     "workflow role {role_id} tool_policy must be default, none or files_only"
                 ));
             }
             let provider = role.runtime_provider.trim();
-            if role.tool_policy.trim() == "files_only" && !matches!(provider, "" | "auto" | "himind.builtin") {
+            if role.tool_policy.trim() == "files_only"
+                && !matches!(provider, "" | "auto" | "himind.builtin")
+            {
                 return Err(format!("workflow role {role_id}: provider {provider} cannot enforce tool_policy=files_only"));
             }
 
@@ -1907,7 +1938,8 @@ pub(crate) fn validate_runtime_permission_mode(provider: &str, mode: &str) -> Re
 }
 
 pub(crate) fn supports_full_access(provider: &str) -> bool {
-    matches!(provider, "himind.builtin" | "personal.codex") || crate::runtime::acp::is_provider(provider)
+    matches!(provider, "himind.builtin" | "personal.codex")
+        || crate::runtime::acp::is_provider(provider)
 }
 
 fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
@@ -1931,14 +1963,22 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
     if !runtime.result_schema.trim().is_empty() {
         validate_relative_asset_path(&runtime.result_schema)?;
     }
-    if !matches!(runtime.tool_policy.as_str(), "" | "default" | "none" | "files_only") {
+    if !matches!(
+        runtime.tool_policy.as_str(),
+        "" | "default" | "none" | "files_only"
+    ) {
         return Err(format!(
             "workflow runtime step {} tool_policy must be default, none or files_only",
             step.id
         ));
     }
-    if runtime.tool_policy.trim() == "files_only" && !matches!(runtime.provider.trim(), "auto" | "himind.builtin") {
-        return Err(format!("workflow runtime step {} cannot enforce tool_policy=files_only with {}", step.id, runtime.provider));
+    if runtime.tool_policy.trim() == "files_only"
+        && !matches!(runtime.provider.trim(), "auto" | "himind.builtin")
+    {
+        return Err(format!(
+            "workflow runtime step {} cannot enforce tool_policy=files_only with {}",
+            step.id, runtime.provider
+        ));
     }
     let mut seen_artifacts = HashSet::new();
     for artifact_id in &runtime.input_artifacts {
@@ -1987,10 +2027,7 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
             ));
         }
         validate_model_alias(alias).map_err(|error| {
-            format!(
-                "workflow runtime step {} model_fallbacks: {error}",
-                step.id
-            )
+            format!("workflow runtime step {} model_fallbacks: {error}", step.id)
         })?;
     }
     // 降级序列必须与主模型同一命名空间：himind 别名换到 acp 客户端上去
@@ -2018,10 +2055,7 @@ fn validate_runtime_declarations(
     package: &WorkflowPackage,
     steps: &[WorkflowStep],
 ) -> Result<(), String> {
-    fn walk(
-        package: &WorkflowPackage,
-        steps: &[WorkflowStep],
-    ) -> Result<(), String> {
+    fn walk(package: &WorkflowPackage, steps: &[WorkflowStep]) -> Result<(), String> {
         for step in steps {
             if let Some(runtime) = step.runtime.as_ref() {
                 let provider = runtime.provider.trim();
@@ -2177,21 +2211,27 @@ fn validate_delegate_step(step: &WorkflowStep, depth: usize) -> Result<(), Strin
                 branch.id
             ));
         }
-        if !matches!(runtime.tool_policy.trim(), "" | "default" | "none" | "files_only") {
+        if !matches!(
+            runtime.tool_policy.trim(),
+            "" | "default" | "none" | "files_only"
+        ) {
             return Err(format!(
                 "workflow delegate branch {} tool_policy must be default, none or files_only",
                 branch.id
             ));
         }
-        if runtime.tool_policy.trim() == "files_only" && !matches!(runtime.provider.trim(), "auto" | "himind.builtin") {
-            return Err(format!("workflow delegate branch {} cannot enforce tool_policy=files_only with {}", branch.id, runtime.provider));
+        if runtime.tool_policy.trim() == "files_only"
+            && !matches!(runtime.provider.trim(), "auto" | "himind.builtin")
+        {
+            return Err(format!(
+                "workflow delegate branch {} cannot enforce tool_policy=files_only with {}",
+                branch.id, runtime.provider
+            ));
         }
-        validate_model_alias(&runtime.model).map_err(|error| {
-            format!("workflow delegate branch {} model: {error}", branch.id)
-        })?;
-        model_alias_matches_provider(&runtime.provider, &runtime.model).map_err(|error| {
-            format!("workflow delegate branch {}: {error}", branch.id)
-        })?;
+        validate_model_alias(&runtime.model)
+            .map_err(|error| format!("workflow delegate branch {} model: {error}", branch.id))?;
+        model_alias_matches_provider(&runtime.provider, &runtime.model)
+            .map_err(|error| format!("workflow delegate branch {}: {error}", branch.id))?;
         for alias in &runtime.model_fallbacks {
             if alias.trim().is_empty() {
                 return Err(format!(
@@ -2406,7 +2446,7 @@ mod tests {
     #[test]
     fn loads_wechat_experience_upload_package() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let package = load_from_directory(&root).unwrap();
         assert_eq!(package.id, "com.himind.workflow.wechat-experience-upload");
@@ -2423,7 +2463,7 @@ mod tests {
     #[test]
     fn ui_craft_team_is_a_review_confirm_delegate_acceptance_loop() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("ui-craft-team");
         let package = load_from_directory(&root).unwrap();
         assert_eq!(package.version, "1.2.0");
@@ -2434,12 +2474,11 @@ mod tests {
             "schemas/verification-report.schema.json",
             "schemas/acceptance-verdict.schema.json",
         ] {
-            let schema: Value = serde_json::from_slice(
-                &fs::read(root.join(schema_path)).unwrap_or_else(|error| {
+            let schema: Value =
+                serde_json::from_slice(&fs::read(root.join(schema_path)).unwrap_or_else(|error| {
                     panic!("missing workflow schema {schema_path}: {error}")
-                }),
-            )
-            .unwrap();
+                }))
+                .unwrap();
             jsonschema::validator_for(&schema)
                 .unwrap_or_else(|error| panic!("invalid schema {schema_path}: {error}"));
         }
@@ -2457,17 +2496,27 @@ mod tests {
         assert!(approval.depends_on.contains(&"PLAN".to_string()));
 
         let polish_loop = step("POLISH-LOOP");
-        assert!(polish_loop.depends_on.contains(&"CONFIRM-FIXES".to_string()));
+        assert!(polish_loop
+            .depends_on
+            .contains(&"CONFIRM-FIXES".to_string()));
         let loop_config = polish_loop.loop_config.as_ref().unwrap();
         assert!(loop_config.pause_for_feedback);
         assert!(loop_config.max_iterations <= 3);
-        let polish = loop_config.steps.iter().find(|step| step.id == "POLISH").unwrap();
+        let polish = loop_config
+            .steps
+            .iter()
+            .find(|step| step.id == "POLISH")
+            .unwrap();
         let delegate = polish.delegate.as_ref().unwrap();
         assert_eq!(delegate.strategy, "sequential");
         assert_eq!(delegate.min_succeeded as usize, delegate.branches.len());
         assert_eq!(delegate.branches.len(), 4);
 
-        let gate = loop_config.steps.iter().find(|step| step.id == "GATE").unwrap();
+        let gate = loop_config
+            .steps
+            .iter()
+            .find(|step| step.id == "GATE")
+            .unwrap();
         assert_eq!(gate.runtime.as_ref().unwrap().tool_policy, "none");
         assert_eq!(
             gate.runtime.as_ref().unwrap().result_schema,
@@ -2475,7 +2524,12 @@ mod tests {
         );
         assert_eq!(package.default_exitpoint, "delivered");
         assert_eq!(
-            package.exits.iter().find(|exit| exit.id == "delivered").unwrap().at_step,
+            package
+                .exits
+                .iter()
+                .find(|exit| exit.id == "delivered")
+                .unwrap()
+                .at_step,
             "POLISH-LOOP"
         );
         assert!(!package.steps.iter().any(|step| step.id == "DELIVER"));
@@ -2568,7 +2622,7 @@ mod tests {
     #[test]
     fn workflow_icon_is_optional_and_package_local() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.icon = "assets/icon.webp".to_string();
@@ -2580,7 +2634,7 @@ mod tests {
     #[test]
     fn workflow_package_v1_current_product_remains_compatible() {
         let package: WorkflowPackage = serde_json::from_str(include_str!(
-            "../../workflows/wechat-experience-upload/workflow.json"
+            "../../tests/fixtures/workflows/wechat-experience-upload/workflow.json"
         ))
         .unwrap();
         package.validate().unwrap();
@@ -2597,7 +2651,7 @@ mod tests {
         // 引擎构建是长任务：步骤必须显式要求阻塞等待，否则运行会「秒完成」，
         // 用户看到成功而构建还在后台跑。
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("engine-build");
         let package = load_from_directory(&root).unwrap();
         assert_eq!(package.id, "com.himind.workflow.engine-build");
@@ -2615,7 +2669,7 @@ mod tests {
     #[test]
     fn segmented_workflow_requires_declared_entry_and_exit_steps() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.execution_policy = "segmented".to_string();
@@ -2647,7 +2701,7 @@ mod tests {
     #[test]
     fn strict_workflow_rejects_custom_entrypoints_and_exits() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         // 该 fixture 现在按分段执行发布，这条用例只验证 strict 契约本身。
@@ -2696,7 +2750,7 @@ mod tests {
     #[test]
     fn rejects_step_dependency_cycles() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let first = package.steps[0].id.clone();
@@ -2709,7 +2763,7 @@ mod tests {
     #[test]
     fn role_id_is_optional_but_validated() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         // 不声明角色是合法的：老包没有这个字段，读出来就是空串。
@@ -2728,7 +2782,7 @@ mod tests {
     #[test]
     fn rejects_custom_ui_path_escape() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.ui.mode = "custom".to_string();
@@ -2739,7 +2793,7 @@ mod tests {
     #[test]
     fn rejects_missing_asset() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let temp = std::env::temp_dir().join(format!(
             "himind-workflow-missing-asset-{}-{}",
@@ -2761,7 +2815,7 @@ mod tests {
     #[test]
     fn rejects_invalid_declarative_ui_field_type() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let temp = std::env::temp_dir().join(format!(
             "himind-workflow-invalid-view-{}-{}",
@@ -2786,7 +2840,7 @@ mod tests {
     #[test]
     fn launch_defaults_fill_missing_input_for_every_entrypoint() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let package = load_from_directory(&root).unwrap();
 
@@ -2815,7 +2869,7 @@ mod tests {
     #[test]
     fn accepts_runtime_step_and_condition_contracts() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -2828,7 +2882,8 @@ mod tests {
             .supported_runtimes
             .push("personal.codex".to_string());
         step.runtime = Some(WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Implement the next change from the current feedback.".to_string(),
             workspace_path: "input.project_root".to_string(),
             result_schema: String::new(),
@@ -2856,7 +2911,7 @@ mod tests {
     #[test]
     fn rejects_runtime_step_timeout_above_one_day() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -2866,7 +2921,8 @@ mod tests {
             .supported_runtimes
             .push("personal.codex".to_string());
         step.runtime = Some(WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Run one bounded iteration.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
@@ -2886,7 +2942,10 @@ mod tests {
     /// 模型别名必须带命名空间：裸 id 无法决定走哪条路由，应当在契约阶段拒绝。
     #[test]
     fn model_alias_requires_a_namespace_prefix() {
-        assert!(validate_model_alias("").is_ok(), "留空表示沿用 Runtime 配置");
+        assert!(
+            validate_model_alias("").is_ok(),
+            "留空表示沿用 Runtime 配置"
+        );
         assert!(validate_model_alias("himind:svc-a:deepseek-chat").is_ok());
         assert!(validate_model_alias("acp:claude:claude-sonnet-4-5").is_ok());
         assert!(validate_model_alias("acp:acp.claude:claude-sonnet-4-5").is_ok());
@@ -2906,7 +2965,7 @@ mod tests {
     #[test]
     fn rejects_runtime_step_with_invalid_model_alias() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -2916,7 +2975,8 @@ mod tests {
             .supported_runtimes
             .extend(["personal.codex".to_string(), "himind.builtin".to_string()]);
         step.runtime = Some(WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
@@ -2938,7 +2998,10 @@ mod tests {
         // `himind:` 别名配外部 CLI 必须被拒绝：CLI 没有这条路由。
         package.steps[0].runtime.as_mut().unwrap().provider = "personal.codex".to_string();
         let error = package.validate().unwrap_err();
-        assert!(error.contains("`himind:` aliases are only resolved"), "{error}");
+        assert!(
+            error.contains("`himind:` aliases are only resolved"),
+            "{error}"
+        );
     }
 
     /// 降级序列不能跨命名空间：himind 主模型降级到 acp 客户端没有语义。
@@ -2948,7 +3011,7 @@ mod tests {
     #[test]
     fn rejects_model_fallbacks_across_namespaces() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -2960,7 +3023,8 @@ mod tests {
         // 主模型与 provider 匹配，只有降级序列跨了命名空间：
         // provider 用内置，这样失败点唯一落在「降级序列与主模型不同源」上。
         step.runtime = Some(WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "himind.builtin".to_string(),
+            permission_mode: String::new(),
+            provider: "himind.builtin".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: "input.workspace_root".to_string(),
             result_schema: String::new(),
@@ -2982,16 +3046,16 @@ mod tests {
         let runtime = package.steps[0].runtime.as_mut().unwrap();
         runtime.provider = "himind.builtin".to_string();
         runtime.model_fallbacks = vec!["himind:svc-b:deepseek-reasoner".to_string()];
-        package.validate().unwrap_or_else(|error| {
-            panic!("合法的 himind 主模型 + 同源降级应通过，实际: {error}")
-        });
+        package
+            .validate()
+            .unwrap_or_else(|error| panic!("合法的 himind 主模型 + 同源降级应通过，实际: {error}"));
     }
 
     /// 角色上的模型别名同样受校验：它是步骤模型的覆盖来源。
     #[test]
     fn rejects_role_with_invalid_model_alias() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("ui-craft-team");
         let mut package = load_from_directory(&root).unwrap();
         let role = package
@@ -3006,7 +3070,7 @@ mod tests {
     #[test]
     fn accepts_bounded_development_loop() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -3054,7 +3118,7 @@ mod tests {
     #[test]
     fn rejects_loop_without_iteration_condition() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
@@ -3095,7 +3159,7 @@ mod tests {
     #[test]
     fn candidate_requires_one_freeze_step() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.candidate = Some(WorkflowCandidatePolicy {
@@ -3133,7 +3197,7 @@ mod tests {
     #[test]
     fn execution_override_can_only_tighten_risk_boundaries() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("software-delivery");
         let package = load_from_directory(&root).unwrap();
 
@@ -3147,7 +3211,11 @@ mod tests {
             }),
         )
         .unwrap();
-        let step = tightened.steps.iter().find(|s| s.id == "IMPLEMENT").unwrap();
+        let step = tightened
+            .steps
+            .iter()
+            .find(|s| s.id == "IMPLEMENT")
+            .unwrap();
         assert!(step.approval_required);
 
         // 放宽：撤掉包里已有的闸门必须被拒绝，而不是静默忽略。
@@ -3158,7 +3226,9 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("cannot remove the approval gate"));
+        assert!(error
+            .to_string()
+            .contains("cannot remove the approval gate"));
     }
 
     /// 运行期换 Runtime 只能在包声明过的 provider 内进行。
@@ -3216,7 +3286,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not declared by the package"), "{error}");
+        assert!(
+            error.to_string().contains("not declared by the package"),
+            "{error}"
+        );
 
         // 空值：拒绝（不能用来清空 provider）。
         assert!(apply_execution_overrides(
@@ -3294,7 +3367,10 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("cannot execute `acp:`"), "{error}");
+        assert!(
+            error.to_string().contains("cannot execute `acp:`"),
+            "{error}"
+        );
 
         // 裸 id：拒绝。
         assert!(apply_execution_overrides(
@@ -3439,7 +3515,11 @@ mod tests {
         for branch in branches {
             let runtime = branch.runtime.as_ref().unwrap();
             assert_eq!(runtime.provider, "acp.claude", "branch {}", branch.id);
-            assert_eq!(runtime.model, "acp:claude:claude-sonnet-4-5", "branch {}", branch.id);
+            assert_eq!(
+                runtime.model, "acp:claude:claude-sonnet-4-5",
+                "branch {}",
+                branch.id
+            );
         }
     }
 
@@ -3632,13 +3712,16 @@ mod tests {
         }))
         .unwrap();
         let err = error.validate().unwrap_err();
-        assert!(err.contains("max_iterations_limit"), "上限低于默认值时必须拒绝：{err}");
+        assert!(
+            err.contains("max_iterations_limit"),
+            "上限低于默认值时必须拒绝：{err}"
+        );
     }
 
     #[test]
     fn execution_override_rejects_unknown_steps_and_bad_values() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("software-delivery");
         let package = load_from_directory(&root).unwrap();
         assert!(apply_execution_overrides(

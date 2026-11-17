@@ -209,7 +209,10 @@ fn collect_roles(package: &WorkflowPackage) -> Value {
                 for branch in &delegate.branches {
                     let role = branch.role_id.trim();
                     if !role.is_empty() {
-                        roles.entry(role.to_string()).or_default().push(branch.id.clone());
+                        roles
+                            .entry(role.to_string())
+                            .or_default()
+                            .push(branch.id.clone());
                     }
                 }
             }
@@ -226,7 +229,7 @@ fn collect_roles(package: &WorkflowPackage) -> Value {
                     .map(|role| role.runtime_provider.trim())
                     .filter(|value| !value.is_empty())
                     /* 角色没指定 provider 时，各步骤可能自己声明了不同的；
-                       只有全部一致才报出确定值，否则留空。 */
+                    只有全部一致才报出确定值，否则留空。 */
                     .map(str::to_string)
                     .or_else(|| {
                         let providers = step_ids
@@ -302,7 +305,7 @@ mod tests {
     #[test]
     fn builds_static_dry_run_for_segmented_wechat_workflow() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let package = super::super::load_from_directory(&root).unwrap();
         let report = contract_dry_run_report(&package).unwrap();
@@ -328,7 +331,7 @@ mod tests {
     #[test]
     fn dry_run_summarizes_declared_roles() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
+            .join("tests/fixtures/workflows")
             .join("wechat-experience-upload");
         let mut package = super::super::load_from_directory(&root).unwrap();
         for (index, step) in package.steps.iter_mut().enumerate() {
@@ -392,9 +395,8 @@ mod tests {
 
     #[test]
     fn role_config_is_reported_with_effective_execution_settings() {
-        let source = include_str!(
-            "../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json"
-        );
+        let source =
+            include_str!("../../contracts/agent-core/v1/examples/workflow-package.roles-v1.json");
         let mut package: super::super::WorkflowPackage = serde_json::from_str(source).unwrap();
         package.source_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
         package.validate().unwrap();

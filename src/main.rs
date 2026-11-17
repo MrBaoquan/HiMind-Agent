@@ -60,25 +60,25 @@ mod mcp_ipc;
 mod mcp_pipe;
 mod mcp_service;
 mod mission;
+mod notification_channels;
 mod path_guard;
 mod plugin_authoring;
 mod remote;
 mod runtime;
 mod scan;
+mod scheduler;
 mod session_history;
-mod session_service;
 mod session_history_actions;
 mod session_history_inspect;
-mod session_history_tools;
 mod session_history_sources;
-mod scheduler;
+mod session_history_tools;
+mod session_service;
 mod skill;
 mod skill_run;
 mod store;
 mod svn;
-mod upload;
-mod notification_channels;
 mod ui_audit_ledger;
+mod upload;
 mod worker;
 #[allow(dead_code)]
 mod workflow;
@@ -175,20 +175,26 @@ fn parse_protocol_open(args: &[String]) -> Option<AgentOpenTarget> {
     }
     let open = open.as_deref().unwrap_or("main");
     if open == "main" {
-        if mission_id.is_some() { return None; }
+        if mission_id.is_some() {
+            return None;
+        }
         return Some(AgentOpenTarget::Main);
     }
     if open == "mission" {
         let mission_id = mission_id?;
         if mission_id.is_empty()
             || mission_id.len() > 160
-            || !mission_id.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+            || !mission_id
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
         {
             return None;
         }
         return Some(AgentOpenTarget::MissionAssignment(mission_id));
     }
-    if mission_id.is_some() { return None; }
+    if mission_id.is_some() {
+        return None;
+    }
     AgentOpenTarget::from_query(open)
 }
 
@@ -309,6 +315,11 @@ fn main() {
     } else if let Some(arguments) = workflow_cli_arguments() {
         if let Err(error) = run_workflow_cli(&options, &arguments) {
             eprintln!("workflow command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = cli_command_arguments("expert") {
+        if let Err(error) = run_expert_cli(&arguments) {
+            eprintln!("expert command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = schedule_cli_arguments() {
@@ -1160,6 +1171,21 @@ fn workflow_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("workflow")
 }
 
+fn run_expert_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let value = match arguments {
+        [action] if action == "list" => serde_json::to_value(expert::list()?)?,
+        [action, id] if action == "retire" => expert::retire(id)?,
+        [action, id] if action == "use-installed" => serde_json::to_value(expert::use_installed(id)?)?,
+        [action, id, version, source_id] if action == "install" =>
+            serde_json::to_value(app::extension_source::install_expert_bound(id, version, source_id)?)?,
+        [action, id, version, digest] if action == "get-pinned" =>
+            serde_json::to_value(expert::get_pinned(id, version, digest)?)?,
+        _ => return Err("usage: himind-agent expert <list|install <id> <version> <source-id>|use-installed <id>|retire <id>|get-pinned <id> <version> <digest>>".into()),
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 fn schedule_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("schedule")
 }
@@ -1895,9 +1921,25 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                 }))?
             );
         }
+        [action, package_id] if action == "retire" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow::retire_workflow(package_id)?)?
+            );
+        }
+        [action, package_id, version, digest] if action == "get-pinned" => {
+            let store = workflow::WorkflowStore::open_default_read_only()?;
+            let (package, digest) = store.load_pinned_version(package_id, version, digest)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"id": package.id, "version": package.version, "digest": digest, "source_root": package.source_root})
+                )?
+            );
+        }
         _ => {
             return Err(
-                "usage: himind-agent workflow <author-save <dir>|author-test <id> <version>|author-confirm <id> <version>|validate <dir>|doctor <dir|id> [input-json|@file]|package <dir> [output.hmwf]|sign <dir> [output.hmwf]|install-archive <path> [--require-signature]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file] [feedback]|dispatch [limit]|runs|metrics|projection-status|projection-requeue [--all|--reason <fragment>] [--drain]|recover [--force]|show <run-id>|verify-run <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <author-save <dir>|author-test <id> <version>|author-confirm <id> <version>|validate <dir>|doctor <dir|id> [input-json|@file]|package <dir> [output.hmwf]|sign <dir> [output.hmwf]|install-archive <path> [--require-signature]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file] [feedback]|dispatch [limit]|runs|metrics|projection-status|projection-requeue [--all|--reason <fragment>] [--drain]|recover [--force]|show <run-id>|verify-run <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>|retire <id>|get-pinned <id> <version> <digest>>"
                     .into(),
             );
         }
