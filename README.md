@@ -4,7 +4,9 @@ HiMind Agent 是可独立安装和运行的 Windows 客户端，提供本机 AI�
 
 ## 仓库与构建
 
-环境要求：Rust stable、Node.js 22 和 PowerShell 7。构建 Agent、前端与官方客户端适配器：
+环境要求：Rust stable、Node.js 22 和 PowerShell 7。开发前先读 [分层验证策略](docs/validation-policy.md)；AI 入口为 [AGENTS.md](AGENTS.md)。日常修改按影响范围检查，具体环境与缓存操作见 [本地构建说明](docs/fast-build.md)。
+
+以下命令运行完整 candidate 验证并构建 Agent、前端与官方客户端适配器，用于功能收敛后生成安装产物，不是每次小修复的默认检查：
 
 ```powershell
 ./scripts/build.ps1
