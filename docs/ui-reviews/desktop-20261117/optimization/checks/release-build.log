@@ -1,0 +1,1333 @@
+   Compiling himind-agent v0.3.92 (C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent)
+warning: constant `DISCOVERY_SCHEMA_VERSION` is never used
+  --> src\mcp_ipc.rs:19:18
+   |
+19 | pub(crate) const DISCOVERY_SCHEMA_VERSION: u32 = 1;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `identity_hash`, `discovery_path`, `lock_path`, and `endpoint` are never used
+  --> src\mcp_ipc.rs:65:19
+   |
+29 | impl ServiceScope {
+   | ----------------- methods in this implementation
+...
+65 |     pub(crate) fn identity_hash(&self) -> &str {
+   |                   ^^^^^^^^^^^^^
+...
+85 |     pub(crate) fn discovery_path(&self, runtime_dir: &Path) -> PathBuf {
+   |                   ^^^^^^^^^^^^^^
+...
+89 |     pub(crate) fn lock_path(&self, runtime_dir: &Path) -> PathBuf {
+   |                   ^^^^^^^^^
+...
+93 |     pub(crate) fn endpoint(&self, runtime_dir: &Path) -> String {
+   |                   ^^^^^^^^
+
+warning: struct `ServiceInstance` is never constructed
+   --> src\mcp_ipc.rs:123:19
+    |
+123 | pub(crate) struct ServiceInstance {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: methods `discovery`, `discovery_path`, and `spawn_discovery_keeper` are never used
+   --> src\mcp_ipc.rs:131:19
+    |
+130 | impl ServiceInstance {
+    | -------------------- methods in this implementation
+131 |     pub(crate) fn discovery(&self) -> &ServiceDiscovery {
+    |                   ^^^^^^^^^
+...
+135 |     pub(crate) fn discovery_path(&self) -> &Path {
+    |                   ^^^^^^^^^^^^^^
+...
+150 |     pub(crate) fn spawn_discovery_keeper(&self) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ServiceStartOutcome` is never used
+   --> src\mcp_ipc.rs:172:17
+    |
+172 | pub(crate) enum ServiceStartOutcome {
+    |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: function `start_service` is never used
+   --> src\mcp_ipc.rs:177:15
+    |
+177 | pub(crate) fn start_service(
+    |               ^^^^^^^^^^^^^
+
+warning: function `read_discovery_with_retry` is never used
+   --> src\mcp_ipc.rs:458:15
+    |
+458 | pub(crate) fn read_discovery_with_retry(runtime_dir: &Path) -> Option<ServiceDiscovery> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_lock_conflict` is never used
+   --> src\mcp_ipc.rs:572:4
+    |
+572 | fn is_lock_conflict(error: &std::io::Error) -> bool {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `random_token` is never used
+   --> src\mcp_ipc.rs:576:4
+    |
+576 | fn random_token() -> String {
+    |    ^^^^^^^^^^^^
+
+warning: function `unix_now` is never used
+   --> src\mcp_ipc.rs:582:4
+    |
+582 | fn unix_now() -> u64 {
+    |    ^^^^^^^^
+
+warning: function `atomic_write` is never used
+   --> src\mcp_ipc.rs:679:4
+    |
+679 | fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    |    ^^^^^^^^^^^^
+
+warning: constant `PIPE_BUFFER_BYTES` is never used
+  --> src\mcp_pipe.rs:16:7
+   |
+16 | const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+   |       ^^^^^^^^^^^^^^^^^
+
+warning: function `accept` is never used
+  --> src\mcp_pipe.rs:51:15
+   |
+51 | pub(crate) fn accept(endpoint: &str) -> io::Result<PipeStream> {
+   |               ^^^^^^
+
+warning: `himind-agent` (bin "himind-agent-mcp") generated 13 warnings
+warning: unused import: `serde_json::json`
+    --> src\app\ai_compatibility.rs:1252:9
+     |
+1252 |     use serde_json::json;
+     |         ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::store::ai_services::AIServiceProtocol`
+  --> src\app\local_image.rs:25:5
+   |
+25 | use crate::store::ai_services::AIServiceProtocol;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `run_required_checks`
+  --> src\mission\mod.rs:19:28
+   |
+19 |     read_projection_usage, run_required_checks, run_required_checks_with_resources, HostCheck,
+   |                            ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MissionWorkflowPin`
+  --> src\mission\store.rs:16:67
+   |
+16 |     MissionStatus, MissionTaskSpec, MissionTaskView, MissionView, MissionWorkflowPin, TaskStatus,
+   |                                                                   ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `MissionAssignment`, `MissionConfirmation`, `MissionFeedbackInput`, `MissionHandoff`, `MissionLegacyVerificationOverride`, `MissionRoleAssignment`, `MissionSourceBaseline`, and `MissionTaskRoleMapping`
+  --> src\mission\mod.rs:27:41
+   |
+27 | ...Pin, MissionAssignment, MissionAssignmentInput, MissionAssignmentOptions,
+   |         ^^^^^^^^^^^^^^^^^
+28 | ...rease, MissionFeedbackInput, MissionFeedbackSubmit, MissionLegacyVerificationOverride, MissionVerificationRetry, MissionSourceBaseline, MissionConfirmation, MissionCreateInput, MissionEvent, MissionHandoff,
+   |           ^^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^                                    ^^^^^^^^^^^^^^
+29 | ...nMode, MissionPlanProposal, MissionRoleAssignment,
+   |                                ^^^^^^^^^^^^^^^^^^^^^
+30 | ...s, MissionTaskRoleMapping, MissionTaskSpec, MissionTaskView,
+   |       ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `package_digest`
+  --> src\workflow\mod.rs:70:24
+   |
+70 | pub(crate) use store::{package_digest, InstalledWorkflow, WorkflowStore};
+   |                        ^^^^^^^^^^^^^^
+
+warning: unused import: `Digest`
+  --> src\svn\auth_cache.rs:14:11
+   |
+14 | use md5::{Digest as _, Md5};
+   |           ^^^^^^
+
+warning: variable does not need to be mutable
+   --> src\app\control_plane_provider.rs:112:9
+    |
+112 |     let mut result = ControlPlaneProviderStatus {
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\app\github_app.rs:445:13
+    |
+445 |         let mut updated = GithubAppRecord {
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\app\inference_gateway.rs:2610:9
+     |
+2610 |     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\app\inference_gateway.rs:3088:9
+     |
+3088 |     let mut send = |candidate: &GatewayBinding, payload: &[u8]| {
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `model`
+   --> src\app\local_image.rs:109:25
+    |
+109 |         (Some((adapter, model)), Some(override_model)) => Ok((adapter, override_model.to_string())),
+    |                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_model`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `model`
+  --> src\app\local_video.rs:37:25
+   |
+37 |         (Some((adapter, model)), Some(override_model)) => (adapter, override_model),
+   |                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_model`
+
+warning: variable does not need to be mutable
+   --> src\app\media_stream.rs:282:9
+    |
+282 |     let mut push = |orig_start: u64, len: u64, segments: &mut Vec<Segment>, syn: &mut u64| -> u64 {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: value assigned to `moov_syn_start` is never read
+   --> src\app\media_stream.rs:281:30
+    |
+281 |     let mut moov_syn_start = 0u64;
+    |                              ^^^^ this value is reassigned later and never used
+...
+300 |     moov_syn_start = push(moov.offset, moov.size, &mut segments, &mut syn);
+    |     ---------------------------------------------------------------------- `moov_syn_start` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\capability\credential_broker.rs:112:25
+    |
+112 |                     Ok((mut stream, _)) => {
+    |                         ----^^^^^^
+    |                         |
+    |                         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\expert.rs:1302:13
+     |
+1302 |         let mut entry = archive.by_index(index)?;
+     |             ----^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `namespace`
+   --> src\workflow\runtime.rs:424:9
+    |
+424 |     let namespace = super::model_alias_namespace(alias).ok_or_else(|| {
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_namespace`
+
+warning: type `PluginCredentials` is more private than the item `status_of`
+   --> src\store\plugin_credentials.rs:134:1
+    |
+134 | / pub(crate) fn status_of(
+135 | |     store: &BTreeMap<String, PluginCredentials>,
+136 | |     plugin_id: &str,
+137 | |     credential_id: &str,
+138 | | ) -> PluginCredentialStatus {
+    | |___________________________^ function `status_of` is reachable at visibility `pub(crate)`
+    |
+note: but type `PluginCredentials` is only usable at visibility `pub(self)`
+   --> src\store\plugin_credentials.rs:55:1
+    |
+ 55 | struct PluginCredentials {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: field `created_at` is never read
+  --> src\api\ai.rs:34:9
+   |
+13 | pub(crate) struct AIUserCredential {
+   |                   ---------------- field in this struct
+...
+34 |     pub created_at: String,
+   |         ^^^^^^^^^^
+   |
+   = note: `AIUserCredential` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `vendor_name` and `service_type` are never read
+   --> src\api\ai.rs:258:9
+    |
+252 | pub(crate) struct AiProviderTemplate {
+    |                   ------------------ fields in this struct
+...
+258 |     pub vendor_name: String,
+    |         ^^^^^^^^^^^
+...
+264 |     pub service_type: String,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `AiProviderTemplate` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `display_name`, `reasoning_efforts`, and `default_reasoning_effort` are never read
+   --> src\api\ai.rs:281:9
+    |
+279 | pub(crate) struct AiProviderTemplateModel {
+    |                   ----------------------- fields in this struct
+280 |     #[serde(default, deserialize_with = "deserialize_nullable_string")]
+281 |     pub display_name: String,
+    |         ^^^^^^^^^^^^
+...
+289 |     pub reasoning_efforts: Vec<String>,
+    |         ^^^^^^^^^^^^^^^^^
+290 |     #[serde(default)]
+291 |     pub default_reasoning_effort: String,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `AiProviderTemplateModel` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `supports_reasoning` is never used
+   --> src\api\ai.rs:331:19
+    |
+324 | impl AIModelMetadata {
+    | -------------------- method in this implementation
+...
+331 |     pub(crate) fn supports_reasoning(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: type alias `InstructionPackCatalogPage` is never used
+   --> src\api\distribution.rs:596:10
+    |
+596 | pub type InstructionPackCatalogPage = CatalogPage<InstructionPackCatalogItem>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ExpertCatalogPage` is never used
+   --> src\api\distribution.rs:597:10
+    |
+597 | pub type ExpertCatalogPage = CatalogPage<ExpertCatalogItem>;
+    |          ^^^^^^^^^^^^^^^^^
+
+warning: function `plugin_catalog_page` is never used
+   --> src\api\distribution.rs:868:8
+    |
+868 | pub fn plugin_catalog_page(
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `skill_catalog_page` is never used
+   --> src\api\distribution.rs:926:8
+    |
+926 | pub fn skill_catalog_page(
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `expert_versions` is never used
+    --> src\api\distribution.rs:1053:8
+     |
+1053 | pub fn expert_versions(
+     |        ^^^^^^^^^^^^^^^
+
+warning: function `publish_software_release` is never used
+    --> src\api\distribution.rs:1745:8
+     |
+1745 | pub fn publish_software_release(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `svn_identity_status` is never read
+   --> src\api\oauth.rs:138:9
+    |
+129 | pub(crate) struct AgentUserInfo {
+    |                   ------------- field in this struct
+...
+138 |     pub svn_identity_status: String,
+    |         ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `AgentUserInfo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `lease_expires_at` is never read
+   --> src\api\types.rs:100:9
+    |
+ 79 | pub struct Task {
+    |            ---- field in this struct
+...
+100 |     pub lease_expires_at: Option<String>,
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: `Task` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `stable_launcher_executable` is never used
+   --> src\app\ai_clients.rs:661:4
+    |
+661 | fn stable_launcher_executable() -> Result<PathBuf, Box<dyn Error>> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DEFAULT_GATEWAY_CLIENT_IDS` is never used
+  --> src\app\ai_compatibility.rs:16:18
+   |
+16 | pub(crate) const DEFAULT_GATEWAY_CLIENT_IDS: &[&str] = &[
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `is_available` is never used
+  --> src\app\ai_compatibility.rs:80:19
+   |
+79 | impl ModelDiscovery {
+   | ------------------- method in this implementation
+80 |     pub(crate) fn is_available(&self) -> bool {
+   |                   ^^^^^^^^^^^^
+
+warning: method `validate` is never used
+   --> src\app\ai_compatibility.rs:441:19
+    |
+365 | impl CapabilityMatrixV1 {
+    | ----------------------- method in this implementation
+...
+441 |     pub(crate) fn validate(&self) -> Result<(), String> {
+    |                   ^^^^^^^^
+
+warning: function `support` is never used
+   --> src\app\ai_compatibility.rs:626:4
+    |
+626 | fn support(is_supported: bool) -> CapabilitySupport {
+    |    ^^^^^^^
+
+warning: method `display_name` is never used
+   --> src\app\ai_provider_import.rs:138:8
+    |
+136 | pub(crate) trait AIClientAdapter {
+    |                  --------------- method in this trait
+137 |     fn id(&self) -> &'static str;
+138 |     fn display_name(&self) -> &'static str;
+    |        ^^^^^^^^^^^^
+
+warning: constant `SYNC_REASON_DRIFT_UNCONFIRMED` is never used
+   --> src\app\ai_provider_import.rs:607:7
+    |
+607 | const SYNC_REASON_DRIFT_UNCONFIRMED: &str = "client_drift_unconfirmed";
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clients_bound_to_service` is never used
+    --> src\app\ai_provider_import.rs:1707:15
+     |
+1707 | pub(crate) fn clients_bound_to_service(options: &Options, service_id: &str) -> Vec<String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clients_bound_to_gateway` is never used
+    --> src\app\ai_provider_import.rs:1729:15
+     |
+1729 | pub(crate) fn clients_bound_to_gateway(options: &Options) -> Vec<String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `is_healthy` is never used
+    --> src\app\ai_provider_import.rs:6327:8
+     |
+6326 | impl ClaudeDesktopEntryHealth {
+     | ----------------------------- method in this implementation
+6327 |     fn is_healthy(&self) -> bool {
+     |        ^^^^^^^^^^
+
+warning: function `classify_path` is never used
+   --> src\app\backup.rs:216:4
+    |
+216 | fn classify_path(rel: &Path) -> Option<Decision> {
+    |    ^^^^^^^^^^^^^
+
+warning: method `set_capabilities` is never used
+   --> src\app\builtin_ai_sync.rs:158:19
+    |
+ 39 | impl BuiltinAiEventSync {
+    | ----------------------- method in this implementation
+...
+158 |     pub(crate) fn set_capabilities(&self, next: RuntimeCapabilities) {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: function `cleanup_inference_media_cache` is never used
+    --> src\app\commands.rs:2884:15
+     |
+2884 | pub(crate) fn cleanup_inference_media_cache() -> Result<serde_json::Value, String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `workspace_history_snapshot` is never used
+    --> src\app\commands.rs:9350:15
+     |
+9350 | pub(crate) fn workspace_history_snapshot(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `ready` is never used
+  --> src\app\data_location.rs:59:19
+   |
+58 | impl MigrationPlan {
+   | ------------------ method in this implementation
+59 |     pub(crate) fn ready(&self) -> bool {
+   |                   ^^^^^
+
+warning: function `remove_asset` is never used
+   --> src\app\distribution_state.rs:188:15
+    |
+188 | pub(crate) fn remove_asset(
+    |               ^^^^^^^^^^^^
+
+warning: method `is_fully_visible` is never used
+   --> src\app\extension_activation.rs:369:19
+    |
+333 | impl ActivationReceipt {
+    | ---------------------- method in this implementation
+...
+369 |     pub(crate) fn is_fully_visible(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: struct `ActivationReport` is never constructed
+   --> src\app\extension_activation.rs:389:19
+    |
+389 | pub(crate) struct ActivationReport {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: methods `transaction_id`, `journal_path`, and `candidate_sha256` are never used
+   --> src\app\extension_activation.rs:431:19
+    |
+430 | impl ActivationTransaction {
+    | -------------------------- methods in this implementation
+431 |     pub(crate) fn transaction_id(&self) -> &str {
+    |                   ^^^^^^^^^^^^^^
+...
+435 |     pub(crate) fn journal_path(&self) -> &Path {
+    |                   ^^^^^^^^^^^^
+...
+439 |     pub(crate) fn candidate_sha256(&self) -> &str {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: struct `ActivationRecoveryReport` is never constructed
+   --> src\app\extension_activation.rs:445:19
+    |
+445 | pub(crate) struct ActivationRecoveryReport {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `path`, `record`, and `recover` are never used
+   --> src\app\extension_activation.rs:478:19
+    |
+473 | impl ActivationStore {
+    | -------------------- methods in this implementation
+...
+478 |     pub(crate) fn path(&self) -> &Path {
+    |                   ^^^^
+...
+507 |     pub(crate) fn record(&self, receipt: &ActivationReceipt) -> Result<String, Box<dyn Error>> {
+    |                   ^^^^^^
+...
+644 |     pub(crate) fn recover(&self) -> Result<ActivationRecoveryReport, Box<dyn Error>> {
+    |                   ^^^^^^^
+
+warning: function `save` is never used
+   --> src\app\extension_lock.rs:164:15
+    |
+164 | pub(crate) fn save(value: &ExtensionLockFile) -> Result<(), Box<dyn Error>> {
+    |               ^^^^
+
+warning: function `list` is never used
+   --> src\app\extension_lock.rs:240:15
+    |
+240 | pub(crate) fn list() -> Result<Vec<ExtensionLockEntry>, Box<dyn Error>> {
+    |               ^^^^
+
+warning: method `key_id` is never used
+  --> src\app\extension_signing.rs:31:19
+   |
+30 | impl ExtensionSigningKey {
+   | ------------------------ method in this implementation
+31 |     pub(crate) fn key_id(&self) -> &str {
+   |                   ^^^^^^
+
+warning: function `install_unit` is never used
+    --> src\app\extension_source.rs:2282:15
+     |
+2282 | pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport, Box<dyn Error>> {
+     |               ^^^^^^^^^^^^
+
+warning: constant `MAX_DEVICE_WAIT` is never used
+  --> src\app\github_app.rs:18:7
+   |
+18 | const MAX_DEVICE_WAIT: Duration = Duration::from_secs(900);
+   |       ^^^^^^^^^^^^^^^
+
+warning: function `device_flow_budget` is never used
+   --> src\app\github_app.rs:472:15
+    |
+472 | pub(crate) fn device_flow_budget() -> Duration {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `unix_timestamp_string` is never used
+    --> src\app\github_publisher.rs:1102:4
+     |
+1102 | fn unix_timestamp_string() -> String {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `port` is never used
+   --> src\app\inference_gateway.rs:152:15
+    |
+152 | pub(crate) fn port() -> Option<u16> {
+    |               ^^^^
+
+warning: function `running` is never used
+   --> src\app\inference_gateway.rs:159:15
+    |
+159 | pub(crate) fn running() -> bool {
+    |               ^^^^^^^
+
+warning: method `port` is never used
+   --> src\app\inference_gateway.rs:466:19
+    |
+351 | impl InferenceGateway {
+    | --------------------- method in this implementation
+...
+466 |     pub(crate) fn port(&self) -> u16 {
+    |                   ^^^^
+
+warning: function `authorize` is never used
+   --> src\app\inference_gateway.rs:735:4
+    |
+735 | fn authorize(
+    |    ^^^^^^^^^
+
+warning: constant `UPSTREAM_ERROR_EXCERPT_CHARS` is never used
+    --> src\app\inference_gateway.rs:3804:7
+     |
+3804 | const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 600;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `upstream_skeleton` is never used
+    --> src\app\inference_gateway.rs:3811:4
+     |
+3811 | fn upstream_skeleton(text: &str, limit: usize) -> String {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `is_skeleton_noise` is never used
+    --> src\app\inference_gateway.rs:3840:4
+     |
+3840 | fn is_skeleton_noise(character: char) -> bool {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `excerpt` is never used
+    --> src\app\inference_gateway.rs:3844:4
+     |
+3844 | fn excerpt(text: &str, limit: usize) -> String {
+     |    ^^^^^^^
+
+warning: function `upstream_request_id` is never used
+    --> src\app\inference_gateway.rs:4006:4
+     |
+4006 | fn upstream_request_id(headers: &reqwest::header::HeaderMap, body: &str) -> Option<String> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_json_request_id` is never used
+    --> src\app\inference_gateway.rs:4038:4
+     |
+4038 | fn find_json_request_id(value: &Value) -> Option<String> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_request_id` is never used
+    --> src\app\inference_gateway.rs:4063:4
+     |
+4063 | fn sanitize_request_id(raw: &str) -> Option<String> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `images_url` is never used
+   --> src\app\local_image.rs:647:4
+    |
+647 | fn images_url(base_url: &str) -> Result<String, Box<dyn Error>> {
+    |    ^^^^^^^^^^
+
+warning: struct `MissingDependency` is never constructed
+  --> src\app\market.rs:79:19
+   |
+79 | pub(crate) struct MissingDependency {
+   |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated function `parse` is never used
+  --> src\app\mcp_catalog.rs:69:8
+   |
+68 | impl CatalogTrust {
+   | ----------------- associated function in this implementation
+69 |     fn parse(value: &str) -> Self {
+   |        ^^^^^
+
+warning: associated function `parse` is never used
+  --> src\app\mcp_catalog.rs:94:8
+   |
+93 | impl CatalogSourceKind {
+   | ---------------------- associated function in this implementation
+94 |     fn parse(value: &str) -> Self {
+   |        ^^^^^
+
+warning: field `transport` is never read
+   --> src\app\mcp_catalog.rs:394:5
+    |
+389 | struct ParsedPackage {
+    |        ------------- field in this struct
+...
+394 |     transport: String,
+    |     ^^^^^^^^^
+    |
+    = note: `ParsedPackage` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `id` is never read
+  --> src\app\media_stream.rs:53:9
+   |
+49 | pub(crate) struct Ticket {
+   |                   ------ field in this struct
+...
+53 |     pub id: String,
+   |         ^^
+   |
+   = note: `Ticket` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `local_display_name` is never used
+   --> src\app\plugin_manager.rs:259:15
+    |
+259 | pub(crate) fn local_display_name(plugin_id: &str) -> Option<String> {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `plan_install` is never used
+   --> src\app\plugin_manager.rs:563:15
+    |
+563 | pub(crate) fn plan_install(
+    |               ^^^^^^^^^^^^
+
+warning: function `build_install_plan` is never used
+   --> src\app\plugin_manager.rs:734:4
+    |
+734 | fn build_install_plan(
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `catalog_item` is never used
+    --> src\app\plugin_manager.rs:1227:4
+     |
+1227 | fn catalog_item(
+     |    ^^^^^^^^^^^^
+
+warning: field `auto_configured` is never read
+  --> src\app\remote_clients.rs:34:9
+   |
+31 | pub(crate) struct ResolvedRemoteClient {
+   |                   -------------------- field in this struct
+...
+34 |     pub auto_configured: bool,
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: `ResolvedRemoteClient` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: struct `MediaCleanupStats` is never constructed
+   --> src\app\responses_media.rs:457:19
+    |
+457 | pub(crate) struct MediaCleanupStats {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: function `cleanup_cache` is never used
+   --> src\app\responses_media.rs:464:15
+    |
+464 | pub(crate) fn cleanup_cache(
+    |               ^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> src\app\security.rs:11:19
+   |
+10 | impl LocalRequestSecurity {
+   | ------------------------- associated function in this implementation
+11 |     pub(crate) fn new(dashboard_base: &str, local_port: u16) -> Self {
+   |                   ^^^
+
+warning: function `run_local_app` is never used
+  --> src\app\service.rs:83:15
+   |
+83 | pub(crate) fn run_local_app(options: Options) -> Result<(), Box<dyn Error>> {
+   |               ^^^^^^^^^^^^^
+
+warning: function `find_unreal_editor` is never used
+    --> src\app\system.rs:2176:4
+     |
+2176 | fn find_unreal_editor() -> Option<String> {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: method `update_profile` is never used
+   --> src\approval\manager.rs:672:12
+    |
+ 37 | impl ApprovalManager {
+    | -------------------- method in this implementation
+...
+672 |     pub fn update_profile(&self, profile: &str, confirmed: bool) -> Result<(), String> {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `local_label` is never used
+  --> src\build_info.rs:27:19
+   |
+25 | impl BuildInfo {
+   | -------------- method in this implementation
+26 |     /// 用于界面的短标签，例如 `本地构建 ef3570e`；正式发版返回空串。
+27 |     pub(crate) fn local_label(&self) -> String {
+   |                   ^^^^^^^^^^^
+
+warning: fields `capability_id`, `workspace_scope`, and `request_approval` are never read
+  --> src\capability\execution.rs:10:5
+   |
+ 8 | pub(crate) struct CapabilityExecutionContext<'a> {
+   |                   -------------------------- fields in this struct
+ 9 |     task_id: String,
+10 |     capability_id: String,
+   |     ^^^^^^^^^^^^^
+11 |     workspace_scope: String,
+   |     ^^^^^^^^^^^^^^^
+...
+14 |     request_approval: Option<Box<dyn FnMut(&str, &str) -> Result<bool, Box<dyn Error>> + 'a>>,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: methods `with_approval`, `capability_id`, `workspace_scope`, and `request_approval` are never used
+  --> src\capability\execution.rs:49:19
+   |
+17 | impl<'a> CapabilityExecutionContext<'a> {
+   | --------------------------------------- methods in this implementation
+...
+49 |     pub(crate) fn with_approval(
+   |                   ^^^^^^^^^^^^^
+...
+61 |     pub(crate) fn capability_id(&self) -> &str {
+   |                   ^^^^^^^^^^^^^
+...
+65 |     pub(crate) fn workspace_scope(&self) -> &str {
+   |                   ^^^^^^^^^^^^^^^
+...
+81 |     pub(crate) fn request_approval(
+   |                   ^^^^^^^^^^^^^^^^
+
+warning: variant `Transport` is never constructed
+  --> src\capability\plugin.rs:53:5
+   |
+51 | pub(crate) enum PluginInvocationError {
+   |                 --------------------- variant in this enum
+52 |     /// 进程或 JSON-RPC 传输失败：计入插件健康。
+53 |     Transport(String),
+   |     ^^^^^^^^^
+   |
+   = note: `PluginInvocationError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `activate_development_plugin` is never used
+   --> src\capability\plugin.rs:478:15
+    |
+478 | pub(crate) fn activate_development_plugin(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `merge_development_items` is never used
+   --> src\capability\plugin.rs:595:4
+    |
+595 | fn merge_development_items(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `plugin_capability_namespace` is never used
+   --> src\capability\plugin.rs:648:15
+    |
+648 | pub(crate) fn plugin_capability_namespace(manifest: &PluginManifest) -> String {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `default_registry_kind` is never used
+    --> src\capability\plugin.rs:2677:4
+     |
+2677 | fn default_registry_kind() -> String {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `capability_id_naming_violations` is never used
+    --> src\capability\service.rs:9343:15
+     |
+9343 | pub(crate) fn capability_id_naming_violations(id: &str) -> Vec<&'static str> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `capability_id_naming_violations_allow` is never used
+    --> src\capability\service.rs:9349:15
+     |
+9349 | pub(crate) fn capability_id_naming_violations_allow(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `capability_boundary_availability_violation` is never used
+    --> src\capability\service.rs:9448:4
+     |
+9448 | fn capability_boundary_availability_violation(id: &str, availability: &str) -> Option<String> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `LEGACY_CAPABILITY_ID_MIGRATIONS` is never used
+    --> src\capability\service.rs:9467:7
+     |
+9467 | const LEGACY_CAPABILITY_ID_MIGRATIONS: &[(&str, &str)] = &[];
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `sha256` is never read
+  --> src\capability\software_distribution.rs:45:9
+   |
+40 | pub(crate) struct VerifiedSoftwareArtifact {
+   |                   ------------------------ field in this struct
+...
+45 |     pub sha256: String,
+   |         ^^^^^^
+   |
+   = note: `VerifiedSoftwareArtifact` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `active_definition` is never used
+    --> src\expert.rs:1456:15
+     |
+1456 | pub(crate) fn active_definition() -> Result<Option<ExpertDefinition>, Box<dyn Error>> {
+     |               ^^^^^^^^^^^^^^^^^
+
+warning: function `operation_error` is never used
+   --> src\extension_authoring.rs:101:15
+    |
+101 | pub(crate) fn operation_error(
+    |               ^^^^^^^^^^^^^^^
+
+warning: function `payload_from_error` is never used
+   --> src\extension_authoring.rs:131:15
+    |
+131 | pub(crate) fn payload_from_error(error: &dyn Error) -> Value {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: field `workspace_root` is never read
+  --> src\extension_workspace.rs:73:9
+   |
+67 | pub(crate) struct DiscoveredExtension {
+   |                   ------------------- field in this struct
+...
+73 |     pub workspace_root: PathBuf,
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: `DiscoveredExtension` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `clear_binding` is never used
+   --> src\extension_workspace.rs:257:15
+    |
+257 | pub(crate) fn clear_binding() -> Result<(), Box<dyn std::error::Error>> {
+    |               ^^^^^^^^^^^^^
+
+warning: function `metadata_for_path` is never used
+   --> src\extension_workspace.rs:575:15
+    |
+575 | pub(crate) fn metadata_for_path(path: &Path) -> Option<(String, String, String)> {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `active_agent_path` is never used
+   --> src\install_layout.rs:124:15
+    |
+124 | pub(crate) fn active_agent_path(root: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_agent_path` is never used
+   --> src\install_layout.rs:135:15
+    |
+135 | pub(crate) fn resolve_agent_path(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `write_active_version` is never used
+   --> src\install_layout.rs:182:15
+    |
+182 | pub(crate) fn write_active_version(root: &Path, version: &str) -> Result<(), Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `version_directory` is never used
+   --> src\install_layout.rs:203:15
+    |
+203 | pub(crate) fn version_directory(root: &Path, version: &str) -> Result<PathBuf, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_version_directory` is never used
+   --> src\install_layout.rs:208:15
+    |
+208 | pub(crate) fn prepare_version_directory(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_request` is never used
+   --> src\mcp.rs:483:4
+    |
+483 | fn handle_request(
+    |    ^^^^^^^^^^^^^^
+
+warning: method `identity_hash` is never used
+  --> src\mcp_ipc.rs:65:19
+   |
+29 | impl ServiceScope {
+   | ----------------- method in this implementation
+...
+65 |     pub(crate) fn identity_hash(&self) -> &str {
+   |                   ^^^^^^^^^^^^^
+
+warning: method `discovery_path` is never used
+   --> src\mcp_ipc.rs:135:19
+    |
+130 | impl ServiceInstance {
+    | -------------------- method in this implementation
+...
+135 |     pub(crate) fn discovery_path(&self) -> &Path {
+    |                   ^^^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> src\mcp_ipc.rs:174:20
+    |
+174 |     AlreadyRunning(Option<ServiceDiscovery>),
+    |     -------------- ^^^^^^^^^^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+174 -     AlreadyRunning(Option<ServiceDiscovery>),
+174 +     AlreadyRunning(()),
+    |
+
+warning: function `run_required_checks` is never used
+  --> src\mission\checks.rs:21:15
+   |
+21 | pub(crate) fn run_required_checks(
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `resource_conflict` is never used
+   --> src\mission\parallel.rs:244:15
+    |
+244 | pub(crate) fn resource_conflict(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `paths_overlap` is never used
+   --> src\mission\parallel.rs:265:15
+    |
+265 | pub(crate) fn paths_overlap(
+    |               ^^^^^^^^^^^^^
+
+warning: methods `runtime_files_only`, `proposed_plan`, and `begin_task_attempt` are never used
+    --> src\mission\store.rs:549:19
+     |
+ 245 | impl MissionStore {
+     | ----------------- methods in this implementation
+...
+ 549 |     pub(crate) fn runtime_files_only(&self, mission_id: &str, plan_sha256: &str) -> Result<bool, Box<dyn Error>> {
+     |                   ^^^^^^^^^^^^^^^^^^
+...
+1865 |     pub(crate) fn proposed_plan(
+     |                   ^^^^^^^^^^^^^
+...
+1885 |     pub(crate) fn begin_task_attempt(
+     |                   ^^^^^^^^^^^^^^^^^^
+
+warning: methods `path` and `remove_file` are never used
+   --> src\path_guard.rs:64:19
+    |
+ 29 | impl TrustedRoot {
+    | ---------------- methods in this implementation
+...
+ 64 |     pub(crate) fn path(&self) -> &Path {
+    |                   ^^^^
+...
+119 |     pub(crate) fn remove_file(
+    |                   ^^^^^^^^^^^
+
+warning: function `ensure_path_within` is never used
+   --> src\path_guard.rs:266:15
+    |
+266 | pub(crate) fn ensure_path_within(
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_sync_exhibits` is never used
+  --> src\remote\sync.rs:34:15
+   |
+34 | pub(crate) fn execute_sync_exhibits(
+   |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `prepare_interactive_launch` is never used
+  --> src\runtime\builtin.rs:40:8
+   |
+16 | trait AIRuntimeAdapter: Sync {
+   |       ---------------- method in this trait
+...
+40 |     fn prepare_interactive_launch(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `prepare_interactive_launch` is never used
+   --> src\runtime\builtin.rs:263:15
+    |
+263 | pub(crate) fn prepare_interactive_launch(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_codex_session_id` is never used
+   --> src\runtime\codex.rs:370:4
+    |
+370 | fn parse_codex_session_id(output: &str) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `observe_reader` is never used
+   --> src\runtime\codex_transport.rs:278:19
+    |
+272 | impl CodexCompletion {
+    | -------------------- method in this implementation
+...
+278 |     pub(crate) fn observe_reader(&mut self, reader: &mut dyn std::io::Read) -> bool {
+    |                   ^^^^^^^^^^^^^^
+
+warning: method `completed` is never used
+  --> src\runtime\codex_usage.rs:69:19
+   |
+31 | impl Meter {
+   | ---------- method in this implementation
+...
+69 |     pub(crate) fn completed(&self) -> Result<bool, Box<dyn Error>> {
+   |                   ^^^^^^^^^
+
+warning: function `install` is never used
+   --> src\runtime\deepseek_harness.rs:958:15
+    |
+958 | pub(crate) fn install(
+    |               ^^^^^^^
+
+warning: function `prepare_interactive_launch` is never used
+    --> src\runtime\deepseek_harness.rs:1065:15
+     |
+1065 | pub(crate) fn prepare_interactive_launch(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `render_himind_profile_patch` is never used
+    --> src\runtime\deepseek_harness.rs:3751:4
+     |
+3751 | fn render_himind_profile_patch(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `versioned_home` is never used
+    --> src\runtime\deepseek_harness.rs:5208:4
+     |
+5208 | fn versioned_home(root: &Path, version: &str) -> Result<PathBuf, String> {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `project_history_snapshot` is never used
+   --> src\session_history.rs:441:15
+    |
+441 | pub(crate) fn project_history_snapshot(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `start` is never used
+  --> src\session_history_inspect.rs:73:15
+   |
+73 | pub(crate) fn start(
+   |               ^^^^^
+
+warning: function `step` is never used
+   --> src\session_history_inspect.rs:160:15
+    |
+160 | pub(crate) fn step(
+    |               ^^^^
+
+warning: function `unsupported_target_clients` is never used
+    --> src\skill\mod.rs:1077:15
+     |
+1077 | pub(crate) fn unsupported_target_clients(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `records_json` is never used
+    --> src\skill\mod.rs:1185:15
+     |
+1185 | pub(crate) fn records_json(records: &[SkillRecord]) -> Value {
+     |               ^^^^^^^^^^^^
+
+warning: constant `SKILL_STANDARD_HIMIND_STORE` is never used
+  --> src\skill\clients.rs:20:18
+   |
+20 | pub(crate) const SKILL_STANDARD_HIMIND_STORE: &str = "himind-store";
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `status_for_target` is never used
+  --> src\skill\copilot.rs:36:15
+   |
+36 | pub(crate) fn status_for_target(
+   |               ^^^^^^^^^^^^^^^^^
+
+warning: function `register_skill` is never used
+  --> src\skill\development.rs:56:15
+   |
+56 | pub(crate) fn register_skill(path: &Path) -> Result<String, Box<dyn Error>> {
+   |               ^^^^^^^^^^^^^^
+
+warning: function `activate_skill` is never used
+  --> src\skill\development.rs:60:15
+   |
+60 | pub(crate) fn activate_skill(path: &Path) -> Result<String, Box<dyn Error>> {
+   |               ^^^^^^^^^^^^^^
+
+warning: function `register_skill_at` is never used
+  --> src\skill\development.rs:68:4
+   |
+68 | fn register_skill_at(path: &Path, registry: &Path) -> Result<String, Box<dyn Error>> {
+   |    ^^^^^^^^^^^^^^^^^
+
+warning: function `recent_plugin_failure` is never used
+   --> src\skill\resolver.rs:105:4
+    |
+105 | fn recent_plugin_failure(plugin: &crate::capability::plugin::PluginRegistryItem) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `with_root` is never used
+  --> src\skill\store.rs:99:19
+   |
+70 | impl SkillStore {
+   | --------------- associated function in this implementation
+...
+99 |     pub(crate) fn with_root(root: PathBuf) -> Self {
+   |                   ^^^^^^^^^
+
+warning: methods `protocol_families` and `protocol_in_family` are never used
+   --> src\store\ai_services.rs:451:19
+    |
+436 | impl CustomAIService {
+    | -------------------- methods in this implementation
+...
+451 |     pub(crate) fn protocol_families(&self) -> Vec<AIServiceProtocolFamily> {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+464 |     pub(crate) fn protocol_in_family(
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `total_tokens` is never used
+  --> src\store\local_usage.rs:66:19
+   |
+65 | impl LocalUsageRecord {
+   | --------------------- method in this implementation
+66 |     pub(crate) fn total_tokens(&self) -> u64 {
+   |                   ^^^^^^^^^^^^
+
+warning: function `list` is never used
+   --> src\store\media_jobs.rs:199:15
+    |
+199 | pub(crate) fn list(limit: usize) -> Result<Vec<MediaJob>, Box<dyn Error>> {
+    |               ^^^^
+
+warning: function `list` is never used
+   --> src\store\media_registry.rs:180:15
+    |
+180 | pub(crate) fn list(limit: usize) -> Result<Vec<MediaRecord>, Box<dyn Error>> {
+    |               ^^^^
+
+warning: function `prune_missing_gateway_media` is never used
+   --> src\store\media_registry.rs:189:15
+    |
+189 | pub(crate) fn prune_missing_gateway_media(cache_dir: &Path) -> Result<usize, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `status_of` is never used
+   --> src\store\plugin_credentials.rs:134:15
+    |
+134 | pub(crate) fn status_of(
+    |               ^^^^^^^^^
+
+warning: function `statuses` is never used
+   --> src\store\plugin_credentials.rs:172:15
+    |
+172 | pub(crate) fn statuses(
+    |               ^^^^^^^^
+
+warning: function `save` is never used
+   --> src\store\plugin_credentials.rs:199:15
+    |
+199 | pub(crate) fn save(
+    |               ^^^^
+
+warning: function `remove_all_for_plugin` is never used
+   --> src\store\plugin_credentials.rs:299:15
+    |
+299 | pub(crate) fn remove_all_for_plugin(plugin_id: &str) -> Result<bool, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `secret_fields` is never used
+   --> src\store\plugin_credentials.rs:310:15
+    |
+310 | pub(crate) fn secret_fields(
+    |               ^^^^^^^^^^^^^
+
+warning: function `bootstrap_svn_admin_credentials` is never used
+   --> src\svn\service.rs:173:15
+    |
+173 | pub(crate) fn bootstrap_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `install_svn_admin_credentials` is never used
+   --> src\svn\service.rs:177:15
+    |
+177 | pub(crate) fn install_svn_admin_credentials(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `svn_admin_ready` is never used
+   --> src\svn\service.rs:185:15
+    |
+185 | pub(crate) fn svn_admin_ready() -> bool {
+    |               ^^^^^^^^^^^^^^^
+
+warning: function `svn_admin_credentials_configured` is never used
+   --> src\svn\service.rs:189:15
+    |
+189 | pub(crate) fn svn_admin_credentials_configured() -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `verify_svn_admin_credentials` is never used
+   --> src\svn\service.rs:193:15
+    |
+193 | pub(crate) fn verify_svn_admin_credentials() -> Result<(), Box<dyn Error>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `svn_admin_status` is never used
+   --> src\svn\service.rs:201:15
+    |
+201 | pub(crate) fn svn_admin_status() -> &'static str {
+    |               ^^^^^^^^^^^^^^^^
+
+warning: function `execute_smb_upload` is never used
+  --> src\upload\smb.rs:16:15
+   |
+16 | pub(crate) fn execute_smb_upload(
+   |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_upload_code` is never used
+  --> src\upload\tasks.rs:18:15
+   |
+18 | pub(crate) fn execute_upload_code(
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_upload_placeholder` is never used
+   --> src\upload\tasks.rs:512:15
+    |
+512 | pub(crate) fn execute_upload_placeholder(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve` is never used
+   --> src\workspace_instructions.rs:136:15
+    |
+136 | pub(crate) fn resolve(
+    |               ^^^^^^^
+
+warning: function `resolve_with_config` is never used
+   --> src\workspace_instructions.rs:165:4
+    |
+165 | fn resolve_with_config(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_dsh_snapshot` is never used
+   --> src\workspace_instructions.rs:366:15
+    |
+366 | pub(crate) fn record_dsh_snapshot(
+    |               ^^^^^^^^^^^^^^^^^^^
+
+warning: variable `skillId` should have a snake case name
+    --> src\app\commands.rs:7523:5
+     |
+7523 |     skillId: String,
+     |     ^^^^^^^ help: convert the identifier to snake case: `skill_id`
+     |
+     = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: `himind-agent` (bin "himind-agent") generated 166 warnings (run `cargo fix --bin "himind-agent" -p himind-agent` to apply 16 suggestions)
+    Finished `release` profile [optimized] target(s) in 7m 29s

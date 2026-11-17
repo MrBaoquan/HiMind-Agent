@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
 import { Activity, AppWindow, Blocks, BookOpen, Cable, CalendarDays, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, Clapperboard, Clock3, Database, Download, ExternalLink, Eye, EyeOff, FileCode2, FileText, FolderOpen, Info, LayoutDashboard, LayoutGrid, LogOut, MessageCircle, Minus, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, Radar, RefreshCw, Search, Settings, Sparkles, Square, Star, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
 // 形变吃的是图标数据，静态图标仍走 lucide-react 组件；两边的图标集版本必须一致，
 // 否则同一个图标在「形变端点」和「静态渲染」下长得不一样（由 check:icon-version 守住）。
@@ -488,6 +488,7 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
   const [hiddenQuickAccessKeys, setHiddenQuickAccessKeys] = useState<string[]>(readQuickAccessHidden);
   const [quickAccessUsage, setQuickAccessUsage] = useState<QuickAccessUsage>(readQuickAccessUsage);
   const sidebarNavRef = useRef<HTMLElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const quickAccessTriggerRef = useRef<HTMLButtonElement>(null);
   const favoriteQuickAccessSet = useMemo(() => new Set(favoriteQuickAccessKeys), [favoriteQuickAccessKeys]);
@@ -518,6 +519,10 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
   // 这样未连接工作台（独立模式）时也能看到「有东西正在执行」和已运行时长。
   const localRun = dashboardEnabled && currentTask ? null : activeRun;
   const localRunElapsed = useRunElapsed(localRun?.startedAt);
+  useLayoutEffect(() => {
+    // Reset navigation scroll while keeping the AI conversation host mounted.
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+  }, [currentPage]);
   useEffect(() => {
     const nav = sidebarNavRef.current;
     if (!nav) return;
@@ -738,7 +743,7 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
               returnFocusRef={quickAccessTriggerRef}
             />
           ) : null}
-          <div className="main-content">
+          <div className="main-content" ref={contentRef}>
             {currentPage === 'builtin-ai' ? null : dashboardEnabled && currentTask ? (
               <button type="button" className="current-task-strip" onClick={() => onNavigate('tasks')} title="查看我的任务">
                 <BusyIndicator size={15} />

@@ -65,3 +65,8 @@
 .ai-manual-model > label:first-child { flex: 1 1 220px; min-width: 0; }
 .ai-manual-model > label { max-width: 100%; }
 .ai-providers-view > .ai-save-result { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius); font-size: var(--fs-body); }
+
+/* The summary keeps its geometry while service configuration loads. */
+.ai-providers-view .ai-overview { min-height: 86px; }
+.ai-providers-view .ai-overview.loading { border-color: var(--border); background: var(--surface); }
+.ai-service-refresh-error { display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); font-size: var(--fs-meta); }

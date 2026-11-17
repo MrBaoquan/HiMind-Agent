@@ -34,6 +34,7 @@ type AiConnectionsPageProps = {
   testResult: McpConnectionTestResult | null;
   busyAction: string | null;
   aiServices: AIServiceListResult | null;
+  aiServicesError?: string;
   aiServiceTemplates: AIServiceTemplateListResult | null;
   gatewayStatus: InferenceGatewayStatus | null;
   gatewayProfiles: GatewayProfile[];
@@ -112,6 +113,7 @@ export function AiConnectionsPage({
   testResult,
   busyAction,
   aiServices,
+  aiServicesError,
   aiServiceTemplates,
   gatewayStatus,
   gatewayProfiles,
@@ -199,6 +201,7 @@ export function AiConnectionsPage({
         <div id="ai-panel-services" role="tabpanel" aria-labelledby="ai-tab-services">
           <AiProvidersPanel
             aiServices={aiServices}
+            loadError={aiServicesError}
             templates={aiServiceTemplates}
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}

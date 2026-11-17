@@ -44,7 +44,8 @@
     "check:interaction-form": "node --experimental-strip-types scripts/check-interaction-form.mts",
     "check:notification-channels": "node --experimental-strip-types scripts/check-notification-channels.mts",
     "check:task-center-model": "node --experimental-strip-types scripts/check-task-center-model.mts",
-    "check:task-center-browser": "node scripts/check-task-center.browser.mjs"
+    "check:task-center-browser": "node scripts/check-task-center.browser.mjs",
+    "check:desktop-ui-browser": "node scripts/check-desktop-ui.browser.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "latest",

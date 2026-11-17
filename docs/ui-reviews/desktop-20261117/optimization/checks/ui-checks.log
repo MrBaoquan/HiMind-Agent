@@ -1,0 +1,292 @@
+
+> check:ui
+> npm run check:start-form && npm run check:workflow-option-sources && npm run check:run-view && npm run check:workflow-approval && npm run check:interaction-form && npm run check:notification-channels && npm run check:workflow-graph && npm run check:workflow-process && npm run check:market-catalog && npm run check:task-view && npm run check:workspace-project-model && npm run check:task-center-model && npm run check:mission-deep-link && npm run check:mission-assignment-ui && npm run check:shell-structure && npm run check:icon-version && npm run check:quick-access && npm run check:status-copy && npm run check:extension-activation-status && npm run check:development-local-only && npm run check:ai-service-presets && npm run check:ai-balance-matching && npm run check:ai-service-routing && npm run check:gateway-profile-ui && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy && npm run check:design-tokens
+
+
+> check:start-form
+> node --experimental-strip-types scripts/check-start-form.mts
+
+start form conversion checks passed
+(node:44304) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/workflowStartForm.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:workflow-option-sources
+> node --experimental-strip-types scripts/check-workflow-option-sources.mts
+
+workflow option source cache checks passed
+(node:35532) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/workflowOptionSources.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:run-view
+> node --experimental-strip-types scripts/check-run-view.mts
+
+run view checks passed
+(node:19760) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/workflowRunView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:workflow-approval
+> node --experimental-strip-types scripts/check-workflow-approval.mts
+
+approval evidence checks passed
+(node:37328) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/approvalEvidence.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:interaction-form
+> node --experimental-strip-types scripts/check-interaction-form.mts
+
+interaction form checks passed
+(node:41140) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/interactionForm.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:notification-channels
+> node --experimental-strip-types scripts/check-notification-channels.mts
+
+notification channels checks passed
+
+> check:workflow-graph
+> node --experimental-strip-types scripts/check-workflow-graph.mts
+
+workflow graph checks passed
+(node:44704) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/workflowGraph.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:workflow-process
+> node --experimental-strip-types scripts/check-workflow-process-ui.mts
+
+workflow process UI checks passed
+
+> check:market-catalog
+> node --experimental-strip-types scripts/check-market-catalog.mts
+
+market catalog checks passed
+(node:13480) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/marketCatalog.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:task-view
+> node --experimental-strip-types scripts/check-task-view.mts
+
+task view checks passed
+manual pause projection checks passed: drain, resume gates, verification, budget/environment, plan association
+(node:43488) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/taskView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:workspace-project-model
+> node --experimental-strip-types scripts/check-workspace-project-model.mts
+
+workspace project model: 14 assertions passed
+(node:6132) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/workspaceProjectModel.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:task-center-model
+> node --experimental-strip-types scripts/check-task-center-model.mts
+
+task center model checks passed: ownership, cycles, views, user actions, lifecycle, stages, plan identity
+B08/B09 regressions passed: DTO association, telemetry, pause/system/unknown, lineage, immutable retry identity
+QA-LEGACY-01 recovery action and manual-pause restrictions passed
+Explicit same-delivery Waiting retry/manual pause guards passed
+P4 runtime-live checks passed: exact ownership/attempt, queued/waiting/missing, occupancy, terminal guards, independent review gate, scheduling waits
+(node:36436) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/taskCenterModel.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:mission-deep-link
+> node --experimental-strip-types scripts/check-mission-deep-link.mts
+
+mission deep-link checks passed
+(node:32000) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/missionDeepLink.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:mission-assignment-ui
+> node --experimental-strip-types scripts/check-mission-assignment-ui.mts
+
+mission directory behavior checks passed
+mission recommendation behavior checks passed
+(node:2728) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/missionAssignment.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:shell-structure
+> node --experimental-strip-types scripts/check-shell-structure.mts
+
+shell structure checks passed
+
+> check:icon-version
+> node --experimental-strip-types scripts/check-icon-version.mts
+
+icon version checks passed
+
+> check:quick-access
+> node --experimental-strip-types scripts/check-quick-access.mts
+
+quick access checks passed
+(node:35532) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/data/quickAccess.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:status-copy
+> node --experimental-strip-types scripts/check-status-copy.mts
+
+status copy checks passed
+(node:37300) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/data/statusPresentation.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:extension-activation-status
+> node --experimental-strip-types scripts/check-extension-activation-status.mts
+
+extension activation UI checks passed
+
+> check:development-local-only
+> node --experimental-strip-types scripts/check-development-local-only.mts
+
+development local-only checks passed
+
+> check:ai-service-presets
+> node --experimental-strip-types scripts/check-ai-service-presets.mts
+
+ai service preset checks passed（32 条 / 4 个分类）
+ai service preset layout checks passed
+(node:44624) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/aiServicePresets.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:ai-balance-matching
+> node --experimental-strip-types scripts/check-ai-balance-matching.mts
+
+AI balance template matching checks passed
+(node:34944) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/balanceProfileMatching.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:ai-service-routing
+> node --experimental-strip-types scripts/check-ai-service-routing.mts
+
+AI service routing checks passed
+(node:32632) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/aiConnectionsTabs.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:gateway-profile-ui
+> node --experimental-strip-types scripts/check-gateway-profile-ui.mts
+
+gateway profile UI checks passed
+(node:38632) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/gatewayProfileView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:text-layout
+> node --experimental-strip-types scripts/check-text-layout.mts
+
+text layout checks passed（4660 条规则 / 6 组路径）
+
+> check:operation-plan
+> node --experimental-strip-types scripts/check-operation-plan.mts
+
+operation plan checks passed（7 个依赖动作 / 7 个后端取值）
+(node:37816) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/components/operationPlanText.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:projection-requeue
+> node --experimental-strip-types scripts/check-projection-requeue.mts
+
+projection-requeue UI checks passed
+
+> check:acp-profiles
+> node --experimental-strip-types scripts/check-acp-profiles.mts
+
+acp profile checks passed（命令解析 / ID 派生 / 状态判读 / 4 个预设）
+(node:44888) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/acpProfileView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:runtime-providers
+> node --experimental-strip-types scripts/check-runtime-providers.mts
+
+runtime provider checks passed（运行环境命名 / 品牌判定 / 探测状态 / 页面接线）
+(node:41140) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/acpProfileView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:mcp-servers
+> node --experimental-strip-types scripts/check-mcp-servers.mts
+
+check:mcp-servers OK
+(node:30696) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/src/pages/mcpServerView.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> check:settings-ia
+> node --experimental-strip-types scripts/check-settings-ia.mts
+
+settings IA: 3 组 / 8 条，深链白名单、窄窗折叠、AI 连接约定校验通过
+
+> check:engine
+> node --experimental-strip-types scripts/check-engine.mts
+
+engine UI checks passed
+
+> check:copy
+> node --experimental-strip-types scripts/check-copy.mts
+
+提示：19 条文案在多处重复，确认是否有必要逐处重写。
+  ×3 这些工具会在对话里提供给 HiMind AI 调用，停用后不再加载。
+  ×2 插件更新了凭据声明，请核对字段后重新保存。
+  ×2 停止对接 AI 工作台，保留本机能力
+  ×2 和终端里一样，按空格切分；路径含空格时用双引号包起来。
+  ×2 开发工具尚未就绪，请检查来源设置
+copy checks passed（113 个文件 / 40+ 字 0 条 / 28+ 字 28 条）
+
+> check:design-tokens
+> node scripts/check-design-tokens.mjs
+
+{
+  "tokens": 24,
+  "contrast": {
+    "bodyOnSurface": 17.44,
+    "mutedOnSurface": 6.24,
+    "subtleOnMuted": 5.16,
+    "neutralBadge": 4.74,
+    "primaryOnSurface": 8.66,
+    "controlBorderOnSurface": 3.66,
+    "controlBorderOnMuted": 3.19
+  },
+  "type": {
+    "meta": 12,
+    "body": 13,
+    "title": 14
+  }
+}
+design token checks passed

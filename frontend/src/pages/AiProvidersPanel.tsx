@@ -96,6 +96,7 @@ function balanceProfileForPreset(baseUrl: string): string {
 
 type AiProvidersPanelProps = {
   aiServices: AIServiceListResult | null;
+  loadError?: string;
   templates: AIServiceTemplateListResult | null;
   onRefresh: () => void;
   onSaveAIService: (input: {
@@ -164,6 +165,7 @@ function serviceHealthLabel(provider: MediaProviderCatalogResult['providers'][nu
 
 export function AiProvidersPanel({
   aiServices,
+  loadError = '',
   templates,
   onRefresh,
   onSaveAIService,
@@ -211,6 +213,7 @@ export function AiProvidersPanel({
   const managed = aiServices?.managed ?? { available: false };
   const clientStatuses = [...new Map((aiServices?.clients?.targets ?? []).map(client => [client.target, client])).values()];
   const serviceCount = customServices.length;
+  const servicesLoading = !aiServices && !loadError;
   const editing = editingServiceId !== null;
 
   useEffect(() => {
@@ -651,12 +654,12 @@ export function AiProvidersPanel({
         <span>{catalogTime ? `最近成功快照：${catalogTime}` : '尚无成功快照'}</span>
         {catalogState === 'error' || catalogState === 'denied' ? <button className="btn" onClick={() => setCatalogRevision(value => value + 1)}>重试健康目录</button> : null}
       </div>
-      <section className={`ai-overview ${serviceCount ? 'ready' : 'attention'}`}>
+      <section className={`ai-overview ${servicesLoading ? 'loading' : serviceCount ? 'ready' : 'attention'}`} aria-busy={servicesLoading}>
         <div className="ai-overview-main">
           <div className="ai-overview-icon"><PlugZap size={20} /></div>
           <div className="ai-overview-copy">
             <span className="ai-overview-eyebrow">AI 服务</span>
-            <strong>{serviceCount ? `${serviceCount} 个本机 AI 服务` : '还没有可用的 AI 服务'}</strong>
+            <strong>{servicesLoading ? '正在读取 AI 服务…' : !aiServices && loadError ? 'AI 服务读取失败' : serviceCount ? `${serviceCount} 个本机 AI 服务` : '尚未配置本机 AI 服务'}</strong>
             <span>对话、图像、视频和音频可共用服务；默认项在「能力路由」。</span>
           </div>
         </div>
@@ -669,13 +672,14 @@ export function AiProvidersPanel({
         <div className="ai-section-heading">
           <div><h3 id="ai-managed-title">工作台 AI 服务</h3><span>由 AI 工作台管理，不计入本机 AI 服务数量。</span></div>
         </div>
-        <ManagedSourceRow managed={managed} active={!activeServiceId} clientStatuses={clientStatuses} onOpenAccount={onOpenAccount} onRefresh={onRefresh} />
+        {aiServices ? <ManagedSourceRow managed={managed} active={!activeServiceId} clientStatuses={clientStatuses} onOpenAccount={onOpenAccount} onRefresh={onRefresh} /> : <div className="ai-empty-row" role="status">{servicesLoading ? <BusyIndicator size={14} /> : <CircleX size={14} />}<span>{servicesLoading ? '正在读取工作台 AI 服务…' : '工作台 AI 服务状态未知'}</span></div>}
       </section>
 
+      {loadError && aiServices ? <p role="status" className="ai-service-refresh-error">刷新失败，当前显示上次配置。<button className="btn" onClick={onRefresh}>重试</button></p> : null}
       <section className="ai-client-section" aria-labelledby="ai-services-title">
         <div className="ai-section-heading">
           <div><h3 id="ai-services-title">本机 AI 服务</h3><span>连接、凭据和能力在这里管理；路由与工具分发在各自页面完成。</span></div>
-          <div className="ai-section-tail"><Pill kind="neutral">{serviceCount}</Pill></div>
+          <div className="ai-section-tail"><Pill kind="neutral">{aiServices ? serviceCount : '—'}</Pill></div>
         </div>
 
         <div className="ai-service-toolbar">
@@ -712,7 +716,7 @@ export function AiProvidersPanel({
               onRemove={() => void onRemoveAIService(service.id)}
             />
           ))}
-          {!serviceCount ? <div className="ai-empty-row" role="status"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>{aiServices ? '暂无本机 AI 服务，点「新增 AI 服务」连接一个模型来源。' : '正在读取 AI 服务配置，请稍候；若持续无响应请刷新。'}</span></div> : null}
+          {!serviceCount ? <div className="ai-empty-row" role="status"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>{aiServices ? '暂无本机 AI 服务，点「新增 AI 服务」连接一个模型来源。' : loadError || '正在读取 AI 服务配置…'}</span>{loadError && !aiServices ? <button className="btn" onClick={onRefresh}>重试</button> : null}</div> : null}
           {serviceCount && !filteredServices.length ? <div className="ai-empty-row"><span className="ai-empty-icon"><Search size={14} /></span><span>没有匹配的服务，换一个关键词或能力筛选。</span></div> : null}
         </div>
       </section>

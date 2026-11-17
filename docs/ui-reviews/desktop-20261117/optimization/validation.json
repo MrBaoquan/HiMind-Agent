@@ -1,0 +1,152 @@
+{
+  "status": "passed",
+  "worktree": "C:\\Users\\Administrator\\.codex\\worktrees\\agent-desktop-ui\\himind-agent",
+  "branch": "codex/agent-desktop-ui",
+  "base_commit": "6e59856",
+  "dirty_source": true,
+  "checks": [
+    {
+      "command": "npm --prefix frontend run check:ui",
+      "exit_code": 0,
+      "check_count": 34
+    },
+    {
+      "exit_code": 0,
+      "command": "npm --prefix frontend run build"
+    },
+    {
+      "exit_code": 0,
+      "command": "cargo build --locked --release --bin himind-agent --bin himind-agent-mcp"
+    },
+    {
+      "groups": 9,
+      "command": "check:desktop-ui-browser",
+      "exit_code": 0
+    },
+    {
+      "main_pages": 9,
+      "command": "inspect-native.cjs",
+      "exit_code": 0,
+      "settings_pages": 1
+    }
+  ],
+  "native": {
+    "cdp_port": 9312,
+    "low_integrity_label": false,
+    "profile": "development",
+    "build": {
+      "channel": "local",
+      "commit": "6e59856"
+    },
+    "pid": 37816,
+    "capabilities": 330,
+    "os_window_visible": true,
+    "stderr_bytes": 0,
+    "events": {
+      "since": "2026-11-17T12:30:47.3806805+08:00",
+      "observed_events": 21,
+      "warning_or_error_count": 0,
+      "messages": null
+    },
+    "os_window_title": "HiMind Agent 设置",
+    "port": 18082
+  },
+  "artifacts": [
+    {
+      "name": "himind-agent.exe",
+      "source": "C:\\Users\\Administrator\\.codex\\worktrees\\agent-desktop-ui\\himind-agent\\target\\release\\himind-agent.exe",
+      "launch_copy": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\himind-agent-test-release-97A9F29366FF\\himind-agent.exe",
+      "source_sha256": "97A9F29366FF8130D545FB3E02C78CB11BC607D7EF5920B5AFD079D0CACF8B69",
+      "copy_sha256": "97A9F29366FF8130D545FB3E02C78CB11BC607D7EF5920B5AFD079D0CACF8B69",
+      "signature": "Valid",
+      "signer": "CN=HiMind Software Publisher, O=AndCrane"
+    },
+    {
+      "name": "himind-agent-mcp.exe",
+      "source": "C:\\Users\\Administrator\\.codex\\worktrees\\agent-desktop-ui\\himind-agent\\target\\release\\himind-agent-mcp.exe",
+      "launch_copy": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\himind-agent-test-release-97A9F29366FF\\himind-agent-mcp.exe",
+      "source_sha256": "4E18BC7FE00F8CCF05ADECA8E574AF01E1592E05E8ED6BF542E5CEC3F71AB7F6",
+      "copy_sha256": "4E18BC7FE00F8CCF05ADECA8E574AF01E1592E05E8ED6BF542E5CEC3F71AB7F6",
+      "signature": "Valid",
+      "signer": "CN=HiMind Software Publisher, O=AndCrane"
+    }
+  ],
+  "source_hashes": [
+    {
+      "path": "frontend/package.json",
+      "sha256": "023504E04AA409656D3E782576BD381966CA47CE17D7546D771A87FAF2C2779E"
+    },
+    {
+      "path": "frontend/scripts/check-desktop-ui.browser.mjs",
+      "sha256": "A3465F58E4F0C8041D936ECF8928119924ED0A9C482CF6B6F89C3421FF67FD13"
+    },
+    {
+      "path": "frontend/scripts/fixtures/desktop-ui.fixture.tsx",
+      "sha256": "3969152C8DDC5356F2779AD085E435617B32777F578D0DC2FA47F6106ED477F5"
+    },
+    {
+      "path": "frontend/scripts/fixtures/desktop-ui.html",
+      "sha256": "69A7A8BF8EAE1D909DBD5341F88C13D6A6584EB96FA43E0F8CE9B497E9A80A8B"
+    },
+    {
+      "path": "frontend/src/components/Shell.tsx",
+      "sha256": "09B7FD99BB5FCBA647BF043B18FD8074B45C173FDFB0E813CDC1C272214313F6"
+    },
+    {
+      "path": "frontend/src/main.tsx",
+      "sha256": "FB637CF99C9B152DD4C938AD5237354D6569C412A897AD803A183BE3403BBF35"
+    },
+    {
+      "path": "frontend/src/pages/AiConnectionsPage.tsx",
+      "sha256": "E96C7C628F73657687029B7F8771013938A8AA3D9B5162C5A31A590AC8AC7910"
+    },
+    {
+      "path": "frontend/src/pages/AiProvidersPanel.tsx",
+      "sha256": "6BAF3B18D372CAA2E57F3383EAD94A8B890CC1B651BE3168719981D990B2EFE0"
+    },
+    {
+      "path": "frontend/src/pages/DashboardPage.tsx",
+      "sha256": "09F489F05CB5DCCF7E3572AC8B1351BD32DB6A1786DDC3BC89B6719F0FF55978"
+    },
+    {
+      "path": "frontend/src/pages/InboxPage.tsx",
+      "sha256": "21D5E4D583D779D53AFF23FB7E8C26A074309AF35F3F8A813774AE2EF80EF535"
+    },
+    {
+      "path": "frontend/src/pages/ServiceUi.css",
+      "sha256": "A97728068F2344607D8764F3CEE073461EE7CADF47AB75ED2FA3A1392726C66D"
+    },
+    {
+      "path": "frontend/src/pages/TaskCenterPage.tsx",
+      "sha256": "5565C7D2A66F77036492A47E136698ABC314013818246231C42FE7B848171CE0"
+    },
+    {
+      "path": "frontend/src/pages/workflowIssuePresentation.ts",
+      "sha256": "A143C53128D4B547BF654B9B72BA561F79CA0208C2181FB90873C107899F829B"
+    },
+    {
+      "path": "frontend/src/pages/WorkflowsPage.tsx",
+      "sha256": "ABE9F1BCA2DF10E9459BB82F22861418C5B6DFA8EC23E17932BABDE976957326"
+    },
+    {
+      "path": "frontend/src/pages/WorkspaceRegistryPage.css",
+      "sha256": "17543F3FA19B7D8373690C22951C99C2E0900E44ECEF2664BF0667F1C23737D8"
+    },
+    {
+      "path": "frontend/styles.css",
+      "sha256": "3611293726E922FA059E0A5C46F5A8543AB1B37700C19DC0FA56483F7BD42709"
+    }
+  ],
+  "coverage": {
+    "native_result": "native-result.json",
+    "zoom": 1,
+    "no_pending_items_in_development": true,
+    "accessibility_special_audit": false,
+    "ready_state_verified_in_fixture": true,
+    "actual_native_ai_services": 4,
+    "no_collaboration_tasks_in_development": true,
+    "fixture_result": "fixture/result.json",
+    "mobile_or_extreme_viewports": false,
+    "no_workflow_library_errors_in_development": true
+  }
+}

@@ -1,0 +1,631 @@
+{
+  "passed": true,
+  "checks": [
+    "scoped-workbench-status",
+    "native-empty-inbox",
+    "native-conversation-host-preserved",
+    "nine-native-pages-titles-and-navigation",
+    "native-tool-label-complete",
+    "native-settings-ai-services-loaded"
+  ],
+  "results": [
+    {
+      "id": "01-home",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "首页",
+          "x": 214,
+          "y": 114,
+          "width": 305.546875,
+          "height": 26,
+          "clientWidth": 306,
+          "scrollWidth": 306,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".overview-facts",
+          "text": "版本\nv0.3.92\n工作台账号\n未授权\n本机服务\n运行中\n工作台任务\n未授权",
+          "x": 214,
+          "y": 571,
+          "width": 1036,
+          "height": 62.5,
+          "clientWidth": 1034,
+          "scrollWidth": 1034,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".workspace-status-panel",
+          "text": "AI 工作台\n待授权\n未连接工作台\n本机功能不受影响。\n停止对接\n授权\n待审批\n0\n远程任务\n已开启\nAI 工具\n未安装",
+          "x": 214,
+          "y": 258.5,
+          "width": 1036,
+          "height": 168.5,
+          "clientWidth": 1034,
+          "scrollWidth": 1034,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "rgba(17, 24, 39, 0.06) 0px 1px 2px 0px, rgba(17, 24, 39, 0.08) 0px 1px 3px 0px"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "02-tasks",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "我的任务",
+          "x": 214,
+          "y": 114,
+          "width": 247,
+          "height": 26,
+          "clientWidth": 247,
+          "scrollWidth": 247,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": [],
+      "departureScrollTop": 400
+    },
+    {
+      "id": "03-inbox",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "需要我处理",
+          "x": 214,
+          "y": 114,
+          "width": 99.015625,
+          "height": 26,
+          "clientWidth": 99,
+          "scrollWidth": 99,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": [],
+      "departureScrollTop": 0
+    },
+    {
+      "id": "04-workspaces",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".workspace-registry-head h2",
+          "text": "工作区",
+          "x": 214,
+          "y": 114,
+          "width": 290.9375,
+          "height": 26,
+          "clientWidth": 291,
+          "scrollWidth": 291,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": [],
+      "departureScrollTop": 0
+    },
+    {
+      "id": "05-workflows",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "工作流",
+          "x": 214,
+          "y": 114,
+          "width": 59.40625,
+          "height": 26,
+          "clientWidth": 59,
+          "scrollWidth": 59,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "06-schedules",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "定时计划",
+          "x": 214,
+          "y": 114,
+          "width": 79.203125,
+          "height": 26,
+          "clientWidth": 79,
+          "scrollWidth": 79,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "07-market",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "市场",
+          "x": 214,
+          "y": 114,
+          "width": 39.609375,
+          "height": 26,
+          "clientWidth": 40,
+          "scrollWidth": 40,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "08-installed",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "我的能力",
+          "x": 214,
+          "y": 114,
+          "width": 234,
+          "height": 26,
+          "clientWidth": 234,
+          "scrollWidth": 234,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "09-development",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 1280,
+      "scrollTop": 0,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "扩展开发",
+          "x": 214,
+          "y": 114,
+          "width": 225.9375,
+          "height": 26,
+          "clientWidth": 226,
+          "scrollWidth": 226,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button",
+          "text": "全部工具\n4",
+          "x": 1138,
+          "y": 48.5,
+          "width": 120,
+          "height": 32,
+          "clientWidth": 118,
+          "scrollWidth": 118,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1171.5,
+          "y": 55.5,
+          "width": 48,
+          "height": 18,
+          "clientWidth": 48,
+          "scrollWidth": 48,
+          "fontSize": "12px",
+          "fontWeight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    },
+    {
+      "id": "10-ai-services",
+      "viewport": {
+        "width": 980,
+        "height": 720,
+        "dpr": 1,
+        "scale": 1
+      },
+      "documentWidth": 980,
+      "metrics": [
+        {
+          "selector": ".page-header h1",
+          "text": "AI 连接",
+          "x": 244,
+          "y": 24,
+          "width": 390.078125,
+          "height": 26,
+          "clientWidth": 390,
+          "scrollWidth": 390,
+          "fontSize": "20px",
+          "fontWeight": "600",
+          "lineHeight": "26px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        },
+        {
+          "selector": ".ai-overview",
+          "text": "AI 服务\n4 个本机 AI 服务\n一个服务可承载对话或媒体能力；默认路由在「能力路由」查看。\n新增 AI 服务",
+          "x": 244,
+          "y": 187.890625,
+          "width": 693,
+          "height": 86,
+          "clientWidth": 691,
+          "scrollWidth": 691,
+          "fontSize": "13px",
+          "fontWeight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shadow": "none"
+        }
+      ],
+      "ready": [],
+      "dialogs": []
+    }
+  ],
+  "errors": []
+}

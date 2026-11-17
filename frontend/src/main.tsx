@@ -227,6 +227,7 @@ function AgentApp() {
   // 「浏览 MCP 工具」是一次性跳转请求：市场消费掉之后清零，否则每次进市场都会再切一次页签。
   const [openMcpRequest, setOpenMcpRequest] = useState(0);
   const [aiServices, setAiServices] = useState<AIServiceListResult | null>(null);
+  const [aiServicesError, setAiServicesError] = useState('');
   const [aiServiceTemplates, setAiServiceTemplates] = useState<AIServiceTemplateListResult | null>(null);
   const [acpRuntimeProfiles, setAcpRuntimeProfiles] = useState<AcpRuntimeProfileSnapshot | null>(null);
   // 用量只做网关这一条口径（ADR 0113）：平台口径留在工作台，不在 Agent 重复展示。
@@ -445,7 +446,11 @@ function AgentApp() {
     return singleFlight('mcp-targets', async () => { setMcpTargets(await agentApi.mcpTargets()); });
   }
   async function refreshAIServices() {
-    return singleFlight('ai-services', async () => { setAiServices(await agentApi.listAIServices()); });
+    return singleFlight('ai-services', async () => {
+      setAiServicesError('');
+      try { setAiServices(await agentApi.listAIServices()); }
+      catch (error) { setAiServicesError('AI 服务读取失败，请重试'); throw error; }
+    });
   }
   async function refreshGatewayProfiles() {
     return singleFlight('gateway-profiles', async () => { setGatewayProfiles(await agentApi.listGatewayProfiles()); });
@@ -2239,6 +2244,7 @@ function AgentApp() {
       testResult={mcpTestResult}
       busyAction={aiOperation}
       aiServices={aiServices}
+      aiServicesError={aiServicesError}
       aiServiceTemplates={aiServiceTemplates}
       gatewayStatus={inferenceGateway}
       gatewayProfiles={gatewayProfiles}
@@ -2470,6 +2476,7 @@ function AgentApp() {
       }, undefined, '恢复正式版失败')}
       onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
       onOpenExtensions={() => setPage('extensions')}
+      onInspectPlugins={() => openInstalled('plugin')}
       onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
       onLoadPresets={(workflowId) => agentApi.workflowPresets(workflowId)}
       onSavePreset={(input) => run(async () => { await agentApi.setWorkflowPreset(input); }, '启动方案已保存', '保存启动方案失败')}
@@ -2713,6 +2720,7 @@ function AgentApp() {
         }, undefined, '恢复正式版失败')}
         onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
         onOpenExtensions={() => setPage('extensions')}
+      onInspectPlugins={() => openInstalled('plugin')}
         onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
         onLoadPresets={(workflowId) => agentApi.workflowPresets(workflowId)}
         onSavePreset={(input) => run(async () => { await agentApi.setWorkflowPreset(input); }, '启动方案已保存', '保存启动方案失败')}

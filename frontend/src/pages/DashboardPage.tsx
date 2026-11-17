@@ -145,9 +145,9 @@ export function DashboardPage({
         <div><span>版本</span><strong>v{status.version}</strong></div>
         {/* 这一格只回答「账号现在能不能用工作台」：写死「已对接」会和上面
             同时出现的「需要登录」自相矛盾。 */}
-        <div><span>AI 工作台</span><strong>{providerAvailable ? '已连接' : provider?.message || '未连接'}</strong></div>
+        <div><span>工作台账号</span><strong>{providerAvailable ? '已授权' : '未授权'}</strong></div>
         <div><span>本机服务</span><strong>运行中</strong></div>
-        <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
+        <div><span>工作台任务</span><strong>{!providerEnabled ? '未启用' : !providerAvailable ? '未授权' : !workerOnline ? '连接异常' : status.current_task ? '执行中' : '无任务'}</strong></div>
       </section>
     </div>
   );

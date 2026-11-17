@@ -1,0 +1,63 @@
+
+> build
+> node scripts/remediation/service-ui-build.mjs
+
+vite v8.1.4 building client environment for production...
+(node:40828) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///C:/Users/Administrator/.codex/worktrees/agent-desktop-ui/himind-agent/frontend/vite.config.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\frontend\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[2K
+transforming...✓ 3241 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                       0.70 kB │ gzip:   0.37 kB
+dist/assets/AiConnectionsPage-CHlBWLDs.css            2.65 kB │ gzip:   0.85 kB
+dist/assets/WorkspaceRegistryPage-d5qzoZAu.css       31.97 kB │ gzip:   4.47 kB
+dist/assets/index-DcKaGTWv.css                      454.25 kB │ gzip:  65.13 kB
+dist/assets/chevron-up-pOyEkdVR.js                    0.11 kB │ gzip:   0.13 kB
+dist/assets/pathDisplay-q0FzifhU.js                   0.17 kB │ gzip:   0.17 kB
+dist/assets/rotate-ccw-CHAbnNrU.js                    0.18 kB │ gzip:   0.17 kB
+dist/assets/circle-x-fG-m-NP4.js                      0.19 kB │ gzip:   0.17 kB
+dist/assets/ellipsis-BB_krqcd.js                      0.21 kB │ gzip:   0.15 kB
+dist/assets/activity-D8LxVp14.js                      0.22 kB │ gzip:   0.19 kB
+dist/assets/copy-D24JKGXu.js                          0.22 kB │ gzip:   0.19 kB
+dist/assets/history-BWcqZs-S.js                       0.22 kB │ gzip:   0.18 kB
+dist/assets/upload-B--1K6lp.js                        0.24 kB │ gzip:   0.20 kB
+dist/assets/book-open-B8tJ8n41.js                     0.26 kB │ gzip:   0.19 kB
+dist/assets/git-branch-D54lZ-j8.js                    0.26 kB │ gzip:   0.21 kB
+dist/assets/send-BqD9j5lf.js                          0.28 kB │ gzip:   0.22 kB
+dist/assets/clipboard-check-CUn854VQ.js               0.29 kB │ gzip:   0.22 kB
+dist/assets/folder-plus-gSqM29hR.js                   0.29 kB │ gzip:   0.21 kB
+dist/assets/github-C3PTJ1OU.js                        0.39 kB │ gzip:   0.28 kB
+dist/assets/unplug-N8F_SZuT.js                        0.43 kB │ gzip:   0.25 kB
+dist/assets/clock-mhJf1rgU.js                         0.63 kB │ gzip:   0.29 kB
+dist/assets/file-text-DzZ9Aw0E.js                     0.69 kB │ gzip:   0.34 kB
+dist/assets/InstalledPage-DcQDCIol.js                 0.82 kB │ gzip:   0.53 kB
+dist/assets/categoryCatalog-D4inMqbK.js               1.42 kB │ gzip:   0.76 kB
+dist/assets/timeFormat-CTHNwBh7.js                    2.22 kB │ gzip:   1.09 kB
+dist/assets/runtimeProviderView-b7MlnH2j.js           3.69 kB │ gzip:   1.75 kB
+dist/assets/InboxPage-CplbOjgV.js                     6.37 kB │ gzip:   2.00 kB
+dist/assets/ApprovalsPage-GTWZ5Kcb.js                 6.43 kB │ gzip:   2.56 kB
+dist/assets/ExpertStudioPanel-PqHSaLtj.js             8.63 kB │ gzip:   3.15 kB
+dist/assets/ManagedCapabilitiesPage-C8axzsMH.js      10.47 kB │ gzip:   3.48 kB
+dist/assets/Common-sk5syyoH.js                       11.21 kB │ gzip:   4.28 kB
+dist/assets/InstructionProjectionPanel-nDCOOY9P.js   15.57 kB │ gzip:   4.65 kB
+dist/assets/preflightNote-DVIcJ0Kc.js                17.44 kB │ gzip:   5.93 kB
+dist/assets/DashboardPage-Chg3x2Vq.js                22.71 kB │ gzip:   7.15 kB
+dist/assets/SchedulesPage-5VjQjoKR.js                41.62 kB │ gzip:  12.15 kB
+dist/assets/WorkspaceRegistryPage-BP9D-O5D.js        59.15 kB │ gzip:  16.23 kB
+dist/assets/ExtensionDevelopmentPage-CXhUqqEF.js     60.49 kB │ gzip:  16.48 kB
+dist/assets/ExtensionsPage-DYjZBK2E.js               62.22 kB │ gzip:  17.28 kB
+dist/assets/WorkflowsPage-DtnDLIoS.js                79.20 kB │ gzip:  21.80 kB
+dist/assets/TaskCenterPage-DTf8TdWS.js               99.91 kB │ gzip:  28.57 kB
+dist/assets/SettingsPage-BsGqIaul.js                116.50 kB │ gzip:  30.44 kB
+dist/assets/AiConnectionsPage-C9-58ywc.js           126.02 kB │ gzip:  33.18 kB
+dist/assets/index-CyX0DD-P.js                       543.26 kB │ gzip: 164.03 kB
+
+✓ built in 418ms
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.

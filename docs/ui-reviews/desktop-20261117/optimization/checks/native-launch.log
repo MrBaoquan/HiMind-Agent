@@ -1,0 +1,13 @@
+Done Adding Additional Store
+Successfully signed: C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\target\release\himind-agent.exe
+
+Authenticode signed: C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\target\release\himind-agent.exe
+Started signed Release test Agent: pid=37816 port=18082 profile=development
+Source artifact: C:\Users\Administrator\.codex\worktrees\agent-desktop-ui\himind-agent\target\release\himind-agent.exe
+Medium-label launch copy: C:\Users\ADMINI~1\AppData\Local\Temp\himind-agent-test-release-97A9F29366FF\himind-agent.exe
+stdout: C:\Users\ADMINI~1\AppData\Local\Temp\himind-agent-test-release-97A9F29366FF\logs\Release-20261117-123046.stdout.log
+stderr: C:\Users\ADMINI~1\AppData\Local\Temp\himind-agent-test-release-97A9F29366FF\logs\Release-20261117-123046.stderr.log
+Test Agent ready: channel=Release version=0.3.92 profile=development port=18082 capabilities=330
+Source artifact SHA256: 97A9F29366FF8130D545FB3E02C78CB11BC607D7EF5920B5AFD079D0CACF8B69
+Launch executable SHA256: 97A9F29366FF8130D545FB3E02C78CB11BC607D7EF5920B5AFD079D0CACF8B69
+Authenticode: Valid / CN=HiMind Software Publisher, O=AndCrane

@@ -1,0 +1,244 @@
+{
+  "capturedAt": "2026-11-17T03:08:04.224Z",
+  "records": [
+    {
+      "id": "04-workspaces-ready",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "visualScale": 1
+      },
+      "metrics": [
+        {
+          "selector": ".workspace-registry-head h2",
+          "text": "工作区",
+          "x": 214,
+          "y": 114,
+          "width": 290.9375,
+          "height": 18.1875,
+          "font": "14px",
+          "weight": "700",
+          "lineHeight": "18.2px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 291,
+          "clientWidth": 291
+        }
+      ]
+    },
+    {
+      "id": "05-workflow-issues",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "visualScale": 1
+      },
+      "metrics": [
+        {
+          "selector": ".workflow-list-issue",
+          "text": "com.himind.workflow.daily-work-log\n读取失败 · v0.7.8 · 当前不可运行\nworkflow lock requires unavailable Plugin com.himind.work-log: plugin returned empty response: com.himind.work-log",
+          "x": 223,
+          "y": 334,
+          "width": 272.390625,
+          "height": 89.5,
+          "font": "13px",
+          "weight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 270,
+          "clientWidth": 270
+        },
+        {
+          "selector": ".workflow-list-issue",
+          "text": "com.himind.workflow.wechat-miniprogram-ci-delivery\n读取失败 · v1.0.0 · 当前不可运行\nworkflow lock Plugin com.himind.wechat-miniprogram-tools content changed",
+          "x": 223,
+          "y": 429.5,
+          "width": 272.390625,
+          "height": 89.5,
+          "font": "13px",
+          "weight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 270,
+          "clientWidth": 270
+        },
+        {
+          "selector": ".workflow-list-issue",
+          "text": "com.himind.workflow.wx-venue-upload\n读取失败 · v1.4.4 · 当前不可运行\nworkflow lock Plugin com.himind.wechat-miniprogram-tools content changed",
+          "x": 223,
+          "y": 525,
+          "width": 272.390625,
+          "height": 89.5,
+          "font": "13px",
+          "weight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 270,
+          "clientWidth": 270
+        },
+        {
+          "selector": ".workflow-list-issue-reason",
+          "text": "workflow lock requires unavailable Plugin com.himind.work-log: plugin returned empty response: com.himind.work-log",
+          "x": 270,
+          "y": 381.5,
+          "width": 176.390625,
+          "height": 33,
+          "font": "11px",
+          "weight": "400",
+          "lineHeight": "16.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 176,
+          "clientWidth": 176
+        },
+        {
+          "selector": ".workflow-list-issue-reason",
+          "text": "workflow lock Plugin com.himind.wechat-miniprogram-tools content changed",
+          "x": 270,
+          "y": 477,
+          "width": 176.390625,
+          "height": 33,
+          "font": "11px",
+          "weight": "400",
+          "lineHeight": "16.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 176,
+          "clientWidth": 176
+        },
+        {
+          "selector": ".workflow-list-issue-reason",
+          "text": "workflow lock Plugin com.himind.wechat-miniprogram-tools content changed",
+          "x": 270,
+          "y": 572.5,
+          "width": 176.390625,
+          "height": 33,
+          "font": "11px",
+          "weight": "400",
+          "lineHeight": "16.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 176,
+          "clientWidth": 176
+        }
+      ]
+    },
+    {
+      "id": "11-ai-services-ready",
+      "viewport": {
+        "width": 980,
+        "height": 720,
+        "dpr": 1,
+        "visualScale": 1
+      },
+      "metrics": [
+        {
+          "selector": ".ai-overview strong",
+          "text": "8 个本机 AI 服务",
+          "x": 311,
+          "y": 221.421875,
+          "width": 348,
+          "height": 22.5,
+          "font": "15px",
+          "weight": "600",
+          "lineHeight": "22.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 348,
+          "clientWidth": 348
+        },
+        {
+          "selector": ".page-header h1",
+          "text": "AI 连接",
+          "x": 244,
+          "y": 24,
+          "width": 390.078125,
+          "height": 28.59375,
+          "font": "22px",
+          "weight": "600",
+          "lineHeight": "28.6px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 390,
+          "clientWidth": 390
+        }
+      ]
+    },
+    {
+      "id": "01-home-final",
+      "viewport": {
+        "width": 1280,
+        "height": 820,
+        "dpr": 1,
+        "visualScale": 1
+      },
+      "metrics": [
+        {
+          "selector": ".workspace-status-panel",
+          "text": "AI 工作台\n已就绪\n超级管理员\n账号已登录 · 桌面端已就绪\n取消授权\n待审批\n0\n远程任务\n已开启\nAI 工具\n13/13 已连接",
+          "x": 214,
+          "y": 252.59375,
+          "width": 1021,
+          "height": 168.5,
+          "font": "13px",
+          "weight": "400",
+          "lineHeight": "19.5px",
+          "animation": "4.8s ease-in-out 0s infinite normal none running workspace-status-breathe",
+          "shrink": "1",
+          "scrollWidth": 1019,
+          "clientWidth": 1019
+        },
+        {
+          "selector": ".page-header h1",
+          "text": "首页",
+          "x": 214,
+          "y": 114,
+          "width": 305.546875,
+          "height": 28.59375,
+          "font": "22px",
+          "weight": "600",
+          "lineHeight": "28.6px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 306,
+          "clientWidth": 306
+        },
+        {
+          "selector": ".quick-access-all-button .quick-access-button-label",
+          "text": "全部工具",
+          "x": 1176.6875,
+          "y": 55.5,
+          "width": 44.3125,
+          "height": 18,
+          "font": "12px",
+          "weight": "500",
+          "lineHeight": "18px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 48,
+          "clientWidth": 44
+        },
+        {
+          "selector": ".overview-facts",
+          "text": "版本\nv0.3.92\nAI 工作台\n已连接\n本机服务\n运行中\n当前任务\n无任务",
+          "x": 214,
+          "y": 734.59375,
+          "width": 1021,
+          "height": 62.5,
+          "font": "13px",
+          "weight": "400",
+          "lineHeight": "19.5px",
+          "animation": "none 0s ease 0s 1 normal none running",
+          "shrink": "1",
+          "scrollWidth": 1019,
+          "clientWidth": 1019
+        }
+      ]
+    }
+  ]
+}

@@ -48,7 +48,7 @@ export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTod
   const total = approvals.length + workflowRuns.length + missionTodos.length;
 
   return (
-    <>
+    <div className="inbox-page">
       <PageHeader
         title="需要我处理"
         actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button><button className="btn" onClick={onRefresh}>刷新</button></div>}
@@ -67,14 +67,14 @@ export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTod
           <EmptyState icon={CheckCircle2} title="当前没有待处理事项" text="新的审批、反馈和人工交互会集中显示在这里。" />
         </div>
       ) : (
-        <div className="inbox-grid">
+        <div className={`inbox-grid${[missionTodos.length, approvals.length, workflowRuns.length].filter(Boolean).length === 1 ? ' is-single' : ''}`}>
           {missionTodos.length ? <section className="card inbox-section">
             <div className="inbox-section-header"><div><strong>协作任务待办</strong><span>需要处理的协作任务</span></div><Pill kind="warn">{missionTodos.length}</Pill></div>
             <div className="inbox-item-list">{missionTodos.map(todo => <button type="button" className="inbox-item inbox-item-button" data-todo-id={todo.id} data-snapshot-cursor={todo.cursor} data-wait-reason={todo.reason} data-wait-actor={todo.actor} key={todo.id} onClick={() => onOpenMission?.(todo.missionId)}>
               <div className="inbox-item-icon workflow"><ShieldCheck size={18}/></div><div className="inbox-item-main"><strong>{todo.title}</strong><span>{todo.action}</span></div><ArrowRight size={17}/>
             </button>)}</div>
           </section>:null}
-          <section className="card inbox-section">
+          {approvals.length ? <section className="card inbox-section">
             <div className="inbox-section-header">
               <div><strong>操作审批</strong><span>需要确认的敏感操作</span></div>
               <Pill kind={approvals.length ? 'warn' : 'neutral'}>{approvals.length}</Pill>
@@ -97,9 +97,9 @@ export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTod
                 ))}
               </div>
             ) : <div className="inbox-section-empty">暂无操作审批。</div>}
-          </section>
+          </section> : null}
 
-          <section className="card inbox-section">
+          {workflowRuns.length ? <section className="card inbox-section">
             <div className="inbox-section-header">
               <div><strong>工作流等待</strong><span>等待反馈、审批或填写信息</span></div>
               <Pill kind={workflowRuns.length ? 'warn' : 'neutral'}>{workflowRuns.length}</Pill>
@@ -121,9 +121,9 @@ export function InboxPage({ approvals, workflowRuns: allWorkflowRuns, missionTod
                 ))}
               </div>
             ) : <div className="inbox-section-empty">暂无等待中的工作流。</div>}
-          </section>
+          </section> : null}
         </div>
       )}
-    </>
+    </div>
   );
 }

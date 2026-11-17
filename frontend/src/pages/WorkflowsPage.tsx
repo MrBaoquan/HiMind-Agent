@@ -40,6 +40,7 @@ import { roleLabel, shortRunId } from './taskView';
 import { buildApprovalEvidence } from './approvalEvidence';
 import { buildInteractionForm, formToFeedback, initialFormState } from './interactionForm';
 import { runtimeProviderLabel } from './runtimeProviderView';
+import { workflowIssuePresentation } from './workflowIssuePresentation';
 
 type WorkflowsPageProps = {
   snapshot: WorkflowCenterSnapshot | null;
@@ -82,6 +83,7 @@ type WorkflowsPageProps = {
   onRemoveDevelopment: (packageId: string) => Promise<void>;
   onPickDirectory: () => Promise<string | null>;
   onOpenExtensions: () => void;
+  onInspectPlugins?: () => void;
   /** 跳到平台级「定时计划」页，并预选该工作流作为定时目标。 */
   onScheduleWorkflow: (workflowId: string) => void;
   onLoadPresets: (workflowId: string) => Promise<{ presets: WorkflowRunPreset[] }>;
@@ -547,7 +549,7 @@ function withExecutionOverrides(
   return Object.keys(overrides).length ? { execution_overrides: overrides } : {};
 }
 
-export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', onBackToTasks, loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', onBackToTasks, loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onInspectPlugins, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
   // 工作流页把「有哪些能力」和「跑成什么样」拆成两个页签：进来先看到能跑的工作流，
   // 而不是一张运行记录表；有活动运行时才在列表上方补一条运行态。
   const [pageTab, setPageTab] = useState<'library' | 'runs'>(() => (mode === 'library' ? 'library' : initialRunId ? 'runs' : 'library'));
@@ -1624,9 +1626,15 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                 <div className="workflow-list-issue" key={`issue:${issue.package_id}`}>
                   <span className="workflow-list-mark is-danger"><CircleAlert size={16} /></span>
                   <span>
-                    <strong>{issue.package_id}</strong>
-                    <small>读取失败{issue.version ? ` · v${issue.version}` : ''} · 当前不可运行</small>
-                    <small className="workflow-list-issue-reason" title={issue.message}>{issue.message}</small>
+                    <strong title={issue.package_id}>{issue.package_id.replace(/^com\.himind\.workflow\./, '')}</strong>
+                    <small>不可运行{issue.version ? ` · v${issue.version}` : ''}</small>
+                    <details className="workflow-issue-diagnostic">
+                      <summary>{workflowIssuePresentation(issue.message).reason}<ChevronRight size={12} /></summary>
+                      <p>{workflowIssuePresentation(issue.message).recovery}</p>
+                      <code>{issue.package_id}</code>
+                      <pre>{issue.message}</pre>
+                      {onInspectPlugins ? <button type="button" className="btn" onClick={onInspectPlugins}>检查已装插件</button> : null}
+                    </details>
                   </span>
                   <button
                     type="button"
@@ -1992,7 +2000,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                     onClick={() => {
                       setPendingConfirm({
                         title: '确认移除工作流？',
-                        description: `移除“${selectedWorkflow.package.name}”后它不再出现在这里，指向它的定时计划也会失效；需要时可从「市场」重装。`,
+                        description: `移除后，“${selectedWorkflow.package.name}”及关联计划将不可用；可从市场重装。`,
                         confirmText: '确认移除',
                         run: () => void performPackageAction('remove', () => onRemove(selectedWorkflow.package.id)),
                       });

@@ -6,7 +6,7 @@
 .workspace-registry > :not(.workspace-registry-view) { flex-shrink: 0; }
 .workspace-registry [hidden] { display: none !important; }
 .workspace-registry-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
-.workspace-registry-head h2 { margin: 0 0 var(--space-1); font-size: var(--fs-title); }
+.workspace-registry-head h2 { margin: 0 0 var(--space-1); font-size: var(--fs-page-title); font-weight: 600; line-height: var(--lh-page-title); }
 .workspace-registry-head p, .workspace-registry-list-head p { max-width: 64ch; margin: 0; color: var(--text-muted); font-size: var(--fs-body); line-height: 1.5; }
 .workspace-registry-status { color: var(--text-muted); font-size: var(--fs-meta); }
 .workspace-registry-status:empty { display: none; }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useRef, useLayoutEffect } from 'react';
 import { Activity, AlertCircle, Search } from 'lucide-react';
+import { tailPath } from './pathDisplay';
 // 状态图标链吃的是图标数据：同一个图标位在等待/运行/完成之间形变。
 import { CircleAlert, CircleCheck, CircleDashed, Clock, LoaderCircle as loaderIconData } from 'lucide';
 import { BusyIndicator } from '../components/BusyIndicator';
@@ -36,7 +37,7 @@ import { formatError } from '../types';
 import { CollaborationTaskDetail, CreateMissionDialog } from './MissionTeamPanel';
 import { useMissionCatalog, type MissionCatalog } from './useMissionCatalog';
 import { executionTodoId, activityNeedsUser, activityStatusLabel, projectTasks, missionTodo, workspaceKey, EMPTY_TASK_CONTEXT, type TaskListContext } from './taskCenterModel';
-import { missionActionActor, missionWait, missionResponsibility, missionNextAction, missionProgress, missionStage, missionStatusLabel, MISSION_STAGE_LABELS } from './missionView';
+import { missionActionActor, missionWait, missionNextAction, missionProgress, missionStage, missionStatusLabel, MISSION_STAGE_LABELS } from './missionView';
 
 type ActivitySource = 'dashboard' | 'workflow' | 'skill' | 'schedule';
 
@@ -344,9 +345,10 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, initialMissionId
             if (row.mission) {
               const mission=row.mission; const progress=missionProgress(mission); const activities=missionActivities(mission.mission_id); const todo=missionTodo(mission, activities); const wait=missionWait(mission);
               return <article className="task-center-row mission-task-entry" key={row.id} data-task-id={row.id} data-todo-id={todo?.id} data-snapshot-cursor={wait?.cursor} data-wait-reason={wait?.reason} data-wait-actor={missionActionActor(mission, activities)}>
-                <div className="task-center-row-main"><div className="task-center-row-title"><button type="button" className="task-title-link" onClick={()=>openMission(mission.mission_id)}>{row.title}</button><span className="task-center-source">协作任务</span><span className={'collaboration-task-status status-'+mission.status}>{missionStatusLabel(mission, [], activities)}</span></div>
-                <div className="task-center-row-meta"><span title={row.workspace}>{row.workspace || '未记录工作区'}</span><span>来源：{row.client}</span>{row.trigger?<span>{row.trigger}</span>:null}<time>{formatRelativeTime(row.updatedAt,now)}</time></div>
-                <p className="task-row-next">{missionNextAction(mission, [], activities)}</p><p className="task-row-next muted">{missionResponsibility(mission, activities)}</p><div className="task-center-row-meta"><span>阶段：{MISSION_STAGE_LABELS[missionStage(mission)]}</span>{progress.total?<span>{progress.done}/{progress.total} 项原始交付已通过验收 · {progress.awaitingVerification} 项待验收</span>:<span>未记录执行进度</span>}<button type="button" className="task-center-row-action" onClick={()=>openMission(mission.mission_id)}>{todo ? todo.action : '查看任务'}</button></div></div>
+                <div className="task-center-row-main"><div className="task-center-row-title"><button type="button" className="task-title-link" onClick={()=>openMission(mission.mission_id)}>{row.title}</button><span className={'collaboration-task-status status-'+mission.status}>{missionStatusLabel(mission, [], activities)}</span></div>
+                <div className="task-center-row-meta"><span className="task-workspace-label" title={row.workspace}>{row.workspace ? tailPath(row.workspace, 1) : '未记录工作区'}</span><span>{row.client}</span><time title={formatAbsoluteTime(row.updatedAt)}>{formatRelativeTime(row.updatedAt,now)}</time></div>
+                <p className="task-row-next" title={missionNextAction(mission, [], activities)}>{progress.total ? `${progress.done}/${progress.total} 项交付已验收${progress.awaitingVerification ? ` · ${progress.awaitingVerification} 项待验收` : ''}` : MISSION_STAGE_LABELS[missionStage(mission)]}{mission.status === 'failed' ? ` · ${missionNextAction(mission, [], activities)}` : ''}</p></div>
+                <button type="button" className="btn task-center-row-action" onClick={()=>openMission(mission.mission_id)}>{todo ? todo.action : '查看任务'}</button>
               </article>;
             }
             const item=row.activity!; const entry=item.source==='dashboard'?fromTask(item as unknown as AgentTaskHistoryItem):fromActivity(item);
