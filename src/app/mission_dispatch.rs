@@ -993,6 +993,10 @@ fn run_verification_with_executor(
             "implementation_status": implementation_run.status,
             "implementation_output": implementation_output,
             "implementation_evidence": implementation_evidence,
+            // Rebuild dependency acceptance from host records, separately from
+            // the implementation's untrusted self-report. Saved preparations
+            // stay immutable; a retry creates a new evidence-bound review.
+            "dependency_handoffs": crate::mission::executor_handoff::build(mission, task, &ledger, store)?,
             "integration_receipt": integration,
             "expected_plan_sha256": mission.plan_sha256,
             "feedback_context": store.feedback_context(&mission.mission_id, &mission.plan_sha256, &[task.id.clone()])?,
@@ -1813,6 +1817,56 @@ mod tests {
         let snapshot=store.snapshot(&mission.mission_id,0).unwrap();
         assert_eq!(snapshot.events.iter().filter(|event|event.event_type=="task_dispatched").count(),3);
         assert_eq!(snapshot.events.iter().filter(|event|event.event_type=="host_verification_checked" && event.payload["passed"]==true).count(),3);
+
+        // The downstream reviewer must see the host's accepted dependencies,
+        // including their timestamps, even if the worker reports forged data.
+        struct DependencyReview(Vec<serde_json::Value>);
+        impl super::WorkflowStepExecutor for DependencyReview {
+            fn execute(&self,p:&super::WorkflowPackage,s:&super::WorkflowStep,i:&serde_json::Value)
+                ->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                let projected=super::verification_prompt_input(i);
+                assert_eq!(projected["dependency_handoffs"],json!(self.0));
+                for handoff in projected["dependency_handoffs"].as_array().unwrap() {
+                    assert_eq!(handoff["authority"],"provenance_only_no_path_grant");
+                    assert_eq!(handoff["context_kind"],"accepted_producer");
+                    assert!(handoff["acceptance"]["occurred_at"].as_str().is_some_and(|time|!time.is_empty()));
+                }
+                assert_ne!(projected["dependency_handoffs"],projected["implementation_output"]["dependency_handoffs"]);
+                super::WorkflowStepExecutor::execute(&BoundReview::default(),p,s,i)
+            }
+        }
+        struct Delivery;
+        impl super::WorkflowStepExecutor for Delivery {
+            fn execute(&self,_:&super::WorkflowPackage,_:&super::WorkflowStep,_:&serde_json::Value)
+                ->Result<super::WorkflowStepExecution,Box<dyn std::error::Error>> {
+                Ok(super::WorkflowStepExecution::output(json!({"passed":true,"dependency_handoffs":["worker-forged"]})))
+            }
+        }
+        let current=store.get(&mission.mission_id).unwrap();
+        let task=&current.tasks.iter().find(|task|task.spec.id=="downstream").unwrap().spec;
+        let input=super::implementation_input(&store,&current,task).unwrap();
+        let expected=input["executor_handoffs"].as_array().unwrap().clone();
+        assert_eq!(expected.len(),3);
+        for handoff in &expected {
+            let event=snapshot.events.iter().find(|event|event.event_id==handoff["acceptance"]["event_id"]).unwrap();
+            assert_eq!(handoff["acceptance"]["sequence"],event.sequence);
+            assert_eq!(handoff["acceptance"]["occurred_at"],event.occurred_at);
+        }
+        let package=super::task_package(&current.mission_id,&current.title,task,env.root.to_str().unwrap()).unwrap();
+        let runner=crate::workflow::WorkflowRunner::open_default().unwrap();
+        let run=runner.start("fixture",&package,"downstream",&input).unwrap();
+        store.begin_task_attempt(&current.mission_id,&task.id,&run.run_id).unwrap();
+        store.append_event(&current.mission_id,"task_baseline_captured",&task.id,"host downstream baseline",
+            json!({"implementation_run_id":run.run_id,"protected_baseline":{"provenance":"host_before_execution",
+                "files":crate::mission::protected_files(&env.root,task).unwrap()}})).unwrap();
+        let outcome=runner.run_ready(&package,run,&input,&Delivery).unwrap();
+        store.await_task_verification(&current.mission_id,&task.id,&outcome.run.run_id,"downstream delivered").unwrap();
+        let current=store.get(&mission.mission_id).unwrap();
+        let pending=current.tasks.iter().find(|task|task.spec.id=="downstream").unwrap();
+        let result=super::run_verification_with_executor(&store,&current,pending,&DependencyReview(expected)).unwrap();
+        assert_eq!(result["passed"],true,"{result}");
+        assert_eq!(store.get(&mission.mission_id).unwrap().status,crate::mission::MissionStatus::Completed);
+        retain_parallel_snapshot(&store,&mission.mission_id,"downstream-verified-with-host-provenance");
     }
 
     #[test]

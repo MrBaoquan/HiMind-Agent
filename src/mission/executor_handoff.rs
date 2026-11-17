@@ -128,6 +128,7 @@ pub(crate) fn build(mission: &MissionView, receiver: &MissionTaskSpec, ledger: &
                 "verification_run_id":logical.verification_run_id,"verification_passed_projection":logical.verification_passed,
                 "note":"original run fields retained; completed parent projection does not attest its failed run"},
             "acceptance":acceptance.map(|host|json!({"event_id":host.event_id,"sequence":host.sequence,
+                "occurred_at":host.occurred_at,
                 "implementation_run_id":host.payload["implementation_run_id"],"verification_run_id":host.payload["verification_run_id"],
                 "checks":host.payload["checks"],"candidate":host.payload["candidate_before"]})),
             "attempts":run.steps.iter().map(|step| json!({"step_id":step.step_id,"attempt":step.attempt})).collect::<Vec<_>>(),
