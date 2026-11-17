@@ -70,9 +70,10 @@ type AiConnectionsPageProps = {
     speech_adapter: string;
     transcribe_model: string;
     transcribe_adapter: string;
-    /** 视觉理解专用模型；留空表示跟随对话模型（ADR 0023 第七条）。 */
+    /** 视觉理解专用模型；旧配置留空时跟随对话模型，新配置受 enabled_capabilities 限制。 */
     vision_model: string;
     media_models: Record<string, string[]>;
+    enabled_capabilities: AIServiceCapability[];
     balance_profile_id: string;
     balance_access_token: string;
     balance_user_id: string;
@@ -204,6 +205,7 @@ export function AiConnectionsPage({
             onRemoveAIService={onRemoveAIService}
             onCloneAIService={onCloneAIService}
             onOpenAccount={onOpenAccount}
+            onOpenRoutes={() => setActiveTab('routes')}
             onFetchModels={onFetchModels}
             onFetchSavedModels={onFetchSavedModels}
             onFetchBalance={onFetchBalance}

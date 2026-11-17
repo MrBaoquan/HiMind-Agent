@@ -3414,11 +3414,12 @@ pub(crate) fn save_ai_service(
     speech_adapter: Option<String>,
     transcribe_model: Option<String>,
     transcribe_adapter: Option<String>,
-    // 视觉理解专用模型。留空表示不写该槽位，运行时跟随服务对话模型（ADR 0023 第七条）。
+    // 视觉理解专用模型。留空不写槽位；旧配置跟随对话模型，显式配置受 enabled_capabilities 限制。
     vision_model: Option<String>,
     // 媒体能力的额外可选模型：能力 → 模型列表（不含默认模型）。
     // 与对话的 `models` 同义，供能力路由按模型选择。
     media_models: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    enabled_capabilities: Option<Vec<String>>,
     balance_profile_id: Option<String>,
     balance_access_token: Option<String>,
     balance_user_id: Option<String>,
@@ -3563,15 +3564,13 @@ pub(crate) fn save_ai_service(
         media,
         api_key,
     };
-    let service = match balance_profile_id.as_deref() {
-        Some(profile_id) => crate::store::ai_services::upsert_with_balance_profile(
-            input,
-            Some(profile_id),
-            balance_access_token.as_deref(),
-            balance_user_id.as_deref(),
-        ),
-        None => crate::store::ai_services::upsert(input),
-    }
+    let service = crate::store::ai_services::upsert_with_settings(
+        input,
+        balance_profile_id.as_deref(),
+        balance_access_token.as_deref(),
+        balance_user_id.as_deref(),
+        enabled_capabilities,
+    )
     .map_err(|e| e.to_string())?;
     let affected_clients =
         crate::app::ai_provider_import::refresh_all_binding_sync_states(&state.options);
