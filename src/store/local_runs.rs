@@ -107,7 +107,10 @@ impl LocalRunLedger {
         interaction.validate().map_err(std::io::Error::other)?;
         let payload = serde_json::to_string(interaction)?;
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // Parallel runners create distinct interactions in the same ledger.
+        // Reserve the writer before reading identity, avoiding an un-retryable
+        // deferred read-to-write upgrade when another runner commits first.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing: Option<(String, String)> = transaction
             .query_row(

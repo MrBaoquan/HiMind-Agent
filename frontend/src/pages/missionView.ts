@@ -1,4 +1,4 @@
-import type { AgentActivityItem, MissionEvent, MissionStatus, MissionStatus as MissionStatusType, MissionTaskStatus, MissionView } from '../services/agentApi';
+import type { AgentActivityItem, MissionEvent, MissionStatus, MissionStatus as MissionStatusType, MissionTaskStatus, MissionTaskView, MissionView } from '../services/agentApi';
 
 export const MISSION_STATUS_LABELS: Record<MissionStatus, string> = {
   draft: '待规划',
@@ -37,6 +37,24 @@ export function missionWait(mission: MissionView) {
     && wait.plan_sha256 === mission.plan_sha256
     && mission.confirmation?.plan_sha256 === mission.plan_sha256
     && Number.isSafeInteger(wait.cursor) && wait.cursor >= 0 ? wait : null;
+}
+
+/** Task Running records an occupied dispatch slot. Only the current attempt's
+ * explicitly owned ledger activity can establish live execution or waiting. */
+export function missionTaskActivity(mission: MissionView, task: MissionTaskView, activities: AgentActivityItem[] = []) {
+  if (!['active', 'waiting'].includes(mission.status) || task.status !== 'running' || !task.attempt_run_id) return undefined;
+  return activities.find(item => item.mission_id === mission.mission_id && item.mission_task_id === task.spec.id
+    && item.workflow_run_id === task.attempt_run_id);
+}
+
+export function missionRunningTasks(mission: MissionView, activities: AgentActivityItem[] = []) {
+  return mission.tasks.filter(task => missionTaskActivity(mission, task, activities)?.status === 'running');
+}
+
+export function missionTaskExecutionLabel(mission: MissionView, task: MissionTaskView, activities: AgentActivityItem[] = []) {
+  if (task.status !== 'running') return MISSION_TASK_STATUS_LABELS[task.status];
+  const activity = missionTaskActivity(mission, task, activities);
+  return activity?.status === 'running' ? '执行中' : activity?.status === 'waiting' ? '执行等待中' : '已派发，等待运行状态';
 }
 
 /** can_resume is a host admission, including ownership; the UI never invents it.
@@ -80,16 +98,19 @@ export function missionActionActor(mission: MissionView, activities: AgentActivi
 }
 
 export function missionResponsibility(mission: MissionView, activities: AgentActivityItem[] = []) {
+  const wait = missionWait(mission);
+  if (mission.status === 'waiting' && wait?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '当前工作正在收尾 · 后续派发已暂停 · 暂不可继续';
+  }
   if (missionRunningVerifications(mission, activities).length) return '另一位专家核验中 · 当前无需你操作';
   const resume = missionResumeAction(mission, activities);
   if (resume) return resume.responsibility;
-  const wait = missionWait(mission);
   if (mission.status === 'waiting') return wait?.actor === 'user'
-    ? wait.reason === 'manual_pause' ? '由你决定何时继续 · 当前无需处理' : '需要你处理'
+    ? wait.reason === 'manual_pause' ? '后续派发已暂停 · 当前不可继续，等待状态核对' : '需要你处理'
     : wait?.actor === 'system' ? '系统核对恢复资格 · 当前无可用续跑操作' : '处理者未确认 · 请刷新状态';
   if (['draft','planned','awaiting_assignment','awaiting_confirmation'].includes(mission.status)) return '需要你处理';
   if (mission.status !== 'active') return '当前无需你操作';
-  const running = mission.tasks.filter(task => task.status === 'running');
+  const running = missionRunningTasks(mission, activities);
   if (running.length) {
     const actors = [...new Set(running.map(task => {
       const execution = task.spec?.execution;
@@ -98,6 +119,8 @@ export function missionResponsibility(mission: MissionView, activities: AgentAct
     }))];
     return `${actors.join('、')}执行中 · 无需你操作`;
   }
+  if (mission.tasks.some(task => missionTaskActivity(mission, task, activities)?.status === 'waiting')) return '执行器等待中 · 查看关联执行的等待原因';
+  if (mission.tasks.some(task => task.status === 'running')) return '任务已派发 · 等待执行器运行状态';
   return mission.tasks.some(task => task.status === 'awaiting_verification')
     ? '系统检查与另一位专家核验 · 无需你操作' : '执行者未确认 · 等待系统更新';
 }
@@ -173,6 +196,7 @@ export function missionProgress(mission: MissionView) {
   return {
     done: deliveries.groups.filter(group => group.done).length,
     total: deliveries.groups.length,
+    // Occupied/assigned slots, including queued and waiting LocalRuns.
     running: selected.filter(task => task.status === 'running').length,
     awaitingVerification: selected.filter(task => task.status === 'awaiting_verification').length,
     startedVerification: selected.filter(task => task.status === 'awaiting_verification' && Boolean(task.verification_run_id)).length,
@@ -188,6 +212,9 @@ export function missionRuntimeBlocked(mission: MissionView, _events: MissionEven
 }
 
 export function missionStatusLabel(mission: MissionView, _events: MissionEvent[] = [], activities: AgentActivityItem[] = []) {
+  if (mission.status === 'waiting' && missionWait(mission)?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '已暂停后续派发 · 当前工作收尾中';
+  }
   if (missionRunningVerifications(mission, activities).length) return mission.status === 'waiting' ? '核验进行中 · 后续派发已暂停' : '核验进行中';
   const resume = missionResumeAction(mission, activities);
   if (resume?.kind === 'verification' && !resume.optional) return '待手动续跑核验';
@@ -198,7 +225,9 @@ export function missionStatusLabel(mission: MissionView, _events: MissionEvent[]
   }
   if (mission.status === 'active') {
     const progress = missionProgress(mission);
-    if (progress.running) return '专家执行中';
+    if (missionRunningTasks(mission, activities).length) return '专家执行中';
+    if (mission.tasks.some(task => missionTaskActivity(mission, task, activities)?.status === 'waiting')) return '执行等待中';
+    if (progress.running) return '已派发，等待运行状态';
     if (progress.awaitingVerification) return progress.startedVerification ? '核验任务已派发' : '待核验';
     return '状态待核对';
   }
@@ -231,6 +260,8 @@ export function eventLabel(event: MissionEvent) {
     plan_proposed: '生成计划',
     plan_confirmed: '确认计划',
     task_dispatched: '派发任务',
+    parallel_wave_admitted: '已安排一批任务',
+    parallel_wave_waiting: '调度等待依赖、名额或资源释放',
     task_baseline_captured: '记录执行前文件基线',
     verification_retry_override_authorized: '确认本次旧记录人工恢复授权',
     verification_retry_requested: '重新核验同一实现',
@@ -274,6 +305,29 @@ export function taskTitle(mission: MissionView, taskId: string) {
   return mission.tasks.find(task => task.spec.id === taskId)?.spec.title || taskId;
 }
 
+/** Latest scheduling decision for this Mission and confirmed plan, including a
+ * wave that admitted no task. Never carry a previous plan's wait into this one. */
+export function missionSchedulingWait(mission: MissionView, taskId: string, events: MissionEvent[]) {
+  if (!mission.plan_sha256) return '';
+  const event = events.filter(value => ['parallel_wave_admitted', 'parallel_wave_waiting'].includes(value.event_type.replace(/\./g, '_'))
+    && value.mission_id === mission.mission_id && value.payload.plan_sha256 === mission.plan_sha256)
+    .reduce<MissionEvent | undefined>((latest, value) => !latest || value.sequence > latest.sequence ? value : latest, undefined);
+  const scheduling = event?.payload.scheduling;
+  if (!scheduling || typeof scheduling !== 'object' || !('waiting' in scheduling) || !Array.isArray(scheduling.waiting)) return '';
+  const reason = scheduling.waiting.find(value => value?.task_id === taskId)?.reason;
+  if (!reason || typeof reason !== 'object') return '';
+  if (reason.code === 'dependencies_not_verified' && Array.isArray(reason.task_ids)) {
+    return `等待依赖通过验收：${reason.task_ids.filter((id: unknown) => typeof id === 'string').map((id: string) => taskTitle(mission, id)).join('、')}`;
+  }
+  if (reason.code === 'max_active_tasks' && typeof reason.limit === 'number') return `等待并发名额（上限 ${reason.limit}）`;
+  if (reason.code === 'executor_capacity' && typeof reason.limit === 'number') return `等待 ${reason.executor} 的执行名额（上限 ${reason.limit}）`;
+  if (reason.code === 'resource_busy' && typeof reason.holder_task_id === 'string') {
+    const resource = typeof reason.conflict?.name === 'string' ? ` · ${reason.conflict.name}` : '';
+    return `等待 ${taskTitle(mission, reason.holder_task_id)} 释放资源${resource}`;
+  }
+  return '';
+}
+
 /** 没有细粒度上游事件时，界面只能诚实展示状态和最近事件。 */
 export function progressDisclosure(mission: MissionView, events: MissionEvent[]) {
   if (events.length) return '按实际运行事件更新';
@@ -284,6 +338,9 @@ export function progressDisclosure(mission: MissionView, events: MissionEvent[])
 
 /** One sentence the list can show without opening the task. */
 export function missionNextAction(mission: MissionView, _events: MissionEvent[] = [], activities: AgentActivityItem[] = []) {
+  if (mission.status === 'waiting' && missionWait(mission)?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '等待当前工作收尾后，再选择继续；后续派发已暂停';
+  }
   if (missionRunningVerifications(mission, activities).length) return mission.status === 'waiting'
     ? '查看在途核验；当前步骤可收尾，后续派发已暂停' : '查看在途核验；不重复启动';
   switch (mission.status) {
@@ -292,8 +349,13 @@ export function missionNextAction(mission: MissionView, _events: MissionEvent[] 
     case 'awaiting_confirmation': return '审查计划与访问范围';
     case 'active': {
       const progress = missionProgress(mission);
-      if (progress.running && progress.awaitingVerification) return `${progress.running} 项执行中，${progress.awaitingVerification} 项结果待核验`;
-      if (progress.running) return '专家正在执行子任务';
+      const live = missionRunningTasks(mission, activities).length;
+      if (progress.running) {
+        const waiting = mission.tasks.some(task => missionTaskActivity(mission, task, activities)?.status === 'waiting');
+        const execution = live ? `${live} 项执行中${progress.running > live ? `，${progress.running - live} 项已派发等待` : ''}`
+          : waiting ? '执行器等待中，查看关联执行的等待原因' : '任务已派发，等待执行器运行状态';
+        return `${execution}${progress.awaitingVerification ? `，${progress.awaitingVerification} 项结果待核验` : ''}`;
+      }
       if (progress.awaitingVerification) return progress.startedVerification
         ? `${progress.startedVerification} 项核验任务已派发，等待状态更新` : `${progress.awaitingVerification} 项结果待核验`;
       return '等待系统更新执行或跟进状态；可查看最近记录';
@@ -304,7 +366,7 @@ export function missionNextAction(mission: MissionView, _events: MissionEvent[] 
       const wait = missionWait(mission);
       if (wait?.reason === 'budget_exhausted') return wait.can_increase_budget ? '增加预算并继续' : '预算已用尽，先核对运行状态';
       if (wait?.environment_blocked) return '选择工作区授权或仅用文件工具继续';
-      if (wait?.reason === 'manual_pause') return '由你决定何时续跑；继续尚未完成的任务';
+      if (wait?.reason === 'manual_pause') return '后续派发已暂停；当前不可继续，等待状态核对';
       if (wait?.reason === 'system_verification') return '核对核验恢复资格；当前不可续跑，不重复执行实现';
       return '刷新等待原因；资格未确认前不提交恢复或增额';
     }

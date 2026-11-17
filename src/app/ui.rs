@@ -602,6 +602,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::mission_commands::get_mission_snapshot,
             super::mission_commands::list_mission_execution_options,
             super::mission_commands::create_mission_handoff,
+            super::mission_commands::create_mission_intent,
             super::mission_commands::list_mission_assignment_options,
             super::mission_commands::assign_mission_roles,
             super::mission_commands::export_mission_workflow,

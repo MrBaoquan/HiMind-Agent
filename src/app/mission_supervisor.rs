@@ -240,7 +240,7 @@ mod tests {
             }, repair_of: String::new(),
         };
         MissionView {
-            schema_version: "mission.v1".to_string(), mission_id: id.to_string(), title: "Task".to_string(),
+            scheduling: None, schema_version: "mission.v1".to_string(), mission_id: id.to_string(), title: "Task".to_string(),
             objective: String::new(), status,
             workspace: MissionWorkspace { permission_mode: String::new(), root: "F:/repo".to_string(), read_scope: vec![], write_scope: vec![] },
             acceptance_criteria: vec!["ok".to_string()], plan_revision: 1, plan_sha256: "a".repeat(64),
@@ -268,7 +268,7 @@ mod tests {
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
-            summary: "test".to_string(),
+            scheduling: None, summary: "test".to_string(),
             tasks: vec![mission("unused", MissionStatus::Active, TaskStatus::Ready, true).tasks[0].spec.clone()],
             required_acceptance: vec!["ok".to_string()],
             budget: MissionBudget { max_rounds: 1, max_minutes: 1, max_repair_attempts: 0, max_total_tokens: None, max_cost: None, currency: None },
@@ -315,7 +315,7 @@ mod tests {
             acceptance_criteria: vec!["ok".to_string()],
         }).unwrap();
         let proposal = MissionPlanProposal {
-            summary: "repairable".to_string(),
+            scheduling: None, summary: "repairable".to_string(),
             tasks: vec![mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks[0].spec.clone()],
             required_acceptance: vec!["ok".to_string()],
             budget: MissionBudget { max_rounds: 3, max_minutes: 10, max_repair_attempts: 1, max_total_tokens: None, max_cost: None, currency: None },
@@ -431,7 +431,7 @@ mod tests {
             }).unwrap();
             let first = mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks.remove(0).spec;
             let mut next = first.clone(); next.id = "next".into(); next.depends_on = vec!["task".into()];
-            let proposal = MissionPlanProposal { summary: "boundary fixture".into(), tasks: vec![first, next],
+            let proposal = MissionPlanProposal { scheduling: None, summary: "boundary fixture".into(), tasks: vec![first, next],
                 required_acceptance: vec!["independent check".into()],
                 budget: MissionBudget { max_rounds: 10, max_minutes: 60, max_repair_attempts: 2, max_total_tokens: Some(100), max_cost: None, currency: None } };
             let planned = store.propose_plan(&created.mission_id, &proposal).unwrap();
@@ -594,7 +594,7 @@ mod tests {
         // legacy/corrupt persisted states and independent reviewer are fixtures.
         // No formal reviewer or installed host acceptance is claimed here.
         for case in ["pending", "pending-budget", "manual-pause", "environment",
-            "foreign-claim", "wrong-task", "wrong-run", "wrong-workspace",
+            "foreign-claim", "foreign-source-claim", "wrong-task", "wrong-run", "wrong-workspace",
             "missing-implementation", "missing-confirmation", "stale-confirmation",
             "empty-plan", "running-worker", "canceled", "active-verification"] {
             let root = std::env::temp_dir().join(format!("recovery-projection-{:016x}", rand::random::<u64>()));
@@ -609,7 +609,7 @@ mod tests {
             let first = mission("seed", MissionStatus::Active, TaskStatus::Ready, true).tasks.remove(0).spec;
             let mut next = first.clone(); next.id = "next".into(); next.depends_on = vec!["task".into()];
             let planned = store.propose_plan(&created.mission_id, &MissionPlanProposal {
-                summary: "recovery boundary".into(), tasks: vec![first, next], required_acceptance: vec!["separate review".into()],
+                scheduling: None, summary: "recovery boundary".into(), tasks: vec![first, next], required_acceptance: vec!["separate review".into()],
                 budget: MissionBudget { max_rounds: 100, max_minutes: 60, max_repair_attempts: 2,
                     max_total_tokens: Some(100), max_cost: None, currency: None },
             }).unwrap();
@@ -645,15 +645,21 @@ mod tests {
                     store.control(&foreign,"pause").unwrap();
                     db.execute("UPDATE mission_workspace_claims SET mission_id=?2 WHERE mission_id=?1", rusqlite::params![id,foreign]).unwrap();
                 },
+                "foreign-source-claim" => {
+                    let key: String = db.query_row("SELECT source_key FROM mission_workspace_claims WHERE mission_id=?1", [id], |r|r.get(0)).unwrap();
+                    let foreign = persist_confirmed_mission(&store, "foreign-source");
+                    store.control(&foreign,"pause").unwrap();
+                    db.execute("INSERT INTO mission_workspace_claims (workspace_key,mission_id,task_id,run_id,acquired_at,source_key) VALUES ('attempt:foreign-source',?1,'task','foreign-source-run','fixture',?2)", rusqlite::params![foreign,key]).unwrap();
+                },
                 "wrong-task" => { db.execute("UPDATE mission_workspace_claims SET task_id='next' WHERE mission_id=?1", [id]).unwrap(); },
                 "wrong-run" => { db.execute("UPDATE mission_workspace_claims SET run_id='obsolete' WHERE mission_id=?1", [id]).unwrap(); },
                 "wrong-workspace" => { let key: String = db.query_row("SELECT workspace_key FROM mission_workspace_claims WHERE mission_id=?1", [id], |r|r.get(0)).unwrap();
-                    db.execute("UPDATE mission_workspace_claims SET workspace_key='wrong' WHERE mission_id=?1", [id]).unwrap();
+                    db.execute("UPDATE mission_workspace_claims SET workspace_key='wrong',source_key='wrong' WHERE mission_id=?1", [id]).unwrap();
                     // Keep a foreign occupant at the current key so the legacy
                     // migration cannot legitimately restore this owned claim.
                     let foreign = persist_confirmed_mission(&store, "occupant");
                     store.control(&foreign,"pause").unwrap();
-                    db.execute("INSERT INTO mission_workspace_claims SELECT ?1,?2,'task','foreign-run','fixture'", rusqlite::params![key,foreign]).unwrap();
+                    db.execute("INSERT INTO mission_workspace_claims (workspace_key,mission_id,task_id,run_id,acquired_at) VALUES (?1,?2,'task','foreign-run','fixture')", rusqlite::params![key,foreign]).unwrap();
                 },
                 "missing-implementation" => { db.execute("UPDATE mission_tasks SET attempt_run_id='' WHERE mission_id=?1 AND task_id='task'", [id]).unwrap(); },
                 "missing-confirmation" => { db.execute("UPDATE mission_runs SET confirmation_json=NULL WHERE mission_id=?1", [id]).unwrap(); },

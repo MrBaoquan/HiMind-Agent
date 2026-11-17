@@ -11,12 +11,12 @@ fn check_definition(pin: &MissionExpertPin, definition: &crate::expert::ExpertDe
 }
 
 pub(crate) fn validate_expert_pin(pin: &MissionExpertPin) -> Result<(), Box<dyn Error>> {
-    let definition = crate::expert::get(&pin.expert_id, Some(&pin.expert_version))?;
+    let definition = crate::expert::get_pinned(&pin.expert_id, &pin.expert_version, &pin.expert_digest)?;
     check_definition(pin, &definition)
 }
 
 pub(crate) fn expert_instructions(pin: &MissionExpertPin) -> Result<String, Box<dyn Error>> {
-    let expert = crate::expert::get(&pin.expert_id, Some(&pin.expert_version))?;
+    let expert = crate::expert::get_pinned(&pin.expert_id, &pin.expert_version, &pin.expert_digest)?;
     check_definition(pin, &expert)?;
     Ok(format!("所选专家：{} @ {}\n{}\n输出要求：{}\n工作阶段：{}\n证据要求：{}\n恢复规则：{}\n技能引用：{}\n能力引用：{}\n引用不是授权；仍须遵守任务的计划、工具和访问范围。",
         expert.name, expert.version, expert.instructions,
@@ -61,7 +61,7 @@ fn validate_catalog_choices(input: &MissionAssignmentInput, catalog: &MissionAss
             service_id: role.service_id.clone(), model: role.model.clone(), expert: role.expert.clone(),
         }, &catalog.executors)?;
     }
-    if catalog.roles.iter().any(|option| !input.roles.iter().any(|role| role.role_id == option.role_id)) {
+    if catalog.roles.iter().any(|option| !option.optional && !input.roles.iter().any(|role| role.role_id == option.role_id)) {
         return Err("请为固定工作流的每个职责槽位选择专家".into());
     }
     Ok(())
@@ -120,6 +120,8 @@ mod tests {
         assert!(validate_catalog_choices(&stale, &catalog).is_err());
         let mut extra_slot = catalog.clone(); let mut slot = extra_slot.roles[0].clone(); slot.role_id = "implementer".into(); extra_slot.roles.push(slot);
         assert!(validate_catalog_choices(&input, &extra_slot).unwrap_err().to_string().contains("每个职责"));
+        extra_slot.roles.last_mut().unwrap().optional = true;
+        validate_catalog_choices(&input, &extra_slot).unwrap();
         let mut unavailable = catalog.clone(); unavailable.executors[0].available = false;
         assert!(validate_catalog_choices(&input, &unavailable).is_err());
         let mut wrong_model = input.clone(); wrong_model.roles[0].model = "himind:svc:missing".into();

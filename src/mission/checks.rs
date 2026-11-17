@@ -380,7 +380,7 @@ mod tests {
         let expected = serde_json::to_string(&expected).unwrap();
         let script = format!(
             "const assert=require('node:assert/strict');const expected=JSON.parse(String.fromCharCode({}));for(const key of String.fromCharCode({}).split(',')){{assert.equal(process.env[key],expected[key]);}}",
-            expected.bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
+            expected.encode_utf16().map(|unit| unit.to_string()).collect::<Vec<_>>().join(","),
             keys.join(",").bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
         );
         // Long task resource paths can make encoded env fixtures exceed the

@@ -91,6 +91,11 @@ Workflow Runner substrate. The ADR records target architecture and implementatio
 gates, not a claim that the handoff, assignment UI or persistent scheduler has
 already shipped.
 
+0029 extends 0028 with goal-first expert team selection and bounded parallel
+Mission execution. It preserves one writer to a shared source directory while
+allowing isolated task workspaces, explicit resource claims and verified candidate
+integration. See [the implementation and acceptance plan](../collaboration-architecture-implementation.md).
+
 ## Adding a record
 
 Next number is the highest in this directory plus one. Use

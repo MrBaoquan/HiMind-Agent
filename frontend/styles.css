@@ -1835,10 +1835,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .mission-budget-fields .mission-budget-toggle input { width: auto; }
 .mission-detail { min-width: 0; display: grid; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
 .mission-detail-head { display: flex; justify-content: space-between; align-items: center; }
-.mission-detail-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.mission-detail-hero { display: grid; grid-template-columns: minmax(0, 1fr) 220px; align-items: start; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.mission-detail-hero-copy { min-width: 0; }
 .mission-detail-hero h2 { margin: 5px 0; font-size: 19px; }
 .mission-detail-hero p { margin: 0; color: var(--text-muted); font-size: var(--fs-meta); }
 .mission-detail-progress { min-width: 150px; display: grid; gap: 3px; text-align: right; }
+.mission-detail-progress.is-empty { align-content: start; }
 .mission-detail-progress strong { font-size: 22px; font-variant-numeric: tabular-nums; }
 .mission-detail-progress span { color: var(--text-muted); font-size: 10px; }
 .mission-detail-progress .task-center-progress { margin-top: 4px; }
@@ -1907,7 +1909,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .mission-timeline p { margin: 2px 0; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
 .mission-timeline time { color: var(--text-muted); font-size: 9px; }
 .mission-detail-foot { display: flex; justify-content: space-between; gap: 12px; padding-top: 2px; color: var(--text-muted); font-size: 10px; }
-@media (max-width: 720px) { .mission-detail-grid { grid-template-columns: 1fr; } .mission-stage-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mission-detail-hero { display: grid; } .mission-detail-progress { text-align: left; } }
+@media (max-width: 720px) { .mission-detail-grid { grid-template-columns: 1fr; } .mission-stage-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mission-detail-hero { grid-template-columns: minmax(0, 1fr); } .mission-detail-progress { text-align: left; } }
 @media (max-width: 480px) { .mission-path-choice { display: grid; grid-template-columns: minmax(0, 1fr); } .mission-path-permissions { justify-content: flex-start; } }
 .task-center-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
 .task-center-summary-item { min-height: 68px; display: grid; align-content: center; gap: var(--space-1); padding: 8px 12px; border-right: 1px solid var(--border); }

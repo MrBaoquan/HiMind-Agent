@@ -5,7 +5,33 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+
+/// Peer changes are permitted only for a host-integrated isolated attempt.
+/// Integration independently checks that attempt against its exact write scope.
+pub(crate) fn baseline_protection_task(
+    mission: &super::MissionView, task: &super::MissionTaskSpec, run_id: &str,
+    baseline: &Value, integration: Option<&Value>,
+) -> Result<super::MissionTaskSpec, Box<dyn Error>> {
+    let mut protected = task.clone();
+    let Some(paths) = baseline.get("excluded_peer_write_paths") else { return Ok(protected); };
+    let paths = paths.as_array().ok_or("invalid host baseline peer paths")?;
+    if paths.is_empty() { return Ok(protected); }
+    let receipt = integration.and_then(|value| value.get("receipt")).ok_or("peer exclusions require a host integration receipt")?;
+    if baseline["provenance"] != "host_before_execution"
+        || receipt["mission_id"] != mission.mission_id || receipt["task_id"] != task.id
+        || receipt["attempt_id"] != run_id {
+        return Err("peer baseline exclusions are not bound to this host-integrated attempt".into());
+    }
+    for path in paths {
+        let path = path.as_str().ok_or("invalid host baseline peer path")?;
+        if !mission.tasks.iter().any(|peer| peer.spec.write_paths.iter().any(|allowed| allowed == path)) {
+            return Err("host baseline excludes a path outside the confirmed team plan".into());
+        }
+        protected.write_paths.push(path.to_string());
+    }
+    Ok(protected)
+}
 
 pub(crate) fn scoped_candidate_identity(
     workspace: &Path,
@@ -116,13 +142,15 @@ pub(crate) fn protected_files(
     let root = workspace.canonicalize()?;
     let writes = task.write_paths.iter().map(|raw| {
         let path = Path::new(raw);
-        if path.is_absolute() { path.to_path_buf() } else { root.join(path) }
+        let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+        protected_path_key(&path)
     }).collect::<Vec<_>>();
     let identity = scoped_candidate_identity(workspace, &task.read_paths)?;
     let files = identity["files"].as_object().ok_or("candidate file manifest missing")?;
     Ok(Value::Object(files.iter().filter(|(label, value)| {
         let path = Path::new(label);
         let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+        let path = protected_path_key(&path);
         // A missing read directory can be a required parent of an authorized
         // output. Creating that directory must not look like deleting a
         // protected file. Existing files at that path and new siblings still
@@ -130,6 +158,28 @@ pub(crate) fn protected_files(
         !writes.iter().any(|write| path.starts_with(write)
             || (value.is_null() && write.starts_with(&path)))
     }).map(|(key, value)| (key.clone(), value.clone())).collect()))
+}
+
+/// Normalize only comparison keys; keep manifest labels and candidate hashes
+/// unchanged. Path::starts_with still compares whole components, so a sibling
+/// such as src-extra never inherits src's write scope.
+fn protected_path_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let normalized = path.to_string_lossy().replace('\\', "/").to_lowercase();
+        // canonicalize returns verbatim roots while approved absolute scopes
+        // commonly use ordinary drive/UNC roots. Both identify the same root.
+        let normalized = if let Some(unc) = normalized.strip_prefix("//?/unc/") {
+            format!("//{unc}")
+        } else {
+            normalized.strip_prefix("//?/").unwrap_or(&normalized).to_string()
+        };
+        PathBuf::from(normalized)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 fn hash_field(hash: &mut Sha256, value: &[u8]) {
@@ -204,6 +254,74 @@ mod tests {
         std::fs::remove_dir_all(root.join("reports")).unwrap();
         std::fs::write(root.join("reports"), "parent is an unauthorized file").unwrap();
         assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_manifest_windows_case_and_separator_scopes_keep_siblings_protected() {
+        let root = std::env::temp_dir().join(format!("mission-protected-case-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("src-extra")).unwrap();
+        std::fs::write(root.join("src/app.js"), "before").unwrap();
+        std::fs::write(root.join("src/app.js.extra"), "protected file sibling").unwrap();
+        std::fs::write(root.join("src-extra/input.js"), "protected directory sibling").unwrap();
+        for scope in ["SRC\\APP.JS".to_string(), root.join("SRC/APP.JS").to_string_lossy().into_owned()] {
+            let task = serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["."],
+                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+            let baseline = protected_files(&root, &task).unwrap();
+            assert!(baseline.get("src/app.js").is_none());
+            assert!(baseline.get("src/app.js.extra").is_some());
+            assert!(baseline.get("src-extra/input.js").is_some());
+            std::fs::write(root.join("src/app.js"), "authorized change").unwrap();
+            assert_eq!(baseline, protected_files(&root, &task).unwrap());
+            std::fs::write(root.join("src/app.js.extra"), "unauthorized sibling change").unwrap();
+            assert_ne!(baseline, protected_files(&root, &task).unwrap());
+            std::fs::write(root.join("src/app.js.extra"), "protected file sibling").unwrap();
+        }
+        let task = serde_json::from_value(json!({"id":"directory", "title":"directory", "read_paths":["."],
+            "write_paths":["SRC\\"], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+        let baseline = protected_files(&root, &task).unwrap();
+        assert_eq!(baseline.as_object().unwrap().len(), 1);
+        assert!(baseline.get("src-extra/input.js").is_some());
+        std::fs::write(root.join("src-extra/input.js"), "unauthorized directory sibling change").unwrap();
+        assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_manifest_windows_case_allows_only_authorized_missing_parents() {
+        let root = std::env::temp_dir().join(format!("mission-protected-parent-case-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task = serde_json::from_value(json!({"id":"report", "title":"report",
+            "read_paths":["reports", "unavailable-input.txt"], "write_paths":["REPORTS\\Nested\\PLAN.json"],
+            "execution":{"executor":"himind.fixture","role_id":"report"}})).unwrap();
+        let baseline = protected_files(&root, &task).unwrap();
+        assert_eq!(baseline, json!({"unavailable-input.txt":null}));
+        std::fs::create_dir_all(root.join("reports/nested")).unwrap();
+        std::fs::write(root.join("reports/nested/plan.json"), "authorized report").unwrap();
+        assert_eq!(baseline, protected_files(&root, &task).unwrap());
+        std::fs::write(root.join("reports/plan.json.extra"), "unauthorized sibling").unwrap();
+        assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn protected_manifest_non_windows_keeps_case_and_backslash_semantics() {
+        let root = std::env::temp_dir().join(format!("mission-protected-case-sensitive-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.js"), "before").unwrap();
+        for scope in ["SRC/APP.JS", "src\\app.js"] {
+            let task = serde_json::from_value(json!({"id":"fix", "title":"fix", "read_paths":["src"],
+                "write_paths":[scope], "execution":{"executor":"himind.fixture","role_id":"fix"}})).unwrap();
+            std::fs::write(root.join("src/app.js"), "before").unwrap();
+            let baseline = protected_files(&root, &task).unwrap();
+            assert!(baseline.get("src/app.js").is_some());
+            std::fs::write(root.join("src/app.js"), "outside declared write scope").unwrap();
+            assert_ne!(baseline, protected_files(&root, &task).unwrap());
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -268,6 +268,7 @@ export type MissionBudgetIncrease = {
 };
 
 export type MissionPlanProposal = {
+    scheduling?: MissionScheduling | null;
     summary: string;
     tasks: MissionTaskSpec[];
     required_acceptance: string[];
@@ -297,6 +298,12 @@ export type MissionWorkflowPin = {
 };
 
 export type MissionPlanMode = 'imported' | 'generated';
+
+export type MissionScheduling = {
+    max_active_tasks: number;
+    task_resources?: Record<string, string[]>;
+    executor_limits?: Record<string, number>;
+};
 
 export type MissionHandoffInput = {
     idempotency_key: string;
@@ -335,6 +342,9 @@ export type MissionAssignmentInput = {
 };
 
 export type MissionRoleOption = {
+    optional?: boolean;
+    recommended_expert?: MissionExpertPin | null;
+    recommendation_reason?: string;
     role_id: string;
     label: string;
     brief: string;
@@ -347,6 +357,7 @@ export type MissionRoleOption = {
 };
 
 export type MissionAssignmentOptions = {
+    recommendation_warnings?: string[];
     workflow_id: string;
     workflow_version: string;
     workflow_sha256: string;
@@ -401,6 +412,7 @@ export type MissionRoleAssignmentRecord = {
 };
 
 export type MissionView = {
+    scheduling?: MissionScheduling | null;
     schema_version: 'mission.v1' | string;
     mission_id: string;
     title: string;
@@ -3848,6 +3860,7 @@ export const agentApi = {
         invoke<MissionView>('update_mission_task_execution', { missionId, taskId, expectedPlanSha256, execution }),
     createMission: (input: MissionCreateInput) => invoke<MissionView>('create_mission', { input }),
     createMissionHandoff: (input: MissionHandoffInput) => invoke<MissionView>('create_mission_handoff', { input }),
+    createMissionIntent: (input: MissionCreateInput & { idempotency_key: string; source_client: string; source_reference: string; source_message_refs?: string[]; context_summary?: string }) => invoke<MissionView>('create_mission_intent', { input }),
     missionAssignmentOptions: (missionId: string) => invoke<MissionAssignmentOptions>('list_mission_assignment_options', { missionId }),
     assignMissionRoles: (missionId: string, input: MissionAssignmentInput) => invoke<MissionView>('assign_mission_roles', { missionId, input }),
     exportMissionWorkflow: (missionId: string, workflowId: string, version: string, name: string, entrypoint = 'start') =>

@@ -770,6 +770,10 @@ pub(crate) struct WorkflowRuntimeStep {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowRole {
+    /// Optional duties need not be staffed unless selected by the Mission plan.
+    /// Historical packages omit this flag and retain mandatory assignment.
+    #[serde(default)]
+    pub optional: bool,
     #[serde(default)]
     pub label: String,
     /// 该角色负责步骤的职责说明；会拼进提示词前缀，让同一 Runtime 按角色行事。

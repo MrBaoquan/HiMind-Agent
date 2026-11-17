@@ -631,7 +631,7 @@ pub(crate) fn dsh_preset_document() -> Result<String, Box<dyn Error>> {
 
 pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
     let active = active()?;
-    let mut definitions = stored_definitions()?;
+    let definitions = stored_definitions()?;
     let mut result = definitions
         .into_iter()
         .map(|definition| summary(&definition, active.as_ref(), false))
@@ -654,14 +654,97 @@ pub(crate) fn get(id: &str, version: Option<&str>) -> Result<ExpertDefinition, B
             return Ok(definition);
         }
     }
-    let candidates = stored_definitions()?
+    let candidates = installed_version_definitions()?
         .into_iter()
         .filter(|item| item.id == id && version.map(|v| v == item.version).unwrap_or(true))
         .collect::<Vec<_>>();
     candidates
         .into_iter()
-        .max_by(|left, right| left.version.cmp(&right.version))
+        .max_by(|left, right| compare_versions(&left.version, &right.version))
         .ok_or_else(|| format!("未找到专家: {id}").into())
+}
+
+/// Assignment directories include historical versions, unlike the default
+/// one-entry-per-identity library. A development projection may share a version
+/// label with a published package; the digest distinguishes their exact content.
+pub(crate) fn list_versions() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
+    let active = active()?;
+    let mut definitions = installed_version_definitions()?;
+    definitions.extend(development_definitions()?);
+    definitions.extend(archived_development_definitions()?);
+    definitions.sort_by(|left, right| left.id.cmp(&right.id)
+        .then_with(|| compare_versions(&right.version, &left.version))
+        .then_with(|| digest(left).unwrap_or_default().cmp(&digest(right).unwrap_or_default())));
+    definitions.dedup();
+    Ok(definitions.iter().map(|definition| summary(definition, active.as_ref(), false)).collect())
+}
+
+/// New-team candidates retain every installed release and the live development
+/// projection, so semantic ordering cannot be hidden by an older projection.
+/// Archived development content remains available only through historical-pin
+/// APIs. This does not change the default-persona semantics of `get` or `list`.
+pub(crate) fn list_team_candidates() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
+    let mut definitions = installed_version_definitions()?;
+    definitions.extend(development_definitions()?);
+    let mut candidates = definitions.iter()
+        .map(|definition| summary(definition, None, false)).collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.id.cmp(&right.id)
+        .then_with(|| compare_versions(&right.version, &left.version))
+        .then_with(|| left.digest.cmp(&right.digest)));
+    candidates.dedup_by(|left, right| left.id == right.id
+        && left.version == right.version && left.digest == right.digest);
+    Ok(candidates)
+}
+
+/// Resolve an immutable Mission pin by content, never by the current default
+/// persona. Activating a new development definition cannot replace a published
+/// version already bound to a Mission.
+pub(crate) fn get_pinned(id: &str, version: &str, expected_digest: &str) -> Result<ExpertDefinition, Box<dyn Error>> {
+    let id = validate_id(id)?;
+    let version = validate_version(version)?;
+    let mut definitions = installed_version_definitions()?;
+    definitions.extend(development_definitions()?);
+    definitions.extend(archived_development_definitions()?);
+    for definition in definitions {
+        if definition.id == id && definition.version == version && digest(&definition)? == expected_digest {
+            return Ok(definition);
+        }
+    }
+    Err("所选专家版本或内容已变化，请重新指派专家".into())
+}
+
+fn archived_development_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
+    let root = store_root().join("development-versions");
+    let mut definitions = Vec::new();
+    if !root.is_dir() { return Ok(definitions); }
+    for identity in fs::read_dir(root)? {
+        let identity = identity?;
+        if !identity.file_type()?.is_dir() { continue; }
+        for revision in fs::read_dir(identity.path())? {
+            let revision = revision?;
+            if !revision.file_type()?.is_dir() { continue; }
+            let path = revision.path().join("expert.json");
+            if path.is_file() {
+                let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
+                validate(&definition)?;
+                if identity.file_name().to_str() == Some(definition.id.as_str()) {
+                    definitions.push(definition);
+                }
+            }
+        }
+    }
+    Ok(definitions)
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(left), semver::Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        // Legacy packages allowed non-semver labels. Preserve their readability
+        // and deterministic ordering without pretending they are semantic versions.
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => left.cmp(right),
+    }
 }
 
 pub(crate) fn save(input: ExpertDraftInput) -> Result<ExpertSummary, Box<dyn Error>> {
@@ -1477,13 +1560,24 @@ fn summary(
 }
 
 fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
-    let mut items = Vec::new();
-    let mut seen = HashSet::new();
-    for definition in development_definitions()? {
-        if seen.insert(definition.id.clone()) {
-            items.push(definition);
+    let mut items = std::collections::BTreeMap::<String, ExpertDefinition>::new();
+    for definition in installed_version_definitions()? {
+        let replace = items.get(&definition.id).is_none_or(|previous|
+            compare_versions(&definition.version, &previous.version).is_gt());
+        if replace {
+            items.insert(definition.id.clone(), definition);
         }
     }
+    // Explicitly activated development projections remain the default for new
+    // sessions. They do not participate in resolving a Mission's exact pin.
+    for definition in development_definitions()? {
+        items.insert(definition.id.clone(), definition);
+    }
+    Ok(items.into_values().collect())
+}
+
+fn installed_version_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
+    let mut items = Vec::new();
     let root = store_root();
     if !root.is_dir() {
         return Ok(items);
@@ -1492,15 +1586,17 @@ fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
         .flatten()
         .filter(|entry| entry.path().is_dir())
     {
+        if matches!(id_dir.file_name().to_str(), Some("development" | "development-versions" | "projections" | "workspaces")) {
+            continue;
+        }
         // Versioned experts are stored under `<id>/versions/<version>`. Keep
         // reading the legacy `<id>/<version>` layout so upgrades do not make
         // previously installed assets disappear.
-        let versions_root = id_dir.path().join("versions");
-        let versions_root = if versions_root.is_dir() {
-            versions_root
-        } else {
-            id_dir.path()
-        };
+        let mut roots = vec![id_dir.path()];
+        if id_dir.path().join("versions").is_dir() {
+            roots.push(id_dir.path().join("versions"));
+        }
+        for versions_root in roots {
         for version_dir in fs::read_dir(versions_root)?
             .flatten()
             .filter(|entry| entry.path().is_dir())
@@ -1509,12 +1605,17 @@ fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
             if path.is_file() {
                 let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
                 validate(&definition)?;
-                if seen.insert(definition.id.clone()) {
-                    items.push(definition);
-                }
+                items.push(definition);
             }
         }
+        }
     }
+    // read_dir order is platform dependent. Stable order also gives legacy
+    // duplicate paths deterministic behavior; pins still select exact digests.
+    items.sort_by(|left, right| left.id.cmp(&right.id)
+        .then_with(|| compare_versions(&left.version, &right.version))
+        .then(left.instructions.cmp(&right.instructions)));
+    items.dedup();
     Ok(items)
 }
 
@@ -1706,6 +1807,127 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("EXPERT.md"), definition.instructions.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn expert_directory_preserves_old_pins_and_uses_semantic_latest_version() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!("expert-versions-{}-{}", std::process::id(), now_stamp()));
+        let old = std::env::var_os("HIMIND_AGENT_HOME");
+        let old_development = std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        let mut original = test_definition("com.himind.expert.versioned", "Versioned", "Original instructions");
+        original.version = "1.9.0".into();
+        let original_digest = digest(&original).unwrap();
+        store_test_definition(&original);
+        let mut newer = original.clone();
+        newer.version = "1.10.0".into();
+        newer.instructions = "New release instructions".into();
+        store_test_definition(&newer);
+
+        assert_eq!(list().unwrap()[0].version, "1.10.0");
+        assert_eq!(get(&original.id, None).unwrap(), newer);
+        assert_eq!(get(&original.id, Some("1.9.0")).unwrap(), original);
+        assert_eq!(get_pinned(&original.id, "1.9.0", &original_digest).unwrap(), original);
+        assert_eq!(list_versions().unwrap().len(), 2);
+
+        let development = development_root().join(&original.id);
+        fs::create_dir_all(&development).unwrap();
+        let mut override_definition = original.clone();
+        override_definition.instructions = "Explicit development projection".into();
+        fs::write(development.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
+        assert_eq!(get(&original.id, None).unwrap(), override_definition);
+        assert_eq!(list().unwrap()[0].digest, digest(&override_definition).unwrap());
+        assert_eq!(get_pinned(&original.id, "1.9.0", &original_digest).unwrap(), original);
+        assert_eq!(list_versions().unwrap().len(), 3, "exact digests distinguish published and development content");
+        assert!(get_pinned(&original.id, "1.9.0", "sha256:missing").is_err());
+
+        let development_digest = digest(&override_definition).unwrap();
+        let archive = development_version_root(&original.id, "previous-package-sha");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
+        override_definition.instructions = "Next development build".into();
+        fs::write(development.join("expert.json"), serde_json::to_vec(&override_definition).unwrap()).unwrap();
+        assert_eq!(get_pinned(&original.id, "1.9.0", &development_digest).unwrap().instructions, "Explicit development projection");
+        assert_eq!(list_versions().unwrap().len(), 4, "archived development pins survive activation changes");
+
+        // A legacy version remains resolvable when the newer layout also exists.
+        let mut legacy = original.clone();
+        legacy.version = "0.9.0".into();
+        let legacy_root = store_root().join(&original.id).join(&legacy.version);
+        fs::create_dir_all(&legacy_root).unwrap();
+        fs::write(legacy_root.join("expert.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(get(&original.id, Some("0.9.0")).unwrap(), legacy);
+
+        match old {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        match old_development {
+            Some(value) => std::env::set_var("HIMIND_EXPERT_DEVELOPMENT_DIR", value),
+            None => std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expert_version_ordering_keeps_semver_prereleases_and_legacy_labels_deterministic() {
+        assert!(compare_versions("1.10.0", "1.9.0").is_gt());
+        assert!(compare_versions("1.0.0", "1.0.0-rc.1").is_gt());
+        assert!(compare_versions("1.0.0-rc.2", "1.0.0-rc.10").is_lt());
+        assert!(compare_versions("legacy-b", "legacy-a").is_gt());
+        assert!(compare_versions("1.0.0", "legacy-b").is_gt());
+        assert!(compare_versions("legacy-b", "1.0.0").is_lt());
+    }
+
+    #[test]
+    fn team_candidates_do_not_hide_new_releases_or_recommend_archived_projections() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!("expert-team-{}-{}", std::process::id(), rand::random::<u64>()));
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in [("HIMIND_AGENT_HOME", &self.0), ("HIMIND_EXPERT_DEVELOPMENT_DIR", &self.1)] {
+                    if let Some(value) = value { std::env::set_var(key, value); }
+                    else { std::env::remove_var(key); }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("HIMIND_AGENT_HOME"), std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR"));
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        std::env::remove_var("HIMIND_EXPERT_DEVELOPMENT_DIR");
+        let mut older = test_definition("com.himind.expert.software-engineer", "软件工程师", "Old release");
+        older.version = "1.9.0".into();
+        store_test_definition(&older);
+        let mut newer = older.clone();
+        newer.version = "1.10.0".into();
+        newer.instructions = "Current release".into();
+        store_test_definition(&newer);
+        let mut live = older.clone();
+        live.instructions = "Live development projection".into();
+        let development = development_root().join(&live.id);
+        fs::create_dir_all(&development).unwrap();
+        fs::write(development.join("expert.json"), serde_json::to_vec(&live).unwrap()).unwrap();
+        let mut archived = newer.clone();
+        archived.version = "9.0.0".into();
+        archived.instructions = "Historical development content".into();
+        let archive = development_version_root(&archived.id, "archived-package");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("expert.json"), serde_json::to_vec(&archived).unwrap()).unwrap();
+
+        let candidates = list_team_candidates().unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert!(!candidates.iter().any(|expert| expert.version == "9.0.0"));
+        let recommendation = crate::mission::team::recommend_team("实现接口", &candidates);
+        let pin = &recommendation.roles.iter().find(|role| role.role_id == "implementer").unwrap().expert;
+        assert_eq!(pin.expert_version, "1.10.0");
+        assert_eq!(pin.expert_digest, digest(&newer).unwrap());
+        assert_eq!(get(&older.id, None).unwrap(), live);
+        assert_eq!(list().unwrap()[0].digest, digest(&live).unwrap());
+        assert_eq!(get_pinned(&archived.id, &archived.version, &digest(&archived).unwrap()).unwrap(), archived);
+        assert_eq!(get_pinned(&older.id, &older.version, &digest(&older).unwrap()).unwrap(), older);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_expert_workspace(workspace: &Path, instructions: &str) {
