@@ -594,7 +594,7 @@ mod tests {
         // legacy/corrupt persisted states and independent reviewer are fixtures.
         // No formal reviewer or installed host acceptance is claimed here.
         for case in ["pending", "pending-budget", "manual-pause", "environment",
-            "foreign-claim", "wrong-task", "wrong-run", "wrong-workspace",
+            "foreign-claim", "foreign-source-claim", "wrong-task", "wrong-run", "wrong-workspace",
             "missing-implementation", "missing-confirmation", "stale-confirmation",
             "empty-plan", "running-worker", "canceled", "active-verification"] {
             let root = std::env::temp_dir().join(format!("recovery-projection-{:016x}", rand::random::<u64>()));
@@ -645,15 +645,21 @@ mod tests {
                     store.control(&foreign,"pause").unwrap();
                     db.execute("UPDATE mission_workspace_claims SET mission_id=?2 WHERE mission_id=?1", rusqlite::params![id,foreign]).unwrap();
                 },
+                "foreign-source-claim" => {
+                    let key: String = db.query_row("SELECT source_key FROM mission_workspace_claims WHERE mission_id=?1", [id], |r|r.get(0)).unwrap();
+                    let foreign = persist_confirmed_mission(&store, "foreign-source");
+                    store.control(&foreign,"pause").unwrap();
+                    db.execute("INSERT INTO mission_workspace_claims (workspace_key,mission_id,task_id,run_id,acquired_at,source_key) VALUES ('attempt:foreign-source',?1,'task','foreign-source-run','fixture',?2)", rusqlite::params![foreign,key]).unwrap();
+                },
                 "wrong-task" => { db.execute("UPDATE mission_workspace_claims SET task_id='next' WHERE mission_id=?1", [id]).unwrap(); },
                 "wrong-run" => { db.execute("UPDATE mission_workspace_claims SET run_id='obsolete' WHERE mission_id=?1", [id]).unwrap(); },
                 "wrong-workspace" => { let key: String = db.query_row("SELECT workspace_key FROM mission_workspace_claims WHERE mission_id=?1", [id], |r|r.get(0)).unwrap();
-                    db.execute("UPDATE mission_workspace_claims SET workspace_key='wrong' WHERE mission_id=?1", [id]).unwrap();
+                    db.execute("UPDATE mission_workspace_claims SET workspace_key='wrong',source_key='wrong' WHERE mission_id=?1", [id]).unwrap();
                     // Keep a foreign occupant at the current key so the legacy
                     // migration cannot legitimately restore this owned claim.
                     let foreign = persist_confirmed_mission(&store, "occupant");
                     store.control(&foreign,"pause").unwrap();
-                    db.execute("INSERT INTO mission_workspace_claims SELECT ?1,?2,'task','foreign-run','fixture'", rusqlite::params![key,foreign]).unwrap();
+                    db.execute("INSERT INTO mission_workspace_claims (workspace_key,mission_id,task_id,run_id,acquired_at) VALUES (?1,?2,'task','foreign-run','fixture')", rusqlite::params![key,foreign]).unwrap();
                 },
                 "missing-implementation" => { db.execute("UPDATE mission_tasks SET attempt_run_id='' WHERE mission_id=?1 AND task_id='task'", [id]).unwrap(); },
                 "missing-confirmation" => { db.execute("UPDATE mission_runs SET confirmation_json=NULL WHERE mission_id=?1", [id]).unwrap(); },

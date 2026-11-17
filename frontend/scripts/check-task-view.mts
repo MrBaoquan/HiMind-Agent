@@ -272,7 +272,7 @@ assert.equal(
 console.log('task view checks passed');
 
 // Environment waiting survives later telemetry and cannot leak across plans.
-import {missionRuntimeBlocked, missionStatusLabel, missionNextAction} from '../src/pages/missionView.ts';
+import {missionRuntimeBlocked, missionStatusLabel, missionNextAction, missionResponsibility, missionResumeAction} from '../src/pages/missionView.ts';
 import type {MissionView, MissionEvent} from '../src/services/agentApi.ts';
 const environmentMission = {status:'waiting',plan_sha256:'current-plan', confirmation:{plan_sha256:'current-plan'}, effective_wait:{contract_version:'mission.wait.v1',plan_sha256:'current-plan',cursor:2,reason:'environment_blocked',actor:'user',environment_blocked:true,can_resume:false,can_increase_budget:true}} as MissionView;
 const runtimeEvents = [
@@ -286,3 +286,57 @@ assert.equal(missionRuntimeBlocked({...environmentMission,plan_sha256:'new-plan'
 assert.equal(missionRuntimeBlocked({...environmentMission,status:'completed'},runtimeEvents),false);
 assert.equal(missionRuntimeBlocked(environmentMission,[...runtimeEvents,{event_type:'runtime_workspace_resolved'} as MissionEvent]),true, 'historical events cannot override the authoritative DTO');
 assert.equal(missionRuntimeBlocked({...environmentMission,effective_wait:null},runtimeEvents),false, 'missing association stays unknown');
+
+// Pausing dispatch allows an admitted attempt to drain, without offering resume.
+const pausedRunningMission = {...environmentMission, mission_id:'pause-fixture', tasks:[{
+  spec:{id:'fix',title:'Fix'}, status:'running', attempt_run_id:'current-run', verification_run_id:'',
+}], effective_wait:{...environmentMission.effective_wait!, reason:'manual_pause', actor:'user',
+  environment_blocked:false, can_resume:false, can_increase_budget:false}} as MissionView;
+const pauseEvents = [{event_type:'mission_pause',payload:{action:'pause'}},
+  {event_type:'task_progress',payload:{}}] as MissionEvent[];
+for (const can_resume of [false, true]) {
+  const draining = {...pausedRunningMission, effective_wait:{...pausedRunningMission.effective_wait!, can_resume}};
+  assert.equal(missionStatusLabel(draining,pauseEvents),'已暂停后续派发 · 当前工作收尾中');
+  assert.equal(missionResponsibility(draining),'当前工作正在收尾 · 后续派发已暂停 · 暂不可继续');
+  assert.equal(missionNextAction(draining,pauseEvents),'等待当前工作收尾后，再选择继续；后续派发已暂停');
+  assert.equal(missionResumeAction(draining),null, 'a running task never becomes a resume action');
+}
+const systemWaiting = {...pausedRunningMission,effective_wait:{...pausedRunningMission.effective_wait!,reason:'system_verification',actor:'system'}};
+assert.equal(missionStatusLabel(systemWaiting,pauseEvents),'等待系统检查或核验', 'history cannot invent current manual pause intent');
+assert.match(missionResponsibility(systemWaiting),/系统核对恢复资格/);
+assert.equal(missionResumeAction(systemWaiting),null);
+for (const reason of ['budget_exhausted','environment_blocked']) {
+  const blocked = {...pausedRunningMission,effective_wait:{...pausedRunningMission.effective_wait!,reason,
+    environment_blocked:reason === 'environment_blocked',budget_reason:reason === 'budget_exhausted' ? 'Token 1/1' : null}};
+  assert.equal(missionStatusLabel(blocked,pauseEvents),reason === 'budget_exhausted' ? '预算已用尽' : '命令环境待处理');
+  assert.equal(missionResponsibility(blocked),'需要你处理');
+  assert.equal(missionResumeAction(blocked),null);
+  assert.doesNotMatch(missionNextAction(blocked,pauseEvents),/再选择继续|由你决定/);
+}
+const mismatchedPause = {...pausedRunningMission,plan_sha256:'other-plan'};
+assert.equal(missionStatusLabel(mismatchedPause,pauseEvents),'等待原因未确认');
+assert.equal(missionResumeAction(mismatchedPause),null);
+
+const drainedPause = {...pausedRunningMission,tasks:[{...pausedRunningMission.tasks[0],status:'ready' as const}],
+  effective_wait:{...pausedRunningMission.effective_wait!,can_resume:true}};
+assert.equal(missionStatusLabel(drainedPause),'已暂停');
+assert.match(missionResponsibility(drainedPause),/由你决定何时继续/);
+assert.equal(missionResumeAction(drainedPause)?.kind,'tasks');
+const ineligiblePause = {...drainedPause,effective_wait:{...drainedPause.effective_wait,can_resume:false}};
+assert.equal(missionResumeAction(ineligiblePause),null);
+assert.match(missionNextAction(ineligiblePause),/当前不可继续/);
+assert.doesNotMatch(missionResponsibility(ineligiblePause),/由你决定/);
+
+const verificationTask = {...pausedRunningMission.tasks[0],status:'awaiting_verification' as const,verification_run_id:'current-review'};
+const reviewActivity = {status:'running',mission_id:'pause-fixture',mission_task_id:'fix',workflow_run_id:'current-review'};
+const activeVerification = {...systemWaiting,status:'active' as const,tasks:[verificationTask]};
+assert.equal(missionStatusLabel(activeVerification,[],[reviewActivity] as never),'核验进行中');
+assert.match(missionResponsibility(activeVerification,[reviewActivity] as never),/另一位专家核验中/);
+assert.equal(missionResumeAction(activeVerification,[reviewActivity] as never),null);
+const mixedDrain = {...pausedRunningMission,tasks:[pausedRunningMission.tasks[0],{...verificationTask,spec:{...verificationTask.spec,id:'review'}}]};
+const mixedActivity = {...reviewActivity,mission_task_id:'review'};
+assert.equal(missionStatusLabel(mixedDrain,[],[mixedActivity] as never),'已暂停后续派发 · 当前工作收尾中');
+assert.match(missionResponsibility(mixedDrain,[mixedActivity] as never),/后续派发已暂停/);
+assert.match(missionNextAction(mixedDrain,[],[mixedActivity] as never),/收尾后/);
+assert.equal(missionResumeAction(mixedDrain,[mixedActivity] as never),null);
+console.log('manual pause projection checks passed: drain, resume gates, verification, budget/environment, plan association');

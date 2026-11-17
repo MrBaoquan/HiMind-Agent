@@ -1374,8 +1374,13 @@ fn task_package(
     task: &MissionTaskSpec,
     workspace_root: &str,
 ) -> Result<WorkflowPackage, Box<dyn Error>> {
+    let readiness = if task.write_paths.is_empty() && task.execution.executor == "himind.builtin" {
+        "本阶段是只读文件审查，工具不提供 Shell。passed 仅表示基于实际文件审阅的送验材料是否就绪，不表示必需检查通过。计划中的命令由宿主在下一阶段实际执行，再交给独立实例复核；evidence 必须明确标注这些命令 pending_host_checks，不得伪造执行或通过。不要仅因本阶段没有 Shell 或宿主检查尚未开始而拒绝送验；发现实际缺陷、文件依据缺失或其他交付未完成时必须返回 false。"
+    } else {
+        "本阶段 passed 只表示当前任务交付是否就绪、必需检查是否真实通过，是送验建议，不代表 Mission 或独立验收已通过。交付未完成、必需检查失败或证据不足时必须如实返回 false。"
+    };
     let prompt = format!(
-        "你是专家团队的{}。只执行下面这一项任务，不扩大范围。\n任务：{}\n目标：{}\n允许读取：{}\n允许写入：{}\n验收：{}\n必须检查：{}\n绝对路径必须严格限于宿主确认记录中的授权范围；Mission 授权是业务策略，不代表操作系统沙箱。\n完成后输出 JSON：{{\"passed\":true|false,\"summary\":\"...\",\"evidence\":[\"...\"]}}。本阶段 passed 只表示当前任务交付是否就绪、必需检查是否真实通过，是送验建议，不代表 Mission 或独立验收已通过。宿主将在本阶段成功结束后另行启动正式 VERIFY；不要因正式 VERIFY 尚未运行而把已就绪的本阶段交付判为失败，也不得自行调用或冒充宿主 VERIFY。交付未完成、必需检查失败或证据不足时必须如实返回 false。",
+        "你是专家团队的{}。只执行下面这一项任务，不扩大范围。\n任务：{}\n目标：{}\n允许读取：{}\n允许写入：{}\n验收：{}\n必须检查：{}\n绝对路径必须严格限于宿主确认记录中的授权范围；Mission 授权是业务策略，不代表操作系统沙箱。\n完成后输出 JSON：{{\"passed\":true|false,\"summary\":\"...\",\"evidence\":[\"...\"]}}。{}宿主将在本阶段成功结束后另行启动正式 VERIFY；不要因正式 VERIFY 尚未运行而把已就绪的本阶段交付判为失败，也不得自行调用或冒充宿主 VERIFY。",
         task.execution.role_id,
         task.title,
         task.objective,
@@ -1383,6 +1388,7 @@ fn task_package(
         task.write_paths.join(", "),
         task.acceptance_criteria.join("；"),
         task.required_checks.join("；"),
+        readiness,
     );
     let prompt = format!("{prompt}\n宿主输入 host_runtime_resources 是已分配的生成输出资源，与业务源码授权分开：可以在该专用根内写本任务测试、构建、截图和临时缓存并读取所引用证据；执行器已预置其环境，SERVICE_UI_RUNTIME_ROOT 是兼容配置，无须再请求用户批准该根。不能据此读取其他宿主路径或扩大源码修改范围。生成物应保留在资源根，只有明确交付报告写入原获准范围；原必需检查不得在验收期改写交付候选。");
     let prompt = format!("{prompt}\n{}", crate::mission::FEEDBACK_CONTEXT_POLICY);
@@ -1892,6 +1898,12 @@ mod tests {
     #[cfg(windows)]
     fn boundary_fixture_with_provider(root: &std::path::Path, mutate: bool, pause: bool, provider: &str)
         -> (crate::mission::MissionStore, crate::mission::MissionView, crate::mission::MissionTaskView) {
+        boundary_fixture_with_scope(root, mutate, pause, provider, None)
+    }
+
+    #[cfg(windows)]
+    fn boundary_fixture_with_scope(root: &std::path::Path, mutate: bool, pause: bool, provider: &str, read_only_exit: Option<i32>)
+        -> (crate::mission::MissionStore, crate::mission::MissionView, crate::mission::MissionTaskView) {
         // Production Agent data is independent of the workspace. Preserve that
         // boundary in this fixture rather than putting its host cache inside it.
         std::env::set_var("HIMIND_AGENT_HOME", root.with_extension("host-home"));
@@ -1901,20 +1913,23 @@ mod tests {
         std::fs::write(root.join("output/delivery.txt"), "delivery").unwrap();
         let extra = if mutate { "\nPath('output/delivery.txt').write_text('changed by check')" }
             else if pause { "\nPath('check-started').touch()\n__import__('time').sleep(0.8)" } else { "" };
-        std::fs::write(root.join("boundary-check.py"),format!("from pathlib import Path\np=Path('host-check-count')\np.write_text(p.read_text()+'x' if p.exists() else 'x'){extra}\n")).unwrap();
+        let check = read_only_exit.map(|code| format!("print('read-only host check')\nraise SystemExit({code})\n"))
+            .unwrap_or_else(|| format!("from pathlib import Path\np=Path('host-check-count')\np.write_text(p.read_text()+'x' if p.exists() else 'x'){extra}\n"));
+        std::fs::write(root.join("boundary-check.py"), check).unwrap();
         let command = "python boundary-check.py";
+        let write_paths = if read_only_exit.is_some() { vec![] } else { vec!["output"] };
         let task: crate::mission::MissionTaskSpec = serde_json::from_value(json!({
-            "id":"work","title":"Boundary fixture","read_paths":["read.txt"],"write_paths":["output"],
+            "id":"work","title":"Boundary fixture","read_paths":["read.txt"],"write_paths":write_paths,
             "acceptance_criteria":["unchanged delivery"],"required_checks":[command],
             "execution":{"executor":provider,"role_id":"implementer"}
         })).unwrap();
         let created = store.create(&serde_json::from_value(json!({"title":"host check fixture",
-            "workspace":{"root":root,"read_scope":["read.txt"],"write_scope":["output"]}})).unwrap()).unwrap();
+            "workspace":{"root":root,"read_scope":["read.txt"],"write_scope":write_paths}})).unwrap()).unwrap();
         let plan = serde_json::from_value(json!({"summary":"check boundary","tasks":[task],"required_acceptance":[],
             "budget":{"max_rounds":20,"max_minutes":10,"max_repair_attempts":2}})).unwrap();
         let planned = store.propose_plan(&created.mission_id, &plan).unwrap();
         let active = store.confirm_plan(&created.mission_id, &planned.plan_sha256,
-            &["work".into()], &["output".into()], &[], &[], "fixture").unwrap();
+            &["work".into()], &write_paths.iter().map(|path| path.to_string()).collect::<Vec<_>>(), &[], &[], "fixture").unwrap();
         let package = super::task_package(&active.mission_id, &active.title, &task, root.to_str().unwrap()).unwrap();
         let runner = crate::workflow::WorkflowRunner::open_default().unwrap();
         let mut run = runner.start("fixture", &package, "implementation", &json!({})).unwrap();
@@ -2065,6 +2080,31 @@ mod tests {
         assert_eq!(result["passed"],true);
         assert_eq!(store.get(&mission.mission_id).unwrap().tasks[0].status,crate::mission::TaskStatus::Completed);
         assert_eq!(std::fs::read_to_string(env.root.join("host-check-count")).unwrap(),"x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readonly_himind_handoff_still_requires_real_successful_host_checks() {
+        use crate::runtime::process::codex_test_support::Environment;
+        let _lock = crate::store::paths::test_env_lock();
+        for exit_code in [0, 7] {
+            let env = Environment::new();
+            let (store, mission, pending) = boundary_fixture_with_scope(&env.root, false, false, "himind.builtin", Some(exit_code));
+            assert!(pending.spec.write_paths.is_empty());
+            let package = super::task_package(&mission.mission_id, &mission.title, &pending.spec, env.root.to_str().unwrap()).unwrap();
+            assert!(package.steps[0].runtime.as_ref().unwrap().prompt.contains("pending_host_checks"));
+            let reviewer = BoundReview::default();
+            let result = super::run_verification_with_executor(&store, &mission, &pending, &reviewer).unwrap();
+            assert_eq!(result["passed"], exit_code == 0);
+            let current = store.get(&mission.mission_id).unwrap();
+            assert_eq!(current.tasks[0].verification_passed, Some(exit_code == 0));
+            assert_eq!(current.tasks[0].status == crate::mission::TaskStatus::Completed, exit_code == 0);
+            let checked = store.snapshot(&mission.mission_id, 0).unwrap().events.into_iter()
+                .find(|event| event.event_type == "host_verification_checked").unwrap();
+            assert_eq!(checked.payload["checks"][0]["exit_code"], exit_code);
+            assert_eq!(std::fs::read_to_string(env.root.join("read.txt")).unwrap(), "protected");
+            assert!(!env.root.join("host-check-count").exists());
+        }
     }
 
     #[cfg(windows)]

@@ -98,12 +98,15 @@ export function missionActionActor(mission: MissionView, activities: AgentActivi
 }
 
 export function missionResponsibility(mission: MissionView, activities: AgentActivityItem[] = []) {
+  const wait = missionWait(mission);
+  if (mission.status === 'waiting' && wait?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '当前工作正在收尾 · 后续派发已暂停 · 暂不可继续';
+  }
   if (missionRunningVerifications(mission, activities).length) return '另一位专家核验中 · 当前无需你操作';
   const resume = missionResumeAction(mission, activities);
   if (resume) return resume.responsibility;
-  const wait = missionWait(mission);
   if (mission.status === 'waiting') return wait?.actor === 'user'
-    ? wait.reason === 'manual_pause' ? '由你决定何时继续 · 当前无需处理' : '需要你处理'
+    ? wait.reason === 'manual_pause' ? '后续派发已暂停 · 当前不可继续，等待状态核对' : '需要你处理'
     : wait?.actor === 'system' ? '系统核对恢复资格 · 当前无可用续跑操作' : '处理者未确认 · 请刷新状态';
   if (['draft','planned','awaiting_assignment','awaiting_confirmation'].includes(mission.status)) return '需要你处理';
   if (mission.status !== 'active') return '当前无需你操作';
@@ -209,6 +212,9 @@ export function missionRuntimeBlocked(mission: MissionView, _events: MissionEven
 }
 
 export function missionStatusLabel(mission: MissionView, _events: MissionEvent[] = [], activities: AgentActivityItem[] = []) {
+  if (mission.status === 'waiting' && missionWait(mission)?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '已暂停后续派发 · 当前工作收尾中';
+  }
   if (missionRunningVerifications(mission, activities).length) return mission.status === 'waiting' ? '核验进行中 · 后续派发已暂停' : '核验进行中';
   const resume = missionResumeAction(mission, activities);
   if (resume?.kind === 'verification' && !resume.optional) return '待手动续跑核验';
@@ -332,6 +338,9 @@ export function progressDisclosure(mission: MissionView, events: MissionEvent[])
 
 /** One sentence the list can show without opening the task. */
 export function missionNextAction(mission: MissionView, _events: MissionEvent[] = [], activities: AgentActivityItem[] = []) {
+  if (mission.status === 'waiting' && missionWait(mission)?.reason === 'manual_pause' && mission.tasks.some(task => task.status === 'running')) {
+    return '等待当前工作收尾后，再选择继续；后续派发已暂停';
+  }
   if (missionRunningVerifications(mission, activities).length) return mission.status === 'waiting'
     ? '查看在途核验；当前步骤可收尾，后续派发已暂停' : '查看在途核验；不重复启动';
   switch (mission.status) {
@@ -357,7 +366,7 @@ export function missionNextAction(mission: MissionView, _events: MissionEvent[] 
       const wait = missionWait(mission);
       if (wait?.reason === 'budget_exhausted') return wait.can_increase_budget ? '增加预算并继续' : '预算已用尽，先核对运行状态';
       if (wait?.environment_blocked) return '选择工作区授权或仅用文件工具继续';
-      if (wait?.reason === 'manual_pause') return '由你决定何时续跑；继续尚未完成的任务';
+      if (wait?.reason === 'manual_pause') return '后续派发已暂停；当前不可继续，等待状态核对';
       if (wait?.reason === 'system_verification') return '核对核验恢复资格；当前不可续跑，不重复执行实现';
       return '刷新等待原因；资格未确认前不提交恢复或增额';
     }

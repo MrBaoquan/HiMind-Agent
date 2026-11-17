@@ -2727,6 +2727,12 @@ fn owned_pending_verification_on(connection: &Connection, mission: &MissionView)
         || (mission.scheduling.is_none() && mission.tasks.iter().any(|task| task.status == TaskStatus::Running)) {
         return Ok(false);
     }
+    // Resume and its UI projection must reject the same foreign source owner
+    // that verification admission rejects, including isolated attempt claims.
+    let foreign_owner: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
+        WHERE (source_key=?1 OR workspace_key=?1) AND mission_id<>?2)",
+        params![workspace_claim_key(&mission.workspace.root), mission.mission_id], |row| row.get(0))?;
+    if foreign_owner { return Ok(false); }
     let mut found=false;
     for task in mission.tasks.iter().filter(|task| super::parallel::holds_resources(task.status)) {
         found |= task.status == TaskStatus::AwaitingVerification;
@@ -2744,14 +2750,16 @@ fn assert_verification_ownership_on(connection: &Connection, mission: &MissionVi
     -> Result<(), Box<dyn Error>> {
     if mission.status != MissionStatus::Active
         || !mission.tasks.iter().any(|task| task.spec.id == task_id && task.status == TaskStatus::AwaitingVerification
-            && task.attempt_run_id == run_id && !run_id.is_empty())
-        || !owned_pending_verification_on(connection, mission)? {
+            && task.attempt_run_id == run_id && !run_id.is_empty()) {
         return Err("verification admission requires an active confirmed plan and its current workspace claim".into());
     }
     let foreign_owner: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace_claims
         WHERE (source_key=?1 OR workspace_key=?1) AND mission_id<>?2)",
         params![workspace_claim_key(&mission.workspace.root), mission.mission_id], |row| row.get(0))?;
     if foreign_owner { return Err("verification workspace is owned by another Mission".into()); }
+    if !owned_pending_verification_on(connection, mission)? {
+        return Err("verification admission requires an active confirmed plan and its current workspace claim".into());
+    }
     if let Some((holder, name)) = external_resource_conflict_on(connection, mission, task_id)? {
         return Err(format!("named resource {name} is occupied by {holder}").into());
     }
@@ -3255,13 +3263,23 @@ fn effective_wait_on(connection: &Connection, mission: &MissionView) -> Result<s
     let environment = associated && runtime_blocked_on(connection, mission)?;
     let budget_reason = if associated { budget_exhaustion_reason_on(connection, mission)?
         .or_else(|| mission.budget.as_ref().and_then(|b| repair_exhaustion_reason(mission,b))) } else { None };
+    // A user pause stops later dispatch, not the admitted work still draining.
+    // Bind intent to this confirmation; automatic verification pauses carry a
+    // verification_run_id and must not be presented as a user's pause.
+    let manual_pause = waiting && associated && decision_event(connection,
+        "event.mission_id=?1 AND event.event_type IN ('mission_pause','mission_resume','budget_exhausted')
+         AND event.sequence > (SELECT MAX(sequence) FROM mission_events WHERE mission_id=?1
+             AND event_type='plan_confirmed' AND json_extract(payload_json,'$.plan_sha256')=?2)",
+        params![mission.mission_id, mission.plan_sha256], true)?
+        .is_some_and(|event| event.event_type == "mission_pause" && event.payload["action"] == "pause"
+            && event.payload.get("verification_run_id").is_none());
     let reason = if !waiting {
             if mission.status == MissionStatus::Active && associated && verifying { "system_verification" } else { "not_waiting" }
         } else if !associated { "unknown" }
         else if budget_reason.is_some() && !admitted_verification { "budget_exhausted" } else if environment { "environment_blocked" }
+        else if manual_pause { "manual_pause" }
         else if running { "system_verification" } else {
             if verifying && !admitted_verification { "unknown" }
-            else if manually_paused_on(connection, mission)? { "manual_pause" }
             // Waiting is not dispatched by the supervisor. An owned submitted
             // implementation needs an explicit user resume; the active state
             // above belongs to the system. Do not infer liveness from a saved
@@ -4894,6 +4912,105 @@ mod tests {
             &["fix".to_string()], &["frontend/src".to_string()], &[], &[], "test-user").unwrap();
         let _ = name;
         created
+    }
+
+    #[test]
+    fn manual_pause_projects_dispatch_stop_while_running_work_drains() {
+        let store = store("manual-pause-draining");
+        let created = confirmed_single_task(&store, "manual-pause-draining");
+        let id = &created.mission_id;
+        let running = store.begin_task_attempt(id, "fix", "draining-run").unwrap();
+        let paused = store.control(id, "pause").unwrap();
+        let wait = paused.effective_wait.as_ref().unwrap();
+        assert_eq!((&*wait.reason, &*wait.actor), ("manual_pause", "user"));
+        assert!(!wait.can_resume);
+        assert!(!wait.can_increase_budget);
+        assert_eq!(paused.tasks, running.tasks, "pause must not interrupt the admitted attempt");
+        assert_eq!(paused.confirmation, running.confirmation);
+        assert!(store.workspace_claim(&paused.workspace.root).unwrap().is_some());
+        assert!(store.next_ready_task(id).unwrap().is_none());
+        store.append_event(id, "task_progress", "fix", "finishing current work", serde_json::json!({})).unwrap();
+        let reopened = MissionStore::new(store.path.clone());
+        let persisted = reopened.get(id).unwrap();
+        assert_eq!(persisted.effective_wait.as_ref().unwrap().reason, "manual_pause");
+        assert!(!persisted.effective_wait.as_ref().unwrap().can_resume);
+
+        let submitted = reopened.await_task_verification(id, "fix", "draining-run", "submitted").unwrap();
+        let wait = submitted.effective_wait.as_ref().unwrap();
+        assert_eq!(wait.reason, "manual_pause");
+        assert!(wait.can_resume, "the existing owned verification resume admission remains available after drain");
+        let resumed = reopened.control(id, "resume").unwrap();
+        let wait = resumed.effective_wait.as_ref().unwrap();
+        assert_eq!((&*wait.reason, &*wait.actor), ("system_verification", "system"));
+        assert!(!wait.can_resume);
+        assert_eq!(resumed.tasks[0].attempt_run_id, "draining-run");
+
+        reopened.control(id, "pause").unwrap();
+        let connection = reopened.connection().unwrap();
+        connection.execute("DELETE FROM mission_workspace_claims WHERE mission_id=?1", [id]).unwrap();
+        // Read before legacy claim restoration: manual intent is still clear,
+        // but it cannot grant missing ownership or make resume admissible.
+        let unowned = load_mission(&connection, id).unwrap().unwrap();
+        assert_eq!(unowned.effective_wait.as_ref().unwrap().reason, "manual_pause");
+        assert!(!unowned.effective_wait.as_ref().unwrap().can_resume);
+    }
+
+    #[test]
+    fn manual_pause_projection_does_not_override_budget_or_environment_waits() {
+        for cause in ["budget", "environment"] {
+            let store = store(&format!("manual-pause-{cause}"));
+            let created = store.create(&create_input()).unwrap();
+            let id = &created.mission_id;
+            let mut plan = proposal();
+            plan.tasks.truncate(1);
+            plan.budget.max_total_tokens = Some(1);
+            let proposed = store.propose_plan(id, &plan).unwrap();
+            store.confirm_plan(id, &proposed.plan_sha256, &["fix".into()], &["frontend/src".into()], &[], &[], "fixture").unwrap();
+            store.begin_task_attempt(id, "fix", "draining-run").unwrap();
+            assert_eq!(store.control(id, "pause").unwrap().effective_wait.unwrap().reason, "manual_pause");
+            if cause == "budget" {
+                store.record_run_usage(id, "fix", "draining-run", &crate::agent_core_contracts::LocalRunUsage {
+                    input_tokens: 1, output_tokens: 0, estimated_cost: 0.0,
+                    currency: String::new(), billing_owner: "fixture".into(),
+                }).unwrap();
+            } else {
+                store.append_event(id, "runtime_workspace_blocked", "fix", "late environment diagnosis",
+                    serde_json::json!({"plan_sha256":proposed.plan_sha256})).unwrap();
+            }
+            store.append_event(id, "task_progress", "fix", "late progress", serde_json::json!({})).unwrap();
+            let waiting = store.get(id).unwrap();
+            let wait = waiting.effective_wait.as_ref().unwrap();
+            assert_eq!(wait.reason, if cause == "budget" { "budget_exhausted" } else { "environment_blocked" });
+            assert_eq!(wait.actor, "user");
+            assert!(!wait.can_resume);
+            assert_eq!(wait.environment_blocked, cause == "environment");
+            assert_eq!(wait.budget_reason.is_some(), cause == "budget");
+        }
+    }
+
+    #[test]
+    fn manual_pause_projection_requires_current_plan_and_manual_control_evidence() {
+        let store = store("manual-pause-plan-binding");
+        let created = confirmed_single_task(&store, "manual-pause-plan-binding");
+        let id = &created.mission_id;
+        store.control(id, "pause").unwrap();
+        let mut plan = proposal();
+        plan.tasks.truncate(1);
+        plan.summary = "new confirmed plan".into();
+        let proposed = store.propose_plan(id, &plan).unwrap();
+        store.confirm_plan(id, &proposed.plan_sha256, &["fix".into()], &["frontend/src".into()], &[], &[], "fixture").unwrap();
+        store.begin_task_attempt(id, "fix", "new-plan-run").unwrap();
+        // Seed a non-manual wait; the old plan's pause is not its cause.
+        store.connection().unwrap().execute("UPDATE mission_runs SET status='waiting' WHERE mission_id=?1", [id]).unwrap();
+        let waiting = store.get(id).unwrap();
+        assert_eq!(waiting.effective_wait.as_ref().unwrap().reason, "system_verification");
+        assert!(!waiting.effective_wait.as_ref().unwrap().can_resume);
+        store.append_event(id, "mission_pause", "", "automatic verification pause",
+            serde_json::json!({"action":"pause","verification_run_id":"failed-verifier"})).unwrap();
+        let automatic = store.get(id).unwrap();
+        assert_eq!(automatic.effective_wait.as_ref().unwrap().reason, "system_verification");
+        assert_eq!(automatic.effective_wait.as_ref().unwrap().actor, "system");
+        assert!(!automatic.effective_wait.as_ref().unwrap().can_resume);
     }
 
     #[test]
