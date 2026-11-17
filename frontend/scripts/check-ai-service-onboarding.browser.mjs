@@ -116,14 +116,14 @@ try {
   await next(); await row('shared').waitFor(); assert.equal(await page.evaluate(() => window.savedFetches.length), 1);
   assert.equal(await row('shared').getByRole('button', { name: '视觉理解 ×', exact: true }).count(), 0);
   await back(); await dialog().getByLabel('Base URL', { exact: true }).fill('https://new-saved.test/v1'); await next();
-  await page.getByText('连接地址或接口已修改；', { exact: false }).waitFor();
+  await page.getByText('连接已修改，请填写 API Key 后重新获取模型目录。', { exact: true }).waitFor();
   assert.equal(await page.evaluate(() => window.savedFetches.length), 1, 'must not fetch old saved address for changed connection');
   assert.equal(await row('shared').count(), 0); await manual('vision-new', 'vision.describe'); await save(); await dialog().waitFor({ state: 'hidden' });
   data = await page.evaluate(() => window.saves.at(-1)); assert.equal(data.id, 'existing'); assert.equal(data.api_key, ''); assert.equal(data.vision_model, 'vision-new');
   passed.push('edit preserves explicit disabled vision, changed endpoint never queries saved old endpoint');
 
   await fresh(); await dialog().getByLabel('服务供应商').selectOption('wan-video'); await dialog().getByLabel('API Key', { exact: true }).fill('fake-test-key'); await next();
-  await page.getByText('此接入方式未提供通用模型目录', { exact: false }).waitFor(); assert.equal(await page.evaluate(() => window.fetches.length), 0);
+  await page.getByText('此接口无模型目录。请用预设或手动添加，使用前需验证。', { exact: true }).waitFor(); assert.equal(await page.evaluate(() => window.fetches.length), 0);
   await save(); await dialog().waitFor({ state: 'hidden' }); data = await page.evaluate(() => window.saves[0]); assert.equal(data.video_adapter, 'wan-video'); assert.deepEqual(data.models, []);
   passed.push('provider without generic catalog uses explicit template/manual configuration without inference probe');
 
