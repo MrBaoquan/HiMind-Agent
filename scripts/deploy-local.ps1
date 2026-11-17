@@ -95,7 +95,7 @@ if ($ArtifactManifest) {
     $managedRoot = Get-BuildRoot $BuildRoot -ReadOnly
     [void](Assert-BuildPath $ArtifactManifest -Within (Join-Path $managedRoot 'artifacts'))
     $buildLock = Enter-BuildLock $managedRoot
-    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification
+    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification -AllowLocalVerification
     if ($deploymentManifest.channel -ne 'local' -or $deploymentManifest.configuration -ne 'release' -or $deploymentManifest.version -ne $ActiveVersion) { throw 'Artifact channel/configuration/version does not match local installation' }
     foreach ($pair in @(@('HIMIND_SIGNING_PUBLIC_KEY_PATH',$UpdatePublicKeyPath),@('HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH',$ExtensionPublicKeyPath))) {
         if ($deploymentManifest.tools.environment.($pair[0]) -ne (Get-BuildFileHash $pair[1])) { throw "Artifact trust root mismatch: $($pair[0])" }
@@ -291,7 +291,7 @@ if (-not $ArtifactManifest) {
     finally { Exit-BuildEnvironment $savedKeys }
     $managedRoot = Get-BuildRoot $BuildRoot -ReadOnly
     $buildLock = Enter-BuildLock $managedRoot
-    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification
+    $deploymentManifest = Read-BuildManifest $ArtifactManifest -RequireVerification -AllowLocalVerification
 }
 $artifactDirectory = Split-Path -Parent $ArtifactManifest
 $BuiltExe = Join-Path $artifactDirectory 'himind-agent.exe'

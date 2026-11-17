@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$FixtureRoot)
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot 'build-support.ps1')
 $ReuseRuntime = $false
@@ -33,7 +33,8 @@ finally {
 }
 
 # Start-Agent must return only a Process-shaped object, never its log text.
-$fixtureRoot = Join-Path $repoRoot ("target/deploy-local-tests-" + [Guid]::NewGuid().ToString("N"))
+if (-not $FixtureRoot) { $FixtureRoot = Join-Path $repoRoot 'target' }
+$fixtureRoot = Assert-BuildPath (Join-Path $FixtureRoot ("deploy-local-tests-" + [Guid]::NewGuid().ToString("N"))) -Within $FixtureRoot
 New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
 $stateHome = Join-Path $fixtureRoot 'unenrolled home'
 $missingState = Join-Path $stateHome 'data/agent-state.json'

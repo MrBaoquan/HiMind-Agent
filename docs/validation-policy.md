@@ -1,6 +1,6 @@
 # 分层验证与证据复用策略
 
-生效日期：2026-11-17。适用于本仓库的人类与 AI 开发、长任务推进、合并、本机更新和正式发布。策略现在生效；文末列出的脚本优化尚未实现。用户对具体任务的验收约定优先，既有授权不因选择验证层级而失效。
+生效日期：2026-11-17。适用于本仓库的人类与 AI 开发、长任务推进、合并、本机更新和正式发布。分层入口、内容复用和受限本机增量准入已实现；后续待办单独列出。用户对具体任务的验收约定优先，既有授权不因选择验证层级而失效。
 
 ## 为什么分层
 
@@ -86,23 +86,35 @@ try {
 核实测试实际匹配数量，零匹配不能计作通过；必要时先以同一筛选器加 `-- --list` 盘点。其他 bin 的相关测试使用各自 `--bin`。不要把 `cargo check` 写成测试通过，也不要把普通 `--locked` 写成离线验证；只有显式 `--offline` 且依赖齐备时才是离线运行。
 
 ```powershell
-# 在主仓库根目录：先解释现有 quick 会选择的范围。
-pwsh -File scripts/verify.ps1 -Mode quick -Explain
-# 综合开发检查：可能因未知改动、缺基线或工具变化退回全量。
+# 在主仓库根目录：任务开始记录 HEAD，整个任务使用同一基线。
+pwsh -File scripts/verify.ps1 -BaseRef '<任务起始提交>' -Explain
+# 默认 affected：包含相对基线的已提交、暂存、未暂存、新增与删除文件。
+pwsh -File scripts/verify.ps1 -BaseRef '<任务起始提交>'
+# 不传 BaseRef 时比较上次成功开发快照；首次无快照按全部源码选择。
+pwsh -File scripts/verify.ps1
+# 兼容综合检查：仍检查前端和 Rust，可发现无改动时的 dist/依赖损坏。
 pwsh -File scripts/verify.ps1 -Mode quick
 # 完整 candidate 验证，不生成新的安装产物。
-pwsh -File scripts/verify.ps1 -Mode candidate
-# 功能收敛且需要新安装产物时：完整 candidate + release 构建。
-pwsh -File scripts/build.ps1
+pwsh -File scripts/verify.ps1 -Mode candidate -BaseRef '<任务起始提交>'
+# 新完整基线，或 Rust/脚本等超出 local 范围时：candidate + release 构建。
+pwsh -File scripts/build.ps1 -BaseRef '<任务起始提交>'
+# 仅 UI/VS Code 适配器/说明文件变化：用新检查与完整基线组合覆盖。
+pwsh -File scripts/build.ps1 -Mode local -BaselineManifest '<完整 candidate 的 verified manifest>'
 # 之后部署同一 verified manifest；不再次调用 Cargo/npm。
 pwsh -File scripts/deploy-local.ps1 -ArtifactManifest '<实际 verified manifest 路径>' -BuildRoot $env:HIMIND_BUILD_ROOT
 ```
 
-当前 `quick` 按“上次对应槽的源码快照”计算影响，不等于任务完整差异，也不是几秒内结束的保证。没有基线、工具环境变化或 `src/app/*` 等未被映射识别的路径可触发全量。纯文档和已界定的小改动直接用适当的定向命令，不为使用 quick 而接受无关全量执行。
+`affected` 纯说明文件仅做相对任务基线的累计差异/空白检查及输入稳定性核对，不启动 Rust/Node 工具链；引用与示例仍需审查。UI 变化只运行前端依赖/构建/检查，VS Code 变化只运行适配器检查。Rust 变化运行编译检查、已映射模块与调用方测试；若嵌入的 dist 缺失、损坏或未经验证，先准备前端。构建脚本变化运行语法与隔离流水线夹具，不自动运行 Agent 业务全测。选择规则和逐文件理由在 `scripts/verification-plan.ps1`、`-Explain` 与每轮 `plan` 中。
 
-`build.ps1`、`verify.ps1 -Mode candidate` 都不是日常小修复默认入口。`verify.ps1 -Mode quick -Build` 当前不支持。安装/打包仍严格要求完整 candidate 收据；尚无 `affected`/`local` 验证 profile、定向收据导入器或绕过全量的受支持部署参数。
+`quick` 保留前端/Rust 综合流程，按对应槽快照选择测试；`affected` 则适合有明确任务基线的日常迭代。无法识别的共享输入扩大到完整检查，Rust 工具/选项与上次快照不同扩大 Rust 测试。`-Explain` 不启动工具，无法提前判断全部工具链失效条件。筛选测试必须有实际匹配，零项直接失败。两种开发模式均不生成安装收据，也不支持 `-Build`。
 
-如果用户要求新安装版，当前在本次开发改动收敛后集中运行一次现有 candidate 构建并部署；已经匹配的步骤由现有内容校验缓存复用。如果产物身份不再匹配，解释失效原因并完成必要构建。不要手改 manifest、伪造 `full_tests=true`、弱化 `Read-BuildManifest` 或用 Skip 参数制造“已验证安装版”。文档/AI 说明提交本身不要求重建已安装的业务程序；报告当前源码 HEAD 与安装版提交不同及其原因。
+`candidate` 覆盖完整 Rust、前端、适配器检查；匹配的原始成功步骤可复用。源码清单存入收据。格式检查保留既有范围：当前修改的 Rust 文件，无变更时检查 build.rs；affected 显式基线还包括相对该基线已提交的 Rust 文件。不是历史全仓格式清理。
+
+`local` 是受限本机更新，不是任意定向结果导入器。只接受 `frontend/`、`integrations/vscode-himind-ai/`、`docs/`、README/AGENTS/CLAUDE 和 Copilot 入口的内容差异；完整基线的源码清单、收据、四个产物及原始证据均须可核验，工具、配置、渠道、Runtime 必须匹配。旧收据缺源码清单时先建立一次新 candidate；local 不能作为下一次 local 的基线。改动 Rust、构建脚本、公共合同、根依赖或无法证明一致时拒绝，回到 candidate。
+
+local 核验当前前端/适配器检查（可按输入身份执行或复用）、Rust 格式与二进制构建，`full_tests=false`，在 `baseline` 中明确记录完整 Rust 覆盖来源和当前差异。基线 Rust 测试含旧 UI；变化的 UI 由当前前端检查与实际安装场景补证，不能声称完整 Rust 测试在新 UI 上重跑过。local 不接受 Skip；只有 deploy-local 显式接受此收据，正式 package/release 仍要求完整 candidate。缓存清理保留安装 current/previous 所依赖的完整基线产物与全部证据。
+
+如果用户要求新安装版，开发改动收敛后选择合法构建并部署同一产物；身份不匹配时解释原因并完成必要构建。不要手改 manifest、伪造 `full_tests=true` 或用 Skip 参数制造“已验证安装版”。说明提交本身不要求重建业务程序；报告当前源码 HEAD 与安装版提交不同及原因。
 
 ## 复用、失败与收尾
 
@@ -126,13 +138,13 @@ Rust 进程内用例目前共享环境变量、路径和端口，保留串行参
 
 结束条件：本次影响范围覆盖完整、相关失败解决或明确报告、产物/部署要求达到、未执行边界清楚。满足后停止验证；新改动、新失败或未解决风险才扩大/重跑。后续优化进入待办。不要为了在新提交号上得到“同一轮全绿”重跑所有步骤。
 
-## 后续脚本优化，尚未实现
+## 实施边界与后续待办
 
-按以下顺序推进，另行实施时各自做定向验证，不能在后续会话中误认为这些能力已经可用：
+本轮通过真实小型 Rust/npm 工程验证选择、跨提交复用、内容/证据损坏重跑、local 基线准入及拒绝；通过隔离部署夹具验证失败恢复。夹具不是实际 Agent 全量/安装验收，也不以其耗时宣称 Agent 性能。[实施记录](validation-implementation-20261117.md) 列出范围与结果，原始证据在 `.himind/reviews/20261117-validation-policy-implementation/`。当前业务安装版未因脚本实施重新部署。
 
-1. 分离开发检查、测试、构建、部署入口；输出选择理由与实际范围。补充 `src/app`、会话与公开合同的人工依赖映射，保留无法判定时的扩大策略。
-2. 纯测试缓存按相关内容和工具身份复用，Git commit 保留作来源；实际构建继续识别嵌入提交号、前端产物、公钥和 Runtime。减少无改动依赖目录重复扫描，保留缺失/损坏输出检查。
-3. 在完整基线和定向证据可核验后，设计本机更新的正式收据与准入规则；不直接放宽正式发布门禁。验收“无关变更可复用、相关变化失效、篡改/缺失拒绝、来源可追溯”。
-4. 隔离共享环境、目录与端口后评估测试并行；证明无互扰再启用。分别记录编译、运行、身份扫描和部署耗时。
+1. 模块与调用方映射是人工维护的开发辅助，不是完整依赖图。新模块/接口须维护映射并补场景；范围不明仍扩大。Rust 测试缓存保守包含全部非说明输入与工具，暂未做精确到单测的依赖切片。
+2. 每一步成功或复用后携带输出摘要，减少同一轮重复扫描；仍核验依赖与产物内容，尚无文件监视器或持久化目录摘要加速。
+3. local 暂不接纳 Rust 增量、不串联局部基线、不替代真实模型、取消恢复、预算和 UI 的现场验收。按影响范围补充这些场景，后续扩展另行设计准入与回归。
+4. Rust 进程内仍串行；共享环境、目录与端口隔离后再评估并行或 cargo-nextest。本次未引入新测试运行器/大规模验收框架。
 
-本次策略文档落地不修改流水线行为，也不为了说明策略而重跑全测或重新部署 Agent。
+各步和整轮收据记录耗时与来源。缺基线、首次编译及保守扩大仍可能较慢，不承诺所有开发改动都在固定秒数内完成。

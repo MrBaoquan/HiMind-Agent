@@ -89,11 +89,48 @@ $context.evidence = Join-Path $root 'evidence\tampered'
 Invoke-BuildStep $context 'fixture' @{source='v2'; flags='release'} $action $outputs
 Assert-Check ($script:executions -eq 5) 'Modified receipt accepted'
 $results.Add('modified-receipt-reexecuted')
+$priorSuccess = Get-Content -LiteralPath (Join-Path $root 'state/fixture.json') -Raw | ConvertFrom-Json
+Remove-Item -LiteralPath $priorSuccess.path
+$context.evidence = Join-Path $root 'evidence/missing'
+Invoke-BuildStep $context 'fixture' @{source='v2'; flags='release'} $action $outputs
+Assert-Check ($script:executions -eq 6) 'Missing original evidence accepted'
+$results.Add('missing-original-receipt-reexecuted')
+Assert-Check ((Get-BuildHash $null) -eq (Get-BuildHash $null) -and (Get-BuildHash $null) -ne (Get-BuildHash @{})) 'Optional Runtime identity lost null distinction'
+$results.Add('optional-runtime-null-identity')
+$wrapped = @('first','other' | Where-Object { $true })
+$roundTrip = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $wrapped)
+Assert-Check ((Get-BuildHash $wrapped) -eq (Get-BuildHash $roundTrip)) 'Pipeline scalar wrappers changed persisted identity'
+Assert-Check ((Get-BuildHash @($wrapped[0])) -ne (Get-BuildHash @($wrapped[1]))) 'Same-length scalar values collided'
+$results.Add('pipeline-scalar-identity-survives-json')
+$objectIdentity=[pscustomobject]@{path='fixture-path';sha256='fixture-hash'}
+$mapIdentity=[ordered]@{sha256='fixture-hash';path='fixture-path'}
+Assert-Check ((Get-BuildHash $objectIdentity) -eq (Get-BuildHash $mapIdentity)) 'Object property order changed persistent identity'
+$results.Add('object-and-hashtable-property-order-canonicalized')
 $impact = Get-BuildImpact @('src/mission/store.rs')
 Assert-Check ($impact.rust -and -not $impact.frontend -and $impact.selectors -contains 'mission::') 'Known module not selected'
 $unknown = Get-BuildImpact @('unexpected.file')
 Assert-Check ($unknown.full -and $unknown.rust -and $unknown.frontend) 'Unknown input did not widen checks'
 $results.Add('impact-selection-and-unknown-fallback')
+$mission = Get-BuildImpact @('src/app/mission_dispatch.rs')
+Assert-Check (-not $mission.full -and $mission.selectors -contains 'app::mission' -and $mission.selectors -contains 'mcp::') 'Mission callers missing from affected plan'
+$session = Get-BuildImpact @('src/session_service/query.rs')
+Assert-Check (-not $session.full -and $session.selectors -contains 'session_service::') 'Session service missing from affected plan'
+$ui = Get-BuildImpact @('frontend/src/pages/TaskCenterPage.tsx')
+Assert-Check ($ui.frontend -and -not $ui.rust) 'UI-only plan selected Rust tests'
+$docs = Get-BuildImpact @('AGENTS.md','CLAUDE.md','.github/copilot-instructions.md','docs/validation-policy.md')
+Assert-Check (-not $docs.rust -and -not $docs.frontend -and -not $docs.full) 'Instructions triggered application tests'
+$buildScripts = Get-BuildImpact @('scripts/verification-plan.ps1')
+Assert-Check (-not $buildScripts.full -and $buildScripts.script_checks -contains 'check-build-pipeline.ps1') 'Build changes missed isolated verification'
+$results.Add('affected-mission-session-ui-docs-tooling-selection')
+$sourceOne = [pscustomobject]@{files=[ordered]@{'src/main.rs'='one';'docs/note.md'='first'};commit='first'}
+$sourceTwo = [pscustomobject]@{files=[ordered]@{'src/main.rs'='one';'docs/note.md'='second'};commit='second'}
+$one = Get-BuildTestIdentity $sourceOne @{rustc='same'} $fixture 'local' 'same-ui' 'ALL'
+$two = Get-BuildTestIdentity $sourceTwo @{rustc='same'} $fixture 'local' 'same-ui' 'ALL'
+Assert-Check ((Get-BuildHash $one) -eq (Get-BuildHash $two)) 'Docs/commit unnecessarily invalidated test cache'
+$sourceTwo.files['src/main.rs']='changed'
+Assert-Check ((Get-BuildHash $one) -ne (Get-BuildHash (Get-BuildTestIdentity $sourceTwo @{rustc='same'} $fixture 'local' 'same-ui' 'ALL'))) 'Rust input did not invalidate tests'
+Assert-Check ((Get-BuildHash $one) -ne (Get-BuildHash (Get-BuildTestIdentity $sourceOne @{rustc='changed'} $fixture 'local' 'same-ui' 'ALL'))) 'Tools did not invalidate tests'
+$results.Add('test-cache-content-tools-not-git-commit')
 $tree = Join-Path $root 'tree'
 [IO.Directory]::CreateDirectory($tree) | Out-Null
 $treeFile = Join-Path $tree 'input.txt'

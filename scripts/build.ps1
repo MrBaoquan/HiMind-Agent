@@ -2,6 +2,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet('debug','release')][string]$Configuration = 'release',
+    [ValidateSet('candidate','local')][string]$Mode = 'candidate',
+    [string]$BaseRef, [string]$BaselineManifest,
     [string]$BuildRoot,
     [switch]$SkipDependencyInstall,
     [switch]$SkipTests,
@@ -17,7 +19,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-pipeline.ps1')
 if ($EnableIncremental) { Write-Warning 'Candidate builds use the fixed verify slot without incremental data. Use verify.ps1 -Mode quick for incremental development.' }
-$result = Invoke-AgentBuildPipeline -Repository (Split-Path -Parent $PSScriptRoot) -Mode candidate -Build `
+$result = Invoke-AgentBuildPipeline -Repository (Split-Path -Parent $PSScriptRoot) -Mode $Mode -BaseRef $BaseRef -BaselineManifest $BaselineManifest -Build `
     -Configuration $Configuration -BuildRoot $BuildRoot -BuildChannel $BuildChannel `
     -SkipDependencyInstall:$SkipDependencyInstall -SkipTests:$SkipTests -SkipIntegration:$SkipIntegration `
     -RuntimeReleaseDirectory $RuntimeReleaseDirectory -SkipRuntimeBundle:$SkipRuntimeBundle `

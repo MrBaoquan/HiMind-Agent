@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('quick','candidate')][string]$Mode = 'quick',
+    [ValidateSet('affected','quick','candidate','local')][string]$Mode = 'affected',
+    [string]$BaseRef, [string]$BaselineManifest,
     [string]$BuildRoot,
     [string]$RuntimeReleaseDirectory,
     [switch]$Build,
@@ -11,7 +12,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-pipeline.ps1')
-if ($Build -and $Mode -ne 'candidate') { throw '-Build requires -Mode candidate' }
+if ($Build -and $Mode -notin @('candidate','local')) { throw '-Build requires -Mode candidate or local' }
 Invoke-AgentBuildPipeline -Repository (Split-Path -Parent $PSScriptRoot) -BuildRoot $BuildRoot -Mode $Mode `
-    -Build:$Build -RuntimeReleaseDirectory $RuntimeReleaseDirectory -UseSccache:$UseSccache -Explain:$Explain -DryRun:$DryRun |
+    -BaseRef $BaseRef -BaselineManifest $BaselineManifest -Build:$Build -RuntimeReleaseDirectory $RuntimeReleaseDirectory -UseSccache:$UseSccache -Explain:$Explain -DryRun:$DryRun |
     ConvertTo-Json -Depth 20

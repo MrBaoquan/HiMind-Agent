@@ -17,12 +17,15 @@ $env:HIMIND_EXTENSION_SIGNING_KEY_ID = 'himind-extension-production-2026'
 # 在开始较长的构建前确认这台机器的依赖与目标架构。
 pwsh -File scripts/check-build-machine.ps1 -BuildRoot $env:HIMIND_BUILD_ROOT
 # 只解释影响范围，不安装依赖、不编译。
-pwsh -File scripts/verify.ps1 -Mode quick -Explain
-# 综合开发检查，Cargo 原生增量；未知影响/缺基线/工具变化可能退回全量。
-# 已界定的小改动优先按验证策略直接运行相关检查。
+pwsh -File scripts/verify.ps1 -BaseRef '<任务起始提交>' -Explain
+# 默认 affected，检查任务累计差异；按模块选择，不生成可部署产物。
+pwsh -File scripts/verify.ps1 -BaseRef '<任务起始提交>'
+# 兼容综合检查；包含前端和 Rust，以及无改动时的依赖/dist 完整性。
 pwsh -File scripts/verify.ps1 -Mode quick
 # 完整功能验证并冻结四个可安装 EXE。先配置公钥环境变量，见下文。
-pwsh -File scripts/build.ps1
+pwsh -File scripts/build.ps1 -BaseRef '<任务起始提交>'
+# 只有 UI/VS Code 适配器/说明变化时，可用新完整基线组合验证。
+pwsh -File scripts/build.ps1 -Mode local -BaselineManifest '<完整 candidate verified manifest>'
 # 使用同一 verified manifest 打包；打包不会再次编译 Agent。
 pwsh -File scripts/package.ps1 -ArtifactManifest '<build-manifest.verified-*.json>' -BuildRoot $env:HIMIND_BUILD_ROOT
 # 直接安装返回的 verified manifest；不调用 Cargo/rustc/npm。
@@ -35,7 +38,7 @@ pwsh -File scripts/build-cache.ps1 -TargetBudgetBytes 40GB -Apply
 构建根也可用各入口的 `-BuildRoot` 指定；不指定时使用 `%LOCALAPPDATA%/HiMindAgentBuilds/shared-v1`。`-RuntimeReleaseDirectory` 可覆盖 Runtime 环境变量。相对路径按当前 repository 解析，跨机器建议用绝对路径。
 脚本只接管带自己 ownership 标记的目录，拒绝已有非空陌生目录。
 根下只有 dev/verify 两个固定 target 槽；共享写锁覆盖依赖、编译、验证和制品冻结，冲突时直接说明并退出。
-quick 使用开发增量，candidate 关闭增量并固定较小调试符号；release 保留 Cargo 默认优化配置。
+affected/quick 使用开发增量，candidate/local 关闭增量并固定较小调试符号；release 保留 Cargo 默认优化配置。
 构建环境仅在当前进程作用域内设置并恢复，Cargo 下载和 npm 缓存、临时文件归该根所有。
 固定 Cargo home 不复制用户全局凭据；私有依赖需在该环境中另行配置。
 `-UseSccache` 可选，缺失时正常降级，缓存上限 10G。
@@ -47,29 +50,30 @@ quick 使用开发增量，candidate 关闭增量并固定较小调试符号；r
 本地安装默认读取 AgentHome/trusted-keys 下的官方公钥；公钥内容必须与产物记录匹配。
 可使用 `-AgentHome <独立目录> -LocalPort <空闲端口> -StatePath <独立状态>` 隔离安装，显式传入两个公钥路径。
 独立 AgentHome 默认使用 build-acceptance profile，避免共享生产 WebView/单实例资源。
-安装前核验四个 EXE、公钥、Runtime、完整验证及原始复用证据；逐卷计算复制、备份、解压和回滚空间，再停旧进程。
+安装前核验四个 EXE、公钥、Runtime、合法完整或 local 组合验证及原始证据；逐卷计算复制、备份、解压和回滚空间，再停旧进程。
 Runtime 仅在已记录的包/签名、安装内容摘要和实际版本探测全部匹配时复用；仅版本号相同不够。
 部署保留 EXE/Runtime 包备份；失败自动恢复文件、Runtime 状态指针、active-version 和原有可用性。
 成功部署会固定 current/previous manifest 引用；重复安装同一产物保留原 previous。
 
 每步明确 EXECUTED / REUSED / FAILED。evidence/<运行>/result.json 含本轮状态，REUSED 的 source 指向原始成功执行及 SHA-256。
-源码含脏文件按内容哈希；锁文件、工具/构建参数、公钥内容、前端 dist、Runtime 和 Git 提交改变会使相关结果失效。
+源码含脏文件按内容哈希；锁文件、工具/构建参数、公钥内容、前端 dist、Runtime 改变会使相关结果失效。纯测试身份排除说明文件与提交号；提交号仍记录在来源中，且继续使嵌入该身份的二进制重建。
 依赖和冻结产物亦校验内容。失败不进入缓存；中途源码变更使整轮失败。
-candidate 覆盖 Rust 完整测试、前端 check:ui 和 VSCode 扩展测试；quick 按模块选择测试，未知改动扩大检查。quick 当前仍进入前端构建/检查、身份扫描和 Cargo 检查流程，并非所有小改动都能快速结束；先 Explain，避免把入口名称当作耗时承诺。
-格式检查限工作区变更的 Rust 文件（无变更时检查 build.rs），不声称清除了历史全仓格式差异。
+candidate 覆盖 Rust 完整测试、前端 check:ui 和 VSCode 扩展测试；affected 按累计改动及调用方选择，纯说明不启动应用工具链，UI 不自动运行 Rust。构建脚本走隔离夹具；未知改动扩大检查，Rust 工具链变化扩大 Rust 测试。quick 仍检查前端和 Cargo，不是最轻入口；先 Explain，避免把名称当作耗时承诺。
+格式检查限变更的 Rust 文件（affected 显式基线包括累计变更，无变更时检查 build.rs），不声称清除了历史全仓格式差异。
 安装、健康、取消恢复等现场检查必须重新执行，不从历史收据推断当前可用。
 旧 -SkipTests/-SkipIntegration/-SkipDependencyInstall 可用于开发构建，但不会生成允许部署的完整验证 manifest。
-当前安装门禁仍要求完整 candidate 收据，不接受策略中的普通定向验证记录；本机更新的定向收据准入是后续待办，不能据此跳过现有校验。无需新产物的检查结束后停止，不为维持安装版与纯文档提交号一致而再次发布。
+普通 affected/quick 结果仍不能部署。local 仅允许前端、VS Code 适配器、docs、README/AGENTS/CLAUDE 和 Copilot 入口变化；工具、配置、Runtime 和 local 渠道必须与完整基线一致。基线须有源码清单；旧格式收据先补一次 candidate。Rust/脚本/公共合同等变化拒绝 local；不支持 local 链式基线或 Skip。
+local 核验当前前端/适配器检查（按输入身份执行或复用）、格式与二进制构建，明确 `full_tests=false` 并引用完整基线的 Rust 覆盖。旧 Rust 用例未在新 UI 上全量重跑，相关 UI/安装现场场景需要补验。只有 deploy-local 接受该收据，package/release 不接受。无需新产物的检查结束后停止，不为纯说明提交重新安装。
 GitHub 发布脚本可用 -ArtifactManifest/-BuildRoot 消费 release-channel verified manifest，并把同一 Runtime 传给安装包；它会校验 release channel、版本、制品收据与 Runtime 哈希。公开发布仍需配置发布签名；本机 unsigned package 只作打包验证，不是可发布签名产物。
 
-回收默认保留最近两个完整制品、所有 current/previous pins、最近使用的 target 槽及全部证据。
+回收默认保留最近两个制品、所有 current/previous pins、被 local pin 引用的完整基线、最近使用的 target 槽及全部证据。
 超预算缓存可重建，Apply 会清空对应缓存目录；固定 target 总量仍超预算时会明确报告保留部分超标。
 预算是回收策略而非文件系统硬配额。应定期运行回收；证据、隔离实例和未完成 staging 不自动删除，以便故障调查。
 Plan/Apply 使用同一写锁，并检查遗留原生进程、路径归属和目录链接；不涉及源码、生产目录或别的项目。
 回滚代码：还原本分支构建脚本和 build.rs；旧候选/备份不受缓存清理影响。无需变更全局工具配置。
 
 可重复检查：check-build-machine.ps1、check-build-support.ps1、check-build-pipeline.ps1、check-build-cache.ps1、check-deploy-local.ps1。
-前三者接受 FixtureRoot，建议也放 G 盘。pipeline 检查使用真实小型 Rust/npm 工程，不能代替实际 Agent 安装验证。
+除机器预检外，其余四个夹具检查接受 FixtureRoot，建议放在空间充足且有正常执行权限的受管盘。pipeline 检查使用真实小型 Rust/npm 工程，覆盖跨提交复用、累计差异、local 准入及拒绝，不能代替实际 Agent 安装验证。
 本机实测结果与来源见本任务 .himind/long-tasks/20261116-fast-build-storage-optimization；不把小工程耗时当成 Agent 性能。
 
 本机隔离实测（Windows x64、Rust 1.97.1、Node 22.18.0；观测到其他任务并行编译）：完整 Agent 候选 1,098s，包含 Rust 全测 474s 和 release 构建 528s；无改动候选 36.7s，8 个阶段均从哈希核对过的成功收据复用；Rust 单文件变更 360s，UI 变更 477s（前端重建 1.8s）。这轮完整验证覆盖 2,162 个 Rust 测试通过、VS Code 10 项测试通过、前端检查通过。另一次 513s 冷 release 编译只作为编译耗时记录；该操作最终因并发源码漂移失败，且没有安装，不能计作冷候选通过。

@@ -2,9 +2,10 @@
 # Files under a managed build root are disposable caches or immutable receipts;
 # source worktrees and installed Agent homes are never cleanup targets.
 Set-StrictMode -Version 3.0
+. (Join-Path $PSScriptRoot 'verification-plan.ps1')
 
 function Get-BuildHash {
-    param([Parameter(Mandatory)][object]$Value)
+    param([Parameter(Mandatory)][AllowNull()][object]$Value)
     # Hashtable enumeration varies between PowerShell processes. Canonicalize
     # every object, retaining array order, before computing persistent identities.
     function ConvertTo-CanonicalBuildValue([AllowNull()][object]$Item) {
@@ -14,7 +15,9 @@ function Get-BuildHash {
             foreach ($key in $Item.Keys | Sort-Object -CaseSensitive) { $ordered[$key] = ConvertTo-CanonicalBuildValue $Item[$key] }
             return $ordered
         }
-        if ($Item -is [pscustomobject]) {
+        # Pipeline-emitted strings can carry a PSObject wrapper and satisfy
+        # `-is [pscustomobject]`. Hash their value, not their Length property.
+        if ($Item.GetType().FullName -eq 'System.Management.Automation.PSCustomObject') {
             $ordered = [ordered]@{}
             foreach ($property in $Item.PSObject.Properties | Sort-Object Name -CaseSensitive) { $ordered[$property.Name] = ConvertTo-CanonicalBuildValue $property.Value }
             return $ordered
@@ -423,14 +426,15 @@ function Invoke-BuildStep {
     $inputHash = Get-BuildHash $InputIdentity
     $cachePath = Join-Path $Context.root "state\$Name.json"
     $receiptPath = Join-Path $Context.evidence "$Name.json"
-    $prior = $null
+    $prior = $null; $reusedOutputHash = $null
     if (-not $Always -and (Test-Path -LiteralPath $cachePath)) {
         try {
             $candidate = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
             $original = Get-Content -LiteralPath $candidate.path -Raw | ConvertFrom-Json
             if ((Get-BuildFileHash $candidate.path) -eq $candidate.sha256 -and $original.result -eq 'PASS' -and
-                $original.input_hash -eq $inputHash -and $original.output_hash -eq (Get-BuildHash (& $Outputs))) {
-                $prior = $candidate
+                $original.disposition -eq 'EXECUTED' -and $original.step -eq $Name -and $original.input_hash -eq $inputHash) {
+                $currentOutputHash = Get-BuildHash (& $Outputs)
+                if ($original.output_hash -eq $currentOutputHash) { $prior = $candidate; $reusedOutputHash = $currentOutputHash }
             }
         }
         catch { Write-Verbose "Invalid prior $Name receipt: $_" }
@@ -441,7 +445,8 @@ function Invoke-BuildStep {
         source = $prior; recorded_utc = [DateTime]::UtcNow.ToString('o'); duration_ms = 0; output_hash = '' }
     try {
         if (-not $prior) { & $Action | Out-Host }
-        $receipt.output_hash = Get-BuildHash (& $Outputs)
+        $receipt.output_hash = if ($prior) { $reusedOutputHash } else { Get-BuildHash (& $Outputs) }
+        if ($Context.PSObject.Properties['provenance']) { $receipt['provenance'] = $Context.provenance }
     }
     catch {
         $receipt.result = 'FAILED'; $receipt.disposition = 'FAILED'; $receipt['error'] = $_.Exception.Message
@@ -451,7 +456,7 @@ function Invoke-BuildStep {
     finally {
         $timer.Stop(); $receipt.duration_ms = $timer.ElapsedMilliseconds
         Write-BuildJson $receiptPath $receipt
-        $Context.steps.Add([pscustomobject]@{ step = $Name; disposition = $receipt.disposition; result = $receipt.result; path = $receiptPath; sha256 = Get-BuildFileHash $receiptPath; duration_ms = $receipt.duration_ms })
+        $Context.steps.Add([pscustomobject]@{ step = $Name; disposition = $receipt.disposition; result = $receipt.result; path = $receiptPath; sha256 = Get-BuildFileHash $receiptPath; output_hash=$receipt.output_hash; duration_ms = $receipt.duration_ms })
         Write-Host "$($receipt.disposition) $Name ($($receipt.duration_ms) ms)"
         if ($receipt.result -eq 'PASS') {
             # Keep direct provenance to the original execution, not a chain of
@@ -464,23 +469,11 @@ function Invoke-BuildStep {
 
 function Get-BuildImpact {
     param([string[]]$Changed)
-    $rust = $false; $frontend = $false; $full = $false
-    $selectors = [Collections.Generic.HashSet[string]]::new()
-    foreach ($name in $Changed) {
-        if ($name -match '^docs/|^README\.md$') { continue }
-        if ($name -match '^frontend/') { $frontend = $true; continue }
-        if ($name -match '^src/(mission|workflow|expert|runtime|executor|store)(?:[/.])') {
-            $rust = $true
-            [void]$selectors.Add(($Matches[1] + '::'))
-        }
-        else { $rust = $true; $frontend = $true; $full = $true }
-    }
-    return [pscustomobject]@{ rust = $rust; frontend = $frontend; full = $full;
-        selectors = @($selectors | Sort-Object); changed = $Changed }
+    return Get-AgentVerificationImpact $Changed
 }
 
 function Read-BuildManifest {
-    param([string]$Path, [switch]$RequireVerification)
+    param([string]$Path, [switch]$RequireVerification, [switch]$AllowLocalVerification)
     $manifestPath = Assert-BuildPath $Path
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     if ($manifest.schema -ne 'himind.build-manifest.v1') { throw 'Unsupported build manifest' }
@@ -504,10 +497,21 @@ function Read-BuildManifest {
         $verification = $manifest.verification
         if (-not $verification -or (Get-BuildFileHash $verification.path) -ne $verification.sha256) { throw 'Missing or modified verification receipt' }
         $receipt = Get-Content -LiteralPath $verification.path -Raw | ConvertFrom-Json
-        if ($receipt.result -ne 'PASS' -or $receipt.mode -ne 'candidate' -or $receipt.build_input_hash -ne $manifest.build_input_hash -or $receipt.source_hash -ne $manifest.source_hash -or -not $receipt.full_tests) {
+        $local = $receipt.mode -eq 'local'
+        if ($receipt.result -ne 'PASS' -or $receipt.build_input_hash -ne $manifest.build_input_hash -or $receipt.source_hash -ne $manifest.source_hash -or
+            (-not $local -and ($receipt.mode -ne 'candidate' -or -not $receipt.full_tests)) -or ($local -and -not $AllowLocalVerification)) {
             throw 'Candidate has not passed matching full verification'
         }
-        foreach ($stepName in @('frontend-dependencies','frontend-build','frontend-checks','rust-format','rust-tests-ALL','integration-dependencies','integration-tests','rust-build')) {
+        if ($local) {
+            $inventory = Get-Content -LiteralPath $verification.path -Raw | ConvertFrom-Json -AsHashtable
+            if ($receipt.full_tests -or -not $inventory.ContainsKey('baseline') -or -not $inventory.ContainsKey('source_files') -or
+                (Get-BuildHash $inventory.source_files) -ne $manifest.source_hash) { throw 'Invalid incremental verification inventory' }
+            $expected = Assert-LocalVerificationBaseline $inventory.source_files $manifest.tools $manifest.channel $manifest.configuration $manifest.runtime $inventory.baseline
+            if ((Get-BuildHash $expected) -ne (Get-BuildHash $inventory.baseline)) { throw 'Local baseline coverage was altered' }
+        }
+        $requiredSteps = @('frontend-dependencies','frontend-build','frontend-checks','rust-format','integration-dependencies','integration-tests','rust-build')
+        if (-not $local) { $requiredSteps += 'rust-tests-ALL' }
+        foreach ($stepName in $requiredSteps) {
             $entries = @($receipt.steps | Where-Object step -eq $stepName)
             if ($entries.Count -ne 1) { throw "Missing full verification step: $stepName" }
             $entry = $entries[0]

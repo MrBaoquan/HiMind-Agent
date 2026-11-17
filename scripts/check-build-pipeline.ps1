@@ -13,6 +13,11 @@ $storage = Join-Path $fixture 'managed'
 foreach ($path in @('src','frontend','icons','integrations\vscode-himind-ai')) { [IO.Directory]::CreateDirectory((Join-Path $repository $path)) | Out-Null }
 function Write-Fixture([string]$Relative, [string]$Text) { [IO.File]::WriteAllText((Join-Path $repository $Relative), ($Text.TrimEnd() + "`n"), [Text.UTF8Encoding]::new($false)) }
 function Assert-Pipeline([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+function Assert-PipelineRejected([scriptblock]$Action, [string]$Message) {
+    $rejected = $false
+    try { & $Action | Out-Null } catch { $rejected = $true }
+    Assert-Pipeline $rejected $Message
+}
 Write-Fixture '.gitignore' "**/node_modules/`n**/dist/`n/target/`n"
 Write-Fixture 'Cargo.toml' @'
 [package]
@@ -74,6 +79,11 @@ Write-Fixture 'integrations\vscode-himind-ai\package-lock.json' '{"name":"build-
 & git -C $repository -c user.name=HiMindFixture -c user.email=fixture@example.invalid commit -qm fixture
 if ($LASTEXITCODE) { throw 'Fixture Git initialization failed' }
 $checks = [Collections.Generic.List[string]]::new()
+Write-Fixture 'README.md' 'Documentation-only development edit'
+$docs = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -BaseRef HEAD
+Assert-Pipeline ($docs.result -eq 'PASS' -and $docs.steps.Count -eq 0 -and -not $docs.manifest -and -not $docs.full_tests) 'Docs-only affected started application checks'
+Remove-Item -LiteralPath (Join-Path $repository 'README.md')
+$checks.Add('docs-only-affected-no-application-toolchain')
 $cold = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
 Assert-Pipeline ($cold.result -eq 'PASS' -and $cold.full_tests) 'Cold fixture failed'
 Assert-Pipeline ($cold.machine.ready -and $cold.machine.tool_versions.node -and $cold.machine.tool_versions.rustc) 'Candidate omitted its successful machine/toolchain compatibility report'
@@ -121,6 +131,97 @@ $keyStamp=[IO.File]::GetLastWriteTimeUtc($keyPath)
 $keyResult=Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
 Assert-Pipeline ((@(& (Join-Path (Split-Path -Parent $keyResult.manifest) 'himind-agent.exe')) -join "`n") -match 'rotated-fixture-key') 'Key content rotated but old key embedded'
 $checks.Add('public-key-content-with-preserved-timestamp')
+# A new commit changes embedded build metadata, while semantic test inputs stay
+# identical. Preserve both facts instead of calling an old binary a new build.
+& git -C $repository add .
+& git -C $repository -c user.name=HiMindFixture -c user.email=fixture@example.invalid commit -qm baseline
+$baselineCommit = [string](& git -C $repository rev-parse HEAD)
+$committed = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
+Assert-Pipeline (($committed.steps | Where-Object step -eq 'rust-tests-ALL').disposition -eq 'REUSED') 'Commit-only change invalidated semantic tests'
+Write-Fixture 'README.md' 'New docs commit with unchanged executable inputs'
+& git -C $repository add README.md
+& git -C $repository -c user.name=HiMindFixture -c user.email=fixture@example.invalid commit -qm docs
+$docsCandidate = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode candidate -Build -Configuration debug -SkipRuntimeBundle
+Assert-Pipeline (($docsCandidate.steps | Where-Object step -eq 'rust-tests-ALL').disposition -eq 'REUSED') 'Docs commit reran Rust tests'
+Assert-Pipeline ($docsCandidate.build_input_hash -ne $committed.build_input_hash -and ($docsCandidate.steps | Where-Object step -eq 'rust-build').disposition -eq 'EXECUTED') 'Docs commit reused obsolete binary metadata'
+$docsCommit = [string](& git -C $repository rev-parse HEAD)
+Assert-Pipeline ((@(& (Join-Path (Split-Path -Parent $docsCandidate.manifest) 'himind-agent.exe')) -join "`n").Contains($docsCommit.Substring(0,7))) 'Binary omitted new docs commit'
+$checks.Add('cross-commit-test-reuse-with-fresh-binary-identity')
+
+# Explicit task baselines include committed, staged, unstaged, deleted and new
+# files together, rather than silently checking only the latest dirty delta.
+Write-Fixture 'frontend/input.txt' 'staged interface'
+& git -C $repository add frontend/input.txt
+Write-Fixture 'frontend/input.txt' 'incremental local interface'
+Write-Fixture 'frontend/untracked.txt' 'new input'
+Remove-Item -LiteralPath (Join-Path $repository 'frontend/check.cjs')
+$cumulative = Get-BuildChanges $repository (Get-BuildSource $repository) @{} $baselineCommit
+foreach ($path in @('README.md','frontend/input.txt','frontend/untracked.txt','frontend/check.cjs')) {
+    Assert-Pipeline ($cumulative.changed -contains $path) "Cumulative baseline missed $path"
+}
+& git -C $repository restore --source=HEAD -- frontend/check.cjs
+$uiAffected = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -BaseRef HEAD
+Assert-Pipeline ($uiAffected.result -eq 'PASS' -and @($uiAffected.steps | Where-Object step -like 'rust-*').Count -eq 0 -and @($uiAffected.steps | Where-Object step -eq 'frontend-checks').Count -eq 1) 'UI-only affected selected Rust checks'
+$checks.Add('cumulative-baseline-and-ui-only-selection')
+
+$local = Invoke-AgentBuildPipeline -Repository $repository -BuildRoot $storage -Mode local -Build -BaselineManifest $docsCandidate.manifest -Configuration debug -SkipRuntimeBundle
+Assert-Pipeline ($local.result -eq 'PASS' -and -not $local.full_tests -and $local.baseline.rust_tests -eq 'REUSED_FROM_COMPLETE_BASELINE') 'Local run falsely claimed complete current tests'
+Assert-Pipeline (@($local.steps | Where-Object step -like 'rust-tests-*').Count -eq 0) 'Local run repeated full Rust suite'
+Assert-PipelineRejected { Read-BuildManifest $local.manifest -RequireVerification } 'Release gate accepted incremental local evidence'
+[void](Read-BuildManifest $local.manifest -RequireVerification -AllowLocalVerification)
+$checks.Add('local-ui-build-combined-coverage-release-rejection')
+$localManifest = Read-BuildManifest $local.manifest
+$baselineRecord = @{path=$docsCandidate.manifest;sha256=Get-BuildFileHash $docsCandidate.manifest}
+$localSource = Get-BuildSource $repository
+$badFiles = [ordered]@{}
+foreach ($name in $localSource.files.Keys) { $badFiles[$name] = $localSource.files[$name] }
+$badFiles['src/main.rs']='changed'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $badFiles $localManifest.tools 'local' 'debug' $null $baselineRecord } 'Local gate covered changed Rust'
+$badFiles['src/main.rs']=$localSource.files['src/main.rs']
+$badFiles['scripts/verify.ps1']='changed'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $badFiles $localManifest.tools 'local' 'debug' $null $baselineRecord } 'Local gate covered changed build scripts'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files @{rustc='changed'} 'local' 'debug' $null $baselineRecord } 'Local gate ignored changed tools'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files $localManifest.tools 'local' 'release' $null $baselineRecord } 'Local gate ignored changed configuration'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files $localManifest.tools 'local' 'debug' @{package='changed'} $baselineRecord } 'Local gate ignored changed Runtime'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files $localManifest.tools 'release' 'debug' $null $baselineRecord } 'Local gate allowed release channel'
+Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files $localManifest.tools 'local' 'debug' $null @{path=$local.manifest;sha256=Get-BuildFileHash $local.manifest} } 'Local baseline chain accepted'
+# Retention verifies the pinned local receipt and must preserve its complete
+# baseline artifacts while allowing unrelated old artifacts to be collected.
+Write-BuildJson (Join-Path $storage 'pins/local-fixture.json') @{current_manifest=$local.manifest;previous_manifest=$null}
+1..3 | ForEach-Object {
+    $extra=Join-Path $storage ('artifacts/'+('f'*62)+$_.ToString('00'))
+    [IO.Directory]::CreateDirectory($extra) | Out-Null
+    Write-BuildJson (Join-Path $extra 'build-manifest.json') @{fixture=$true}
+    (Get-Item $extra).LastWriteTimeUtc=[DateTime]::UtcNow.AddMinutes($_)
+}
+$cacheText = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'build-cache.ps1') -BuildRoot $storage
+if ($LASTEXITCODE) { throw 'Local baseline retention plan failed' }
+$cachePlan = $cacheText | ConvertFrom-Json
+$baselineDirectory = Split-Path -Parent $docsCandidate.manifest
+Assert-Pipeline ($cachePlan.protected -contains $baselineDirectory -and @($cachePlan.deletions | Where-Object path -eq $baselineDirectory).Count -eq 0) 'Cleanup lost pinned local baseline'
+$checks.Add('pinned-local-retains-complete-baseline')
+$baselineBytes = [IO.File]::ReadAllBytes($docsCandidate.manifest)
+try {
+    [IO.File]::AppendAllText($docsCandidate.manifest,' ')
+    Assert-PipelineRejected { Read-BuildManifest $local.manifest -RequireVerification -AllowLocalVerification } 'Modified baseline manifest accepted'
+} finally { [IO.File]::WriteAllBytes($docsCandidate.manifest,$baselineBytes) }
+$baselineVerification = (Read-BuildManifest $docsCandidate.manifest).verification.path
+$baselineReceiptBytes = [IO.File]::ReadAllBytes($baselineVerification)
+try {
+    $oldInventory = Get-Content -LiteralPath $baselineVerification -Raw | ConvertFrom-Json -AsHashtable
+    $oldInventory.Remove('source_files')
+    Write-BuildJson $baselineVerification $oldInventory
+    $noInventoryManifest = Get-Content -LiteralPath $docsCandidate.manifest -Raw | ConvertFrom-Json -AsHashtable
+    $noInventoryManifest.verification.sha256=Get-BuildFileHash $baselineVerification
+    Write-BuildJson $docsCandidate.manifest $noInventoryManifest
+    Assert-PipelineRejected { Assert-LocalVerificationBaseline $localSource.files $localManifest.tools 'local' 'debug' $null @{path=$docsCandidate.manifest;sha256=Get-BuildFileHash $docsCandidate.manifest} } 'Legacy baseline without inventory accepted'
+} finally {
+    [IO.File]::WriteAllBytes($docsCandidate.manifest,$baselineBytes)
+    [IO.File]::WriteAllBytes($baselineVerification,$baselineReceiptBytes)
+}
+$checks.Add('local-baseline-input-tamper-legacy-and-chain-rejections')
+& git -C $repository restore --staged --worktree -- frontend/input.txt
+Remove-Item -LiteralPath (Join-Path $repository 'frontend/untracked.txt')
 # A linked checkout uses a .git file; native Cargo must watch its real branch ref.
 $linked=Join-Path $fixture 'linked checkout'
 & git -C $repository worktree add -b fixture-linked $linked HEAD 2>&1 | Out-Host
@@ -164,6 +265,15 @@ Assert-Pipeline (($dependencyRepair.steps|Where-Object step -eq 'frontend-depend
 Assert-Pipeline (-not(Test-Path (Join-Path $repository 'frontend/node_modules/tampered'))) 'npm ci did not restore dependencies'
 $checks.Add('corrupt-dependency-tree-reinstalled')
 $checks.Add('twenty-quick-calls-two-stable-slots')
+$selectionEnvironment = Enter-BuildEnvironment $storage 'dev'
+$selectionToolchain = Initialize-BuildToolchain
+try {
+Assert-PipelineRejected { Invoke-SelectedRustTests $repository (Join-Path $fixture 'zero-selection') 'missing-tests' 'no_such_test_867294' } 'Zero matching tests counted as passed'
+} finally {
+    Exit-BuildEnvironment $selectionToolchain
+    Exit-BuildEnvironment $selectionEnvironment
+}
+$checks.Add('zero-matching-rust-filter-rejected')
 $checkScript = Join-Path $repository 'frontend/check.cjs'
 $originalCheck = [IO.File]::ReadAllBytes($checkScript)
 $originalRust = [IO.File]::ReadAllBytes($rustInput)
@@ -185,7 +295,7 @@ try {
     [IO.File]::WriteAllBytes($checkScript, $originalCheck)
     [IO.File]::WriteAllBytes($rustInput, $originalRust)
 }
-$report = @{passed=$true;checks=$checks.ToArray();fixture=$fixture;cold=$cold;hot=$hot;rust=$rust;ui=$ui;quick_last=$quick[-1]}
+$report = @{passed=$true;checks=$checks.ToArray();fixture=$fixture;cold=$cold;hot=$hot;rust=$rust;ui=$ui;docs=$docs;docs_candidate=$docsCandidate;affected_ui=$uiAffected;local=$local;quick_last=$quick[-1]}
 Write-BuildJson (Join-Path $fixture 'report.json') $report
 @{passed=$true;checks=$checks.ToArray();report=(Join-Path $fixture 'report.json')} | ConvertTo-Json -Depth 6
 

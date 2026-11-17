@@ -7,6 +7,12 @@ if(-not $FixtureRoot){$FixtureRoot=Join-Path (Split-Path -Parent $PSScriptRoot) 
 $fixture=Join-Path $FixtureRoot ([Guid]::NewGuid().ToString('N'))
 $root=Get-BuildRoot $fixture
 function Assert-Check([bool]$ok,[string]$message){if(-not $ok){throw $message}}
+$emptyRoot=Get-BuildRoot (Join-Path $fixture 'empty-managed')
+[IO.Directory]::CreateDirectory((Join-Path $emptyRoot 'slots/dev/target'))|Out-Null
+$emptyText=& pwsh @('-NoProfile','-File',$cacheScript,'-BuildRoot',$emptyRoot)
+if($LASTEXITCODE){throw 'Empty-cache plan failed'}
+$emptyPlan=$emptyText|ConvertFrom-Json
+Assert-Check ($emptyPlan.target_bytes_after -eq 0 -and -not $emptyPlan.deletions.Count) 'Empty cache plan is not stable'
 foreach($relative in @('slots/dev/target','slots/verify/target','cache/npm')) {
     $p=Join-Path $root $relative
     [IO.Directory]::CreateDirectory($p)|Out-Null
@@ -56,5 +62,5 @@ New-Item -ItemType Junction -Path (Join-Path $root 'cache/npm') -Target $outside
 & pwsh @argsForCache -Apply 2>&1 | Out-Null
 Assert-Check ($LASTEXITCODE -ne 0) 'Reparse deletion accepted'
 Assert-Check (Test-Path (Join-Path $outside 'keep')) 'External junction target changed'
-Write-BuildJson (Join-Path $root 'report.json') @{passed=$true;checks=@('plan-does-not-delete','cross-process-lock','active-native-process-protected','exact-apply','two-recent-artifacts','current-and-previous-pins','evidence-preserved','junction-rejected');plan=$plan;applied=$applied}
+Write-BuildJson (Join-Path $root 'report.json') @{passed=$true;checks=@('empty-cache-plan','plan-does-not-delete','cross-process-lock','active-native-process-protected','exact-apply','two-recent-artifacts','current-and-previous-pins','evidence-preserved','junction-rejected');plan=$plan;applied=$applied}
 Write-Output "PASS maintenance; report=$root/report.json"

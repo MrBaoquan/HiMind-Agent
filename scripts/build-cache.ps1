@@ -37,7 +37,7 @@ try {
         $items = @(Get-ChildItem -LiteralPath $absolute -Force -Recurse)
         if (@($items | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count) { throw "Reparse in cleanup target: $absolute" }
         $files = @($items | Where-Object { -not $_.PSIsContainer })
-        $bytes = ($files | Measure-Object Length -Sum).Sum
+        $bytes = if ($files.Count) { [long](($files | Measure-Object Length -Sum).Sum) } else { 0L }
         return [pscustomobject]@{path=$absolute; bytes=[long]$bytes; files=$files.Count; last_write=(Get-Item -LiteralPath $absolute).LastWriteTimeUtc}
     }
     $deletions = [Collections.Generic.List[object]]::new()
@@ -61,7 +61,8 @@ try {
             $slots += $item
         }
     }
-    $total = [long](($slots | Measure-Object bytes -Sum).Sum)
+    $slotMeasure = @($slots | Measure-Object bytes -Sum)
+    $total = if ($slotMeasure.Count) { [long]$slotMeasure[0].Sum } else { 0L }
     $newestSlot = @($slots | Sort-Object last_write -Descending | Select-Object -First 1)
     if ($newestSlot.Count) { $protected.Add($newestSlot[0].path) }
     foreach ($slot in $slots | Sort-Object last_write) {
@@ -83,7 +84,19 @@ try {
         foreach ($file in Get-ChildItem -LiteralPath $pinParent -Filter '*.json' -File) {
             $pin = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
             foreach ($manifest in @($pin.current_manifest,$pin.previous_manifest)) {
-                if ($manifest) { $protected.Add((Split-Path -Parent (Assert-BuildPath $manifest -Within $artifactParent))) }
+                if ($manifest) {
+                    $protected.Add((Split-Path -Parent (Assert-BuildPath $manifest -Within $artifactParent)))
+                    # Incremental local receipts depend on an immutable complete
+                    # baseline. Retain its artifacts while either pin uses it.
+                    $pinned = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json -AsHashtable
+                    if ($pinned.ContainsKey('verification') -and $pinned.verification) {
+                        $verification = Get-Content -LiteralPath $pinned.verification.path -Raw | ConvertFrom-Json -AsHashtable
+                        if ($verification.mode -eq 'local') {
+                            [void](Read-BuildManifest $manifest -RequireVerification -AllowLocalVerification)
+                            $protected.Add((Split-Path -Parent (Assert-BuildPath $verification.baseline.path -Within $artifactParent)))
+                        }
+                    }
+                }
             }
         }
     }
