@@ -30,26 +30,22 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-pub(crate) fn route_key(base_url: &str, upstream_model: &str) -> String {
-    format!(
-        "{}|{}",
-        base_url.trim().trim_end_matches('/'),
-        upstream_model.trim()
-    )
+pub(crate) fn route_key(route_identity: &str) -> String {
+    route_identity.trim().to_string()
 }
 
-pub(crate) fn mark_failure(base_url: &str, upstream_model: &str) -> u32 {
-    mark_failure_at(route_key(base_url, upstream_model), now_ms())
+pub(crate) fn mark_failure(route_identity: &str) -> u32 {
+    mark_failure_at(route_key(route_identity), now_ms())
 }
 
-pub(crate) fn mark_success(base_url: &str, upstream_model: &str) {
+pub(crate) fn mark_success(route_identity: &str) {
     if let Ok(mut health) = health().lock() {
-        health.remove(&route_key(base_url, upstream_model));
+        health.remove(&route_key(route_identity));
     }
 }
 
-pub(crate) fn is_healthy(base_url: &str, upstream_model: &str) -> bool {
-    is_healthy_at(route_key(base_url, upstream_model), now_ms())
+pub(crate) fn is_healthy(route_identity: &str) -> bool {
+    is_healthy_at(route_key(route_identity), now_ms())
 }
 
 fn mark_failure_at(key: String, now_ms: u64) -> u32 {
@@ -90,7 +86,7 @@ mod tests {
     #[test]
     fn failure_cools_down_then_recovers() {
         reset_for_test();
-        let key = route_key("https://example.com/v1", "model-a");
+        let key = route_key("route:example|model-a|openai-responses");
         mark_failure_at(key.clone(), 1_000);
         assert!(!is_healthy_at(key.clone(), 1_000));
         assert!(!is_healthy_at(key.clone(), 1_000 + FAILURE_TTL_MS - 1));
@@ -99,19 +95,28 @@ mod tests {
 
     #[test]
     fn failure_count_increments_before_recovery() {
-        let key = route_key("https://failure-count.example/v1", "model-a");
+        let key = route_key("route:failure-count|model-a|openai-chat");
         assert_eq!(mark_failure_at(key.clone(), 1_000), 1);
         assert_eq!(mark_failure_at(key, 1_000), 2);
     }
 
     #[test]
+    fn separate_credentialed_routes_do_not_share_circuit_state() {
+        reset_for_test();
+        let first = "custom:account-a|https://shared.example/v1|model-a|openai-chat";
+        let second = "custom:account-b|https://shared.example/v1|model-a|openai-chat";
+        mark_failure(first);
+        assert!(!is_healthy(first));
+        assert!(is_healthy(second));
+    }
+
+    #[test]
     fn success_clears_failure_immediately() {
         reset_for_test();
-        let base = "https://example.com/v1";
-        let model = "model-a";
-        mark_failure(base, model);
-        assert!(!is_healthy(base, model));
-        mark_success(base, model);
-        assert!(is_healthy(base, model));
+        let identity = "route:success|model-a|openai-responses";
+        mark_failure(identity);
+        assert!(!is_healthy(identity));
+        mark_success(identity);
+        assert!(is_healthy(identity));
     }
 }

@@ -2722,14 +2722,22 @@ pub(crate) fn gateway_bindings(
                 if left.exposed_model != right.exposed_model {
                     return std::cmp::Ordering::Equal;
                 }
-                let left_healthy = crate::store::ai_route_health::is_healthy(
-                    &gateway_upstream_base_url(left_service, &entry_protocol),
-                    &left.upstream_model,
-                );
-                let right_healthy = crate::store::ai_route_health::is_healthy(
-                    &gateway_upstream_base_url(right_service, &entry_protocol),
-                    &right.upstream_model,
-                );
+                let identity = |service: &crate::store::ai_services::CustomAIService,
+                                route: &crate::store::gateway_profiles::GatewayModelRoute| {
+                    format!(
+                        "custom:{}|{}|{}|{}",
+                        service.id,
+                        gateway_upstream_base_url(service, &entry_protocol).trim_end_matches('/'),
+                        route.upstream_model,
+                        gateway_upstream_protocol(service, &entry_protocol)
+                    )
+                };
+                let left_healthy = crate::store::ai_route_health::is_healthy(&identity(
+                    left_service, left,
+                ));
+                let right_healthy = crate::store::ai_route_health::is_healthy(&identity(
+                    right_service, right,
+                ));
                 right_healthy.cmp(&left_healthy)
             });
             let default_model = routes
