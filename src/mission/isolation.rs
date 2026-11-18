@@ -250,39 +250,55 @@ fn prepare_request(request: PrepareRequest<'_>) -> Result<TaskIsolation> {
     #[cfg(windows)]
     {
         // Git 2.32's child update-ref and process cwd are MAX_PATH-limited,
-        // even with core.longpaths. Initialize only host-owned data under the
-        // source Git metadata, then let Git move it to the full isolated path.
+        // even with core.longpaths. Same-volume staging keeps the Git metadata
+        // path short; across volumes add the worktree directly at its target.
         // Never overwrite or clean up an interrupted staging workspace.
-        let staging = common.join(format!(".hm-{}", id_key(path_str(&isolated)?)));
-        guard_path(&staging)?;
-        if staging.exists() {
-            return Err(IsolationError::Rejected(
-                "host staging workspace exists; preserved without cleanup".into(),
-            ));
+        if same_windows_volume(&source, &storage) {
+            let staging = common.join(format!(".hm-{}", id_key(path_str(&isolated)?)));
+            guard_path(&staging)?;
+            if staging.exists() {
+                return Err(IsolationError::Rejected(
+                    "host staging workspace exists; preserved without cleanup".into(),
+                ));
+            }
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--",
+                    path_str(&staging)?,
+                    &head,
+                ],
+                None,
+            )?;
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "move",
+                    "--",
+                    path_str(&staging)?,
+                    path_str(&isolated)?,
+                ],
+                None,
+            )?;
+        } else {
+            let target = windows_git_target(&isolated)?;
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--",
+                    path_str(&target)?,
+                    &head,
+                ],
+                None,
+            )?;
         }
-        git(
-            &source,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                "--",
-                path_str(&staging)?,
-                &head,
-            ],
-            None,
-        )?;
-        git(
-            &source,
-            &[
-                "worktree",
-                "move",
-                "--",
-                path_str(&staging)?,
-                path_str(&isolated)?,
-            ],
-            None,
-        )?;
     }
     #[cfg(not(windows))]
     git(
@@ -654,6 +670,61 @@ fn git_directory(root: &Path, argument: &str) -> Result<PathBuf> {
     })
 }
 
+#[cfg(windows)]
+fn same_windows_volume(left: &Path, right: &Path) -> bool {
+    let left = left.components().next();
+    let right = right.components().next();
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// Git 2.32 does not accept every long path that Rust can canonicalize (including
+/// paths expanded by packaged Windows applications). Use an existing directory's
+/// OS alias for the Git argument only; persistent identity remains canonical.
+#[cfg(windows)]
+fn windows_git_target(path: &Path) -> Result<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, size: u32) -> u32;
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| IsolationError::Rejected("missing target parent".into()))?;
+    let canonical = canonical_directory(parent)?;
+    let long: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut short = vec![0u16; 32768];
+    let len = unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) }
+        as usize;
+    if len == 0 || len >= short.len() {
+        return Err(IsolationError::Unsupported(
+            "Git worktree target has no usable Windows short path".into(),
+        ));
+    }
+    let alias = std::ffi::OsString::from_wide(&short[..len]);
+    let alias = PathBuf::from(alias);
+    if canonical_directory(&alias)? != canonical {
+        return Err(IsolationError::Rejected(
+            "Git worktree target alias changed identity".into(),
+        ));
+    }
+    let target = alias.join(
+        path.file_name()
+            .ok_or_else(|| IsolationError::Rejected("missing target name".into()))?,
+    );
+    if target.as_os_str().encode_wide().count() >= 248 {
+        return Err(IsolationError::Unsupported(
+            "Git worktree target Windows alias exceeds the supported length".into(),
+        ));
+    }
+    Ok(target)
+}
+
 fn snapshot(root: &Path, modes: &BTreeMap<String, String>) -> Result<Files> {
     guard_path(root)?;
     let mut pending = vec![root.to_path_buf()];
@@ -945,6 +1016,11 @@ fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
 }
 
 fn git_output(mut command: Command, args: &[&str]) -> Result<Vec<u8>> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let cwd = command
+        .get_current_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<default>".into());
     let Output {
         status,
         stdout,
@@ -952,8 +1028,10 @@ fn git_output(mut command: Command, args: &[&str]) -> Result<Vec<u8>> {
     } = command.args(args).output()?;
     if !status.success() {
         return Err(IsolationError::Failure(format!(
-            "git {}: {}",
-            args.first().unwrap_or(&""),
+            "{} {} (cwd={}): {}",
+            program,
+            args.join(" "),
+            cwd,
             String::from_utf8_lossy(&stderr).trim()
         )));
     }
@@ -1173,8 +1251,11 @@ mod tests {
                     .as_nanos(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+            Self::new_at(root.clone(), root.join("host"))
+        }
+
+        fn new_at(root: PathBuf, storage: PathBuf) -> Self {
             let source = root.join("source");
-            let storage = root.join("host");
             fs::create_dir_all(source.join("src")).unwrap();
             git(&source, &["init", "--quiet"], None).unwrap();
             git(
@@ -1216,15 +1297,29 @@ mod tests {
         fn drop(&mut self) {
             // Only the exact, uniquely created fixture root is eligible. Production
             // code has no directory removal or worktree prune operation.
-            if self.root.parent() == Some(std::env::temp_dir().as_path())
-                && self
-                    .root
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("himind-isolation-")
+            let name = self.root.file_name().unwrap().to_string_lossy();
+            let parent = self.root.parent().unwrap();
+            let is_temp_parent = parent == std::env::temp_dir();
+            #[cfg(windows)]
+            let is_cross_volume_test_parent = std::env::var_os("HIMIND_TEST_CROSS_VOLUME_ROOT")
+                .map(PathBuf::from)
+                .is_some_and(|allowed| allowed == parent)
+                && name.starts_with("himind-isolation-cross-");
+            #[cfg(not(windows))]
+            let is_cross_volume_test_parent = false;
+            if name.starts_with("himind-isolation-")
+                && (is_temp_parent || is_cross_volume_test_parent)
             {
                 let _ = fs::remove_dir_all(&self.root);
+            }
+            let storage_parent = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|path| path.join("HiMindAgentBuilds/shared-v1/tmp"));
+            let storage_name = self.storage.file_name().unwrap().to_string_lossy();
+            if storage_parent.as_deref() == self.storage.parent()
+                && storage_name.starts_with("himind-isolation-host-")
+            {
+                let _ = fs::remove_dir_all(&self.storage);
             }
         }
     }
@@ -1259,6 +1354,55 @@ mod tests {
         assert!(replay.already_integrated);
         assert_eq!(replay.receipt, first.receipt);
         assert_eq!(repo.prepare("long-path").unwrap(), attempt);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires HIMIND_TEST_CROSS_VOLUME_ROOT on a volume different from LOCALAPPDATA"]
+    fn cross_volume_host_storage_prepares_and_integrates_on_its_volume() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let storage_parent = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("HiMindAgentBuilds/shared-v1/tmp");
+        let root = PathBuf::from(
+            std::env::var_os("HIMIND_TEST_CROSS_VOLUME_ROOT")
+                .expect("set a writable cross-volume fixture parent"),
+        )
+        .join(format!("himind-isolation-cross-{suffix}"));
+        let storage = storage_parent.join(format!("himind-isolation-host-{suffix}"));
+        let repo = Repo::new_at(root, storage);
+        assert!(!same_windows_volume(&repo.source, &repo.storage));
+
+        let attempt = repo.prepare("cross-volume").unwrap_or_else(|error| {
+            panic!(
+                "cross-volume isolation preparation failed: source={} storage={} attempt={}: {error}",
+                repo.source.display(),
+                repo.storage.display(),
+                repo.storage
+                    .join("mission-isolation-v1")
+                    .join(id_key("mission"))
+                    .join(id_key("cross-volume"))
+                    .join(id_key("attempt-1"))
+                    .display()
+            )
+        });
+        assert!(!same_windows_volume(
+            &attempt.source_root,
+            &attempt.isolated_root
+        ));
+        fs::write(
+            attempt.isolated_root.join("src/a.txt"),
+            b"cross-volume output\n",
+        )
+        .unwrap();
+        integrate(&attempt, &writes(&["src/a.txt"])).unwrap();
+        assert_eq!(
+            fs::read(repo.source.join("src/a.txt")).unwrap(),
+            b"cross-volume output\n"
+        );
     }
 
     #[test]
