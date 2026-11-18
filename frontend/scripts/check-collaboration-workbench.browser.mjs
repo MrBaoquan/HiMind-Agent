@@ -35,9 +35,11 @@ try{
  assert.match(await page.locator('.mission-detail-progress').innerText(),/2 项实际执行/);
  const close=page.getByRole('button',{name:'关闭协调助手',exact:true});
  assert.ok(await close.locator('svg').count(),'panel close control uses an icon');
+ assert.equal((await close.innerText()).trim(),'','panel close control must remain icon-only; text belongs in its tooltip and accessible name');
  assert.equal(await close.getAttribute('title'),'关闭协调助手');
  await close.click();
  assert.equal(await aside.count(),0);
+ checks.push('icon-only-context-panel-close-control');
  await assistantTool.click();
  checks.push('desktop-dock-fills-window-with-visible-composer');
  await input.fill('待发送的离线需求草稿');
