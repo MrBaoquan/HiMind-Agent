@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::extension_contracts::DistributionTarget;
 
+mod activation;
 mod authoring;
 mod candidate;
 mod condition;
@@ -21,6 +22,10 @@ mod runner;
 mod runtime;
 mod store;
 
+pub(crate) use activation::{
+    activate as activate_authoring_draft, rollback as rollback_authoring_activation,
+    WorkflowActivationResult,
+};
 #[allow(unused_imports)]
 pub(crate) use authoring::{
     confirm as confirm_authoring_candidate,

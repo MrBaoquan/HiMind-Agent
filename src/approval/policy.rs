@@ -132,6 +132,18 @@ pub(crate) fn risk_rank(value: &str) -> u8 {
 }
 
 pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value) -> String {
+    if matches!(
+        capability_id,
+        "extension.plugin.candidate.activate"
+            | "extension.workflow.candidate.activate"
+            | "extension.activation.rollback"
+    ) {
+        return serde_json::json!({
+            "id":input.get("id"),"version":input.get("version"),"kind":input.get("kind"),
+            "candidate_sha256":input.get("candidate_sha256"),"workspace_root":input.get("workspace_root"),
+            "runtime_scope":"current Agent Profile; workspace identifies the candidate origin"
+        }).to_string();
+    }
     if capability_id == "mission.plan.confirm" {
         return mission_plan_confirmation_target(input)
             .unwrap_or_else(|_| "计划确认信息无效或超出显示限制".to_string());

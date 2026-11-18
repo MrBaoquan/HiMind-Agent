@@ -572,7 +572,10 @@ pub(crate) fn activate(
     plugin_id: &str,
     version: &str,
 ) -> Result<PluginActivationResult, Box<dyn Error>> {
-    let draft = read(plugin_id, version)?;
+    activate_pinned_draft(read(plugin_id, version)?)
+}
+
+pub(crate) fn activate_draft(draft: PluginDraft) -> Result<PluginActivationResult, Box<dyn Error>> {
     let versions_root = development_versions_root();
     let registry_path = activation_registry_path();
     let store = ActivationStore::new(activation_store_path());
@@ -582,10 +585,40 @@ pub(crate) fn activate(
     Ok(result)
 }
 
+/// Use archive bytes for capability activation, never trust a writable test directory.
+pub(crate) fn activate_pinned_draft(
+    mut draft: PluginDraft,
+) -> Result<PluginActivationResult, Box<dyn Error>> {
+    let _operation_lock = crate::app::extension_lifecycle::operation_lock(
+        ActivationKind::Plugin,
+        &draft.manifest.id,
+    )?;
+    ensure_candidate_unchanged(&draft)?;
+    let source = draft
+        .candidate_path
+        .parent()
+        .ok_or("plugin candidate storage is unavailable")?
+        .join(format!(
+            ".activate-source-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+    let result = (|| {
+        extract_and_validate(&draft.candidate_path, &source, &draft.manifest)?;
+        ensure_candidate_unchanged(&draft)?;
+        draft.development_path = Some(source.clone());
+        activate_draft(draft)
+    })();
+    let _ = fs::remove_dir_all(source);
+    result
+}
+
 pub(crate) fn rollback(
     plugin_id: &str,
     workspace_root: &Path,
 ) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let _operation_lock =
+        crate::app::extension_lifecycle::operation_lock(ActivationKind::Plugin, plugin_id)?;
     let store = ActivationStore::new(activation_store_path());
     let target = resolve_activation_target(
         &crate::store::paths::profile_name(),
@@ -658,6 +691,9 @@ fn activate_draft_with_paths(
     if draft.tested_at.is_none() {
         return Err("请先完成插件候选包测试".into());
     }
+    if draft.confirmed_at.is_none() {
+        return Err("插件 Candidate 尚未确认".into());
+    }
     let source = draft
         .development_path
         .as_deref()
@@ -670,6 +706,7 @@ fn activate_draft_with_paths(
     let slot = versions_root
         .join(&draft.manifest.id)
         .join(&draft.candidate_sha256);
+    let slot_existed = slot.exists();
     let staging = versions_root
         .join(&draft.manifest.id)
         .join(format!(".staging-{}", now_stamp()));
@@ -681,13 +718,21 @@ fn activate_draft_with_paths(
         verify_plugin_checksums(&staging)?;
         validate_manifest_contributions(&staging, &draft.manifest)?;
         validate_development_entry(&staging, &draft.manifest)?;
-        if slot.exists() {
-            fs::remove_dir_all(&slot)?;
+        if slot_existed {
+            verify_plugin_checksums(&slot)?;
+            if fs::read(slot.join("checksums.sha256"))?
+                != fs::read(staging.join("checksums.sha256"))?
+            {
+                return Err("插件 SHA 开发槽内容与候选不一致".into());
+            }
+            // Keep an already active executable intact, including while a call owns it.
+            fs::remove_dir_all(&staging)?;
+        } else {
+            if let Some(parent) = slot.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&staging, &slot)?;
         }
-        if let Some(parent) = slot.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(&staging, &slot)?;
         Ok(())
     })();
     if let Err(error) = stage_result {
@@ -718,7 +763,13 @@ fn activate_draft_with_paths(
         workspace_key,
         target,
         status: ActivationStatus::Active,
-        previous_sha256: previous.map(|item| item.candidate_sha256),
+        previous_sha256: previous.and_then(|item| {
+            if item.candidate_sha256 == draft.candidate_sha256 {
+                item.previous_sha256
+            } else {
+                Some(item.candidate_sha256)
+            }
+        }),
         surfaces: vec![
             ActivationSurface::visible("runtime"),
             ActivationSurface::visible("mcp"),
@@ -734,7 +785,9 @@ fn activate_draft_with_paths(
     if let Err(error) = activation_result {
         let rollback = activation_store.rollback(&mut transaction);
         let restore = registry_snapshot.restore();
-        let _ = fs::remove_dir_all(&slot);
+        if !slot_existed {
+            let _ = fs::remove_dir_all(&slot);
+        }
         return match (rollback, restore) {
             (Ok(()), Ok(())) => Err(error),
             (rollback, restore) => Err(format!(
@@ -746,7 +799,9 @@ fn activate_draft_with_paths(
     if let Err(error) = activation_store.commit(&mut transaction) {
         let rollback = activation_store.rollback(&mut transaction);
         let restore = registry_snapshot.restore();
-        let _ = fs::remove_dir_all(&slot);
+        if !slot_existed {
+            let _ = fs::remove_dir_all(&slot);
+        }
         return match (rollback, restore) {
             (Ok(()), Ok(())) => Err(error),
             (rollback, restore) => Err(format!(
@@ -1015,7 +1070,7 @@ mod tests {
             revision_of: None,
             parent_submission_id: None,
             tested_at: Some(now_stamp()),
-            confirmed_at: None,
+            confirmed_at: Some(now_stamp()),
             submitted_at: None,
             dashboard_submission_id: None,
             test_report: Some(json!({"state":"passed"})),
@@ -1172,7 +1227,7 @@ mod tests {
                 revision_of: None,
                 parent_submission_id: None,
                 tested_at: Some(now_stamp()),
-                confirmed_at: None,
+                confirmed_at: Some(now_stamp()),
                 submitted_at: None,
                 dashboard_submission_id: None,
                 test_report: Some(json!({"state":"passed"})),

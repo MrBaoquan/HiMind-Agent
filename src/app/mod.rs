@@ -25,6 +25,7 @@ pub(crate) mod distribution_publish;
 pub(crate) mod distribution_state;
 pub(crate) mod extension_activation;
 pub(crate) mod extension_icons;
+pub(crate) mod extension_lifecycle;
 pub(crate) mod extension_lock;
 pub(crate) mod extension_orchestrator;
 pub(crate) mod extension_reconciler;

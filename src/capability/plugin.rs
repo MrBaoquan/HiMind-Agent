@@ -1284,9 +1284,9 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             &["dashboard.knowledge.search", "oauth.delegated_user"],
         ),
         builtin_plugin(
-            "com.himind.session-history", "会话历史服务", "1.0.0",
+            "com.himind.session-history", "会话历史服务", "1.1.0",
             "向工作区、工作日志和工作流提供跨客户端会话与活动的只读投影。",
-            &["workspace.session.sources", "workspace.session.list", "workspace.session.messages", "workspace.session.activity"],
+            &["workspace.session.sources", "workspace.session.list", "workspace.session.messages", "workspace.session.activity", "workspace.session.source.get", "workspace.session.source.configure"],
             &[],
         ),
         // 工作区登记表：数据落 data/ 而不是 plugin-data/，因为后者不进备份包。
@@ -1501,14 +1501,29 @@ pub(crate) fn plugin_view_entry(
 }
 
 /// Host-owned SDK assets do not grant capabilities; invocation still checks the view manifest.
-pub(crate) fn embedded_plugin_sdk_resource(url: &url::Url) -> Result<Option<&'static [u8]>, Box<dyn Error>> {
-    if !is_plugin_ui_origin(url) { return Err("invalid plugin UI resource origin".into()); }
-    let segments = url.path_segments().ok_or("missing plugin UI path")?.collect::<Vec<_>>();
-    if segments.len() != 5 || segments[2] != "_himind" || segments[3] != "ai-v1" { return Ok(None); }
-    if plugin_view_entry(segments[0], segments[1])?.is_none() { return Err("plugin UI view is unavailable".into()); }
+pub(crate) fn embedded_plugin_sdk_resource(
+    url: &url::Url,
+) -> Result<Option<&'static [u8]>, Box<dyn Error>> {
+    if !is_plugin_ui_origin(url) {
+        return Err("invalid plugin UI resource origin".into());
+    }
+    let segments = url
+        .path_segments()
+        .ok_or("missing plugin UI path")?
+        .collect::<Vec<_>>();
+    if segments.len() != 5 || segments[2] != "_himind" || segments[3] != "ai-v1" {
+        return Ok(None);
+    }
+    if plugin_view_entry(segments[0], segments[1])?.is_none() {
+        return Err("plugin UI view is unavailable".into());
+    }
     match segments[4] {
-        "client.mjs" => Ok(Some(include_bytes!("../../integrations/plugin-ai/client.mjs"))),
-        "service-selector.mjs" => Ok(Some(include_bytes!("../../integrations/plugin-ai/service-selector.mjs"))),
+        "client.mjs" => Ok(Some(include_bytes!(
+            "../../integrations/plugin-ai/client.mjs"
+        ))),
+        "service-selector.mjs" => Ok(Some(include_bytes!(
+            "../../integrations/plugin-ai/service-selector.mjs"
+        ))),
         _ => Err("unknown plugin SDK resource".into()),
     }
 }
@@ -2477,7 +2492,7 @@ pub(crate) fn validate_manifest_contributions(
     }
     let mut capability_dependencies = std::collections::HashSet::new();
     for pattern in &manifest.capability_dependencies {
-        validate_external_capability_pattern(pattern)?;
+        validate_broker_capability_pattern(pattern)?;
         if !capability_dependencies.insert(pattern.as_str()) {
             return Err(format!("duplicate capability dependency: {pattern}").into());
         }
@@ -3614,6 +3629,81 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn broker_capability_dependencies_allow_read_only_workspace_session_services() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-plugin-broker-dependency-test-{}",
+            next_request_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = PluginManifest {
+            icon: String::new(),
+            id: "com.test.work-log".to_string(),
+            name: "Work log".to_string(),
+            author: "Test".to_string(),
+            description: String::new(),
+            release_notes: "Test broker capability dependencies.".to_string(),
+            version: "1.0.0".to_string(),
+            entry: "plugin.exe".to_string(),
+            runtime: "process-jsonrpc-stdio".to_string(),
+            min_agent_version: String::new(),
+            categories: Vec::new(),
+            governance: "optional".to_string(),
+            package_role: default_package_role(),
+            capability_namespace: "work-log".to_string(),
+            capabilities: Vec::new(),
+            credentials: Vec::new(),
+            permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
+            capability_dependencies: vec![
+                "workspace.session.activity".to_string(),
+                "workspace.session.sources".to_string(),
+                "workspace.session.list".to_string(),
+                "workspace.session.messages".to_string(),
+                "media.image.generate".to_string(),
+            ],
+            contributes: PluginContributions::default(),
+        };
+
+        assert!(validate_manifest_contributions(&root, &manifest).is_ok());
+        assert!(validate_external_capability_pattern("workspace.session.activity").is_err());
+
+        let mut invalid_dependency = manifest;
+        for pattern in [
+            "workspace.session.*",
+            "workspace.*",
+            "workspace.registry.project.upsert",
+            "system.health",
+            "market.install",
+            "*",
+            "workspace.session.activity.*.bad",
+            "workspace.session.activity bad",
+            "media.*.generate",
+            "media..generate",
+        ] {
+            invalid_dependency.capability_dependencies = vec![pattern.to_string()];
+            assert!(
+                validate_manifest_contributions(&root, &invalid_dependency).is_err(),
+                "unexpected broker authorization for {pattern}"
+            );
+        }
+        invalid_dependency.capability_dependencies = vec![
+            "workspace.session.sources".to_string(),
+            "workspace.session.sources".to_string(),
+        ];
+        assert!(validate_manifest_contributions(&root, &invalid_dependency)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate capability dependency"));
+        invalid_dependency.capability_dependencies =
+            vec!["workspace.session.sources".to_string(); 33];
+        assert!(validate_manifest_contributions(&root, &invalid_dependency)
+            .unwrap_err()
+            .to_string()
+            .contains("at most 32"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// 版本号会被拼成 `versions/<版本>`：`..` 之类会改变落点的写法必须在清单
     /// 校验阶段就被拒，而不是等到拼接路径时才被文件系统解释成上级目录。
     #[test]
@@ -4071,6 +4161,41 @@ fn valid_capability_segment(segment: &str) -> bool {
 }
 
 pub(crate) fn validate_external_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error>> {
+    validate_capability_pattern_shape(pattern)?;
+    let value = pattern.trim();
+    if !VIEW_EXTERNAL_CAPABILITY_PREFIXES
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(format!(
+            "external capability namespace is not allowed for plugin views: {value}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_broker_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error>> {
+    let value = pattern.trim();
+    validate_capability_pattern_shape(value)?;
+    if matches!(
+        value,
+        "workspace.session.sources"
+            | "workspace.session.source.get"
+            | "workspace.session.source.configure"
+            | "workspace.session.list"
+            | "workspace.session.messages"
+            | "workspace.session.activity"
+    ) || VIEW_EXTERNAL_CAPABILITY_PREFIXES
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    Err(format!("capability is not allowed as a plugin broker dependency: {value}").into())
+}
+
+fn validate_capability_pattern_shape(pattern: &str) -> Result<(), Box<dyn Error>> {
     let value = pattern.trim();
     if value.is_empty() {
         return Err("external capability pattern is empty".into());
@@ -4081,15 +4206,6 @@ pub(crate) fn validate_external_capability_pattern(pattern: &str) -> Result<(), 
     let wildcard = value.ends_with(".*");
     if value.contains('*') && !wildcard {
         return Err(format!("external capability wildcard must be a trailing .*: {value}").into());
-    }
-    if !VIEW_EXTERNAL_CAPABILITY_PREFIXES
-        .iter()
-        .any(|prefix| value.starts_with(prefix))
-    {
-        return Err(format!(
-            "external capability namespace is not allowed for plugin views: {value}"
-        )
-        .into());
     }
     let prefix = if wildcard {
         &value[..value.len() - 2]
@@ -4142,7 +4258,8 @@ mod view_external_capability_tests {
     #[test]
     fn plugin_ai_embedded_sdk_requires_a_real_enabled_view() {
         let _guard = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!("himind-plugin-ai-assets-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("himind-plugin-ai-assets-{}", std::process::id()));
         let previous = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         let plugin = root.join("plugins").join("com.test.ai-assets");
@@ -4153,14 +4270,36 @@ mod view_external_capability_tests {
             "id":"com.test.ai-assets","name":"服务选择测试","author":"测试","description":"仅测试宿主资源","release_notes":"验证资源","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","capabilities":[],"permissions":[],
             "contributes":{"views":[{"id":"main","title":"测试","entry":"ui/index.html","external_capabilities":["media.provider.catalog","media.route.plan"]}]}
         })).unwrap()).unwrap();
-        let url = url::Url::parse("http://plugin-ui.localhost/com.test.ai-assets/main/_himind/ai-v1/client.mjs").unwrap();
-        let bytes = embedded_plugin_sdk_resource(&url).unwrap().expect("embedded SDK");
-        assert!(std::str::from_utf8(bytes).unwrap().contains("createAiClient"));
-        assert!(embedded_plugin_sdk_resource(&url::Url::parse("https://example.com/com.test.ai-assets/main/_himind/ai-v1/client.mjs").unwrap()).is_err());
-        assert!(embedded_plugin_sdk_resource(&url::Url::parse("http://plugin-ui.localhost/com.test.ai-assets/missing/_himind/ai-v1/client.mjs").unwrap()).is_err());
+        let url = url::Url::parse(
+            "http://plugin-ui.localhost/com.test.ai-assets/main/_himind/ai-v1/client.mjs",
+        )
+        .unwrap();
+        let bytes = embedded_plugin_sdk_resource(&url)
+            .unwrap()
+            .expect("embedded SDK");
+        assert!(std::str::from_utf8(bytes)
+            .unwrap()
+            .contains("createAiClient"));
+        assert!(embedded_plugin_sdk_resource(
+            &url::Url::parse(
+                "https://example.com/com.test.ai-assets/main/_himind/ai-v1/client.mjs"
+            )
+            .unwrap()
+        )
+        .is_err());
+        assert!(embedded_plugin_sdk_resource(
+            &url::Url::parse(
+                "http://plugin-ui.localhost/com.test.ai-assets/missing/_himind/ai-v1/client.mjs"
+            )
+            .unwrap()
+        )
+        .is_err());
         fs::write(plugin.join("disabled"), "disabled").unwrap();
         assert!(embedded_plugin_sdk_resource(&url).is_err());
-        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = fs::remove_dir_all(root);
     }
 

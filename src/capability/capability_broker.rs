@@ -17,7 +17,7 @@ use crate::capability::plugin::external_capability_matches;
 
 pub(crate) const BROKER_URL_ENV: &str = "HIMIND_CAPABILITY_BROKER_URL";
 pub(crate) const BROKER_TOKEN_ENV: &str = "HIMIND_CAPABILITY_BROKER_TOKEN";
-const MAX_REQUESTS: usize = 64;
+const MAX_REQUESTS: usize = 256;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CHAIN_DEPTH: usize = 8;
@@ -381,29 +381,70 @@ mod tests {
     #[test]
     fn plugin_ai_broker_invokes_public_gateway_without_management_access() {
         let _guard = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!("himind-plugin-ai-broker-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("himind-plugin-ai-broker-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let previous = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         let mut options = crate::Options::from_env();
         options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
-        let gateway = crate::capability::service::CapabilityGateway::new(options, Arc::new(Mutex::new(crate::store::types::LocalWorkerStatus::default())));
+        let gateway = crate::capability::service::CapabilityGateway::new(
+            options,
+            Arc::new(Mutex::new(crate::store::types::LocalWorkerStatus::default())),
+        );
         let dispatch: Dispatcher = Arc::new(move |capability, input| {
-            gateway.invoke(&crate::capability::types::InvocationContext::new(crate::capability::types::InvocationSource::Plugin, "plugin:ai-test"), capability, input).map_err(|error| error.to_string())
+            gateway
+                .invoke(
+                    &crate::capability::types::InvocationContext::new(
+                        crate::capability::types::InvocationSource::Plugin,
+                        "plugin:ai-test",
+                    ),
+                    capability,
+                    input,
+                )
+                .map_err(|error| error.to_string())
         });
-        let session = CapabilityBrokerSession::start("com.test.ai-selection", "visual.fixture", &["media.route.plan".into(), "media.provider.catalog".into()], vec!["visual.fixture".into()], Duration::from_secs(30), dispatch).unwrap().unwrap();
-        let (status, body) = post(&session.url, &session.token, json!({"capability":"media.route.plan","input":{"capability":"media.image.generate","selection":{"mode":"agent_default"}}}));
+        let session = CapabilityBrokerSession::start(
+            "com.test.ai-selection",
+            "visual.fixture",
+            &["media.route.plan".into(), "media.provider.catalog".into()],
+            vec!["visual.fixture".into()],
+            Duration::from_secs(30),
+            dispatch,
+        )
+        .unwrap()
+        .unwrap();
+        let (status, body) = post(
+            &session.url,
+            &session.token,
+            json!({"capability":"media.route.plan","input":{"capability":"media.image.generate","selection":{"mode":"agent_default"}}}),
+        );
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["result"]["billable"], false);
-        let (status, body) = post(&session.url, &session.token, json!({"capability":"media.provider.catalog","input":{"capability":"audio.speech","ready_only":true}}));
+        let (status, body) = post(
+            &session.url,
+            &session.token,
+            json!({"capability":"media.provider.catalog","input":{"capability":"audio.speech","ready_only":true}}),
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body["result"]["providers"].is_array());
-        let (status, _) = post(&session.url, &session.token, json!({"capability":"ai.service.list","input":{}}));
+        let (status, _) = post(
+            &session.url,
+            &session.token,
+            json!({"capability":"ai.service.list","input":{}}),
+        );
         assert_eq!(status, 403);
-        let (status, _) = post(&session.url, &session.token, json!({"capability":"media.image.generate","input":{"prompt":"cat"}}));
+        let (status, _) = post(
+            &session.url,
+            &session.token,
+            json!({"capability":"media.image.generate","input":{"prompt":"cat"}}),
+        );
         assert_eq!(status, 403);
         drop(session);
-        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

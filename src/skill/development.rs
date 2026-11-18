@@ -77,6 +77,7 @@ fn register_skill_with_mode_at(
     let root = path.canonicalize()?;
     let manifest = load_skill_manifest(&root)?;
     validate_skill_id(&manifest.id)?;
+    super::store::reject_retired_skill(&manifest.id)?;
     // 同一个 Agent 可能同时服务多个工作区会话，每个会话都在登记自己的开发
     // Skill。读改写必须整体串行化，否则先登记的会话会被后登记的整表覆盖。
     let _lock = crate::store::atomic_file::lock(registry)?;
@@ -134,6 +135,7 @@ pub(crate) fn record_at(root: &Path) -> Option<SkillRecord> {
         return None;
     }
     let manifest = load_skill_manifest(root).ok()?;
+    super::store::reject_retired_skill(&manifest.id).ok()?;
     let icon = crate::app::extension_icons::resolve_effective_icon(
         "skill",
         &manifest.id,
@@ -196,6 +198,24 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("SKILL.md"), "# demo").unwrap();
+    }
+
+    #[test]
+    fn retired_authoring_skill_cannot_be_registered_or_discovered() {
+        let base = std::env::temp_dir().join(format!(
+            "himind-retired-authoring-development-{}",
+            std::process::id()
+        ));
+        let registry = base.join("skill-development.json");
+        let source = base.join("old-skill");
+        write_skill(&source, "com.himind.skill.develop-himind-plugins", "1.7.5");
+        assert!(activate_skill_at(&source, &registry)
+            .unwrap_err()
+            .to_string()
+            .contains("已退役"));
+        assert!(record_at(&source).is_none());
+        assert!(!registry.exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

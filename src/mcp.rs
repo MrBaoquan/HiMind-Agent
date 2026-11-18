@@ -2493,6 +2493,55 @@ mod tests {
     }
 
     #[test]
+    fn extension_activation_api_projects_local_contracts_without_auto_activating_candidates() {
+        let _lock = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!("activation-mcp-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _home = EnvironmentRestore::set("HIMIND_AGENT_HOME", &root);
+        let gateway = test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let mut session = McpSessionState::default();
+        let ids = [
+            "extension.plugin.candidate.activate",
+            "extension.workflow.candidate.activate",
+            "extension.activation.list",
+            "extension.activation.rollback",
+        ];
+        let activation = call_tool(
+            &gateway,
+            &mut session,
+            "system.capability.activate",
+            json!({"ids":ids}),
+        );
+        assert_ne!(activation["isError"], true);
+        let tools =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        for id in ids {
+            let tool = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == id)
+                .unwrap();
+            assert_eq!(tool["annotations"]["availability"], "local");
+            assert_eq!(
+                tool["annotations"]["approvalRequired"],
+                !id.ends_with(".list")
+            );
+        }
+        let listed = call_tool(
+            &gateway,
+            &mut session,
+            "extension.activation.list",
+            json!({}),
+        );
+        assert_ne!(listed["isError"], true);
+        assert_eq!(listed["structuredContent"]["activations"], json!([]));
+        assert!(!root.join("plugin-development.json").exists());
+        assert!(!root.join("workflows").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn default_activation_survives_registry_generation_change() {
         let gateway = test_gateway();
         let mut session = McpSessionState {

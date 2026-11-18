@@ -234,11 +234,16 @@ impl WorkflowStore {
         extension_lock: Option<ExtensionLock>,
         lock_required: bool,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
-        let source = source.canonicalize()?;
-        validate_package_integrity(&source, require_signature)?;
-        let package = load_from_directory(&source)?;
+        let source = source
+            .canonicalize()
+            .map_err(|e| format!("workflow source unavailable: {e}"))?;
+        validate_package_integrity(&source, require_signature)
+            .map_err(|e| format!("workflow package integrity failed: {e}"))?;
+        let package = load_from_directory(&source)
+            .map_err(|e| format!("workflow package load failed: {e}"))?;
         let product_root = self.product_root(&package.id)?;
-        fs::create_dir_all(product_root.join("versions"))?;
+        fs::create_dir_all(product_root.join("versions"))
+            .map_err(|e| format!("workflow version directory unavailable: {e}"))?;
         let _lock = atomic_file::lock(&product_root.join(INSTALLATION_FILE))?;
 
         let version_root = product_root

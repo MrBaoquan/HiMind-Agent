@@ -3,6 +3,92 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::fmt;
 
+pub(crate) const AUTHORING_SKILL_ID: &str = "com.himind.skill.extension-authoring";
+pub(crate) const AUTHORING_SKILL_MIN_VERSION: &str = "1.0.0";
+
+pub(crate) fn required_authoring_tools(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "plugin" => &[
+            "extension.plugin.scaffold",
+            "extension.plugin.validate",
+            "extension.plugin.build",
+            "extension.plugin.package",
+            "extension.plugin.candidate.save",
+        ],
+        "skill" => &[
+            "extension.skill.scaffold",
+            "extension.skill.validate",
+            "extension.skill.package",
+            "extension.skill.candidate.save",
+        ],
+        "workflow" => &[
+            "extension.workflow.scaffold",
+            "extension.workflow.validate",
+            "extension.workflow.build",
+            "extension.workflow.package",
+            "extension.workflow.candidate.save",
+        ],
+        _ => &[],
+    }
+}
+
+/// 清单保持跨类型可发现；进入某一类型后，把该分支的能力契约作为必需项解析。
+pub(crate) fn resolve_authoring_readiness(
+    manifest: &crate::skill::types::SkillManifest,
+    facts: &[crate::skill::resolver::CapabilityFact],
+    agent_version: &str,
+    kind: &str,
+) -> crate::skill::resolver::SkillReadiness {
+    let mut selected = manifest.clone();
+    for capability in &mut selected.capabilities {
+        if required_authoring_tools(kind).contains(&capability.id.as_str()) {
+            capability.required = true;
+        }
+    }
+    crate::skill::resolver::SkillReadiness::resolve(&selected, facts, agent_version, "himind-ai")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skill::resolver::CapabilityFact;
+
+    #[test]
+    fn authoring_branch_checks_versions_without_requiring_unrelated_tools() {
+        let manifest = serde_json::from_value(json!({
+            "id": AUTHORING_SKILL_ID, "name": "扩展创作", "version": "1.0.0",
+            "scope": "organization", "supported_clients": ["agent-skills"],
+            "capabilities": [
+                {"id":"extension.skill.package","required":false,"min_version":"1.4.3","provider":"agent"},
+                {"id":"extension.plugin.candidate.save","required":false,"min_version":"1.0.0","provider":"agent"},
+                {"id":"extension.workflow.candidate.save","required":false,"min_version":"1.0.0","provider":"agent"}
+            ]
+        })).unwrap();
+        let mut facts = vec![CapabilityFact {
+            id: "extension.skill.package".to_string(),
+            version: "1.4.3".to_string(),
+            source: "builtin".to_string(),
+        }];
+        assert_eq!(
+            resolve_authoring_readiness(&manifest, &facts, crate::VERSION, "skill").state,
+            "ready"
+        );
+        assert_eq!(
+            resolve_authoring_readiness(&manifest, &facts, crate::VERSION, "plugin").state,
+            "blocked"
+        );
+        assert_eq!(
+            resolve_authoring_readiness(&manifest, &facts, crate::VERSION, "workflow").state,
+            "blocked"
+        );
+        facts[0].version = "1.4.2".to_string();
+        assert_ne!(
+            resolve_authoring_readiness(&manifest, &facts, crate::VERSION, "skill").state,
+            "ready"
+        );
+    }
+}
+
 /// Stable diagnostic contract returned by Agent-owned extension authoring
 /// orchestration capabilities. External AI clients can branch on `code` and
 /// `stage` without parsing localized error text.

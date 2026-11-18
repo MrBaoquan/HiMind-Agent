@@ -4911,8 +4911,6 @@ fn normalize_dsh_skill_name(value: &str) -> Option<String> {
 
 fn shorten_dsh_skill_name(value: &str) -> String {
     match value {
-        "develop-himind-plugins" => "plugin-dev".to_string(),
-        "develop-himind-skills" => "skill-dev".to_string(),
         "software-distribution" => "software-dist".to_string(),
         "unihper-unity-development" => "unity-dev".to_string(),
         "git-svn-commit-summary" => "commit-summary".to_string(),
@@ -7784,11 +7782,11 @@ mod tests {
     fn himind_skill_adapter_uses_valid_stable_names_and_one_frontmatter_block() {
         let mut used = HashSet::new();
         let name = dsh_skill_name(
-            "com.himind.skill.develop-himind-plugins",
-            "---\nname: develop-himind-plugins\ndescription: test\n---\n# Test",
+            "com.himind.skill.software-distribution",
+            "---\nname: software-distribution\ndescription: test\n---\n# Test",
             &mut used,
         );
-        assert_eq!(name, "plugin-dev");
+        assert_eq!(name, "software-dist");
         assert!(name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
@@ -7801,10 +7799,10 @@ mod tests {
         );
         let mut used = HashSet::new();
         assert_eq!(
-            name,
+            "extension-authoring",
             dsh_skill_name(
-                "com.himind.skill.develop-himind-plugins",
-                "---\nname: develop-himind-plugins\ndescription: test\n---\n# Test",
+                "com.himind.skill.extension-authoring",
+                "---\nname: extension-authoring\ndescription: test\n---\n# Test",
                 &mut used,
             )
         );

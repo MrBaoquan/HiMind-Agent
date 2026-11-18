@@ -104,6 +104,10 @@ const NAMED_FILES: &[(&str, &str)] = &[("agent-state.device-id", "设备身份�
 const EXCLUDED_DATA_DIRS: &[(&str, &str)] = &[
     ("distribution-manifests", "发布清单暂存，重新发布即可生成"),
     ("extension-transactions", "拓展安装事务日志，启动时自行恢复"),
+    (
+        "extension-lifecycle-locks",
+        "拓展候选激活操作锁，进程结束后可重建",
+    ),
     ("extension-provenance", "拓展来源记录，联网后从市场重新获取"),
     ("extension-source-cache", "扩展源目录缓存，联网后自动刷新"),
     ("mcp-catalog-cache", "MCP 目录快照缓存，联网后自动刷新"),

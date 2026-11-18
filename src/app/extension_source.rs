@@ -21,15 +21,6 @@ const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_DISTRIBUTION_CHANNEL: &str = "stable";
 const DEFAULT_CATALOG_ID: &str = "public";
 pub(crate) const AUTHORING_FEATURE_ID: &str = "com.himind.feature.extension-authoring";
-const AUTHORING_PLUGIN_ID: &str = "com.himind.extension-development-tools";
-/// 「扩展创作」能力集 = 1 个插件 + 4 个技能。缺任何一项，AI 都不知道
-/// 自己该按什么规范创作对应类型的扩展，所以这里必须成套校验。
-const AUTHORING_SKILL_IDS: [&str; 4] = [
-    "com.himind.skill.develop-himind-plugins",
-    "com.himind.skill.develop-himind-skills",
-    "com.himind.skill.develop-himind-workflows",
-    "com.himind.skill.develop-himind-conventions",
-];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -910,6 +901,9 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 }
             }
             for item in &mut catalog.skills {
+                if crate::skill::store::retired_skill_ids().contains(&item.skill_id.as_str()) {
+                    continue;
+                }
                 normalize_skill_item(item, &source)?;
                 assets.skills.push((
                     item.skill_id.clone(),
@@ -1103,6 +1097,17 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 }
             }
             for mut pack in catalog.feature_packs {
+                pack.skill_ids
+                    .retain(|id| !crate::skill::store::retired_skill_ids().contains(&id.as_str()));
+                // 缓存中的旧创作能力包不能重新提供已退役入口。
+                if pack.id == AUTHORING_FEATURE_ID
+                    && !pack
+                        .skill_ids
+                        .iter()
+                        .any(|id| id == crate::extension_authoring::AUTHORING_SKILL_ID)
+                {
+                    continue;
+                }
                 validate_feature_pack(&pack)?;
                 pack.source_id = source.id.clone();
                 let pack_identity = source_identity(&source);
@@ -2685,54 +2690,42 @@ pub(crate) fn plan_workflow(
 }
 
 pub(crate) fn ensure_authoring_feature() -> Result<(), Box<dyn Error>> {
-    let plugin_ready = crate::app::plugin_manager::local_status(AUTHORING_PLUGIN_ID).enabled;
+    use crate::extension_authoring::{AUTHORING_SKILL_ID, AUTHORING_SKILL_MIN_VERSION};
+    if !crate::app::plugin_manager::local_status(
+        crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_ID,
+    )
+    .enabled
+    {
+        return Err("内置扩展开发工具不可用，请检查 Agent 安装与插件状态".into());
+    }
     let store = crate::skill::store::SkillStore::new();
-    let skills_ready = AUTHORING_SKILL_IDS
-        .iter()
-        .all(|skill_id| store.get_record(skill_id).ok().flatten().is_some());
-    if plugin_ready && skills_ready {
+    store.bootstrap_builtin_skills()?;
+    if store.get_record(AUTHORING_SKILL_ID)?.is_some_and(|record| {
+        crate::skill::resolver::compare_versions(
+            &record.manifest.version,
+            AUTHORING_SKILL_MIN_VERSION,
+        ) != std::cmp::Ordering::Less
+    }) {
         return Ok(());
     }
-    let snapshot = snapshot()?;
-    let pack = snapshot
-        .feature_packs
-        .iter()
-        .find(|pack| pack.id == AUTHORING_FEATURE_ID)
-        .cloned()
-        .unwrap_or_else(|| ExtensionFeaturePack {
-            id: AUTHORING_FEATURE_ID.to_string(),
-            name: "扩展创作".to_string(),
-            plugin_ids: vec![AUTHORING_PLUGIN_ID.to_string()],
-            skill_ids: AUTHORING_SKILL_IDS
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-            agent_preset_ids: Vec::new(),
-            source_id: String::new(),
-        });
-    if !plugin_ready {
-        if !snapshot
-            .plugins
-            .iter()
-            .any(|item| item.plugin_id == AUTHORING_PLUGIN_ID)
-        {
-            return Err("扩展创作组件尚未安装，且已配置的扩展源未提供扩展开发工具".into());
-        }
-        install_plugin(AUTHORING_PLUGIN_ID, None)?;
-    }
-    for skill_id in &pack.skill_ids {
-        if store.get_record(skill_id)?.is_none() {
-            if !snapshot
-                .skills
-                .iter()
-                .any(|item| item.skill_id == *skill_id)
-            {
-                return Err(format!("扩展创作组件缺少 Skill: {skill_id}").into());
-            }
-            let (_, record) = install_skill(skill_id, None)?;
-            crate::skill::sync_record_to_supported_clients(&record, crate::VERSION, &[])?;
-        }
-    }
+    let item = snapshot()?
+        .skills
+        .into_iter()
+        .find(|item| {
+            item.skill_id == AUTHORING_SKILL_ID
+                && crate::skill::resolver::compare_versions(
+                    &item.version,
+                    AUTHORING_SKILL_MIN_VERSION,
+                ) != std::cmp::Ordering::Less
+        })
+        .ok_or("扩展源未提供新版「扩展创作」，请刷新扩展源，或添加包含新版源码的本地扩展源")?;
+    // 此入口启动 HiMind AI。其读取 Skill Store，不需投放到外部客户端目录。
+    install_skill_bound(
+        AUTHORING_SKILL_ID,
+        Some(&item.version),
+        Some(source_id_of(&item.source)),
+        Some(&item.sha256),
+    )?;
     Ok(())
 }
 

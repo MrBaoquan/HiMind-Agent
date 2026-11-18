@@ -415,6 +415,7 @@ impl SkillStore {
     ) -> Result<SkillRecord, Box<dyn Error>> {
         self.bootstrap_builtin_skills()?;
         let manifest = validate_skill_package_root(package_root)?;
+        reject_retired_skill(&manifest.id)?;
         if manifest.scope != scope {
             return Err(scope_error.into());
         }
@@ -702,6 +703,13 @@ fn builtin_skill_seeds() -> Vec<SkillSeed> {
     Vec::new()
 }
 
+pub(crate) fn reject_retired_skill(id: &str) -> Result<(), Box<dyn Error>> {
+    if retired_skill_ids().contains(&id) {
+        return Err(format!("Skill {id} 已退役，不可安装或启用").into());
+    }
+    Ok(())
+}
+
 pub(crate) fn retired_skill_ids() -> &'static [&'static str] {
     &[
         "com.himind.skill.environment-doctor",
@@ -711,6 +719,10 @@ pub(crate) fn retired_skill_ids() -> &'static [&'static str] {
         // 留在盘上的那一份永远等不到更新，登录态里还会显示成一条来源未知的
         // 已装技能，所以按退役处理：清干净，让用户从市场重装新 ID 的那一份。
         "com.himind.skill.engineering-workflow-orchestrator",
+        "com.himind.skill.develop-himind-plugins",
+        "com.himind.skill.develop-himind-skills",
+        "com.himind.skill.develop-himind-workflows",
+        "com.himind.skill.develop-himind-conventions",
     ]
 }
 
@@ -752,6 +764,32 @@ mod tests {
             agent_profile: "test".to_string(),
             updated_at: now_stamp(),
         }
+    }
+
+    #[test]
+    fn retired_authoring_skills_are_removed_without_removing_the_new_entry() {
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
+        let retired = retired_skill_ids()
+            .iter()
+            .copied()
+            .filter(|id| id.starts_with("com.himind.skill.develop-himind-"))
+            .collect::<Vec<_>>();
+        assert_eq!(retired.len(), 4);
+        let active = crate::extension_authoring::AUTHORING_SKILL_ID;
+        for id in retired.iter().copied().chain(std::iter::once(active)) {
+            fs::create_dir_all(root.join("managed").join(id)).unwrap();
+            fs::create_dir_all(root.join("rendered/codex").join(id)).unwrap();
+        }
+        store.bootstrap_builtin_skills().unwrap();
+        for id in retired {
+            assert!(!root.join("managed").join(id).exists());
+            assert!(!root.join("rendered/codex").join(id).exists());
+            assert!(reject_retired_skill(id).is_err());
+        }
+        assert!(root.join("managed").join(active).is_dir());
+        assert!(reject_retired_skill(active).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

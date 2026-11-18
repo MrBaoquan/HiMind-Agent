@@ -35,10 +35,14 @@ Plugins may declare capability dependencies:
 }
 ```
 
-The Agent validates each pattern with the same namespace rules as plugin view
-`external_capabilities`. Management namespaces such as `system.*`,
-`plugin.invoke`, `workflow.run.start`, `market.install` and wildcard `*` are
-forbidden.
+Broker dependencies and plugin-view `external_capabilities` have separate
+allowlists. Views retain their UI-facing `media.*`, `audio.*`, `visual.*`,
+`asset.*` and `render.*` allowlist. Broker dependencies retain those domains
+and additionally allow the exact read-only Agent session capabilities
+`workspace.session.sources`, `.list`, `.messages` and `.activity`; the broader
+`workspace.*` namespace is not granted. Management namespaces such as
+`system.*`, `plugin.invoke`, `workflow.run.start`, `market.install` and wildcard
+`*` remain forbidden.
 
 For each plugin invocation with declared dependencies, the Agent starts a
 loopback-only capability broker bound to:

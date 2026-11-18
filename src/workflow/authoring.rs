@@ -354,6 +354,9 @@ fn test_in_root(
     capabilities: Option<&[CapabilityDescriptor]>,
 ) -> Result<WorkflowDraft, Box<dyn Error>> {
     let mut draft = read_from_root(storage_root, package_id, version)?;
+    if !sha256_file(&draft.candidate_path)?.eq_ignore_ascii_case(&draft.candidate_sha256) {
+        return Err("Workflow 候选包已变化，请重新保存并测试".into());
+    }
     let package = crate::workflow::load_from_directory(&draft.source_root)?;
     let preflight = capabilities.map(|capabilities| {
         crate::workflow::preflight(&package, crate::VERSION, capabilities, &Value::Null)

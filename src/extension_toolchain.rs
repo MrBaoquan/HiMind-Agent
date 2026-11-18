@@ -29,7 +29,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 pub(crate) const DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-development-tools";
 /// 内置插件自身的契约版本。它跟随对外能力契约，而不是 Agent 版本：
 /// Skill/Workflow 依赖声明里的 min_version 比较的是这个值。
-pub(crate) const DEVELOPMENT_TOOLS_PLUGIN_VERSION: &str = "1.4.3";
+pub(crate) const DEVELOPMENT_TOOLS_PLUGIN_VERSION: &str = "1.5.0";
 
 /// 第一方创作能力的完整清单：内核实现覆盖其中一部分，其余仍由扩展开发工具插件
 /// 提供。这份清单是唯一事实来源（审批白名单、调用上限、内核覆盖都从它派生），
@@ -67,7 +67,7 @@ pub(crate) const AUTHORING_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(30
 /// 内核独立提供的能力：新建骨架、校验、构建、打包、preflight。
 /// 更合适（`extension_projects::create` 对工作流已经有原生骨架兜底）；
 /// 而构建/校验/打包是每次开发都要走的动作，不能依赖可选制品。
-pub(crate) const BUILTIN_CAPABILITIES: [&str; 12] = [
+pub(crate) const BUILTIN_CAPABILITIES: [&str; 16] = [
     "extension.environment.preflight",
     "extension.plugin.scaffold",
     "extension.plugin.validate",
@@ -80,6 +80,10 @@ pub(crate) const BUILTIN_CAPABILITIES: [&str; 12] = [
     "extension.workflow.validate",
     "extension.workflow.build",
     "extension.workflow.package",
+    "extension.plugin.candidate.activate",
+    "extension.workflow.candidate.activate",
+    "extension.activation.list",
+    "extension.activation.rollback",
 ];
 
 /// 内核实现的能力 → 是否覆盖。用于「插件缺失时是否还能继续」的判定。

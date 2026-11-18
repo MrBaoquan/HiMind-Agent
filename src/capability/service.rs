@@ -230,6 +230,10 @@ enum CapabilityHandler {
     PluginCandidateSave,
     PluginCandidateTest,
     PluginCandidateConfirm,
+    PluginCandidateActivate,
+    WorkflowCandidateActivate,
+    ExtensionActivationList,
+    ExtensionActivationRollback,
     WorkflowCandidateSave,
     WorkflowCandidateTest,
     WorkflowCandidateConfirm,
@@ -380,7 +384,6 @@ impl CapabilityGateway {
         self.invalidate_registry_cache();
     }
 
-    #[cfg(test)]
     fn invalidate_registry_cache(&self) {
         if let Ok(mut cache) = self.registry_cache.lock() {
             cache.revision = cache.revision.wrapping_add(1);
@@ -1153,7 +1156,7 @@ impl CapabilityGateway {
             registration(
                 "extension.authoring.preflight",
                 "扩展创作预检",
-                "检查当前工作区、三件套、Agent 能力和运行模式，返回可机器处理的受阻点。",
+                "检查当前工作区、扩展创作 Skill、所选类型的 Agent 能力和运行模式。",
                 "read_only",
                 json!({
                     "type": "object",
@@ -1166,7 +1169,7 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::AuthoringPreflight,
             ),
-            // 扩展开发工具链：12 条能力全部由内核实现，并作为内置插件
+            // 扩展开发工具链：能力由内核实现，并作为内置插件
             // com.himind.extension-development-tools 的对外能力暴露给 MCP/UI。
             registration_versioned(
                 "extension.environment.preflight",
@@ -3377,6 +3380,26 @@ impl CapabilityGateway {
                 authoring_identity_schema(),
                 CapabilityHandler::PluginCandidateConfirm,
             ),
+            registration_versioned(
+                "extension.plugin.candidate.activate", crate::app::extension_lifecycle::CONTRACT_VERSION,
+                "激活插件候选", "按工作区和 SHA-256 激活已测试且已确认的本地插件候选，切换当前 Profile 的开发版，不发布或提审。",
+                "local_write", crate::app::extension_lifecycle::activation_schema(), CapabilityHandler::PluginCandidateActivate,
+            ),
+            registration_versioned(
+                "extension.workflow.candidate.activate", crate::app::extension_lifecycle::CONTRACT_VERSION,
+                "激活工作流候选", "按工作区和 SHA-256 将已测试且已确认的 Workflow 安装到当前 Profile 开发槽，保留依赖锁与回滚账本。",
+                "local_write", crate::app::extension_lifecycle::activation_schema(), CapabilityHandler::WorkflowCandidateActivate,
+            ),
+            registration_versioned(
+                "extension.activation.list", crate::app::extension_lifecycle::CONTRACT_VERSION,
+                "查看扩展激活", "读取当前 Profile 的扩展开发版激活账本；运行发现范围是整个 Profile，workspace_root 记录候选来源。",
+                "read_only", json!({"type":"object","additionalProperties":false}), CapabilityHandler::ExtensionActivationList,
+            ),
+            registration_versioned(
+                "extension.activation.rollback", crate::app::extension_lifecycle::CONTRACT_VERSION,
+                "回滚扩展激活", "校验当前活动候选哈希及来源工作区，回滚插件或 Workflow 到上一开发版。",
+                "local_write", crate::app::extension_lifecycle::rollback_schema(), CapabilityHandler::ExtensionActivationRollback,
+            ),
             registration(
                 "extension.workflow.candidate.save",
                 "保存 Workflow 候选",
@@ -3773,10 +3796,12 @@ impl CapabilityGateway {
             media_registration("workbench.media.audio.transcribe", "语音转写（工作台）", "由 AI 工作台媒体通道转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
             media_registration("workbench.media.job.get", "查看工作台媒体任务", "查看工作台图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
             media_registration("workbench.media.job.cancel", "取消工作台媒体任务", "取消工作台上仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
-            registration_versioned("workspace.session.sources", "1.0.0", "查看会话来源", "探测 Agent 支持的会话历史来源、可用性及完整性；不返回正文。", "read_only", crate::session_service::capability_schema("sources"), CapabilityHandler::WorkspaceSession("sources")),
-            registration_versioned("workspace.session.list", "1.0.0", "查询跨客户端会话", "按项目、子项目、全部或未归属范围分页列出本机历史会话。", "read_only", crate::session_service::capability_schema("list"), CapabilityHandler::WorkspaceSession("list")),
-            registration_versioned("workspace.session.messages", "1.0.0", "读取会话消息页", "读取已校验范围内的会话正文；使用与快照绑定的可恢复游标。", "read_only", crate::session_service::capability_schema("messages"), CapabilityHandler::WorkspaceSession("messages")),
-            registration_versioned("workspace.session.activity", "1.0.0", "查询会话活动素材", "按带时区的时间区间读取有限批次的活动和证据引用；缺时间不伪造，游标可跨进程恢复。", "read_only", crate::session_service::capability_schema("activity"), CapabilityHandler::WorkspaceSession("activity")),
+            registration_versioned("workspace.session.source.get", "1.1.0", "读取会话来源配置", "读取 Agent 管理的客户端和声明式会话来源配置。", "read_only", json!({"type":"object","additionalProperties":false}), CapabilityHandler::WorkspaceSession("source.get")),
+            registration_versioned("workspace.session.source.configure", "1.1.0", "配置会话来源", "配置本机只读会话适配器的路径与 JSON 字段映射，不执行脚本或写回客户端存储。", "local_write", json!({"type":"object","properties":{"sources":{"type":"array","maxItems":32,"items":{"type":"object"}},"native_roots":{"type":"object","additionalProperties":{"type":"string","maxLength":4096}}},"additionalProperties":false}), CapabilityHandler::WorkspaceSession("source.configure")),
+            registration_versioned("workspace.session.sources", "1.1.0", "查看会话来源", "探测 Agent 支持的会话历史来源、可用性及完整性；不返回正文。", "read_only", crate::session_service::capability_schema("sources"), CapabilityHandler::WorkspaceSession("sources")),
+            registration_versioned("workspace.session.list", "1.1.0", "查询跨客户端会话", "按项目、子项目、全部或未归属范围分页列出本机历史会话。", "read_only", crate::session_service::capability_schema("list"), CapabilityHandler::WorkspaceSession("list")),
+            registration_versioned("workspace.session.messages", "1.1.0", "读取会话消息页", "读取已校验范围内的会话正文；使用与快照绑定的可恢复游标。", "read_only", crate::session_service::capability_schema("messages"), CapabilityHandler::WorkspaceSession("messages")),
+            registration_versioned("workspace.session.activity", "1.1.0", "查询会话活动素材", "按带时区的时间区间读取有限批次的活动和证据引用；缺时间不伪造，游标可跨进程恢复。", "read_only", crate::session_service::capability_schema("activity"), CapabilityHandler::WorkspaceSession("activity")),
             // 工作区登记表：10 条能力全部由内核实现，并作为内置插件
             // com.himind.workspace-registry 对外暴露。数据落 data/ 而不是
             // plugin-data/，因为后者不进备份包（见 app::backup 与 ADR 0002）。
@@ -5861,6 +5886,25 @@ impl CapabilityGateway {
                     &id, &version,
                 )?)?)
             }
+            CapabilityHandler::PluginCandidateActivate => {
+                let result = crate::app::extension_lifecycle::activate_plugin(
+                    serde_json::from_value(input)?,
+                )
+                .map_err(|error| authoring_operation_error("plugin", "activate", error))?;
+                self.invalidate_registry_cache();
+                Ok(result)
+            }
+            CapabilityHandler::WorkflowCandidateActivate => {
+                crate::app::extension_lifecycle::activate_workflow(serde_json::from_value(input)?)
+                    .map_err(|error| authoring_operation_error("workflow", "activate", error))
+            }
+            CapabilityHandler::ExtensionActivationList => crate::app::extension_lifecycle::list(),
+            CapabilityHandler::ExtensionActivationRollback => {
+                let result =
+                    crate::app::extension_lifecycle::rollback(serde_json::from_value(input)?)?;
+                self.invalidate_registry_cache();
+                Ok(result)
+            }
             CapabilityHandler::WorkflowCandidateSave => {
                 validate_mcp_capability_workspace(context, capability_id, &input)?;
                 let source_root = input
@@ -6739,31 +6783,6 @@ impl CapabilityGateway {
             }
         }
 
-        let required_tools = match kind.as_str() {
-            "plugin" => vec![
-                "extension.environment.preflight",
-                "extension.plugin.scaffold",
-                "extension.plugin.validate",
-                "extension.plugin.build",
-                "extension.plugin.package",
-            ],
-            "skill" => vec![
-                "extension.environment.preflight",
-                "extension.skill.scaffold",
-                "extension.skill.validate",
-                "extension.skill.package",
-            ],
-            _ => vec![
-                "extension.environment.preflight",
-                "extension.workflow.scaffold",
-                "extension.workflow.validate",
-                "extension.workflow.build",
-                "extension.workflow.package",
-                "extension.workflow.candidate.save",
-                "extension.workflow.candidate.test",
-                "extension.test",
-            ],
-        };
         let visible_capabilities = self.list_capabilities(&InvocationContext::local_http())?;
         let visible_ids = visible_capabilities
             .iter()
@@ -6777,14 +6796,12 @@ impl CapabilityGateway {
                 source: item.source.clone(),
             })
             .collect::<Vec<_>>();
-        for required in required_tools {
-            // 内核已经内建的能力不算缺失：扩展开发不能因为一个可选的市场制品
-            // 没装就在预检里全线报红。
-            if !visible_ids.contains(required) && !crate::extension_toolchain::covers(required) {
+        for &required in crate::extension_authoring::required_authoring_tools(&kind) {
+            if !visible_ids.contains(required) {
                 blockers.push(crate::extension_authoring::blocker(
                     "extension_tool_missing",
                     "toolchain",
-                    format!("三件套未提供必需能力: {required}"),
+                    format!("当前创作类型缺少必需能力: {required}"),
                     "重启 Agent 以加载内置扩展开发工具；若问题仍在，检查 Agent 安装包是否完整",
                     true,
                 ));
@@ -6843,54 +6860,33 @@ impl CapabilityGateway {
             )),
         }
 
-        let required_skill = match kind.as_str() {
-            "plugin" => Some((
-                "com.himind.skill.develop-himind-plugins",
-                "1.7.0",
-                "extension.plugin.scaffold",
-            )),
-            "skill" => Some((
-                "com.himind.skill.develop-himind-skills",
-                "1.8.0",
-                "extension.skill.scaffold",
-            )),
-            _ => Some((
-                "com.himind.skill.develop-himind-workflows",
-                "1.0.0",
-                "extension.workflow.scaffold",
-            )),
-        };
-        if let Some((skill_id, minimum, required_capability)) = required_skill {
-            match crate::skill::store::SkillStore::new().list_records() {
-                Ok(records) => match records.iter().find(|record| record.manifest.id == skill_id) {
+        {
+            let skill_id = crate::extension_authoring::AUTHORING_SKILL_ID;
+            let minimum = crate::extension_authoring::AUTHORING_SKILL_MIN_VERSION;
+            match crate::skill::store::SkillStore::new().get_record(skill_id) {
+                Ok(record) => match record {
                     Some(record)
                         if crate::skill::resolver::compare_versions(
                             &record.manifest.version,
                             minimum,
                         ) != std::cmp::Ordering::Less =>
                     {
-                        let readiness = crate::skill::resolver::SkillReadiness::resolve(
+                        let readiness = crate::extension_authoring::resolve_authoring_readiness(
                             &record.manifest,
                             &capability_facts,
                             VERSION,
-                            "himind-ai",
+                            &kind,
                         );
-                        if readiness.state == "blocked"
-                            || !visible_ids.contains(required_capability)
-                        {
+                        if readiness.state != "ready" {
                             blockers.push(crate::extension_authoring::blocker(
                                 "authoring_skill_contract_mismatch",
                                 "toolchain",
                                 format!(
                                     "{} 的 MCP 依赖契约未满足: {}",
                                     record.manifest.name,
-                                    if readiness.reasons.is_empty() {
-                                        format!("缺少 {required_capability}")
-                                    } else {
-                                        readiness.reasons.join("、")
-                                    }
+                                    readiness.reasons.join("、")
                                 ),
-                                "更新 Agent 能力或重新安装与当前 Agent 契约匹配的三件套 Skill",
+                                "更新 Agent 或安装与当前 Agent 契约匹配的「扩展创作」Skill",
                                 true,
                             ));
                         }
@@ -6904,7 +6900,7 @@ impl CapabilityGateway {
                                 "{} 版本 {} 低于最低要求 {}",
                                 record.manifest.name, record.manifest.version, minimum
                             ),
-                            format!("把该三件套 Skill 升级到 {minimum} 或更高后重试。{hint}"),
+                            format!("把「扩展创作」Skill 升级到 {minimum} 或更高后重试。{hint}"),
                             true,
                         ));
                     }
@@ -6912,21 +6908,21 @@ impl CapabilityGateway {
                         "authoring_skill_missing",
                         "toolchain",
                         format!("未安装 {skill_id}"),
-                        "安装对应的插件开发助手、技能开发助手或工作流开发助手后重试",
+                        "从扩展源安装「扩展创作」后重试",
                         true,
                     )),
                 },
                 Err(error) => blockers.push(crate::extension_authoring::blocker(
                     "authoring_skill_lookup_failed",
                     "toolchain",
-                    format!("读取三件套 Skill 失败: {error}"),
+                    format!("读取「扩展创作」Skill 失败: {error}"),
                     "修复 Agent Skill Store 后重新执行预检",
                     true,
                 )),
             }
         }
 
-        // 扩展开发工具版本过低时，下游的「三件套缺少必需能力」和「Skill 契约未
+        // 扩展开发工具版本过低时，下游的「缺少必需能力」和「Skill 契约未
         // 满足」都是同一个根因的派生症状：老插件不提供新契约，Skill 再有新版本也
         // 起不来。把它们指回根因，避免用户和模型照着字面去重装 Skill、重装能力，
         // 绕一圈却始终升不到达标版本。
@@ -8433,6 +8429,9 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
                     // 从市场装能力会写入本机磁盘，属于"改变我这台机器"的操作，
                     // 必须有人确认，不能由模型单方面批准。
                     | CapabilityHandler::MarketInstall
+                    | CapabilityHandler::PluginCandidateActivate
+                    | CapabilityHandler::WorkflowCandidateActivate
+                    | CapabilityHandler::ExtensionActivationRollback
                     | CapabilityHandler::ExtensionExpertInstall
                     | CapabilityHandler::ExtensionExpertRetire
                     | CapabilityHandler::ExtensionWorkflowRetire
@@ -9131,6 +9130,10 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::PluginCandidateSave
         | CapabilityHandler::PluginCandidateTest
         | CapabilityHandler::PluginCandidateConfirm
+        | CapabilityHandler::PluginCandidateActivate
+        | CapabilityHandler::WorkflowCandidateActivate
+        | CapabilityHandler::ExtensionActivationList
+        | CapabilityHandler::ExtensionActivationRollback
         | CapabilityHandler::WorkflowCandidateSave
         | CapabilityHandler::WorkflowCandidateTest
         | CapabilityHandler::WorkflowCandidateConfirm => CapabilityAvailability::Local,
