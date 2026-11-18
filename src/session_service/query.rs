@@ -12,7 +12,7 @@ use crate::session_history::{
 use crate::workspace_registry::Registry;
 
 pub(crate) const CONTRACT_VERSION: &str = "session_history.v1";
-const MAX_BODY_PAGES: usize = 8;
+const MAX_BODY_PAGES: usize = 64;
 const MAX_CONTENT_CHARS: usize = 8_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -39,12 +39,16 @@ struct Request {
     from: Option<String>,
     to: Option<String>,
     max_chars: Option<usize>,
+    #[serde(skip)]
+    metadata_snapshot: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_snapshot: Option<String>,
     operation: String,
     fingerprint: String,
     session: usize,
@@ -60,8 +64,8 @@ pub(crate) fn capability_schema(operation: &str) -> Value {
         "scope":{"type":"string","enum":["all","project","unassigned"]},
         "project_id":{"type":"string","minLength":1},
         "include_children":{"type":"boolean"},
-        "sources":{"type":"array","minItems":1,"uniqueItems":true,"maxItems":5,
-            "items":{"type":"string","enum":["dsh","acp","claude_code","codex","opencode"]}},
+        "sources":{"type":"array","minItems":1,"uniqueItems":true,"maxItems":37,
+            "items":{"type":"string","minLength":1,"maxLength":64}},
         "query":{"type":"string","maxLength":200},
         "cursor":{"type":"string","maxLength":8192},
         "limit":{"type":"integer","minimum":1,"maximum":200}
@@ -87,12 +91,16 @@ fn selected_sources(request: &Request) -> Result<Vec<SessionSource>, String> {
     let selected = request
         .sources
         .clone()
-        .unwrap_or_else(|| SessionSource::ALL.to_vec());
-    if selected.is_empty() || selected.len() > 5 {
+        .unwrap_or(super::available_sources()?);
+    if selected.is_empty() || selected.len() > 37 {
         return Err("SESSION_SOURCES_INVALID".into());
     }
     let mut seen = HashSet::new();
-    if !selected.iter().all(|source| seen.insert(*source)) {
+    let available = super::available_sources()?;
+    if !selected
+        .iter()
+        .all(|source| available.contains(source) && seen.insert(source.clone()))
+    {
         return Err("SESSION_SOURCES_INVALID".into());
     }
     Ok(selected)
@@ -266,7 +274,13 @@ fn window(request: &Request) -> Result<(DateTime<FixedOffset>, DateTime<FixedOff
 }
 
 pub(crate) fn invoke(operation: &str, input: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let request: Request = serde_json::from_value(input.clone())?;
+    if operation == "source.configure" {
+        return crate::session_history_sources::external::configure(input).map_err(Into::into);
+    }
+    if operation == "source.get" {
+        return crate::session_history_sources::external::config_get().map_err(Into::into);
+    }
+    let mut request: Request = serde_json::from_value(input.clone())?;
     // Validate before opening any source.
     limit(&request)?;
     if operation == "activity" {
@@ -287,7 +301,56 @@ pub(crate) fn invoke(operation: &str, input: &Value) -> Result<Value, Box<dyn st
     let registry = Registry::load()?;
     // Reject a foreign/invalid scope before touching client storage.
     scoped_sessions(&registry, &request, Vec::new())?;
-    let (sessions, sources) = super::scan_sources(&registry, &selected)?;
+    let (sessions, sources) = if operation == "activity" {
+        let mut binding = request.clone();
+        binding.cursor = None;
+        let roots = [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "OPENCODE_DB",
+            "OPENCODE_DATA_DIR",
+            "XDG_DATA_HOME",
+        ]
+        .map(|name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()));
+        let config = crate::session_history_sources::external::config_get()?;
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!([binding, roots, config]))?)
+        );
+        let previous = request
+            .cursor
+            .as_ref()
+            .map(|c| {
+                URL_SAFE_NO_PAD
+                    .decode(c)
+                    .map_err(|_| "SESSION_CURSOR_INVALID")
+                    .and_then(|b| {
+                        serde_json::from_slice::<Cursor>(&b).map_err(|_| "SESSION_CURSOR_INVALID")
+                    })
+            })
+            .transpose()?;
+        if let Some(id) = previous.as_ref().and_then(|c| c.metadata_snapshot.clone()) {
+            let result = super::snapshots::load(&id, &digest, &registry.revision())?;
+            request.metadata_snapshot = Some(id);
+            result
+        } else {
+            let (sessions, sources) = super::scan_sources(&registry, &selected)?;
+            if request.cursor.is_none() {
+                request.metadata_snapshot = Some(super::snapshots::save(
+                    &digest,
+                    &registry.revision(),
+                    &sessions,
+                    &sources,
+                )?);
+            }
+            (sessions, sources)
+        }
+    } else {
+        super::scan_sources(&registry, &selected)?
+    };
     project(
         &registry,
         operation,
@@ -317,6 +380,9 @@ fn project(
     let sessions = scoped_sessions(registry, request, sessions)?;
     let fingerprint = fingerprint(registry, request, &sessions)?;
     let mut cursor = decode_cursor(request, operation, &fingerprint, sessions.len())?;
+    if request.metadata_snapshot.is_some() {
+        cursor.metadata_snapshot = request.metadata_snapshot.clone();
+    }
     let limit = limit(request)?;
     let complete = sources.iter().all(|s| {
         matches!(
@@ -471,6 +537,11 @@ fn project(
                     }
                 }
                 if consumed < page.messages.len() {
+                    // Freeze the provider's native page boundary before returning a
+                    // partial page, so new appends do not shift the page on resume.
+                    if let Some(boundary) = &page.snapshot_cursor {
+                        cursor.message = Some(boundary.clone());
+                    }
                     cursor.within_page = consumed;
                     cursor.page_revision = Some(page_revision);
                 } else {
@@ -563,6 +634,7 @@ mod tests {
     }
     fn page(times: &[Option<&str>]) -> SessionTranscriptPage {
         SessionTranscriptPage {
+            snapshot_cursor: None,
             session_id: "codex:a".into(),
             through_seq: None,
             next_cursor: None,
@@ -737,7 +809,7 @@ mod tests {
     #[test]
     fn page_budget_returns_restartable_cursor_even_without_matching_rows() {
         let r = request(json!({"from":"2026-11-16T00:00:00Z","to":"2026-11-17T00:00:00Z"}));
-        let data = (0..12)
+        let data = (0..MAX_BODY_PAGES + 4)
             .map(|i| session(&format!("a{i:02}"), None))
             .collect();
         let result = project(&registry(), "activity", &r, data, status(), |_, _| {

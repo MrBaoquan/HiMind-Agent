@@ -1463,7 +1463,7 @@ export type WorkspaceRegistryValidation = {
   workspace_count: number;
 };
 
-export type SessionHistorySource = 'dsh' | 'acp' | 'claude_code' | 'codex' | 'opencode';
+export type SessionHistorySource = string;
 export type WorkspaceSessionHistorySort = 'recent' | 'oldest' | 'title';
 
 export type WorkspaceSessionSummary = {

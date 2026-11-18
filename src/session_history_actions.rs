@@ -64,7 +64,7 @@ fn build_plan(
     session: &SessionSummary,
     executable: Option<&Path>,
 ) -> Result<ResumePlan, String> {
-    let name = client_name(session.source)?;
+    let name = client_name(session.source.clone())?;
     if !valid_resume_id(&session.native_id) {
         return Err("SESSION_RESUME_ID_INVALID".into());
     }
@@ -121,7 +121,7 @@ pub(crate) fn resolve(project_id: &str, session_id: &str) -> Result<ResumePlan, 
         &registry,
         project_id,
         session,
-        client_path(session.source).as_deref(),
+        client_path(session.source.clone()).as_deref(),
     )
 }
 

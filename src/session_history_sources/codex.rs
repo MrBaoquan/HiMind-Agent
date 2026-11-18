@@ -17,7 +17,7 @@ use super::ProviderScan;
 const MAX_CODEX_FILES: usize = 20_000;
 const MAX_CODEX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CODEX_INDEX_LINE_BYTES: usize = 64 * 1024;
-const MAX_CODEX_HEAD_BYTES: u64 = 64 * 1024;
+const MAX_CODEX_HEAD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CODEX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CODEX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -35,6 +35,9 @@ pub(crate) fn scan_codex(registry: &Registry) -> ProviderScan {
 }
 
 fn codex_config_root() -> Option<PathBuf> {
+    if let Some(path) = crate::session_history_sources::external::native_root("codex") {
+        return Some(path);
+    }
     if let Some(value) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return resolve_user_path(PathBuf::from(value));
     }
@@ -327,8 +330,11 @@ fn parse_codex_metadata(
 }
 
 pub(crate) fn codex_transcript_page(
-    registry: &Registry, project_id: Option<&str>, native_id: &str,
-    end_offset: Option<u64>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    end_offset: Option<u64>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::Codex.stable_session_id(native_id)?;
     let config_root = codex_config_root().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
@@ -354,18 +360,35 @@ fn codex_transcript_page_at(
     end_offset: Option<u64>,
     page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
-    codex_transcript_page_scoped_at(registry, Some(project_id), native_id, config_root, titles, end_offset, page_size)
+    codex_transcript_page_scoped_at(
+        registry,
+        Some(project_id),
+        native_id,
+        config_root,
+        titles,
+        end_offset,
+        page_size,
+    )
 }
 
 fn codex_transcript_page_scoped_at(
-    registry: &Registry, project_id: Option<&str>, native_id: &str,
-    config_root: &Path, titles: &HashMap<String, String>,
-    end_offset: Option<u64>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    config_root: &Path,
+    titles: &HashMap<String, String>,
+    end_offset: Option<u64>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::Codex.stable_session_id(native_id)?;
     let canonical_config_root =
         fs::canonicalize(config_root).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
-    let cache_key = super::path_cache::key(&canonical_config_root, "codex", project_id.unwrap_or("*"), native_id);
+    let cache_key = super::path_cache::key(
+        &canonical_config_root,
+        "codex",
+        project_id.unwrap_or("*"),
+        native_id,
+    );
     let path = if let Some(path) = super::path_cache::get(&cache_key) {
         path
     } else {
@@ -435,17 +458,20 @@ fn codex_transcript_page_scoped_at(
     let summary = parse_codex_metadata(registry, &path, titles)
         .map_err(|_| "SESSION_NOT_FOUND".to_string())?
         .ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
-    if summary.native_id != native_id || project_id.is_some_and(|id| summary.project_id.as_deref() != Some(id)) {
+    if summary.native_id != native_id
+        || project_id.is_some_and(|id| summary.project_id.as_deref() != Some(id))
+    {
         return Err("SESSION_NOT_FOUND".to_string());
     }
     let metadata = fs::metadata(&path).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
     if !metadata.is_file() || metadata.len() > MAX_CODEX_TRANSCRIPT_BYTES {
         return Err("SESSION_PREVIEW_TOO_LARGE".to_string());
     }
+    let snapshot_end = end_offset.unwrap_or(metadata.len());
     let response_item_format = codex_uses_response_items(&path)?;
     let (messages, next_cursor) = super::read_jsonl_messages_page(
         &path,
-        end_offset,
+        Some(snapshot_end),
         page_size,
         MAX_CODEX_TRANSCRIPT_BYTES,
         MAX_CODEX_LINE_BYTES,
@@ -469,6 +495,7 @@ fn codex_transcript_page_scoped_at(
         },
     )?;
     Ok(session_history::SessionTranscriptPage {
+        snapshot_cursor: Some(snapshot_end.to_string()),
         session_id,
         through_seq: None,
         messages,
@@ -695,12 +722,38 @@ mod tests {
 
     #[test]
     fn codex_session_unassigned_body_is_available_only_without_project_scope() {
-        let temp=TempRoot::new();let root=temp.0.join(".codex");
-        write_codex_session(&root.join("sessions/unassigned.jsonl"),"outside","G:/synthetic-unregistered");
-        let scan=scan_codex_at(&registry(),&root,&HashMap::new(),false);
-        assert!(scan.sessions.iter().any(|s|s.native_id=="outside" && s.project_id.is_none()));
-        assert!(codex_transcript_page_scoped_at(&registry(),None,"outside",&root,&HashMap::new(),None,50).is_ok());
-        assert!(codex_transcript_page_at(&registry(),"project-a","outside",&root,&HashMap::new(),None,50).is_err());
+        let temp = TempRoot::new();
+        let root = temp.0.join(".codex");
+        write_codex_session(
+            &root.join("sessions/unassigned.jsonl"),
+            "outside",
+            "G:/synthetic-unregistered",
+        );
+        let scan = scan_codex_at(&registry(), &root, &HashMap::new(), false);
+        assert!(scan
+            .sessions
+            .iter()
+            .any(|s| s.native_id == "outside" && s.project_id.is_none()));
+        assert!(codex_transcript_page_scoped_at(
+            &registry(),
+            None,
+            "outside",
+            &root,
+            &HashMap::new(),
+            None,
+            50
+        )
+        .is_ok());
+        assert!(codex_transcript_page_at(
+            &registry(),
+            "project-a",
+            "outside",
+            &root,
+            &HashMap::new(),
+            None,
+            50
+        )
+        .is_err());
     }
 
     #[test]

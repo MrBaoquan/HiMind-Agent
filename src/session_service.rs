@@ -4,7 +4,14 @@ use serde_json::json;
 
 pub(crate) mod host;
 mod query;
+mod snapshots;
 pub(crate) use query::{capability_schema, invoke};
+
+pub(crate) fn available_sources() -> Result<Vec<crate::session_history::SessionSource>, String> {
+    let mut sources = crate::session_history::SessionSource::ALL.to_vec();
+    sources.extend(crate::session_history_sources::external::sources()?);
+    Ok(sources)
+}
 
 pub(crate) fn workspace_history_snapshot_scoped(
     project_id: String,
@@ -40,15 +47,8 @@ pub(crate) fn workspace_history_snapshot_scoped(
         .to_lowercase();
     let source_filter = source
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| match value.trim() {
-            "dsh" => Ok(crate::session_history::SessionSource::Dsh),
-            "acp" => Ok(crate::session_history::SessionSource::Acp),
-            "claude_code" => Ok(crate::session_history::SessionSource::ClaudeCode),
-            "codex" => Ok(crate::session_history::SessionSource::Codex),
-            "opencode" => Ok(crate::session_history::SessionSource::OpenCode),
-            _ => Err("SESSION_SOURCE_INVALID".to_string()),
-        })
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| crate::session_history::SessionSource::try_from(s.to_string()))
         .transpose()?;
     let sort = match sort.as_deref().unwrap_or("recent") {
         "recent" => crate::session_history::SessionHistorySort::Recent,
@@ -62,7 +62,7 @@ pub(crate) fn workspace_history_snapshot_scoped(
         return Err("PROJECT_NOT_FOUND".to_string());
     }
 
-    let (sessions, sources) = scan_sources(&registry, &crate::session_history::SessionSource::ALL)?;
+    let (sessions, sources) = scan_sources(&registry, &available_sources()?)?;
     Ok(crate::session_history::scoped_project_history_snapshot(
         &registry,
         &project_id,
@@ -97,14 +97,7 @@ pub(crate) fn transcript_page(
     let (source_id, native_id) = session_id
         .split_once(':')
         .ok_or_else(|| "SESSION_ID_INVALID".to_string())?;
-    let source = match source_id {
-        "dsh" => crate::session_history::SessionSource::Dsh,
-        "acp" => crate::session_history::SessionSource::Acp,
-        "claude_code" => crate::session_history::SessionSource::ClaudeCode,
-        "codex" => crate::session_history::SessionSource::Codex,
-        "opencode" => crate::session_history::SessionSource::OpenCode,
-        _ => return Err("SESSION_PREVIEW_UNAVAILABLE".to_string()),
-    };
+    let source = crate::session_history::SessionSource::try_from(source_id.to_string())?;
     if source.stable_session_id(native_id)? != session_id {
         return Err("SESSION_ID_INVALID".to_string());
     }
@@ -123,6 +116,16 @@ pub(crate) fn transcript_page(
         return Err("PROJECT_NOT_FOUND".to_string());
     }
 
+    if matches!(&source, crate::session_history::SessionSource::External(_)) {
+        return crate::session_history_sources::external::transcript(
+            registry,
+            &source,
+            project_id,
+            native_id,
+            requested_cursor,
+            PAGE_SIZE,
+        );
+    }
     if source == crate::session_history::SessionSource::Acp {
         let stored = crate::store::acp_sessions::load_for_history(native_id)
             .map_err(|_| "ACP_SESSION_UNAVAILABLE".to_string())?
@@ -368,6 +371,9 @@ pub(crate) fn scan_sources(
                 crate::session_history_sources::scan_opencode(registry)
             }
             crate::session_history::SessionSource::Dsh => continue,
+            crate::session_history::SessionSource::External(_) => {
+                crate::session_history_sources::external::scan(registry, source)
+            }
         };
         sessions.extend(scan.sessions);
         sources.push(scan.status);

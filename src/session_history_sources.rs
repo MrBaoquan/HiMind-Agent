@@ -1,6 +1,7 @@
 //! Bounded, read-only metadata adapters for local session providers.
 
 mod codex;
+pub(crate) mod external;
 mod opencode;
 mod path_cache;
 
@@ -45,8 +46,11 @@ pub(crate) fn scan_claude_code(registry: &Registry) -> ProviderScan {
 }
 
 pub(crate) fn claude_transcript_page(
-    registry: &Registry, project_id: Option<&str>, native_id: &str,
-    end_offset: Option<u64>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    end_offset: Option<u64>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::ClaudeCode.stable_session_id(native_id)?;
     let Some(config_root) = claude_config_root() else {
@@ -72,15 +76,31 @@ fn claude_transcript_page_at(
     end_offset: Option<u64>,
     page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
-    claude_transcript_page_scoped_at(registry, Some(project_id), native_id, root, end_offset, page_size)
+    claude_transcript_page_scoped_at(
+        registry,
+        Some(project_id),
+        native_id,
+        root,
+        end_offset,
+        page_size,
+    )
 }
 
 fn claude_transcript_page_scoped_at(
-    registry: &Registry, project_id: Option<&str>, native_id: &str, root: &Path,
-    end_offset: Option<u64>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    root: &Path,
+    end_offset: Option<u64>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let canonical_root = fs::canonicalize(root).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
-    let cache_key = path_cache::key(&canonical_root, "claude_code", project_id.unwrap_or("*"), native_id);
+    let cache_key = path_cache::key(
+        &canonical_root,
+        "claude_code",
+        project_id.unwrap_or("*"),
+        native_id,
+    );
     let path = if let Some(path) = path_cache::get(&cache_key) {
         path
     } else {
@@ -140,16 +160,19 @@ fn claude_transcript_page_scoped_at(
     let summary = parse_claude_metadata(registry, &path)
         .map_err(|_| "SESSION_NOT_FOUND".to_string())?
         .ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
-    if summary.native_id != native_id || project_id.is_some_and(|id| summary.project_id.as_deref() != Some(id)) {
+    if summary.native_id != native_id
+        || project_id.is_some_and(|id| summary.project_id.as_deref() != Some(id))
+    {
         return Err("SESSION_NOT_FOUND".to_string());
     }
     let metadata = fs::metadata(&path).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
     if !metadata.is_file() || metadata.len() > MAX_CLAUDE_TRANSCRIPT_BYTES {
         return Err("SESSION_PREVIEW_TOO_LARGE".to_string());
     }
+    let snapshot_end = end_offset.unwrap_or(metadata.len());
     let (messages, next_cursor) = read_jsonl_messages_page(
         &path,
-        end_offset,
+        Some(snapshot_end),
         page_size,
         MAX_CLAUDE_TRANSCRIPT_BYTES,
         MAX_CLAUDE_LINE_BYTES,
@@ -202,6 +225,7 @@ fn claude_transcript_page_scoped_at(
         },
     )?;
     Ok(session_history::SessionTranscriptPage {
+        snapshot_cursor: Some(snapshot_end.to_string()),
         session_id: SessionSource::ClaudeCode.stable_session_id(native_id)?,
         through_seq: None,
         messages,
@@ -461,6 +485,9 @@ fn timestamp_from_unix(value: u64) -> String {
 }
 
 fn claude_config_root() -> Option<PathBuf> {
+    if let Some(path) = crate::session_history_sources::external::native_root("claude_code") {
+        return Some(path);
+    }
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -1083,10 +1110,18 @@ mod tests {
 
         let scan = scan_claude_code_at(&registry(), &root);
         assert_eq!(scan.sessions.len(), 2);
-        assert!(scan.sessions.iter().any(|s|s.native_id=="session-2" && s.project_id.is_none()));
-        let page=claude_transcript_page_scoped_at(&registry(),None,"session-2",&root,None,50).unwrap();
+        assert!(scan
+            .sessions
+            .iter()
+            .any(|s| s.native_id == "session-2" && s.project_id.is_none()));
+        let page =
+            claude_transcript_page_scoped_at(&registry(), None, "session-2", &root, None, 50)
+                .unwrap();
         assert!(!page.messages.is_empty());
-        assert!(claude_transcript_page_at(&registry(),"project-a","session-2",&root,None,50).is_err());
+        assert!(
+            claude_transcript_page_at(&registry(), "project-a", "session-2", &root, None, 50)
+                .is_err()
+        );
         assert_eq!(scan.status.availability, SourceAvailability::Partial);
         assert_eq!(scan.status.error_code.as_deref(), Some("scan_partial"));
     }

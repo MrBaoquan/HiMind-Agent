@@ -1,0 +1,206 @@
+[
+  {
+    "id": "claude-desktop",
+    "label": "Claude Desktop",
+    "root": "%LOCALAPPDATA%/Claude-3p",
+    "glob": "**/local_*.json",
+    "format": "jsonl",
+    "roots": [
+      "%LOCALAPPDATA%/Claude-3p",
+      "%LOCALAPPDATA%/Claude",
+      "%APPDATA%/Claude"
+    ]
+  },
+  {
+    "id": "github-copilot",
+    "label": "GitHub Copilot",
+    "root": "~/.copilot/session-store.db",
+    "glob": "",
+    "format": "jsonl"
+  },
+  {
+    "id": "vscode",
+    "label": "VS Code Chat",
+    "root": "%APPDATA%/Code/User/workspaceStorage",
+    "glob": "*/chatSessions/*.jsonl",
+    "format": "jsonl",
+    "roots": [
+      "%APPDATA%/Code/User/workspaceStorage",
+      "%APPDATA%/Code - Insiders/User/workspaceStorage"
+    ]
+  },
+  {
+    "id": "cursor",
+    "label": "Cursor",
+    "root": "~/.cursor/projects",
+    "glob": "**/*.jsonl",
+    "format": "jsonl",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "createdAt",
+      "created_at"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "text",
+      "content",
+      "message"
+    ]
+  },
+  {
+    "id": "gemini-cli",
+    "label": "Gemini CLI",
+    "root": "~/.gemini",
+    "glob": "**/chats/*.json",
+    "format": "json",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "startTime",
+      "start_time"
+    ],
+    "records_path": "messages",
+    "prompt_field": "prompt",
+    "assistant_field": "response",
+    "role_field": "type",
+    "user_roles": [
+      "user"
+    ],
+    "assistant_roles": [
+      "gemini",
+      "assistant"
+    ],
+    "content_fields": [
+      "content",
+      "text"
+    ]
+  },
+  {
+    "id": "cline",
+    "label": "Cline / Roo Code",
+    "root": "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev",
+    "glob": "tasks/*/api_conversation_history.json",
+    "format": "json_array",
+    "session_from_file": true,
+    "time_fields": [
+      "ts",
+      "timestamp"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "content",
+      "text"
+    ]
+  },
+  {
+    "id": "continue",
+    "label": "Continue",
+    "root": "~/.continue/sessions",
+    "glob": "*.json",
+    "format": "json",
+    "session_id": "sessionId",
+    "time_fields": [
+      "dateCreated",
+      "createdAt",
+      "timestamp"
+    ],
+    "records_path": "history",
+    "role_field": "message.role",
+    "content_fields": [
+      "message.content"
+    ]
+  },
+  {
+    "id": "windsurf",
+    "label": "Windsurf",
+    "root": "~/.codeium/windsurf",
+    "glob": "**/*.jsonl",
+    "format": "jsonl",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "createdAt"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "text",
+      "content"
+    ]
+  },
+  {
+    "id": "lingma",
+    "label": "通义灵码",
+    "root": "~/.lingma",
+    "glob": "**/*.json",
+    "format": "json",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "createTime",
+      "created_at"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "content",
+      "text"
+    ]
+  },
+  {
+    "id": "codebuddy-cli",
+    "label": "CodeBuddy CLI",
+    "root": "~/.codebuddy",
+    "glob": "**/*.jsonl",
+    "format": "jsonl",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "created_at"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "content",
+      "text"
+    ]
+  },
+  {
+    "id": "kiro",
+    "label": "Kiro",
+    "root": "~/.kiro",
+    "glob": "**/*.json",
+    "format": "json",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "createdAt"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "content",
+      "text"
+    ]
+  },
+  {
+    "id": "workbuddy",
+    "label": "WorkBuddy",
+    "root": "~/.workbuddy/projects",
+    "glob": "*/*.jsonl",
+    "format": "jsonl",
+    "session_id": "sessionId",
+    "time_fields": [
+      "timestamp",
+      "createdAt",
+      "time"
+    ],
+    "role_field": "role",
+    "content_fields": [
+      "content.0.text",
+      "content.0.content",
+      "text",
+      "message.content",
+      "content"
+    ],
+    "user_query_tag": "user_query",
+    "directory_field": "cwd"
+  }
+]

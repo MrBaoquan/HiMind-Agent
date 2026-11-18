@@ -46,7 +46,11 @@ function sourceLabel(source: string): string {
     case 'codex': return 'Codex';
     case 'open_code':
     case 'opencode': return 'OpenCode';
-    default: return '未知来源';
+    case 'claude-desktop': return 'Claude Desktop';
+    case 'github-copilot': return 'GitHub Copilot';
+    case 'vscode': return 'VS Code Chat';
+    case 'workbuddy': return 'WorkBuddy';
+    default: return source;
   }
 }
 

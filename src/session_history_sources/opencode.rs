@@ -33,6 +33,9 @@ pub(crate) fn scan_opencode(registry: &Registry) -> ProviderScan {
 }
 
 fn opencode_base_dir() -> Option<PathBuf> {
+    if let Some(path) = crate::session_history_sources::external::native_root("opencode") {
+        return Some(path);
+    }
     if let Some(value) = std::env::var_os("OPENCODE_DATA_DIR").filter(|value| !value.is_empty()) {
         let path = resolve_user_path(PathBuf::from(value))?;
         return path.is_absolute().then_some(path);
@@ -44,7 +47,17 @@ fn opencode_base_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            return Some(PathBuf::from(app_data).join("opencode"));
+            let current = PathBuf::from(app_data).join("opencode");
+            if current.join("opencode.db").is_file() {
+                return Some(current);
+            }
+            if let Some(home) = std::env::var_os("USERPROFILE") {
+                let legacy = PathBuf::from(home).join(".local/share/opencode");
+                if legacy.join("opencode.db").is_file() {
+                    return Some(legacy);
+                }
+            }
+            return Some(current);
         }
     }
     let home = std::env::var_os("USERPROFILE")
@@ -200,7 +213,8 @@ fn scan_opencode_at(registry: &Registry, paths: &[PathBuf], base_exists: bool) -
 
 fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary>, bool), String> {
     let connection = open_read_only(path)?;
-    let columns = table_columns(&connection, "session")?;
+    let table = session_table(&connection)?;
+    let columns = table_columns(&connection, table)?;
     if !["id", "title", "directory"]
         .iter()
         .all(|name| columns.contains(*name))
@@ -223,7 +237,7 @@ fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary
         "id DESC"
     };
     let sql = format!(
-        "SELECT id, title, directory, {created}, {updated} FROM session ORDER BY {order} LIMIT {}",
+        "SELECT id, title, directory, {created}, {updated} FROM {table} ORDER BY {order} LIMIT {}",
         MAX_OPENCODE_SESSIONS + 1
     );
     let mut statement = connection
@@ -298,8 +312,11 @@ fn scan_database(registry: &Registry, path: &Path) -> Result<(Vec<SessionSummary
 }
 
 pub(crate) fn opencode_transcript_page(
-    registry: &Registry, project_id: Option<&str>, native_id: &str,
-    end_offset: Option<usize>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    end_offset: Option<usize>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::OpenCode.stable_session_id(native_id)?;
     let base = opencode_base_dir().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
@@ -322,12 +339,23 @@ fn opencode_transcript_page_from_paths(
     end_offset: Option<usize>,
     page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
-    opencode_transcript_page_scoped_from_paths(registry, Some(project_id), native_id, paths, end_offset, page_size)
+    opencode_transcript_page_scoped_from_paths(
+        registry,
+        Some(project_id),
+        native_id,
+        paths,
+        end_offset,
+        page_size,
+    )
 }
 
 fn opencode_transcript_page_scoped_from_paths(
-    registry: &Registry, project_id: Option<&str>, native_id: &str, paths: &[PathBuf],
-    end_offset: Option<usize>, page_size: usize,
+    registry: &Registry,
+    project_id: Option<&str>,
+    native_id: &str,
+    paths: &[PathBuf],
+    end_offset: Option<usize>,
+    page_size: usize,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::OpenCode.stable_session_id(native_id)?;
     for path in paths.iter().take(MAX_OPENCODE_DATABASES) {
@@ -341,11 +369,14 @@ fn opencode_transcript_page_scoped_from_paths(
             Ok(association) => association,
             Err(_) => continue,
         };
-        if project_id.is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id)) {
+        if project_id
+            .is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id))
+        {
             continue;
         }
         let selection = read_opencode_messages(&connection, native_id, end_offset, page_size)?;
         return Ok(session_history::SessionTranscriptPage {
+            snapshot_cursor: None,
             session_id,
             through_seq: Some(selection.through_seq),
             messages: selection.messages,
@@ -409,7 +440,7 @@ fn read_v2_page(
     let start = end.saturating_sub(page_size);
     let mut statement = connection
         .prepare(
-            "SELECT type, time_created, data FROM session_message \
+            "SELECT type, time_created, data, id FROM session_message \
              WHERE session_id=?1 ORDER BY seq DESC LIMIT ?2 OFFSET ?3",
         )
         .map_err(|error| error.to_string())?;
@@ -421,14 +452,16 @@ fn read_v2_page(
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .map_err(|error| error.to_string())?;
     let mut messages = Vec::new();
     for row in rows {
-        let (kind, created, data) = row.map_err(|error| error.to_string())?;
-        if let Some(message) = parse_opencode_message(&kind, created, &data, messages.len()) {
+        let (kind, created, data, id) = row.map_err(|error| error.to_string())?;
+        if let Some(mut message) = parse_opencode_message(&kind, created, &data, messages.len()) {
+            message.id = id;
             messages.push(message);
         }
     }
@@ -693,14 +726,28 @@ fn check_transcript_budget(
     Ok(())
 }
 
+fn session_table(connection: &Connection) -> Result<&'static str, String> {
+    for table in ["session_v2", "session"] {
+        let columns = table_columns(connection, table)?;
+        if ["id", "directory", "title"]
+            .iter()
+            .all(|name| columns.contains(*name))
+        {
+            return Ok(table);
+        }
+    }
+    Err("OpenCode session schema is unsupported".into())
+}
+
 fn session_directory(connection: &Connection, session_id: &str) -> Result<String, String> {
-    let columns = table_columns(connection, "session")?;
+    let table = session_table(connection)?;
+    let columns = table_columns(connection, table)?;
     if !columns.contains("id") || !columns.contains("directory") {
         return Err("OpenCode session schema is unsupported".to_string());
     }
     connection
         .query_row(
-            "SELECT directory FROM session WHERE id=?1",
+            &format!("SELECT directory FROM {table} WHERE id=?1"),
             [session_id],
             |row| row.get(0),
         )
@@ -831,12 +878,37 @@ mod tests {
 
     #[test]
     fn opencode_session_unassigned_retains_metadata_and_read_only_body() {
-        let temp=TempRoot::new();let path=temp.0.join("session.db");create_v2_database(&path);
-        Connection::open(&path).unwrap().execute("UPDATE session SET directory='G:/synthetic-unregistered'",[]).unwrap();
-        let paths=vec![path];let scan=scan_opencode_at(&registry(),&paths,true);
-        assert!(scan.sessions.iter().any(|s|s.project_id.is_none()));
-        assert!(opencode_transcript_page_scoped_from_paths(&registry(),None,"ses_synthetic",&paths,None,50).is_ok());
-        assert!(opencode_transcript_page_from_paths(&registry(),"project-a","ses_synthetic",&paths,None,50).is_err());
+        let temp = TempRoot::new();
+        let path = temp.0.join("session.db");
+        create_v2_database(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE session SET directory='G:/synthetic-unregistered'",
+                [],
+            )
+            .unwrap();
+        let paths = vec![path];
+        let scan = scan_opencode_at(&registry(), &paths, true);
+        assert!(scan.sessions.iter().any(|s| s.project_id.is_none()));
+        assert!(opencode_transcript_page_scoped_from_paths(
+            &registry(),
+            None,
+            "ses_synthetic",
+            &paths,
+            None,
+            50
+        )
+        .is_ok());
+        assert!(opencode_transcript_page_from_paths(
+            &registry(),
+            "project-a",
+            "ses_synthetic",
+            &paths,
+            None,
+            50
+        )
+        .is_err());
     }
 
     #[test]
@@ -1031,5 +1103,34 @@ mod tests {
         .unwrap();
         assert_eq!(page.messages.len(), 1);
         assert_eq!(page.messages[0].content, "legacy synthetic prompt");
+    }
+    #[test]
+    fn opencode_session_v2_table_uses_native_message_ids_across_pages() {
+        let temp = TempRoot::new();
+        let path = temp.0.join("session-v2.db");
+        create_v2_database(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("ALTER TABLE session RENAME TO session_v2")
+            .unwrap();
+        drop(connection);
+        let paths = vec![path.clone()];
+        let scan = scan_opencode_at(&registry(), &paths, true);
+        assert_eq!(scan.sessions.len(), 1);
+        let connection = open_read_only(&path).unwrap();
+        assert_eq!(
+            session_directory(&connection, "ses_synthetic").unwrap(),
+            "F:/work/project-a"
+        );
+        let first = read_opencode_messages(&connection, "ses_synthetic", None, 1).unwrap();
+        let second = read_opencode_messages(
+            &connection,
+            "ses_synthetic",
+            first.next_cursor.as_ref().map(|v| v.parse().unwrap()),
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.messages[0].id, "m102");
+        assert_eq!(second.messages[0].id, "m101");
     }
 }

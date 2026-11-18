@@ -81,8 +81,12 @@ pub(crate) fn start(
 }
 
 pub(crate) fn start_scoped(
-    project_id: String, snapshot: SessionHistorySnapshot, session_id: Option<String>,
-    query: String, mode: String, registry_revision: Option<String>,
+    project_id: String,
+    snapshot: SessionHistorySnapshot,
+    session_id: Option<String>,
+    query: String,
+    mode: String,
+    registry_revision: Option<String>,
 ) -> Result<String, String> {
     if !matches!(mode.as_str(), "text" | "prompts" | "files")
         || query.chars().count() > 200
@@ -162,18 +166,24 @@ pub(crate) fn step(
     token: &str,
     mut load: impl FnMut(&str, Option<String>) -> Result<SessionTranscriptPage, String>,
 ) -> Result<InspectBatch, String> {
-    step_impl(project_id, token, None, |session, cursor| load(&session.id, cursor))
+    step_impl(project_id, token, None, |session, cursor| {
+        load(&session.id, cursor)
+    })
 }
 
 pub(crate) fn step_scoped(
-    project_id: &str, token: &str, revision: &str,
+    project_id: &str,
+    token: &str,
+    revision: &str,
     load: impl FnMut(&SessionSummary, Option<String>) -> Result<SessionTranscriptPage, String>,
 ) -> Result<InspectBatch, String> {
     step_impl(project_id, token, Some(revision), load)
 }
 
 fn step_impl(
-    project_id: &str, token: &str, revision: Option<&str>,
+    project_id: &str,
+    token: &str,
+    revision: Option<&str>,
     mut load: impl FnMut(&SessionSummary, Option<String>) -> Result<SessionTranscriptPage, String>,
 ) -> Result<InspectBatch, String> {
     let job = jobs()
@@ -186,7 +196,11 @@ fn step_impl(
     if job.project_id != project_id {
         return Err("PROJECT_NOT_FOUND".into());
     }
-    if job.registry_revision.as_deref().is_some_and(|expected| Some(expected) != revision) {
+    if job
+        .registry_revision
+        .as_deref()
+        .is_some_and(|expected| Some(expected) != revision)
+    {
         job.cancel.store(true, Ordering::Relaxed);
         return Err("WORKSPACE_REGISTRY_CHANGED".into());
     }
@@ -388,14 +402,37 @@ mod tests {
     #[test]
     fn session_history_scoped_search_uses_owner_and_rejects_registry_changes() {
         let mut data = snapshot();
-        for session in &mut data.sessions { session.project_id = Some("child".into()); }
-        let token = start_scoped("root".into(), data.clone(), None, "needle".into(), "text".into(), Some("v1".into())).unwrap();
+        for session in &mut data.sessions {
+            session.project_id = Some("child".into());
+        }
+        let token = start_scoped(
+            "root".into(),
+            data.clone(),
+            None,
+            "needle".into(),
+            "text".into(),
+            Some("v1".into()),
+        )
+        .unwrap();
         let batch = step_scoped("root", &token, "v1", |session, _| {
             assert_eq!(session.project_id.as_deref(), Some("child"));
-            Ok(SessionTranscriptPage { session_id: session.id.clone(), messages: vec![], next_cursor: None, through_seq: None })
-        }).unwrap();
+            Ok(SessionTranscriptPage {
+                snapshot_cursor: None,
+                session_id: session.id.clone(),
+                messages: vec![],
+                next_cursor: None,
+                through_seq: None,
+            })
+        })
+        .unwrap();
         assert_eq!(batch.scanned_sessions, 2);
-        assert_eq!(step_scoped("root", &token, "v2", |_, _| panic!("must not read stale owner")).unwrap_err(), "WORKSPACE_REGISTRY_CHANGED");
+        assert_eq!(
+            step_scoped("root", &token, "v2", |_, _| panic!(
+                "must not read stale owner"
+            ))
+            .unwrap_err(),
+            "WORKSPACE_REGISTRY_CHANGED"
+        );
         cancel("root", &token).unwrap();
     }
     #[test]
@@ -405,6 +442,7 @@ mod tests {
         loop {
             let batch = step("p", &token, |session, cursor| {
                 Ok(SessionTranscriptPage {
+                    snapshot_cursor: None,
                     session_id: session.into(),
                     through_seq: None,
                     messages: vec![SessionTranscriptMessage {
@@ -448,6 +486,7 @@ mod tests {
             let batch = step("p", &token, |session, cursor| {
                 let offset = cursor.as_deref().unwrap_or("0").parse::<usize>().unwrap();
                 Ok(SessionTranscriptPage {
+                    snapshot_cursor: None,
                     session_id: session.into(),
                     through_seq: None,
                     messages: (0..50)

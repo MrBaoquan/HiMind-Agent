@@ -5,15 +5,15 @@ use serde_json::Value;
 
 use crate::workspace_registry::{self, Registry};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum SessionSource {
     Dsh,
     Acp,
     ClaudeCode,
     Codex,
-    #[serde(rename = "opencode", alias = "open_code")]
     OpenCode,
+    External(String),
 }
 
 impl SessionSource {
@@ -25,31 +25,68 @@ impl SessionSource {
         Self::OpenCode,
     ];
 
-    pub(crate) const fn id(self) -> &'static str {
+    pub(crate) fn id(&self) -> &str {
         match self {
             Self::Dsh => "dsh",
             Self::Acp => "acp",
             Self::ClaudeCode => "claude_code",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::External(id) => id,
         }
     }
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::Dsh => "HiMind AI",
             Self::Acp => "ACP",
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
+            Self::External(id) => match id.as_str() {
+                "claude-desktop" => "Claude Desktop",
+                "github-copilot" => "GitHub Copilot",
+                "vscode" => "VS Code Chat",
+                "workbuddy" => "WorkBuddy",
+                _ => id,
+            },
         }
     }
 
-    pub(crate) fn stable_session_id(self, native_id: &str) -> Result<String, String> {
+    pub(crate) fn stable_session_id(&self, native_id: &str) -> Result<String, String> {
         if native_id.trim().is_empty() || native_id.chars().any(char::is_control) {
             return Err("session id is invalid".to_string());
         }
         Ok(format!("{}:{native_id}", self.id()))
+    }
+}
+
+impl TryFrom<String> for SessionSource {
+    type Error = String;
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        Ok(match id.as_str() {
+            "dsh" => Self::Dsh,
+            "acp" => Self::Acp,
+            "claude_code" | "claude-code" => Self::ClaudeCode,
+            "codex" => Self::Codex,
+            "opencode" | "open_code" => Self::OpenCode,
+            _ if !id.is_empty()
+                && id.len() <= 64
+                && id.as_bytes()[0].is_ascii_alphanumeric()
+                && id.bytes().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'_' | b'.')
+                }) =>
+            {
+                Self::External(id)
+            }
+            _ => return Err("SESSION_SOURCE_INVALID".into()),
+        })
+    }
+}
+
+impl From<SessionSource> for String {
+    fn from(source: SessionSource) -> Self {
+        source.id().to_string()
     }
 }
 
@@ -177,6 +214,8 @@ pub(crate) struct SessionTranscriptMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct SessionTranscriptPage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_cursor: Option<String>,
     pub session_id: String,
     pub through_seq: Option<i64>,
     pub messages: Vec<SessionTranscriptMessage>,
@@ -216,6 +255,7 @@ pub(crate) fn paired_transcript_page(
         })
         .collect();
     Ok(SessionTranscriptPage {
+        snapshot_cursor: Some(end.to_string()),
         session_id: session_id.to_string(),
         through_seq: Some(end.saturating_sub(1) as i64),
         messages,
@@ -234,7 +274,10 @@ pub(crate) fn dsh_projected_session_as_of_seq(
 }
 
 pub(crate) fn dsh_session_as_of_seq(
-    registry: &Registry, value: &Value, native_id: &str, project_id: Option<&str>,
+    registry: &Registry,
+    value: &Value,
+    native_id: &str,
+    project_id: Option<&str>,
 ) -> Result<Option<i64>, String> {
     let items = value
         .get("items")
@@ -257,7 +300,8 @@ pub(crate) fn dsh_session_as_of_seq(
         return Ok(None);
     };
     let association = associate_workspace(registry, working_directory)?;
-    if project_id.is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id)) {
+    if project_id.is_some_and(|id| association.as_ref().map(|a| a.project_id.as_str()) != Some(id))
+    {
         return Ok(None);
     }
     let sequence = item
@@ -306,6 +350,7 @@ pub(crate) fn dsh_transcript_page(
         .map(|sequence| sequence.to_string());
 
     Ok(SessionTranscriptPage {
+        snapshot_cursor: Some(through_seq.to_string()),
         session_id: session_id.to_string(),
         through_seq: Some(through_seq),
         messages: messages.into_iter().map(|item| item.message).collect(),
@@ -453,7 +498,17 @@ pub(crate) fn project_history_snapshot(
     sessions: Vec<SessionSummary>,
     sources: Vec<SessionSourceStatus>,
 ) -> SessionHistorySnapshot {
-    history_snapshot_for_ids(&std::collections::HashSet::from([project_id.to_string()]), None, query, source_filter, sort, offset, page_size, sessions, sources)
+    history_snapshot_for_ids(
+        &std::collections::HashSet::from([project_id.to_string()]),
+        None,
+        query,
+        source_filter,
+        sort,
+        offset,
+        page_size,
+        sessions,
+        sources,
+    )
 }
 
 pub(crate) fn scoped_project_history_snapshot(
@@ -468,18 +523,39 @@ pub(crate) fn scoped_project_history_snapshot(
     sessions: Vec<SessionSummary>,
     sources: Vec<SessionSourceStatus>,
 ) -> SessionHistorySnapshot {
-    history_snapshot_for_ids(&registry.scope_ids(project_id, include_children), Some(registry), query, source_filter, sort, offset, page_size, sessions, sources)
+    history_snapshot_for_ids(
+        &registry.scope_ids(project_id, include_children),
+        Some(registry),
+        query,
+        source_filter,
+        sort,
+        offset,
+        page_size,
+        sessions,
+        sources,
+    )
 }
 
 fn history_snapshot_for_ids(
-    ids: &std::collections::HashSet<String>, registry: Option<&Registry>, query: &str,
-    source_filter: Option<SessionSource>, sort: SessionHistorySort, offset: usize,
-    page_size: usize, sessions: Vec<SessionSummary>, mut sources: Vec<SessionSourceStatus>,
+    ids: &std::collections::HashSet<String>,
+    registry: Option<&Registry>,
+    query: &str,
+    source_filter: Option<SessionSource>,
+    sort: SessionHistorySort,
+    offset: usize,
+    page_size: usize,
+    sessions: Vec<SessionSummary>,
+    mut sources: Vec<SessionSourceStatus>,
 ) -> SessionHistorySnapshot {
     let query = query.trim().to_lowercase();
     let mut sessions = sessions
         .into_iter()
-        .filter(|session| session.project_id.as_ref().is_some_and(|id| ids.contains(id)))
+        .filter(|session| {
+            session
+                .project_id
+                .as_ref()
+                .is_some_and(|id| ids.contains(id))
+        })
         .filter(|session| {
             query.is_empty()
                 || session.title.to_lowercase().contains(&query)
@@ -488,8 +564,20 @@ fn history_snapshot_for_ids(
                     .project_name
                     .as_deref()
                     .is_some_and(|name| name.to_lowercase().contains(&query))
-                || registry.and_then(|registry| session.project_id.as_deref().and_then(|id| registry.project(id)))
-                    .is_some_and(|project| project.name.to_lowercase().contains(&query) || project.aliases.iter().any(|alias| alias.to_lowercase().contains(&query)))
+                || registry
+                    .and_then(|registry| {
+                        session
+                            .project_id
+                            .as_deref()
+                            .and_then(|id| registry.project(id))
+                    })
+                    .is_some_and(|project| {
+                        project.name.to_lowercase().contains(&query)
+                            || project
+                                .aliases
+                                .iter()
+                                .any(|alias| alias.to_lowercase().contains(&query))
+                    })
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| {
@@ -524,7 +612,11 @@ fn history_snapshot_for_ids(
             .position(|candidate| *candidate == source.source)
             .unwrap_or(usize::MAX)
     });
-    sessions.retain(|session| source_filter.is_none_or(|source| session.source == source));
+    sessions.retain(|session| {
+        source_filter
+            .as_ref()
+            .is_none_or(|source| &session.source == source)
+    });
     let total = sessions.len();
     let next_offset = offset.saturating_add(page_size);
     let next_cursor = (next_offset < total).then(|| next_offset.to_string());
@@ -600,7 +692,10 @@ mod tests {
 
     #[test]
     fn source_ids_and_qualified_session_ids_are_stable_and_unambiguous() {
-        let ids = SessionSource::ALL.map(SessionSource::id);
+        let ids = SessionSource::ALL
+            .iter()
+            .map(|s| s.id().to_string())
+            .collect::<Vec<_>>();
         let unique = ids.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), SessionSource::ALL.len());
         assert_eq!(SessionSource::ClaudeCode.label(), "Claude Code");
@@ -627,12 +722,12 @@ mod tests {
     #[test]
     fn source_wire_keys_match_filter_ids_and_accept_legacy_opencode() {
         let sources = SessionSource::ALL;
-        for source in sources {
+        for source in &sources {
             let wire = serde_json::to_value(source).unwrap();
             assert_eq!(wire, source.id());
             assert_eq!(
                 serde_json::from_value::<SessionSource>(wire).unwrap(),
-                source
+                source.clone()
             );
         }
         assert_eq!(
@@ -651,9 +746,9 @@ mod tests {
             let history = SessionHistorySnapshot {
                 sessions: sources
                     .iter()
-                    .map(|&source| {
+                    .map(|source| {
                         SessionSummary::new(
-                            source,
+                            source.clone(),
                             "synthetic".into(),
                             "F:/synthetic".into(),
                             "Synthetic session".into(),
@@ -676,8 +771,8 @@ mod tests {
                 sources: sources
                     .iter()
                     .enumerate()
-                    .map(|(i, &source)| SessionSourceStatus {
-                        source,
+                    .map(|(i, source)| SessionSourceStatus {
+                        source: source.clone(),
                         availability: availability[i],
                         session_count: 11,
                         error_code: match i {
@@ -868,25 +963,112 @@ mod tests {
     #[test]
     fn scoped_history_keeps_actual_owner_alias_search_and_global_pagination() {
         use crate::workspace_registry::RegistryProject;
-        let registry = Registry { projects: vec![
-            RegistryProject { id: "root".into(), name: "平台".into(), ..Default::default() },
-            RegistryProject { id: "child".into(), name: "影院播控".into(), aliases: vec!["CinemaControl".into()], parent_id: "root".into(), ..Default::default() },
-            RegistryProject { id: "nested".into(), name: "嵌套".into(), parent_id: "child".into(), ..Default::default() },
-        ], ..Default::default() };
+        let registry = Registry {
+            projects: vec![
+                RegistryProject {
+                    id: "root".into(),
+                    name: "平台".into(),
+                    ..Default::default()
+                },
+                RegistryProject {
+                    id: "child".into(),
+                    name: "影院播控".into(),
+                    aliases: vec!["CinemaControl".into()],
+                    parent_id: "root".into(),
+                    ..Default::default()
+                },
+                RegistryProject {
+                    id: "nested".into(),
+                    name: "嵌套".into(),
+                    parent_id: "child".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let sessions = vec![
-            summary(SessionSource::Codex, "same", Some("root"), "A", "2026-01-01T00:00:00Z"),
-            summary(SessionSource::ClaudeCode, "same", Some("child"), "B", "2026-01-03T00:00:00Z"),
-            summary(SessionSource::ClaudeCode, "same", Some("child"), "B", "2026-01-03T00:00:00Z"),
-            summary(SessionSource::Acp, "third", Some("nested"), "C", "2026-01-02T00:00:00Z"),
-            summary(SessionSource::Dsh, "outside", Some("other"), "D", "2026-01-04T00:00:00Z"),
+            summary(
+                SessionSource::Codex,
+                "same",
+                Some("root"),
+                "A",
+                "2026-01-01T00:00:00Z",
+            ),
+            summary(
+                SessionSource::ClaudeCode,
+                "same",
+                Some("child"),
+                "B",
+                "2026-01-03T00:00:00Z",
+            ),
+            summary(
+                SessionSource::ClaudeCode,
+                "same",
+                Some("child"),
+                "B",
+                "2026-01-03T00:00:00Z",
+            ),
+            summary(
+                SessionSource::Acp,
+                "third",
+                Some("nested"),
+                "C",
+                "2026-01-02T00:00:00Z",
+            ),
+            summary(
+                SessionSource::Dsh,
+                "outside",
+                Some("other"),
+                "D",
+                "2026-01-04T00:00:00Z",
+            ),
         ];
-        let page = scoped_project_history_snapshot(&registry, "root", true, "", None, SessionHistorySort::Recent, 0, 2, sessions.clone(), vec![]);
+        let page = scoped_project_history_snapshot(
+            &registry,
+            "root",
+            true,
+            "",
+            None,
+            SessionHistorySort::Recent,
+            0,
+            2,
+            sessions.clone(),
+            vec![],
+        );
         assert_eq!(page.total, 3);
-        assert_eq!(page.sessions.iter().map(|s| s.project_id.as_deref().unwrap()).collect::<Vec<_>>(), ["child", "nested"]);
+        assert_eq!(
+            page.sessions
+                .iter()
+                .map(|s| s.project_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["child", "nested"]
+        );
         assert_eq!(page.next_cursor.as_deref(), Some("2"));
-        let own = scoped_project_history_snapshot(&registry, "root", false, "", None, SessionHistorySort::Recent, 0, 50, sessions.clone(), vec![]);
+        let own = scoped_project_history_snapshot(
+            &registry,
+            "root",
+            false,
+            "",
+            None,
+            SessionHistorySort::Recent,
+            0,
+            50,
+            sessions.clone(),
+            vec![],
+        );
         assert_eq!(own.total, 1);
-        let alias = scoped_project_history_snapshot(&registry, "root", true, "cinemacontrol", None, SessionHistorySort::Recent, 0, 50, sessions, vec![]);
+        let alias = scoped_project_history_snapshot(
+            &registry,
+            "root",
+            true,
+            "cinemacontrol",
+            None,
+            SessionHistorySort::Recent,
+            0,
+            50,
+            sessions,
+            vec![],
+        );
         assert_eq!(alias.total, 1);
         assert_eq!(alias.sessions[0].project_id.as_deref(), Some("child"));
     }
