@@ -2732,12 +2732,10 @@ pub(crate) fn gateway_bindings(
                         gateway_upstream_protocol(service, &entry_protocol)
                     )
                 };
-                let left_healthy = crate::store::ai_route_health::is_healthy(&identity(
-                    left_service, left,
-                ));
-                let right_healthy = crate::store::ai_route_health::is_healthy(&identity(
-                    right_service, right,
-                ));
+                let left_healthy =
+                    crate::store::ai_route_health::is_healthy(&identity(left_service, left));
+                let right_healthy =
+                    crate::store::ai_route_health::is_healthy(&identity(right_service, right));
                 right_healthy.cmp(&left_healthy)
             });
             let default_model = routes

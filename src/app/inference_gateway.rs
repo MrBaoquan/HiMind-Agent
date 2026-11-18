@@ -1009,8 +1009,7 @@ struct ResponsesFallbackOutcome {
 /// 2xx 立即恢复。400/422 是兼容性问题，不应把整条路由判死。
 fn mark_route_outcome(binding: &GatewayBinding, status: u16) {
     if matches!(status, 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504) {
-        let failures =
-            crate::store::ai_route_health::mark_failure(&route_health_identity(binding));
+        let failures = crate::store::ai_route_health::mark_failure(&route_health_identity(binding));
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
@@ -1114,7 +1113,10 @@ fn apply_observed_responses_fallbacks(
     }
     let mut current = body.to_vec();
     let mut applied = Vec::new();
-    if observed.iter().any(|feature| feature == "reasoning_history") {
+    if observed
+        .iter()
+        .any(|feature| feature == "reasoning_history")
+    {
         if let Some(next) = response_reasoning_history_fallback(&current) {
             current = next;
             applied.push("reasoning_history");
@@ -2458,10 +2460,11 @@ fn forward_translated(
             .body(openai_payload.clone())
             .send()
     };
-    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
-        send_with_transient_retry(candidate, &mut || send(candidate))
-    })
-    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let mut response =
+        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+            send_with_transient_retry(candidate, &mut || send(candidate))
+        })
+        .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
         .get(active_index.get())
         .unwrap_or(binding);
@@ -2689,10 +2692,11 @@ fn forward_anthropic_responses_translated(
             .body(payload.to_vec())
             .send()
     };
-    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
-        send_with_transient_retry(candidate, &mut || send(candidate, &payload))
-    })
-    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let mut response =
+        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+            send_with_transient_retry(candidate, &mut || send(candidate, &payload))
+        })
+        .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
         .get(active_index.get())
         .unwrap_or(binding);
@@ -2918,13 +2922,14 @@ fn forward_responses_translated(
     let mut candidate_attempted = Vec::new();
     let mut prepared_candidates = Vec::new();
     for candidate in non_empty_candidates.iter().cloned() {
-        let Ok(chat_body) = crate::app::responses_chat::request_to_chat(
-            request,
-            &candidate.upstream_model,
-        ) else {
+        let Ok(chat_body) =
+            crate::app::responses_chat::request_to_chat(request, &candidate.upstream_model)
+        else {
             continue;
         };
-        let Ok(normalized) = normalize_compatibility_candidate(&candidate, "openai-chat", chat_body) else {
+        let Ok(normalized) =
+            normalize_compatibility_candidate(&candidate, "openai-chat", chat_body)
+        else {
             continue;
         };
         let payload = normalized.request.to_string();
@@ -2934,9 +2939,15 @@ fn forward_responses_translated(
         prepared_candidates.push((candidate, payload, normalized.attempted));
     }
     if prepared_candidates.is_empty() {
-        return Err(translate_error(stream, "no candidate could adapt the Responses request"));
+        return Err(translate_error(
+            stream,
+            "no candidate could adapt the Responses request",
+        ));
     }
-    let candidate_bindings = prepared_candidates.iter().map(|(b,_,_)| b.clone()).collect::<Vec<_>>();
+    let candidate_bindings = prepared_candidates
+        .iter()
+        .map(|(b, _, _)| b.clone())
+        .collect::<Vec<_>>();
     let prepared = prepared_candidates
         .iter()
         .map(|(binding, payload, attempted)| {
@@ -2962,10 +2973,11 @@ fn forward_responses_translated(
         }
         upstream_request.body(payload.clone()).send()
     };
-    let mut response = send_with_route_failover(&candidate_bindings, &active_index, &mut |candidate| {
-        send_with_transient_retry(candidate, &mut || send(candidate))
-    })
-    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let mut response =
+        send_with_route_failover(&candidate_bindings, &active_index, &mut |candidate| {
+            send_with_transient_retry(candidate, &mut || send(candidate))
+        })
+        .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = candidate_bindings
         .get(active_index.get())
         .unwrap_or(binding);
@@ -3186,10 +3198,11 @@ fn forward_chat_responses_translated(
             .body(payload.to_vec())
             .send()
     };
-    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
-        send_with_transient_retry(candidate, &mut || send(candidate, &payload))
-    })
-    .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
+    let mut response =
+        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+            send_with_transient_retry(candidate, &mut || send(candidate, &payload))
+        })
+        .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
         .get(active_index.get())
         .unwrap_or(binding);
@@ -3396,7 +3409,11 @@ fn normalize_compatibility_candidate(
     )
     .map_err(|error| error.message)?;
     Ok(NormalizedOutbound {
-        attempted: normalized.changes.iter().map(|change| change.action).collect(),
+        attempted: normalized
+            .changes
+            .iter()
+            .map(|change| change.action)
+            .collect(),
         request: normalized.request,
     })
 }
@@ -6883,7 +6900,9 @@ mod tests {
         let mut candidate = binding("codex", "openai-chat", "candidate-token");
         candidate.base_url = "https://opencode.ai/zen/go/v1".to_string();
         candidate.upstream_model = "backup-chat".to_string();
-        let rebuilt = normalize_compatibility_candidate(&candidate, "openai-chat", normalized.request).unwrap();
+        let rebuilt =
+            normalize_compatibility_candidate(&candidate, "openai-chat", normalized.request)
+                .unwrap();
         assert_eq!(rebuilt.request["model"], "backup-chat");
         assert_eq!(rebuilt.request["messages"][0]["content"], "continue");
     }
@@ -6939,7 +6958,10 @@ mod tests {
         let bounded = bounded_route_candidates(candidates, &primary, true);
         assert_eq!(bounded.len(), MAX_ROUTE_ATTEMPTS);
         assert_eq!(
-            bounded.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            bounded
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["candidate-0", "candidate-1", "candidate-2", "candidate-3"]
         );
         assert!(bounded.iter().all(|item| item.protocol == "openai-chat"));
@@ -6960,25 +6982,25 @@ mod tests {
         let mut binding = binding("codex", "openai-responses", "health-token");
         binding.base_url = "https://route-health.example/v1".to_string();
         binding.upstream_model = "route-health-model".to_string();
-        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
-            &binding
-        )));
+        assert!(crate::store::ai_route_health::is_healthy(
+            &route_health_identity(&binding)
+        ));
         mark_route_outcome(&binding, 403);
-        assert!(!crate::store::ai_route_health::is_healthy(&route_health_identity(
-            &binding
-        )));
+        assert!(!crate::store::ai_route_health::is_healthy(
+            &route_health_identity(&binding)
+        ));
         mark_route_outcome(&binding, 200);
-        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
-            &binding
-        )));
+        assert!(crate::store::ai_route_health::is_healthy(
+            &route_health_identity(&binding)
+        ));
         mark_route_outcome(&binding, 429);
-        assert!(!crate::store::ai_route_health::is_healthy(&route_health_identity(
-            &binding
-        )));
+        assert!(!crate::store::ai_route_health::is_healthy(
+            &route_health_identity(&binding)
+        ));
         mark_route_outcome(&binding, 200);
-        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
-            &binding
-        )));
+        assert!(crate::store::ai_route_health::is_healthy(
+            &route_health_identity(&binding)
+        ));
     }
 
     fn assert_route_failover_for_status(status_line: &'static str, good_body: &'static str) {
@@ -7334,9 +7356,15 @@ mod tests {
                     RequestRead::Request(head, body) => (head, body),
                     _ => panic!("expected request"),
                 };
-                seen_thread.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                seen_thread
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
                 let (status, response) = if attempt == 1 {
-                    ("400 Bad Request", r#"{"error":{"message":"invalid request"}}"#)
+                    (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"invalid request"}}"#,
+                    )
                 } else {
                     ("200 OK", r#"{"ok":true}"#)
                 };
@@ -7356,19 +7384,36 @@ mod tests {
             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
             "tool_choice": "auto"
         }).to_string();
-        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
         let url = format!("http://{address}/v1/responses");
         let mut send = |payload: &[u8]| client.post(&url).body(payload.to_vec()).send();
         let binding = binding("codex", "openai-responses", "reasoning-token");
-        let outcome = send_responses_with_compatibility_fallback(&binding, body.as_bytes(), &mut send).unwrap();
+        let outcome =
+            send_responses_with_compatibility_fallback(&binding, body.as_bytes(), &mut send)
+                .unwrap();
         assert_eq!(outcome.response.status(), reqwest::StatusCode::OK);
         assert_eq!(outcome.applied, vec!["reasoning_history"]);
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0]["input"][1]["type"], "reasoning");
-        assert!(seen[1]["input"].as_array().unwrap().iter().all(|item| item["type"] != "reasoning"));
-        assert!(seen[1]["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call"));
-        assert!(seen[1]["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output"));
+        assert!(seen[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "reasoning"));
+        assert!(seen[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call"));
+        assert!(seen[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
         assert_eq!(seen[1]["reasoning"]["effort"], "medium");
         worker.join().unwrap();
     }
@@ -7702,13 +7747,28 @@ mod tests {
         assert_eq!(record.input_tokens, 3);
 
         let finish_without_done = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n";
-        let result = remediation_exchange("openai-responses", "openai-chat", 200, finish_without_done.to_vec(), finish_without_done.len(), true);
+        let result = remediation_exchange(
+            "openai-responses",
+            "openai-chat",
+            200,
+            finish_without_done.to_vec(),
+            finish_without_done.len(),
+            true,
+        );
         assert!(result.starts_with("HTTP/1.1 200"), "{result}");
         assert!(result.contains("response.completed"), "{result}");
         assert!(!result.contains("event: error"), "{result}");
 
-        let unfinished_finish = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
-        let result = remediation_exchange("openai-responses", "openai-chat", 200, unfinished_finish.to_vec(), unfinished_finish.len(), true);
+        let unfinished_finish =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
+        let result = remediation_exchange(
+            "openai-responses",
+            "openai-chat",
+            200,
+            unfinished_finish.to_vec(),
+            unfinished_finish.len(),
+            true,
+        );
         assert!(result.contains("event: error"), "{result}");
         assert!(!result.contains("response.completed"), "{result}");
     }
