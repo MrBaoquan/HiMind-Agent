@@ -58,10 +58,15 @@ detail view exposes too much configuration before explaining actual teamwork.
    stale/disconnected data is explicit. Preview all key states before production
    components; retain stable identity, selection and scroll positions.
    This is a desktop workspace: the board fills the available window height;
-   chat is a right dock with an independently scrolling transcript and anchored
-   composer, never appended below the board. Task details use the same dock,
-   preserving chat drafts and reading positions when switching. Narrow windows
-   overlay that single context pane instead of stacking it beneath the board.
+   execution and coordination are peer work areas. On first opening an active
+   Mission, the coordination assistant is visible in a right dock with an
+   independently scrolling transcript and dock-local anchored composer, never
+   appended below the board. Workspace tools switch that single dock between
+   coordination and task details, preserving chat drafts and reading positions.
+   Close uses a conventional icon button with a tooltip and accessible name.
+   Narrow windows overlay that single context pane instead of stacking it
+   beneath the board. Collaboration/Delivery tabs remain about task content;
+   workspace tools are separate from that tab set.
    Keep status and required actions outside either scroll region; show phase
    history, plan hashes and other diagnostics only in contextual details.
 7. **Make reuse explicit.** Temporary methods stay private to a Mission. Only

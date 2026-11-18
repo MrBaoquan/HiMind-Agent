@@ -52,7 +52,8 @@ fn match_tag(text: &str) -> Option<usize> {
         if tag.is_empty() {
             return None;
         }
-        (text.len() >= tag.len() && text[..tag.len()].eq_ignore_ascii_case(tag))
+        text.get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
             .then_some(tag.len())
     })
 }
@@ -120,6 +121,14 @@ mod tests {
         let (text, removed) = sanitize_reasoning_tags("回答</thought>继续");
         assert_eq!(text, "回答继续");
         assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn preserves_unicode_text_when_less_than_prefix_is_not_a_tag() {
+        let input = "<1234567中后续中文";
+        let (text, removed) = sanitize_reasoning_tags(input);
+        assert_eq!(text, input);
+        assert_eq!(removed, 0);
     }
 
     #[test]

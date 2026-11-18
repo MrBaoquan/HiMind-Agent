@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react';
-import { Activity, CheckCircle2, Clock3, Download, MessageCircle, PackageCheck, Plus, ShieldCheck, Users } from 'lucide-react';
+import { Activity, CheckCircle2, ClipboardList, Clock3, Download, MessageCircle, PackageCheck, Plus, ShieldCheck, Users, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState } from '../components/Common';
 import { agentApi, type AgentActivityItem, type MissionAssignmentInput, type MissionAssignmentOptions, type WorkflowCenterItem, type MissionBudgetIncrease, type MissionEvent, type MissionExecutionOption, type MissionMessageInput, type MissionPlanChangeProposal, type MissionRoleAssignment, type MissionSnapshot, type MissionTaskSpec, type MissionView } from '../services/agentApi';
@@ -293,6 +293,7 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   const [contextPanel, setContextPanel] = useState<'none' | 'coordination' | 'detail'>('none');
   const coordinationOpen = contextPanel === 'coordination';
   const detailsOpen = contextPanel === 'detail';
+  const assistantOpenedForMission = useRef('');
   const [messageDraft, setMessageDraft] = useState('');
   const conversationScroll = useRef(0);
   const [selectedWorkId, setSelectedWorkId] = useState('');
@@ -305,6 +306,12 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
   useEffect(() => { if (mission?.status === 'completed' && completedView.current !== mission.mission_id) {
     completedView.current=mission.mission_id; setViewTab('delivery');
   } }, [mission?.mission_id, mission?.status]);
+  useEffect(() => {
+    if (!mission || !['active', 'waiting'].includes(mission.status)
+        || assistantOpenedForMission.current === mission.mission_id) return;
+    assistantOpenedForMission.current = mission.mission_id;
+    setContextPanel('coordination');
+  }, [mission?.mission_id, mission?.status]);
 
   const [messageBusy, setMessageBusy] = useState(false);
   const openedAssignment = useRef('');
@@ -591,10 +598,15 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
 
       </div> : null}
       {userRuns.length ? <section className="mission-detail-panel"><h3>需要你处理的执行事项</h3>{userRuns.map(item=><div className="task-related-execution" key={item.id} data-todo-id={executionTodoId(item.workflow_run_id || item.id, item.current_step_id || '', item.pause_kind || '')}><span>{taskTitle(mission,item.mission_task_id||'') || item.title} · {activityStatusLabel(item)}</span>{onOpenWorkflowRun&&item.workflow_run_id?<button className="btn btn-primary" onClick={()=>onOpenWorkflowRun(item.workflow_run_id!)}>处理执行事项</button>:null}</div>)}</section>:null}
-      <div className="mission-workbench-tabs" role="tablist" aria-label="协作任务内容">
-        <button role="tab" aria-selected={viewTab==='collaboration'} className={viewTab==='collaboration'?'active':''} onClick={()=>{setViewTab('collaboration');}}><Users size={15}/>协作</button>
-        <button role="tab" aria-selected={viewTab==='delivery'} className={viewTab==='delivery'?'active':''} onClick={()=>setViewTab('delivery')}><PackageCheck size={15}/>交付</button>
-        <button className="mission-talk-action" aria-expanded={coordinationOpen} aria-controls="mission-context-panel" onClick={()=>{setFocusChange(null);setContextPanel(coordinationOpen ? 'none' : 'coordination');}}><MessageCircle size={15}/>{coordinationOpen?'收起对话':'与协调助手沟通'}</button>
+      <div className="mission-workbench-nav">
+        <div className="mission-workbench-tabs" role="tablist" aria-label="协作任务内容">
+          <button role="tab" aria-selected={viewTab==='collaboration'} className={viewTab==='collaboration'?'active':''} onClick={()=>{setViewTab('collaboration');}}><Users size={15}/>协作</button>
+          <button role="tab" aria-selected={viewTab==='delivery'} className={viewTab==='delivery'?'active':''} onClick={()=>setViewTab('delivery')}><PackageCheck size={15}/>交付</button>
+        </div>
+        <div className="mission-workbench-tools" role="toolbar" aria-label="任务工作区">
+          <button type="button" className={`mission-context-tool${coordinationOpen?' is-active':''}`} aria-pressed={coordinationOpen} onClick={()=>{setFocusChange(null);setContextPanel(coordinationOpen?'none':'coordination');}}><MessageCircle size={15}/>协调助手</button>
+          <button type="button" className={`mission-context-tool${detailsOpen?' is-active':''}`} aria-pressed={detailsOpen} onClick={()=>{setSelectedWorkId('');setContextPanel(detailsOpen?'none':'detail');}}><ClipboardList size={15}/>任务详情</button>
+        </div>
       </div>
 
       <div className={`mission-desktop-workspace${coordinationOpen || detailsOpen ? ' has-context-panel' : ''}`} data-panel={coordinationOpen?'coordination':detailsOpen?'detail':'none'}>
@@ -606,7 +618,6 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
         {upcomingCards.length ? upcomingCards.length > 4 ? <details className="mission-upcoming-work"><summary>待派发与等待依赖 · {upcomingCards.length} 项</summary><div className="mission-work-grid">{upcomingCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></details>
           : <section className="mission-work-section"><div className="mission-work-section-head"><h3>下一步与交接</h3><span>等待中的工作不计入并发</span></div><div className="mission-work-grid">{upcomingCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></section> : null}
         {completedCards.length ? <details className="mission-completed-work"><summary>已完成的工作 · {completedCards.length} 项</summary><div className="mission-work-grid">{completedCards.map(task=><MissionWorkCard key={task.spec.id} activities={relatedActivities} fresh={fresh} event={cardEvent(task.spec.id)} mission={mission} task={task as MissionView['tasks'][number]} onSelect={()=>openTask(task.spec.id)}/>)}</div></details> : null}
-        <button type="button" className="btn mission-secondary-toggle" onClick={()=>{setSelectedWorkId('');setContextPanel(detailsOpen ? 'none' : 'detail');}}>{detailsOpen?'收起':'查看'}计划、团队与活动记录</button>
       </div>:null}
       {viewTab==='delivery'?<div className="mission-delivery-view" role="tabpanel" aria-label="交付">
         <MissionEvidence mission={mission} events={events}/>
@@ -615,10 +626,10 @@ export function CollaborationTaskDetail({ missionId, openAssignmentRevision = 0,
       </div>:null}
       </div>
       {coordinationOpen || detailsOpen ? <aside id="mission-context-panel" className="mission-workspace-aside" aria-label={coordinationOpen?'任务协调面板':'任务详情面板'}>
-        <div className="mission-context-head"><strong>{coordinationOpen?'协调助手':'任务详情'}</strong><button type="button" className="btn" onClick={()=>{setContextPanel('none');}}>关闭面板</button></div>
+        <div className="mission-context-head"><strong>{coordinationOpen?'协调助手':'任务详情'}</strong><button type="button" className="btn btn-icon mission-context-close" title={coordinationOpen?'关闭协调助手':'关闭任务详情'} aria-label={coordinationOpen?'关闭协调助手':'关闭任务详情'} onClick={()=>{setContextPanel('none');}}><X size={16}/></button></div>
       {coordinationOpen ? <MissionCoordination message={messageDraft} onMessageChange={setMessageDraft} scrollPosition={conversationScroll} focusChange={focusChange} mission={mission} events={events} busy={messageBusy} onSend={sendCoordinationMessage} onApply={applyCoordinationChange} onWithdraw={async requestId=>{setMessageBusy(true);try{await agentApi.withdrawMissionInstruction(mission.mission_id,requestId);await poll(true);}catch(cause){setError(formatError(cause,'要求未撤回'));}finally{setMessageBusy(false);}}}/> : null}
       {!coordinationOpen && detailsOpen ? <section className="mission-secondary-panel">
-        <div className="mission-detail-tabs segmented-control" role="tablist" aria-label="任务详细信息">{([{id:'overview',label:'运行概况'},{id:'plan',label:'计划与授权'},{id:'experts',label:'协作专家'},{id:'activity',label:'活动记录'}] as const).map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} onClick={()=>setTab(item.id)}>{item.label}</button>)}<button className="btn" onClick={()=>{setContextPanel('none');}}>关闭详情</button></div>
+        <div className="mission-detail-tabs segmented-control" role="tablist" aria-label="任务详细信息">{([{id:'overview',label:'运行概况'},{id:'plan',label:'计划与授权'},{id:'experts',label:'协作专家'},{id:'activity',label:'活动记录'}] as const).map(item=><button key={item.id} role="tab" aria-selected={tab===item.id} onClick={()=>setTab(item.id)}>{item.label}</button>)}</div>
         {tab==='overview'?<>      {!['failed', 'canceled'].includes(mission.status) ? <nav className={`mission-stage-rail${liveWork ? ' is-live' : ''}`} aria-label="协作任务进度">
         {flow.map((step, index) => <div key={step.label} className={`is-${step.state}${step.state === 'current' && currentStageIsVerification && !verificationStarted ? ' is-attention' : ''}${step.state === 'current' && liveWork ? ' is-running' : ''}`} aria-current={step.state === 'current' ? 'step' : undefined}>
           <span>{index < currentFlowIndex || mission.status === 'completed' ? <CheckCircle2 size={13} /> : index + 1}</span><strong>{step.label}</strong>

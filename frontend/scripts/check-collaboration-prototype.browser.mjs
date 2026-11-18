@@ -16,6 +16,14 @@ try {
   await page.goto(pathToFileURL(resolve('../docs/prototypes/collaboration-workbench.html')).href);
   assert.match(await page.locator('nav').innerText(), /示例数据/);
   assert.equal(await page.locator('#concurrency').innerText(), '2');
+  assert.equal(await page.locator('#aside').isVisible(), true);
+  assert.equal(await page.locator('#chat').getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.locator('#closeAside').getAttribute('title'), '关闭协调助手');
+  await page.locator('#closeAside').click();
+  assert.equal(await page.locator('#aside').isVisible(), false);
+  await page.locator('#details').click();
+  assert.equal(await page.locator('#aside').isVisible(), true);
+  assert.equal(await page.locator('#details').getAttribute('aria-pressed'), 'true');
   for (const scene of ['running', 'waiting', 'confirmation', 'verification', 'completed', 'failed', 'disconnected']) {
     await page.locator('#scenario').selectOption(scene);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
@@ -27,6 +35,7 @@ try {
     await page.screenshot({ path: resolve(evidence, `${scene}.png`) });
   }
   await page.locator('#scenario').selectOption('running');
+  await page.locator('#chat').click();
   await page.locator('#chat').click();
   await page.locator('#input').fill('为什么测试还没开始');
   await page.locator('#send').click();

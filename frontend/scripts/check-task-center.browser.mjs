@@ -76,14 +76,14 @@ try {
  assert.equal(await page.locator('.mission-optional-export').getAttribute('open'),null);
  await page.screenshot({path:resolve(evidence,'task-delivery-desktop.png')});
  await page.getByRole('tab',{name:'协作',exact:true}).click();
- await page.getByRole('button',{name:'查看计划、团队与活动记录',exact:true}).click();
+ await page.getByRole('button',{name:'任务详情',exact:true}).click();
  await page.getByRole('tab',{name:'计划与授权',exact:true}).click();
  assert.equal(await page.getByText('执行尝试与重试',{exact:true}).count(),1);
  await page.getByRole('button',{name:'返回我的任务',exact:true}).click();
  await page.getByRole('button',{name:'待验收任务',exact:true}).click();
  assert.equal(await page.locator('.mission-detail-head .collaboration-task-status').textContent(),'待核验');
  await page.getByText(/系统将运行必需检查并由另一位专家核对/).waitFor();
- await page.getByRole('button',{name:'查看计划、团队与活动记录',exact:true}).click();
+ await page.getByRole('button',{name:'任务详情',exact:true}).click();
  assert.equal(await page.locator('.mission-stage-rail [aria-current="step"] strong').textContent(),'独立验收');
  assert.equal(await page.getByRole('button',{name:'查看验收详情',exact:true}).count(),1);
  await page.getByRole('button',{name:'查看验收详情',exact:true}).click();
