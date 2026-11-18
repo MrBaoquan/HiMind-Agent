@@ -39,6 +39,7 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0031](0031-plugin-ai-service-selection.md) | Plugins select AI services without owning provider configuration | accepted | 2026-11-16 |
 | [0032](0032-sustainable-coordination-and-dynamic-mission-workbench.md) | Sustainable coordination, incremental Mission changes and a collaboration workbench | accepted | 2026-11-17 |
 | [0033](0033-capability-driven-ai-client-source-lifecycle.md) | Capability-driven AI client source lifecycle | accepted | 2026-11-17 |
+| [0034](0034-inference-protocol-and-route-isolation.md) | Protocol compatibility and route-isolation resilience | accepted | 2026-11-18 |
 
 ## How these relate
 

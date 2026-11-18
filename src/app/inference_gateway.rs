@@ -301,6 +301,16 @@ impl std::fmt::Debug for GatewayBinding {
     }
 }
 
+fn route_health_identity(binding: &GatewayBinding) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        binding.service.trim(),
+        binding.base_url.trim().trim_end_matches('/'),
+        binding.upstream_model.trim(),
+        binding.protocol.trim()
+    )
+}
+
 type BindingResolver = Arc<dyn Fn() -> Vec<GatewayBinding> + Send + Sync>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -878,6 +888,21 @@ fn response_tool_output_media_fallback(body: &[u8]) -> Option<Vec<u8>> {
     changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
+/// Responses-compatible wire dialects do not all accept prior reasoning
+/// items in `input`. These items are opaque, provider-bound history and cannot
+/// be replayed; remove only them after an actual protocol rejection. Messages,
+/// tool calls and tool outputs remain intact for a second safe attempt.
+fn response_reasoning_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let input = value.get_mut("input")?.as_array_mut()?;
+    let original_len = input.len();
+    input.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+    if input.len() == original_len {
+        return None;
+    }
+    serde_json::to_vec(&value).ok()
+}
+
 /// 将 Responses 输入里的工具调用轨迹降级成普通消息。
 ///
 /// 有些声称为 Responses 兼容的上游（例如 VectorTide）不接受
@@ -985,7 +1010,7 @@ struct ResponsesFallbackOutcome {
 fn mark_route_outcome(binding: &GatewayBinding, status: u16) {
     if matches!(status, 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504) {
         let failures =
-            crate::store::ai_route_health::mark_failure(&binding.base_url, &binding.upstream_model);
+            crate::store::ai_route_health::mark_failure(&route_health_identity(binding));
         crate::approval::manager::append_event_log(
             "warn",
             &format!(
@@ -994,7 +1019,7 @@ fn mark_route_outcome(binding: &GatewayBinding, status: u16) {
             ),
         );
     } else if status < 400 {
-        crate::store::ai_route_health::mark_success(&binding.base_url, &binding.upstream_model);
+        crate::store::ai_route_health::mark_success(&route_health_identity(binding));
     }
 }
 
@@ -1089,6 +1114,12 @@ fn apply_observed_responses_fallbacks(
     }
     let mut current = body.to_vec();
     let mut applied = Vec::new();
+    if observed.iter().any(|feature| feature == "reasoning_history") {
+        if let Some(next) = response_reasoning_history_fallback(&current) {
+            current = next;
+            applied.push("reasoning_history");
+        }
+    }
     if observed
         .iter()
         .any(|feature| feature == "tool_result_media")
@@ -1164,19 +1195,34 @@ where
         });
     }
 
-    // 先做最小兼容：仅移除工具结果中的图片/文件，保留 function_call 结构。
-    if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
-        fallback_body = media_body;
-        if fallback_body.len() > OUTBOUND_BODY_LIMIT {
-            return Err(ResponsesFallbackFailure::TooLarge(fallback_body.len()));
-        }
-        applied.push("tool_result_media");
+    // Prior reasoning is protocol history, not the user's instruction. Try
+    // removing only those items before changing model-authored tool history.
+    if let Some(reasoning_body) = response_reasoning_history_fallback(&fallback_body) {
+        fallback_body = reasoning_body;
+        applied.push("reasoning_history");
         crate::approval::manager::append_event_log(
             "info",
-            "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
+            "本机网关 Responses 协议兼容：已移除不可重放的历史推理条目后重试",
         );
         response = send_with_transient_retry(binding, &mut || send(&fallback_body))
             .map_err(ResponsesFallbackFailure::Upstream)?;
+    }
+
+    // Then try tool-result media convergence.
+    if matches!(response.status().as_u16(), 400 | 422) {
+        if let Some(media_body) = response_tool_output_media_fallback(&fallback_body) {
+            fallback_body = media_body;
+            if fallback_body.len() > OUTBOUND_BODY_LIMIT {
+                return Err(ResponsesFallbackFailure::TooLarge(fallback_body.len()));
+            }
+            applied.push("tool_result_media");
+            crate::approval::manager::append_event_log(
+                "info",
+                "本机网关兼容回退：已移除工具结果中的图片/文件附件后重试",
+            );
+            response = send_with_transient_retry(binding, &mut || send(&fallback_body))
+                .map_err(ResponsesFallbackFailure::Upstream)?;
+        }
     }
 
     // 仍失败时再降级整个工具历史，并移除上游不支持的扩展工具。
@@ -1578,14 +1624,9 @@ fn route(
         .ok_or(GatewayError::UnknownModel)?;
     // 同请求故障转移只针对“同一 Provider、同一上游模型、同一协议”的路由：
     // 这样请求体改写结果完全一致，切换只需换 base_url / API Key。
-    let retry_candidates = candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate.protocol == binding.protocol
-                && candidate.upstream_model == binding.upstream_model
-                && capability_provider_key(candidate).0 == capability_provider_key(&binding).0
-        })
-        .collect::<Vec<_>>();
+    let translated_chat_batch =
+        required_protocol == "openai-responses" && binding.protocol == "openai-chat";
+    let retry_candidates = bounded_route_candidates(candidates, &binding, translated_chat_batch);
     // 单客户端并发闸门：槽在本次请求返回时释放，长流式请求会一直占槽。
     let Some(_request_slot) = acquire_request_slot(&binding.client) else {
         let message = format!(
@@ -1891,6 +1932,32 @@ fn rewrite_sse_model_line(
     format!("data: {value}")
 }
 const TRANSIENT_UPSTREAM_MAX_ATTEMPTS: usize = 2;
+const MAX_ROUTE_ATTEMPTS: usize = 4;
+
+fn bounded_route_candidates(
+    candidates: Vec<GatewayBinding>,
+    primary: &GatewayBinding,
+    translated_chat_batch: bool,
+) -> Vec<GatewayBinding> {
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            if candidate.protocol != primary.protocol {
+                return false;
+            }
+            if translated_chat_batch {
+                // The Responses->Chat sender rebuilds and normalizes every
+                // candidate's request independently, so different services and
+                // upstream models may safely participate before first byte.
+                return true;
+            }
+            // Direct/other translators currently share one serialized payload.
+            candidate.upstream_model == primary.upstream_model
+                && capability_provider_key(candidate).0 == capability_provider_key(primary).0
+        })
+        .take(MAX_ROUTE_ATTEMPTS)
+        .collect()
+}
 
 /// 上游在开始流式输出前返回的瞬时 5xx 可以安全透明重试：此时客户端还没有收到
 /// 任何字节，模型请求也没有执行工具。只重试一次，避免把真实故障放大成重试风暴。
@@ -2391,8 +2458,8 @@ fn forward_translated(
             .body(openai_payload.clone())
             .send()
     };
-    let mut response = send_with_transient_retry(binding, &mut || {
-        send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+        send_with_transient_retry(candidate, &mut || send(candidate))
     })
     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
@@ -2622,10 +2689,8 @@ fn forward_anthropic_responses_translated(
             .body(payload.to_vec())
             .send()
     };
-    let mut response = send_with_transient_retry(binding, &mut || {
-        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
-            send(candidate, &payload)
-        })
+    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+        send_with_transient_retry(candidate, &mut || send(candidate, &payload))
     })
     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
@@ -2844,24 +2909,43 @@ fn forward_responses_translated(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let display_model = binding_exposed_model(binding).to_string();
-    let chat_body =
-        match crate::app::responses_chat::request_to_chat(request, &binding.default_model) {
-            Ok(chat_body) => chat_body,
-            Err(error) => return Err(translate_error(stream, &error)),
-        };
-    let chat_normalized =
-        normalize_compatibility_request(stream, binding, "openai-chat", chat_body)?;
-    let attempted_normalizations = chat_normalized.attempted.clone();
-    let chat_payload = chat_normalized.request.to_string();
-    enforce_outbound_body_limit(stream, chat_payload.len())?;
     let non_empty_candidates = if retry_candidates.is_empty() {
         std::slice::from_ref(binding)
     } else {
         retry_candidates
     };
     let active_index = std::cell::Cell::new(0usize);
-    let mut send = |candidate: &GatewayBinding| {
+    let mut candidate_attempted = Vec::new();
+    let mut prepared_candidates = Vec::new();
+    for candidate in non_empty_candidates.iter().cloned() {
+        let Ok(chat_body) = crate::app::responses_chat::request_to_chat(
+            request,
+            &candidate.upstream_model,
+        ) else {
+            continue;
+        };
+        let Ok(normalized) = normalize_compatibility_candidate(&candidate, "openai-chat", chat_body) else {
+            continue;
+        };
+        let payload = normalized.request.to_string();
+        if payload.len() > OUTBOUND_BODY_LIMIT {
+            continue;
+        }
+        prepared_candidates.push((candidate, payload, normalized.attempted));
+    }
+    if prepared_candidates.is_empty() {
+        return Err(translate_error(stream, "no candidate could adapt the Responses request"));
+    }
+    let candidate_bindings = prepared_candidates.iter().map(|(b,_,_)| b.clone()).collect::<Vec<_>>();
+    let prepared = prepared_candidates
+        .iter()
+        .map(|(binding, payload, attempted)| {
+            (binding.id.clone(), (payload.clone(), attempted.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut send = |candidate: &GatewayBinding| -> reqwest::Result<reqwest::blocking::Response> {
+        let (payload, attempted) = prepared.get(&candidate.id).expect("prepared candidate");
+        candidate_attempted = attempted.clone();
         let client = upstream_client(&candidate.base_url)?;
         let opencode_session = opencode_session_for_value(candidate, client_session, request);
         let mut upstream_request = client
@@ -2876,15 +2960,17 @@ fn forward_responses_translated(
         if let Some(session) = opencode_session.as_deref() {
             upstream_request = upstream_request.header(OPENCODE_SESSION_HEADER, session);
         }
-        upstream_request.body(chat_payload.clone()).send()
+        upstream_request.body(payload.clone()).send()
     };
-    let mut response = send_with_transient_retry(binding, &mut || {
-        send_with_route_failover(non_empty_candidates, &active_index, &mut send)
+    let mut response = send_with_route_failover(&candidate_bindings, &active_index, &mut |candidate| {
+        send_with_transient_retry(candidate, &mut || send(candidate))
     })
     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
-    let binding = non_empty_candidates
+    let binding = candidate_bindings
         .get(active_index.get())
         .unwrap_or(binding);
+    let display_model = binding_exposed_model(binding).to_string();
+    let attempted_normalizations = candidate_attempted;
     let status = response.status();
     mark_route_outcome(binding, status.as_u16());
     if !status.is_success() {
@@ -3100,10 +3186,8 @@ fn forward_chat_responses_translated(
             .body(payload.to_vec())
             .send()
     };
-    let mut response = send_with_transient_retry(binding, &mut || {
-        send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
-            send(candidate, &payload)
-        })
+    let mut response = send_with_route_failover(non_empty_candidates, &active_index, &mut |candidate| {
+        send_with_transient_retry(candidate, &mut || send(candidate, &payload))
     })
     .map_err(|error| write_upstream_failure(stream, &error.to_string()))?;
     let binding = non_empty_candidates
@@ -3286,6 +3370,35 @@ fn translate_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
         &format!("{detail}（request_id={}）", current_request_id()),
     );
     GatewayError::Answered
+}
+
+/// Candidate-local compatibility normalization. This does not write a client
+/// response; a rejected candidate is skipped so another route can be tried.
+fn normalize_compatibility_candidate(
+    binding: &GatewayBinding,
+    protocol: &str,
+    mut request: Value,
+) -> Result<NormalizedOutbound, String> {
+    let protocol = crate::store::ai_services::AIServiceProtocol::parse(protocol)?;
+    request["model"] = json!(binding.upstream_model);
+    let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+    let provider = matrix.resolve_provider(&binding.base_url, &protocol);
+    let requested_model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model_rule = matrix.model_rule(&provider.id, &requested_model);
+    let fallback_client = crate::app::ai_compatibility::ClientCapability::default();
+    let client = matrix.client(&binding.client).unwrap_or(&fallback_client);
+    let normalized = crate::app::ai_compatibility::normalize_provider_request(
+        &protocol, request, client, provider, model_rule,
+    )
+    .map_err(|error| error.message)?;
+    Ok(NormalizedOutbound {
+        attempted: normalized.changes.iter().map(|change| change.action).collect(),
+        request: normalized.request,
+    })
 }
 
 fn compatibility_normalize_error(
@@ -4380,11 +4493,19 @@ fn relay_stream<F: FnMut(&str) -> String>(
     let mut chunk = [0u8; 8192];
     let mut written = false;
     let mut terminal = false;
+    let mut chat_finish_seen = false;
     let mut total = 0usize;
     let failure = loop {
         let count = match response.read(&mut chunk) {
             Ok(0) => {
                 if terminal && pending.is_empty() && event.is_empty() {
+                    return true;
+                }
+                if protocol == "openai-chat"
+                    && chat_finish_seen
+                    && pending.is_empty()
+                    && event.is_empty()
+                {
                     return true;
                 }
                 break BodyFailure::Truncated;
@@ -4456,6 +4577,18 @@ fn relay_stream<F: FnMut(&str) -> String>(
                         (protocol, kind),
                         ("openai-responses", "response.completed") | ("anthropic", "message_stop")
                     );
+                    if protocol == "openai-chat" {
+                        chat_finish_seen |= value
+                            .get("choices")
+                            .and_then(Value::as_array)
+                            .is_some_and(|choices| {
+                                choices.iter().any(|choice| {
+                                    choice
+                                        .get("finish_reason")
+                                        .is_some_and(|reason| !reason.is_null())
+                                })
+                            });
+                    }
                 } else {
                     // Provider protocols carry JSON (or [DONE]); unclassifiable
                     // data must fail closed, not become a raw-body escape hatch.
@@ -6729,6 +6862,44 @@ mod tests {
     }
 
     #[test]
+    fn translated_responses_chat_candidates_are_rebuilt_per_endpoint() {
+        let matrix = crate::app::ai_compatibility::CapabilityMatrixV1::builtin();
+        let client = matrix.client("codex").unwrap();
+        let provider = matrix.provider("opencode_zen_chat").unwrap();
+        let model_rule = matrix.model_rule("opencode_zen_chat", "backup-chat");
+        let request = json!({
+            "model": "primary-chat",
+            "messages": [{"role":"user","content":"continue"}]
+        });
+        let normalized = crate::app::ai_compatibility::normalize_provider_request(
+            &crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+            request,
+            client,
+            provider,
+            model_rule,
+        )
+        .unwrap();
+        assert_eq!(normalized.request["model"], "primary-chat");
+        let mut candidate = binding("codex", "openai-chat", "candidate-token");
+        candidate.base_url = "https://opencode.ai/zen/go/v1".to_string();
+        candidate.upstream_model = "backup-chat".to_string();
+        let rebuilt = normalize_compatibility_candidate(&candidate, "openai-chat", normalized.request).unwrap();
+        assert_eq!(rebuilt.request["model"], "backup-chat");
+        assert_eq!(rebuilt.request["messages"][0]["content"], "continue");
+    }
+
+    #[test]
+    fn route_health_identity_contains_no_api_key() {
+        let binding = binding("codex", "openai-chat", "local-token");
+        let identity = route_health_identity(&binding);
+        assert!(identity.contains(&binding.service));
+        assert!(identity.contains(&binding.upstream_model));
+        assert!(identity.contains(&binding.protocol));
+        assert!(!identity.contains("real-secret"));
+        assert!(!identity.contains("local-token"));
+    }
+
+    #[test]
     fn gateway_binding_debug_redacts_upstream_and_local_secrets() {
         let binding = binding("codex", "openai-responses", "local-token-secret");
         let debug = format!("{binding:?}");
@@ -6748,6 +6919,33 @@ mod tests {
     }
 
     #[test]
+    fn route_candidates_are_ordered_filtered_and_limited_to_four() {
+        let primary = binding("codex", "openai-chat", "route-limit-token");
+        let mut candidates = Vec::new();
+        for index in 0..6 {
+            let mut candidate = primary.clone();
+            candidate.id = format!("candidate-{index}");
+            candidate.service = format!("custom:account-{index}");
+            candidate.upstream_model = format!("model-{index}");
+            candidate.exposed_model = "shared".to_string();
+            candidate.default_model = candidate.upstream_model.clone();
+            candidates.push(candidate);
+        }
+        let mut wrong_protocol = primary.clone();
+        wrong_protocol.id = "wrong-protocol".to_string();
+        wrong_protocol.protocol = "openai-responses".to_string();
+        candidates.insert(2, wrong_protocol);
+
+        let bounded = bounded_route_candidates(candidates, &primary, true);
+        assert_eq!(bounded.len(), MAX_ROUTE_ATTEMPTS);
+        assert_eq!(
+            bounded.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["candidate-0", "candidate-1", "candidate-2", "candidate-3"]
+        );
+        assert!(bounded.iter().all(|item| item.protocol == "openai-chat"));
+    }
+
+    #[test]
     fn route_failover_treats_auth_rate_limit_and_transient_as_retryable() {
         for status in [401, 403, 408, 429, 500, 502, 503, 504] {
             assert!(route_status_is_retryable(status), "status={status}");
@@ -6762,30 +6960,25 @@ mod tests {
         let mut binding = binding("codex", "openai-responses", "health-token");
         binding.base_url = "https://route-health.example/v1".to_string();
         binding.upstream_model = "route-health-model".to_string();
-        assert!(crate::store::ai_route_health::is_healthy(
-            &binding.base_url,
-            &binding.upstream_model
-        ));
+        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
+            &binding
+        )));
         mark_route_outcome(&binding, 403);
-        assert!(!crate::store::ai_route_health::is_healthy(
-            &binding.base_url,
-            &binding.upstream_model
-        ));
+        assert!(!crate::store::ai_route_health::is_healthy(&route_health_identity(
+            &binding
+        )));
         mark_route_outcome(&binding, 200);
-        assert!(crate::store::ai_route_health::is_healthy(
-            &binding.base_url,
-            &binding.upstream_model
-        ));
+        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
+            &binding
+        )));
         mark_route_outcome(&binding, 429);
-        assert!(!crate::store::ai_route_health::is_healthy(
-            &binding.base_url,
-            &binding.upstream_model
-        ));
+        assert!(!crate::store::ai_route_health::is_healthy(&route_health_identity(
+            &binding
+        )));
         mark_route_outcome(&binding, 200);
-        assert!(crate::store::ai_route_health::is_healthy(
-            &binding.base_url,
-            &binding.upstream_model
-        ));
+        assert!(crate::store::ai_route_health::is_healthy(&route_health_identity(
+            &binding
+        )));
     }
 
     fn assert_route_failover_for_status(status_line: &'static str, good_body: &'static str) {
@@ -6853,6 +7046,72 @@ mod tests {
         good_thread.join().unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains(good_body), "{response}");
+    }
+
+    #[test]
+    fn translated_responses_chat_failover_rebuilds_payload_for_backup_candidate() {
+        let bad = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bad_address = bad.local_addr().unwrap();
+        let bad_thread = thread::spawn(move || {
+            let (mut stream, _) = bad.accept().unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            let body = br#"{"error":{"message":"primary unavailable"}}"#;
+            write!(stream, "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), String::from_utf8_lossy(body)).unwrap();
+        });
+        let good = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_address = good.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Value::Null));
+        let seen_thread = Arc::clone(&seen);
+        let good_thread = thread::spawn(move || {
+            let (mut stream, _) = good.accept().unwrap();
+            let (_, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected request"),
+            };
+            *seen_thread.lock().unwrap() = serde_json::from_slice(&body).unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"backup ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n";
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let token = "translated-failover-token".to_string();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new({
+            let token = token.clone();
+            move || {
+                let mut primary = binding("codex", "openai-chat", &token);
+                primary.id = "codex:profile:shared:account-a:chat-primary".to_string();
+                primary.service = "custom:account-a".to_string();
+                primary.exposed_model = "shared".to_string();
+                primary.default_model = "primary-chat".to_string();
+                primary.upstream_model = "primary-chat".to_string();
+                primary.base_url = format!("http://{bad_address}");
+                let mut backup = binding("codex", "openai-chat", &token);
+                backup.id = "codex:profile:shared:account-b:chat-backup".to_string();
+                backup.service = "custom:account-b".to_string();
+                backup.exposed_model = "shared".to_string();
+                backup.default_model = "backup-chat".to_string();
+                backup.upstream_model = "backup-chat".to_string();
+                backup.base_url = format!("http://{good_address}");
+                vec![primary, backup]
+            }
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "shared",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]
+        }).to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        write!(client, "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{request_body}", request_body.len()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        bad_thread.join().unwrap();
+        good_thread.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("response.completed"), "{response}");
+        assert!(!response.contains("event: error"), "{response}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen["model"], "backup-chat", "backup request={seen}");
+        assert_eq!(seen["messages"][0]["content"], "continue");
     }
 
     #[test]
@@ -7060,6 +7319,58 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(status, reqwest::StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    #[test]
+    fn responses_dialect_removes_only_reasoning_history_before_retry() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen_thread = Arc::clone(&seen);
+        let worker = thread::spawn(move || {
+            for attempt in 1..=2 {
+                let (mut socket, _) = upstream.accept().unwrap();
+                let (_, body) = match read_request(&mut socket).unwrap() {
+                    RequestRead::Request(head, body) => (head, body),
+                    _ => panic!("expected request"),
+                };
+                seen_thread.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                let (status, response) = if attempt == 1 {
+                    ("400 Bad Request", r#"{"error":{"message":"invalid request"}}"#)
+                } else {
+                    ("200 OK", r#"{"ok":true}"#)
+                };
+                write!(socket, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let body = json!({
+            "model": "m",
+            "reasoning": {"effort": "medium"},
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "brief"}]},
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ],
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+            "tool_choice": "auto"
+        }).to_string();
+        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let url = format!("http://{address}/v1/responses");
+        let mut send = |payload: &[u8]| client.post(&url).body(payload.to_vec()).send();
+        let binding = binding("codex", "openai-responses", "reasoning-token");
+        let outcome = send_responses_with_compatibility_fallback(&binding, body.as_bytes(), &mut send).unwrap();
+        assert_eq!(outcome.response.status(), reqwest::StatusCode::OK);
+        assert_eq!(outcome.applied, vec!["reasoning_history"]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["input"][1]["type"], "reasoning");
+        assert!(seen[1]["input"].as_array().unwrap().iter().all(|item| item["type"] != "reasoning"));
+        assert!(seen[1]["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call"));
+        assert!(seen[1]["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output"));
+        assert_eq!(seen[1]["reasoning"]["effort"], "medium");
+        worker.join().unwrap();
     }
 
     #[test]
@@ -7389,6 +7700,17 @@ mod tests {
         assert_eq!(record.status, "success");
         assert!(!record.usage_unreported);
         assert_eq!(record.input_tokens, 3);
+
+        let finish_without_done = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n";
+        let result = remediation_exchange("openai-responses", "openai-chat", 200, finish_without_done.to_vec(), finish_without_done.len(), true);
+        assert!(result.starts_with("HTTP/1.1 200"), "{result}");
+        assert!(result.contains("response.completed"), "{result}");
+        assert!(!result.contains("event: error"), "{result}");
+
+        let unfinished_finish = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
+        let result = remediation_exchange("openai-responses", "openai-chat", 200, unfinished_finish.to_vec(), unfinished_finish.len(), true);
+        assert!(result.contains("event: error"), "{result}");
+        assert!(!result.contains("response.completed"), "{result}");
     }
     #[test]
     fn remediation_stream_multidata_error_no_leak() {
