@@ -207,8 +207,18 @@ pub(crate) struct SessionTranscriptMessage {
     pub role: String,
     pub content: String,
     pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<SessionExecutionTiming>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<crate::session_history_tools::HistoryFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct SessionExecutionTiming {
+    pub basis: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -246,6 +256,7 @@ pub(crate) fn paired_transcript_page(
                 ("assistant", &turns[turn_index].1)
             };
             SessionTranscriptMessage {
+                execution: None,
                 files: Vec::new(),
                 id: format!("{turn_index}:{role}"),
                 role: role.to_string(),
@@ -400,6 +411,7 @@ fn dsh_transcript_message(value: &Value, index: usize) -> Option<SequencedTransc
     Some(SequencedTranscriptMessage {
         sequence,
         message: SessionTranscriptMessage {
+            execution: None,
             files: Vec::new(),
             id,
             role: role.to_string(),

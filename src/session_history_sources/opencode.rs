@@ -317,6 +317,7 @@ pub(crate) fn opencode_transcript_page(
     native_id: &str,
     end_offset: Option<usize>,
     page_size: usize,
+    activity: bool,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::OpenCode.stable_session_id(native_id)?;
     let base = opencode_base_dir().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
@@ -327,6 +328,7 @@ pub(crate) fn opencode_transcript_page(
         &opencode_database_paths(&base),
         end_offset,
         page_size,
+        activity,
     )
 }
 
@@ -346,6 +348,7 @@ fn opencode_transcript_page_from_paths(
         paths,
         end_offset,
         page_size,
+        false,
     )
 }
 
@@ -356,6 +359,7 @@ fn opencode_transcript_page_scoped_from_paths(
     paths: &[PathBuf],
     end_offset: Option<usize>,
     page_size: usize,
+    activity: bool,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::OpenCode.stable_session_id(native_id)?;
     for path in paths.iter().take(MAX_OPENCODE_DATABASES) {
@@ -374,7 +378,8 @@ fn opencode_transcript_page_scoped_from_paths(
         {
             continue;
         }
-        let selection = read_opencode_messages(&connection, native_id, end_offset, page_size)?;
+        let selection =
+            read_opencode_messages(&connection, native_id, end_offset, page_size, activity)?;
         return Ok(session_history::SessionTranscriptPage {
             snapshot_cursor: None,
             session_id,
@@ -397,6 +402,7 @@ fn read_opencode_messages(
     session_id: &str,
     end_offset: Option<usize>,
     page_size: usize,
+    activity: bool,
 ) -> Result<TranscriptSelection, String> {
     if page_size == 0 || page_size > 100 {
         return Err("transcript page size is invalid".to_string());
@@ -417,7 +423,9 @@ fn read_opencode_messages(
             || !table_columns(connection, "message")
                 .is_ok_and(|columns| columns.contains("session_id"))
         {
-            return read_v2_page(connection, session_id, count, end_offset, page_size);
+            return read_v2_page(
+                connection, session_id, count, end_offset, page_size, activity,
+            );
         }
     }
     read_legacy_page(connection, session_id, end_offset, page_size)
@@ -429,8 +437,11 @@ fn read_v2_page(
     total: i64,
     end_offset: Option<usize>,
     page_size: usize,
+    activity: bool,
 ) -> Result<TranscriptSelection, String> {
-    check_transcript_budget(connection, "session_message", session_id, total)?;
+    if !activity {
+        check_transcript_budget(connection, "session_message", session_id, total)?;
+    }
     let total = usize::try_from(total).map_err(|_| "SESSION_PREVIEW_TOO_LARGE".to_string())?;
     let end = end_offset.unwrap_or(total);
     if end > total {
@@ -440,26 +451,45 @@ fn read_v2_page(
     let start = end.saturating_sub(page_size);
     let mut statement = connection
         .prepare(
-            "SELECT type, time_created, data, id FROM session_message \
+            "SELECT type, time_created, CASE WHEN LENGTH(CAST(data AS BLOB)) <= ?4 \
+             THEN data ELSE NULL END, id FROM session_message \
              WHERE session_id=?1 ORDER BY seq DESC LIMIT ?2 OFFSET ?3",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(
-            rusqlite::params![session_id, page_size as i64, offset as i64],
+            rusqlite::params![
+                session_id,
+                page_size as i64,
+                offset as i64,
+                if activity {
+                    2 * 1024 * 1024
+                } else {
+                    MAX_OPENCODE_TRANSCRIPT_BYTES
+                }
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                 ))
             },
         )
         .map_err(|error| error.to_string())?;
     let mut messages = Vec::new();
+    let mut page_bytes = 0usize;
     for row in rows {
         let (kind, created, data, id) = row.map_err(|error| error.to_string())?;
+        let data = data.ok_or_else(|| "SESSION_PREVIEW_TOO_LARGE".to_string())?;
+        page_bytes += data.len();
+        if page_bytes > MAX_OPENCODE_MESSAGE_BYTES {
+            return Err("SESSION_PREVIEW_TOO_LARGE".to_string());
+        }
+        if activity && kind == "assistant" {
+            messages.extend(opencode_execution(&id, &data));
+        }
         if let Some(mut message) = parse_opencode_message(&kind, created, &data, messages.len()) {
             message.id = id;
             messages.push(message);
@@ -561,6 +591,7 @@ fn read_legacy_page(
             continue;
         }
         messages.push(SessionTranscriptMessage {
+            execution: None,
             files: Vec::new(),
             id,
             role: role.to_string(),
@@ -625,6 +656,71 @@ fn load_legacy_parts(
     Ok(content)
 }
 
+fn opencode_execution(id: &str, data: &str) -> Vec<SessionTranscriptMessage> {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    let mut add = |key: String, start: Option<i64>, end: Option<i64>| {
+        if let (Some(started_at_ms), Some(completed_at_ms)) = (start, end) {
+            if started_at_ms > 0 && completed_at_ms > started_at_ms {
+                messages.push(SessionTranscriptMessage {
+                    execution: Some(session_history::SessionExecutionTiming {
+                        basis: "opencode_item_timing_v1".into(),
+                        started_at_ms,
+                        completed_at_ms,
+                    }),
+                    id: format!("execution:{id}:{key}"),
+                    role: "execution".into(),
+                    content: String::new(),
+                    timestamp: None,
+                    files: Vec::new(),
+                });
+            }
+        }
+    };
+    let millis = |v: &Value, key: &str| v.get(key).and_then(Value::as_i64);
+    let timing = &value["time"];
+    let mut stream_end = millis(timing, "streamed");
+    if let Some(parts) = value.get("content").and_then(Value::as_array) {
+        for (index, part) in parts.iter().enumerate() {
+            let timing = &part["time"];
+            match part.get("type").and_then(Value::as_str) {
+                Some("reasoning") => add(
+                    format!("reasoning:{index}"),
+                    millis(timing, "created"),
+                    millis(timing, "completed"),
+                ),
+                Some("tool") => {
+                    let start = millis(timing, "ran");
+                    if let (Some(end), Some(start)) = (stream_end, start) {
+                        stream_end = Some(end.min(start));
+                    }
+                    if matches!(
+                        part.get("name").and_then(Value::as_str),
+                        Some(
+                            "shell"
+                                | "read"
+                                | "grep"
+                                | "edit"
+                                | "write"
+                                | "glob"
+                                | "patch"
+                                | "websearch"
+                                | "webfetch"
+                        )
+                    ) {
+                        add(format!("tool:{index}"), start, millis(timing, "completed"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    add("stream".into(), millis(timing, "created"), stream_end);
+    messages
+}
+
 fn parse_opencode_message(
     kind: &str,
     created: i64,
@@ -650,6 +746,7 @@ fn parse_opencode_message(
             .unwrap_or_default()
     };
     (!content.trim().is_empty()).then(|| SessionTranscriptMessage {
+        execution: None,
         files: Vec::new(),
         id: index.to_string(),
         role: role.to_string(),
@@ -897,7 +994,8 @@ mod tests {
             "ses_synthetic",
             &paths,
             None,
-            50
+            50,
+            false,
         )
         .is_ok());
         assert!(opencode_transcript_page_from_paths(
@@ -1122,12 +1220,13 @@ mod tests {
             session_directory(&connection, "ses_synthetic").unwrap(),
             "F:/work/project-a"
         );
-        let first = read_opencode_messages(&connection, "ses_synthetic", None, 1).unwrap();
+        let first = read_opencode_messages(&connection, "ses_synthetic", None, 1, false).unwrap();
         let second = read_opencode_messages(
             &connection,
             "ses_synthetic",
             first.next_cursor.as_ref().map(|v| v.parse().unwrap()),
             1,
+            false,
         )
         .unwrap();
         assert_eq!(first.messages[0].id, "m102");

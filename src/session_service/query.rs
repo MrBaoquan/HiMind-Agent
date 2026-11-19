@@ -358,11 +358,12 @@ pub(crate) fn invoke(operation: &str, input: &Value) -> Result<Value, Box<dyn st
         sessions,
         sources,
         |session, cursor| {
-            super::transcript_page(
+            super::transcript_page_for(
                 &registry,
                 session.project_id.as_deref(),
                 session.id.clone(),
                 cursor,
+                operation == "activity",
             )
         },
     )
@@ -508,6 +509,24 @@ fn project(
                 let mut consumed = cursor.within_page;
                 for message in page.messages.iter().skip(cursor.within_page) {
                     consumed += 1;
+                    if let Some(execution) = &message.execution {
+                        let start = DateTime::from_timestamp_millis(execution.started_at_ms);
+                        let end = DateTime::from_timestamp_millis(execution.completed_at_ms);
+                        if let (Some(start), Some(end)) = (start, end) {
+                            if start < to && end > from {
+                                let from = start.fixed_offset().max(from);
+                                let to = end.fixed_offset().min(to);
+                                rows.push(json!({"session":session,"kind":"agent_execution",
+                                    "message":{"id":message.id},"execution":{"from":from.to_rfc3339(),"to":to.to_rfc3339()},
+                                    "evidence":{"session_id":session.id,"message_id":message.id,
+                                        "snapshot_revision":fingerprint,"basis":execution.basis}}));
+                                if rows.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if !matches!(message.role.as_str(), "user" | "assistant") {
                         continue;
                     }
@@ -642,6 +661,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, time)| SessionTranscriptMessage {
+                    execution: None,
                     id: i.to_string(),
                     role: "user".into(),
                     content: format!("实现功能 {i}"),

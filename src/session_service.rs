@@ -93,6 +93,16 @@ pub(crate) fn transcript_page(
     session_id: String,
     cursor: Option<String>,
 ) -> Result<crate::session_history::SessionTranscriptPage, String> {
+    transcript_page_for(registry, project_id, session_id, cursor, false)
+}
+
+fn transcript_page_for(
+    registry: &crate::workspace_registry::Registry,
+    project_id: Option<&str>,
+    session_id: String,
+    cursor: Option<String>,
+    activity: bool,
+) -> Result<crate::session_history::SessionTranscriptPage, String> {
     const PAGE_SIZE: usize = 50;
     let (source_id, native_id) = session_id
         .split_once(':')
@@ -194,6 +204,7 @@ pub(crate) fn transcript_page(
                     native_id,
                     requested_cursor,
                     PAGE_SIZE,
+                    activity,
                 )
             }
             _ => unreachable!(),
@@ -205,7 +216,7 @@ pub(crate) fn transcript_page(
             .map(|value| usize::try_from(value).map_err(|_| "SESSION_CURSOR_INVALID".to_string()))
             .transpose()?;
         return crate::session_history_sources::opencode_transcript_page(
-            registry, project_id, native_id, end_offset, PAGE_SIZE,
+            registry, project_id, native_id, end_offset, PAGE_SIZE, activity,
         );
     }
 

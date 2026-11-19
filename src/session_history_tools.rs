@@ -181,6 +181,7 @@ mod tests {
             "<command-name>/help",
         ] {
             let message = crate::session_history::SessionTranscriptMessage {
+                execution: None,
                 id: "s".into(),
                 role: "user".into(),
                 content: text.into(),
@@ -190,6 +191,7 @@ mod tests {
             assert!(!is_prompt(&message));
         }
         let mut message = crate::session_history::SessionTranscriptMessage {
+            execution: None,
             id: "s".into(),
             role: "context".into(),
             content: "context without marker".into(),

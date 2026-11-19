@@ -568,6 +568,7 @@ fn push(
 ) {
     if !content.trim().is_empty() && messages.len() < MAX_MESSAGES {
         messages.push(SessionTranscriptMessage {
+            execution: None,
             id,
             role: role.to_string(),
             content,

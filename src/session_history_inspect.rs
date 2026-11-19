@@ -446,6 +446,7 @@ mod tests {
                     session_id: session.into(),
                     through_seq: None,
                     messages: vec![SessionTranscriptMessage {
+                        execution: None,
                         id: cursor.clone().unwrap_or("latest".into()),
                         role: "user".into(),
                         content: "needle 中".into(),
@@ -491,6 +492,7 @@ mod tests {
                     through_seq: None,
                     messages: (0..50)
                         .map(|i| SessionTranscriptMessage {
+                            execution: None,
                             id: format!("{offset}:{i}"),
                             role: "assistant".into(),
                             content: "tool request".into(),

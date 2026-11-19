@@ -200,6 +200,7 @@ fn claude_transcript_page_scoped_at(
                 return None;
             }
             Some(SessionTranscriptMessage {
+                execution: None,
                 files,
                 id: value
                     .get("uuid")
@@ -988,6 +989,7 @@ mod tests {
                 parsed.set(parsed.get() + 1);
                 let value = serde_json::from_slice::<Value>(line).ok()?;
                 Some(SessionTranscriptMessage {
+                    execution: None,
                     files: Vec::new(),
                     id: offset.to_string(),
                     role: "user".to_string(),
@@ -1015,6 +1017,7 @@ mod tests {
         let parse_message = |line: &[u8], offset: u64| {
             let value = serde_json::from_slice::<Value>(line).ok()?;
             Some(SessionTranscriptMessage {
+                execution: None,
                 files: Vec::new(),
                 id: offset.to_string(),
                 role: "user".to_string(),

@@ -335,6 +335,7 @@ pub(crate) fn codex_transcript_page(
     native_id: &str,
     end_offset: Option<u64>,
     page_size: usize,
+    activity: bool,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     SessionSource::Codex.stable_session_id(native_id)?;
     let config_root = codex_config_root().ok_or_else(|| "SESSION_NOT_FOUND".to_string())?;
@@ -347,6 +348,7 @@ pub(crate) fn codex_transcript_page(
         &titles,
         end_offset,
         page_size,
+        activity,
     )
 }
 
@@ -368,6 +370,7 @@ fn codex_transcript_page_at(
         titles,
         end_offset,
         page_size,
+        false,
     )
 }
 
@@ -379,6 +382,7 @@ fn codex_transcript_page_scoped_at(
     titles: &HashMap<String, String>,
     end_offset: Option<u64>,
     page_size: usize,
+    activity: bool,
 ) -> Result<session_history::SessionTranscriptPage, String> {
     let session_id = SessionSource::Codex.stable_session_id(native_id)?;
     let canonical_config_root =
@@ -464,7 +468,12 @@ fn codex_transcript_page_scoped_at(
         return Err("SESSION_NOT_FOUND".to_string());
     }
     let metadata = fs::metadata(&path).map_err(|_| "SESSION_NOT_FOUND".to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_CODEX_TRANSCRIPT_BYTES {
+    let file_limit = if activity {
+        u64::MAX
+    } else {
+        MAX_CODEX_TRANSCRIPT_BYTES
+    };
+    if !metadata.is_file() || metadata.len() > file_limit {
         return Err("SESSION_PREVIEW_TOO_LARGE".to_string());
     }
     let snapshot_end = end_offset.unwrap_or(metadata.len());
@@ -473,11 +482,23 @@ fn codex_transcript_page_scoped_at(
         &path,
         Some(snapshot_end),
         page_size,
-        MAX_CODEX_TRANSCRIPT_BYTES,
+        file_limit,
         MAX_CODEX_LINE_BYTES,
         MAX_CODEX_MESSAGE_BYTES,
         |line, offset| {
             let value = serde_json::from_slice::<Value>(line).ok()?;
+            if activity {
+                if let Some((id, execution)) = codex_execution(&value, native_id) {
+                    return Some(SessionTranscriptMessage {
+                        execution: Some(execution),
+                        id,
+                        role: "execution".into(),
+                        content: String::new(),
+                        timestamp: None,
+                        files: Vec::new(),
+                    });
+                }
+            }
             let timestamp = timestamp(value.get("timestamp"));
             let message = if response_item_format {
                 (value.get("type").and_then(Value::as_str) == Some("response_item"))
@@ -501,6 +522,42 @@ fn codex_transcript_page_scoped_at(
         messages,
         next_cursor,
     })
+}
+
+fn codex_execution(
+    value: &Value,
+    native_id: &str,
+) -> Option<(String, session_history::SessionExecutionTiming)> {
+    if value.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let event = value.get("payload")?;
+    if event.get("type")?.as_str()? != "item_completed"
+        || event.get("thread_id")?.as_str()? != native_id
+    {
+        return None;
+    }
+    let item = event.get("item")?;
+    if !matches!(
+        item.get("type")?.as_str()?,
+        "Reasoning"
+            | "AgentMessage"
+            | "CommandExecution"
+            | "FileChange"
+            | "ContextCompaction"
+            | "ImageView"
+    ) {
+        return None;
+    }
+    let timing = session_history::SessionExecutionTiming {
+        basis: "codex_item_timing_v1".into(),
+        started_at_ms: event.get("started_at_ms")?.as_i64()?,
+        completed_at_ms: event.get("completed_at_ms")?.as_i64()?,
+    };
+    let turn = event.get("turn_id")?.as_str()?;
+    let id = item.get("id")?.as_str()?;
+    (timing.started_at_ms > 0 && timing.completed_at_ms > timing.started_at_ms)
+        .then(|| (format!("execution:{turn}:{id}"), timing))
 }
 
 fn codex_uses_response_items(path: &Path) -> Result<bool, String> {
@@ -530,6 +587,7 @@ fn codex_message(
     let files = crate::session_history_tools::codex_files(payload);
     if !files.is_empty() {
         return Some(SessionTranscriptMessage {
+            execution: None,
             id: String::new(),
             role: "assistant".into(),
             content: "文件操作记录".into(),
@@ -554,6 +612,7 @@ fn codex_message(
     }
     let content = text_content(payload.get("content")?);
     (!content.trim().is_empty()).then(|| SessionTranscriptMessage {
+        execution: None,
         files: Vec::new(),
         id: String::new(),
         role: role.to_string(),
@@ -573,6 +632,7 @@ fn codex_event_message(
         _ => return None,
     };
     (!content.trim().is_empty()).then(|| SessionTranscriptMessage {
+        execution: None,
         files: Vec::new(),
         id: String::new(),
         role: role.to_string(),
@@ -741,7 +801,8 @@ mod tests {
             &root,
             &HashMap::new(),
             None,
-            50
+            50,
+            false,
         )
         .is_ok());
         assert!(codex_transcript_page_at(
