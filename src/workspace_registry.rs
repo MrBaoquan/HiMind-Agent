@@ -148,18 +148,6 @@ pub(crate) struct RegistryContext {
     pub notes: String,
 }
 
-/// 跨系统的稳定 ID。这里只存链接，不复制工时、优先级、下一步。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RegistryLinks {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub work_log_project_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub work_log_project_name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub workbench_project_id: String,
-}
-
 /// 逻辑节点：项目、子项目、聚合节点都用它表达。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -181,16 +169,16 @@ pub(crate) struct RegistryProject {
     #[serde(default)]
     pub context: RegistryContext,
     #[serde(default)]
-    pub links: RegistryLinks,
-    #[serde(default)]
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
 }
 
 fn contains_chinese(value: &str) -> bool {
-    value.chars().any(|ch| matches!(ch as u32,
-        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af))
+    value.chars().any(|ch| {
+        matches!(ch as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af)
+    })
 }
 
 impl RegistryProject {
@@ -200,7 +188,10 @@ impl RegistryProject {
         if contains_chinese(&self.name) {
             return self.name.trim();
         }
-        let mut aliases = self.aliases.iter().map(|alias| alias.trim())
+        let mut aliases = self
+            .aliases
+            .iter()
+            .map(|alias| alias.trim())
             .filter(|alias| contains_chinese(alias));
         match aliases.next() {
             Some(first) if aliases.all(|alias| alias == first) => first,
@@ -293,18 +284,29 @@ pub(crate) fn registry_path() -> PathBuf {
 impl Registry {
     pub(crate) fn revision(&self) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(serde_json::to_vec(self).unwrap_or_default()))
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(self).unwrap_or_default())
+        )
     }
 
-    pub(crate) fn scope_ids(&self, project_id: &str, descendants: bool) -> std::collections::HashSet<String> {
+    pub(crate) fn scope_ids(
+        &self,
+        project_id: &str,
+        descendants: bool,
+    ) -> std::collections::HashSet<String> {
         let mut ids = std::collections::HashSet::from([project_id.to_string()]);
         if descendants {
             loop {
                 let mut changed = false;
                 for project in &self.projects {
-                    if ids.contains(&project.parent_id) && ids.insert(project.id.clone()) { changed = true; }
+                    if ids.contains(&project.parent_id) && ids.insert(project.id.clone()) {
+                        changed = true;
+                    }
                 }
-                if !changed { break; }
+                if !changed {
+                    break;
+                }
             }
         }
         ids
@@ -844,6 +846,11 @@ impl Serialize for ParentField {
 pub(crate) struct ProjectInput {
     pub id: String,
     pub name: String,
+    pub create_only: bool,
+    pub expected_revision: String,
+    pub add_paths: Vec<BindInput>,
+    pub remove_paths: Vec<String>,
+    pub replace_paths: bool,
     pub aliases: Vec<String>,
     pub kind: String,
     pub status: String,
@@ -855,9 +862,6 @@ pub(crate) struct ProjectInput {
     pub docs: Vec<RegistryLink>,
     pub rules: Vec<RegistryLink>,
     pub notes: String,
-    pub work_log_project_id: String,
-    pub work_log_project_name: String,
-    pub workbench_project_id: String,
 }
 
 /// `path.bind` 的输入。`unbind=true` 时只按 `path` 移除。
@@ -902,6 +906,12 @@ pub(crate) fn upsert_project(
     registry: &mut Registry,
     input: ProjectInput,
 ) -> Result<RegistryProject, Box<dyn Error>> {
+    if !input.expected_revision.is_empty() && registry.revision() != input.expected_revision {
+        return Err("WORKSPACE_REGISTRY_CHANGED: 项目登记已改变，请重新读取后再操作".into());
+    }
+    if input.create_only && !input.id.trim().is_empty() {
+        return Err(format!("{ERR_SCHEMA_INVALID}: create_only 不能同时指定项目 ID").into());
+    }
     let name = input.name.trim().to_string();
     if name.is_empty() {
         return Err(format!("{ERR_SCHEMA_INVALID}: name 必填").into());
@@ -933,11 +943,18 @@ pub(crate) fn upsert_project(
             })
         }
     };
+    if input.create_only && existing_index.is_some() {
+        return Err("PROJECT_ALREADY_EXISTS: 已存在同名项目或别名".into());
+    }
 
     let previous_name = existing_index.map(|index| registry.projects[index].name.clone());
     if let Some(owner) = registry.find_project(&name) {
-        if Some(owner.id.as_str()) != existing_index.map(|index| registry.projects[index].id.as_str()) {
-            return Err(format!("{ERR_ALIAS_CONFLICT}: 名称 {name:?} 已属于 {}", owner.name).into());
+        if Some(owner.id.as_str())
+            != existing_index.map(|index| registry.projects[index].id.as_str())
+        {
+            return Err(
+                format!("{ERR_ALIAS_CONFLICT}: 名称 {name:?} 已属于 {}", owner.name).into(),
+            );
         }
     }
     let project_id = match existing_index {
@@ -1035,17 +1052,69 @@ pub(crate) fn upsert_project(
     if !input.notes.is_empty() {
         project.context.notes = input.notes.clone();
     }
-    if !input.work_log_project_id.is_empty() {
-        project.links.work_log_project_id = input.work_log_project_id.clone();
-    }
-    if !input.work_log_project_name.is_empty() {
-        project.links.work_log_project_name = input.work_log_project_name.clone();
-    }
-    if !input.workbench_project_id.is_empty() {
-        project.links.workbench_project_id = input.workbench_project_id.clone();
-    }
     project.updated_at = updated_at;
     Ok(project.clone())
+}
+
+/// Apply a project change and its explicit directory changes as one registry
+/// transaction. A path conflict leaves the original registry unchanged.
+pub(crate) fn upsert_project_with_paths(
+    registry: &mut Registry,
+    mut input: ProjectInput,
+) -> Result<RegistryProject, Box<dyn Error>> {
+    let add_paths = std::mem::take(&mut input.add_paths);
+    let mut remove_paths = std::mem::take(&mut input.remove_paths);
+    let replace_paths = input.replace_paths;
+    if replace_paths && !remove_paths.is_empty() {
+        return Err(format!("{ERR_SCHEMA_INVALID}: 替换目录时不能同时传入 remove_paths").into());
+    }
+    let mut next = registry.clone();
+    let project = upsert_project(&mut next, input)?;
+    if replace_paths {
+        let desired: Vec<String> = add_paths
+            .iter()
+            .map(|item| normalize_path(&item.path))
+            .collect::<Result<_, _>>()?;
+        for existing in next
+            .workspaces
+            .iter()
+            .filter(|item| item.project_id == project.id)
+        {
+            let normalized = normalize_path(&existing.path)?;
+            if !desired.iter().any(|item| paths_equal(item, &normalized)) {
+                remove_paths.push(existing.path.clone());
+            }
+        }
+    }
+    for path in remove_paths {
+        let normalized = normalize_path(&path)?;
+        let owned = next.workspaces.iter().any(|item| {
+            item.project_id == project.id
+                && normalize_path(&item.path)
+                    .map(|existing| paths_equal(&existing, &normalized))
+                    .unwrap_or(false)
+        });
+        if !owned {
+            return Err(format!("{ERR_PATH_CONFLICT}: 目录未绑定到目标项目：{normalized}").into());
+        }
+        bind_path(
+            &mut next,
+            BindInput {
+                path,
+                unbind: true,
+                ..Default::default()
+            },
+        )?;
+    }
+    for mut binding in add_paths {
+        if binding.unbind || !binding.project_ref.is_empty() {
+            return Err(format!("{ERR_SCHEMA_INVALID}: 新增目录不能指定解绑或其他项目").into());
+        }
+        binding.project_ref = project.id.clone();
+        bind_path(&mut next, binding)?;
+    }
+    *registry = next;
+    Ok(project)
 }
 
 /// 删除项目。有子项目或路径绑定时默认拒绝——静默级联删除会让
@@ -1594,12 +1663,6 @@ pub(crate) fn brief(snapshot: &RegistrySnapshot) -> String {
             .collect();
         lines.push(format!("[规则] {}", paths.join("、")));
     }
-    if !project.links.work_log_project_name.is_empty() {
-        lines.push(format!(
-            "[日志项目] {}",
-            project.links.work_log_project_name
-        ));
-    }
     if !project.context.notes.is_empty() {
         lines.push(format!("[备注] {}", project.context.notes));
     }
@@ -1757,411 +1820,6 @@ pub(crate) fn capability_context(
         "matched": snapshot.matched,
         "brief": text,
         "snapshot": snapshot,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// 从工作日志导入
-//
-// 工作日志已经把「路径属于哪个项目」探索了两年，那批事实不该随插件退役一起
-// 丢掉。这里只搬**身份与绑定**：项目名、别名、路径、工作台链接。
-// 工时、优先级、下一步、进度仍然属于工作日志——它们是日志事实，不是项目身份。
-//
-// 导入必须可预演：先把「会写成什么、哪几条会撞车」原样返回，用户看过再落盘。
-// 一次不可撤销的批量写入比多一次确认危险得多。
-// ---------------------------------------------------------------------------
-
-/// 工作日志 `projects.json` 里的一条项目。字段只取迁移用得上的部分，
-/// 其它字段（`work`、`exhibits`）刻意不读——它们不搬。
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct WorkLogProject {
-    pub id: String,
-    pub name: String,
-    pub aliases: Vec<String>,
-    pub kind: String,
-    pub status: String,
-    /// 工作台业务项目 ID（`prj_xxx`）。迁移到 `links.workbench_project_id`。
-    pub external_id: String,
-    pub paths: Vec<WorkLogPath>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct WorkLogPath {
-    pub path: String,
-    /// 工作日志自己的路径类型：`repo` / `workdir` / `svn` / `release`。
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct WorkLogFile {
-    pub schema_version: String,
-    pub projects: Vec<WorkLogProject>,
-}
-
-/// 导入计划里的一条：要么是「要新建的项目」，要么是「命中已有项目」。
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ImportPlanEntry {
-    /// `create` 或 `merge`（同名项目已存在，只补绑定与别名）。
-    pub action: String,
-    pub work_log_id: String,
-    pub name: String,
-    pub aliases: Vec<String>,
-    pub kind: String,
-    pub paths: Vec<ImportPlanPath>,
-    /// 该条目为什么被跳过或降级；空表示没有异常。
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ImportPlanPath {
-    pub path: String,
-    pub role: String,
-    /// `bind` 表示会写入；`skip` 表示与已有绑定或同批次其它项目冲突。
-    pub action: String,
-    pub note: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ImportPlan {
-    pub dry_run: bool,
-    pub source: String,
-    pub schema_version: String,
-    pub total_projects: usize,
-    pub create_count: usize,
-    pub merge_count: usize,
-    pub bind_count: usize,
-    pub skipped_paths: Vec<ImportPlanPath>,
-    pub entries: Vec<ImportPlanEntry>,
-    pub warnings: Vec<String>,
-}
-
-/// 工作日志的 `kind` 是自由文本（「平台产品」「交付项目」…），
-/// 这里给一个保守映射；认不出的落 `other`，并保留原名到 `description`。
-fn kind_from_work_log(kind: &str) -> &'static str {
-    match kind.trim() {
-        "平台产品" => KIND_PRODUCT,
-        "交付项目" => KIND_DELIVERY,
-        "通用沉淀" => KIND_LIBRARY,
-        _ => KIND_OTHER,
-    }
-}
-
-/// 工作日志的路径类型 → 内核的路径角色。
-fn role_from_work_log(kind: &str) -> &'static str {
-    match kind.trim() {
-        "release" => ROLE_RELEASE,
-        "svn" => ROLE_SOURCE,
-        "workdir" => ROLE_WORKTREE,
-        _ => ROLE_ROOT,
-    }
-}
-
-/// 路径键：与登记表同一套归一化，冲突判定才不会有第二个口径。
-fn import_key(raw: &str) -> Option<String> {
-    normalize_path(raw).ok().map(|value| path_key(&value))
-}
-
-/// 生成导入计划。`registry` 只读，不写盘——dry-run 与正式导入共用这一份判断。
-pub(crate) fn plan_work_log_import(registry: &Registry, source: &WorkLogFile) -> ImportPlan {
-    let mut plan = ImportPlan {
-        dry_run: true,
-        source: "work-log".to_string(),
-        schema_version: source.schema_version.clone(),
-        total_projects: source.projects.len(),
-        create_count: 0,
-        merge_count: 0,
-        bind_count: 0,
-        skipped_paths: Vec::new(),
-        entries: Vec::new(),
-        warnings: Vec::new(),
-    };
-
-    // 已经在登记表里的路径：来自既有数据，也来自本批次上一个项目。
-    // 两类来源分开记，冲突说明才能说清「撞的是谁」——一句含糊的
-    // 「已被占用」对排查没有帮助。
-    enum Owner {
-        /// 登记表里已存在的项目，带可读名。
-        Existing(String),
-        /// 本批次里更早出现的项目，带工作日志项目名。
-        Batch(String),
-    }
-    let mut claimed: std::collections::HashMap<String, Owner> = std::collections::HashMap::new();
-    for workspace in &registry.workspaces {
-        if let Some(key) = import_key(&workspace.path) {
-            let name = registry
-                .project(&workspace.project_id)
-                .map(|project| project.name.clone())
-                .unwrap_or_else(|| workspace.project_id.clone());
-            claimed.insert(key, Owner::Existing(name));
-        }
-    }
-
-    for project in &source.projects {
-        let name = project.name.trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let existing = registry.find_project(&name);
-        let action = if existing.is_some() {
-            "merge"
-        } else {
-            "create"
-        };
-        let mut entry = ImportPlanEntry {
-            action: action.to_string(),
-            work_log_id: project.id.clone(),
-            name: name.clone(),
-            aliases: project.aliases.clone(),
-            kind: kind_from_work_log(&project.kind).to_string(),
-            paths: Vec::new(),
-            notes: Vec::new(),
-        };
-        if !project.kind.trim().is_empty() && kind_from_work_log(&project.kind) == KIND_OTHER {
-            entry.notes.push(format!(
-                "工作日志的类型「{}」没有对应项，按「其他」登记",
-                project.kind
-            ));
-        }
-        if project.paths.is_empty() {
-            entry
-                .notes
-                .push("工作日志里这个项目没有路径，只迁项目身份".to_string());
-        }
-
-        for path in &project.paths {
-            let role = role_from_work_log(&path.kind).to_string();
-            let Some(key) = import_key(&path.path) else {
-                let skipped = ImportPlanPath {
-                    path: path.path.clone(),
-                    role,
-                    action: "skip".to_string(),
-                    note: "路径不是绝对路径，无法归一化".to_string(),
-                };
-                plan.skipped_paths.push(skipped.clone());
-                entry.paths.push(skipped);
-                continue;
-            };
-            if let Some(owner) = claimed.get(&key) {
-                // 同批次里同一个路径被两个项目抢：谁先谁得，后来者跳过并说明。
-                let note = match owner {
-                    Owner::Batch(name) if name == project.name.trim() => {
-                        "同一项目内重复，已合并".to_string()
-                    }
-                    Owner::Batch(name) => {
-                        format!("该路径已被本批次的项目「{name}」占用，跳过")
-                    }
-                    Owner::Existing(name) => {
-                        format!("该路径在登记表里已绑定到「{name}」，跳过")
-                    }
-                };
-                let skipped = ImportPlanPath {
-                    path: path.path.clone(),
-                    role,
-                    action: "skip".to_string(),
-                    note,
-                };
-                plan.skipped_paths.push(skipped.clone());
-                entry.paths.push(skipped);
-                continue;
-            }
-            claimed.insert(key, Owner::Batch(project.name.trim().to_string()));
-            plan.bind_count += 1;
-            entry.paths.push(ImportPlanPath {
-                path: path.path.clone(),
-                role,
-                action: "bind".to_string(),
-                note: String::new(),
-            });
-        }
-
-        match action {
-            "create" => plan.create_count += 1,
-            _ => plan.merge_count += 1,
-        }
-        plan.entries.push(entry);
-    }
-
-    if !plan.skipped_paths.is_empty() {
-        plan.warnings.push(format!(
-            "{} 条路径未导入，原因见 skipped_paths",
-            plan.skipped_paths.len()
-        ));
-    }
-
-    // 一个项目占着多个路径、且其中一条是另一条的前缀时，解析会得到两个候选。
-    // 最长前缀能收敛，但值得提前说一声：导出目录与源码目录常常就是这样。
-    let mut binds: Vec<(String, String)> = Vec::new();
-    for entry in &plan.entries {
-        for path in &entry.paths {
-            if path.action == "bind" {
-                if let Some(key) = import_key(&path.path) {
-                    binds.push((key, entry.name.clone()));
-                }
-            }
-        }
-    }
-    // 两个方向都要比：工作日志里的顺序不代表目录层级，外层目录可能排在后面
-    // （实测 `F:\WebProjects` 就排在它的一堆子目录之后）。
-    for (outer_key, outer_name) in binds.iter() {
-        for (inner_key, inner_name) in binds.iter() {
-            if inner_key == outer_key {
-                continue;
-            }
-            if inner_key.starts_with(&format!("{outer_key}/")) {
-                plan.warnings.push(format!(
-                    "路径「{inner_key}」位于「{outer_key}」之下（{inner_name} / {outer_name}），解析按最长前缀取更具体的一条"
-                ));
-            }
-        }
-    }
-    plan
-}
-
-/// 把计划落盘。`source` 里项目与计划条目按 `work_log_id` 对齐。
-///
-/// 只写项目身份与路径绑定；`links.work_log_project_id` 保留原 ID，
-/// 让工作日志退役前还能双向对账。
-pub(crate) fn apply_work_log_import(
-    registry: &mut Registry,
-    source: &WorkLogFile,
-    plan: &ImportPlan,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let by_id: std::collections::HashMap<&str, &WorkLogProject> = source
-        .projects
-        .iter()
-        .map(|project| (project.id.as_str(), project))
-        .collect();
-
-    for entry in &plan.entries {
-        let Some(origin) = by_id.get(entry.work_log_id.as_str()) else {
-            continue;
-        };
-        // 已有同名项目就补别名与链接，不覆盖用户后来改过的名字。
-        let project = match registry.find_project(&entry.name).cloned() {
-            Some(existing) => {
-                let mut updated = ProjectInput {
-                    id: existing.id.clone(),
-                    name: existing.name.clone(),
-                    kind: if existing.kind.is_empty() {
-                        entry.kind.clone()
-                    } else {
-                        existing.kind.clone()
-                    },
-                    ..Default::default()
-                };
-                let mut aliases = existing.aliases.clone();
-                for alias in &entry.aliases {
-                    if !aliases.iter().any(|item| item.eq_ignore_ascii_case(alias)) {
-                        aliases.push(alias.clone());
-                    }
-                }
-                updated.aliases = aliases;
-                updated.work_log_project_id = origin.id.clone();
-                updated.work_log_project_name = origin.name.clone();
-                if !origin.external_id.trim().is_empty() {
-                    updated.workbench_project_id = origin.external_id.clone();
-                }
-                if existing.description.is_empty() && !origin.kind.trim().is_empty() {
-                    updated.description = format!("原工作日志分类：{}", origin.kind.trim());
-                }
-                upsert_project(registry, updated)?
-            }
-            None => {
-                let mut input = ProjectInput {
-                    name: entry.name.clone(),
-                    aliases: entry.aliases.clone(),
-                    kind: entry.kind.clone(),
-                    status: if origin.status.trim().is_empty() {
-                        "active".to_string()
-                    } else {
-                        origin.status.clone()
-                    },
-                    work_log_project_id: origin.id.clone(),
-                    work_log_project_name: origin.name.clone(),
-                    ..Default::default()
-                };
-                if !origin.external_id.trim().is_empty() {
-                    input.workbench_project_id = origin.external_id.clone();
-                }
-                if !origin.kind.trim().is_empty() {
-                    input.description = format!("原工作日志分类：{}", origin.kind.trim());
-                }
-                upsert_project(registry, input)?
-            }
-        };
-
-        for path in &entry.paths {
-            if path.action != "bind" {
-                continue;
-            }
-            // 单条绑定失败不影响其余：冲突已经写进计划的 notes，
-            // 真到这里再失败说明数据在计划之后变过，跳过即可。
-            let _ = bind_path(
-                registry,
-                BindInput {
-                    project_ref: project.id.clone(),
-                    path: path.path.clone(),
-                    role: path.role.clone(),
-                    source: SOURCE_IMPORT.to_string(),
-                    confidence: CONFIDENCE_EXACT.to_string(),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    Ok(())
-}
-
-/// 从工作日志的 `projects.json` 读入。路径由调用方给出，内核不猜日志根。
-pub(crate) fn read_work_log_projects(
-    path: &Path,
-) -> Result<WorkLogFile, Box<dyn std::error::Error>> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("读取工作日志登记表失败 {}: {error}", path.display()))?;
-    let file: WorkLogFile = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-        .map_err(|error| format!("工作日志登记表不是合法 JSON: {error}"))?;
-    Ok(file)
-}
-
-/// `workspace.registry.import` 的实现。`dry_run` 为真时只返回计划。
-pub(crate) fn capability_import(input: &Value) -> Result<Value, Box<dyn std::error::Error>> {
-    let source_path = input
-        .get("source_path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or("source_path 必填：指向工作日志的 projects.json")?;
-    let dry_run = input
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let file = read_work_log_projects(Path::new(source_path))?;
-
-    if dry_run {
-        let registry = Registry::load()?;
-        let mut plan = plan_work_log_import(&registry, &file);
-        plan.dry_run = true;
-        return Ok(serde_json::to_value(plan)?);
-    }
-
-    let mut plan_out = None;
-    let registry = Registry::update(|registry| {
-        let plan = plan_work_log_import(registry, &file);
-        apply_work_log_import(registry, &file, &plan)?;
-        plan_out = Some(plan);
-        Ok(())
-    })?;
-    let mut plan = plan_out.ok_or("导入已执行但计划丢失")?;
-    plan.dry_run = false;
-    Ok(serde_json::json!({
-        "dry_run": false,
-        "plan": plan,
-        "project_count": registry.projects.len(),
-        "workspace_count": registry.workspaces.len(),
-        "updated_at": registry.updated_at,
     }))
 }
 

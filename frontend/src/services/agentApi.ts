@@ -1401,7 +1401,6 @@ export type WorkspaceRegistryProject = {
     rules?: Array<{ label: string; path: string }>;
     notes?: string;
   };
-  links?: { work_log_project_id?: string; work_log_project_name?: string; workbench_project_id?: string };
   created_at?: string;
   updated_at?: string;
 };

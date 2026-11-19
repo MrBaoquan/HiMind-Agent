@@ -321,7 +321,7 @@ enum CapabilityHandler {
     MarketInstalled,
     MarketInstallPlan,
     MarketInstall,
-    /// 工作区登记表的 10 条能力，全部由 `crate::workspace_registry` 实现。
+    /// 工作区项目树能力，全部由 `crate::workspace_registry` 实现。
     WorkspaceSession(&'static str),
     WorkspaceRegistryResolve,
     WorkspaceRegistryContextGet,
@@ -333,7 +333,6 @@ enum CapabilityHandler {
     WorkspaceRegistryCandidateAccept,
     WorkspaceRegistryCandidateDismiss,
     WorkspaceRegistryValidate,
-    WorkspaceRegistryImport,
 }
 
 #[derive(Clone)]
@@ -3857,6 +3856,11 @@ impl CapabilityGateway {
                     "properties": {
                         "id": { "type": "string", "description": "已存在项目 ID；留空按 name 匹配或新建" },
                         "name": { "type": "string", "minLength": 1 },
+                        "create_only": { "type": "boolean", "description": "仅新建；同名或别名已存在时拒绝" },
+                        "expected_revision": { "type": "string", "description": "预期登记版本；不一致时拒绝修改" },
+                        "add_paths": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string", "minLength": 1 }, "role": { "type": "string", "enum": ["root", "worktree", "mirror", "release", "source", "build"] }, "source": { "type": "string", "enum": ["manual", "import", "manifest", "git", "session", "scan"] }, "confidence": { "type": "string", "enum": ["exact", "inferred"] } }, "required": ["path"], "additionalProperties": false } },
+                        "remove_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                        "replace_paths": { "type": "boolean", "description": "以 add_paths 替换目标项目目录，保留未变目录的身份" },
                         "aliases": { "type": "array", "items": { "type": "string" } },
                         "kind": { "type": "string", "enum": ["aggregate", "product", "subproject", "delivery", "library", "docs", "sandbox", "other"] },
                         "status": { "type": "string" },
@@ -3899,9 +3903,6 @@ impl CapabilityGateway {
                             }
                         },
                         "notes": { "type": "string" },
-                        "work_log_project_id": { "type": "string" },
-                        "work_log_project_name": { "type": "string" },
-                        "workbench_project_id": { "type": "string" }
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -4004,23 +4005,6 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::WorkspaceRegistryValidate,
-            ),
-            registration_versioned(
-                "workspace.registry.import",
-                crate::workspace_registry::CAPABILITY_VERSION,
-                "导入工作日志登记",
-                "把工作日志的项目与路径绑定迁进内核登记表；默认 dry_run，先看计划再落盘。",
-                "local_write",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "source_path": { "type": "string", "minLength": 1, "description": "工作日志 projects.json 的绝对路径" },
-                        "dry_run": { "type": "boolean", "description": "默认 true，只返回计划不写盘" }
-                    },
-                    "required": ["source_path"],
-                    "additionalProperties": false
-                }),
-                CapabilityHandler::WorkspaceRegistryImport,
             ),
         ];
 
@@ -5119,8 +5103,10 @@ impl CapabilityGateway {
                 // 所以用闭包把结果带出来，不把整个列表回给模型。
                 let mut saved = None;
                 crate::workspace_registry::Registry::update(|registry| {
-                    let project =
-                        crate::workspace_registry::upsert_project(registry, project_input)?;
+                    let project = crate::workspace_registry::upsert_project_with_paths(
+                        registry,
+                        project_input,
+                    )?;
                     saved = Some(project);
                     Ok(())
                 })?;
@@ -5225,9 +5211,6 @@ impl CapabilityGateway {
                 Ok(serde_json::to_value(
                     crate::workspace_registry::validate_registry(&registry),
                 )?)
-            }
-            CapabilityHandler::WorkspaceRegistryImport => {
-                crate::workspace_registry::capability_import(&input)
             }
             CapabilityHandler::AIClientList => Ok(serde_json::to_value(
                 crate::app::ai_provider_import::status(&self.options),

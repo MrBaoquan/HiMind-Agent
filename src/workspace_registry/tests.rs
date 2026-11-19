@@ -8,7 +8,11 @@ use super::*;
 
 #[test]
 fn chinese_display_name_is_explicit_or_unambiguous() {
-    let mut project = RegistryProject { name: "IOStudio".into(), aliases: vec!["设备配置与编排".into()], ..Default::default() };
+    let mut project = RegistryProject {
+        name: "IOStudio".into(),
+        aliases: vec!["设备配置与编排".into()],
+        ..Default::default()
+    };
     assert_eq!(project.display_name(), "设备配置与编排");
     project.aliases.push("编辑器".into());
     assert_eq!(project.display_name(), "IOStudio");
@@ -19,12 +23,171 @@ fn chinese_display_name_is_explicit_or_unambiguous() {
 #[test]
 fn renaming_preserves_technical_lookup_and_rejects_another_identity() {
     let mut registry = Registry::default();
-    let original = upsert_project(&mut registry, ProjectInput { name: "IOStudio".into(), ..Default::default() }).unwrap();
-    let renamed = upsert_project(&mut registry, ProjectInput { id: original.id.clone(), name: "设备配置与编排".into(), ..Default::default() }).unwrap();
+    let original = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "IOStudio".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let renamed = upsert_project(
+        &mut registry,
+        ProjectInput {
+            id: original.id.clone(),
+            name: "设备配置与编排".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(renamed.id, original.id);
     assert_eq!(registry.find_project("IOStudio").unwrap().id, original.id);
-    let other = upsert_project(&mut registry, ProjectInput { name: "其他项目".into(), ..Default::default() }).unwrap();
-    assert!(upsert_project(&mut registry, ProjectInput { id: other.id, name: "IOStudio".into(), ..Default::default() }).is_err());
+    let other = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "其他项目".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(upsert_project(
+        &mut registry,
+        ProjectInput {
+            id: other.id,
+            name: "IOStudio".into(),
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
+
+#[test]
+fn explicit_create_and_revision_prevent_accidental_updates() {
+    let mut registry = Registry::default();
+    let revision = registry.revision();
+    let project = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "项目 A".into(),
+            create_only: true,
+            expected_revision: revision.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let stale = upsert_project(
+        &mut registry,
+        ProjectInput {
+            id: project.id.clone(),
+            name: "误改".into(),
+            expected_revision: revision,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(stale.to_string().contains("WORKSPACE_REGISTRY_CHANGED"));
+    let current = registry.revision();
+    let same = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "项目 A".into(),
+            create_only: true,
+            expected_revision: current,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(same.to_string().contains("PROJECT_ALREADY_EXISTS"));
+    assert_eq!(registry.project(&project.id).unwrap().name, "项目 A");
+}
+
+#[test]
+fn project_and_paths_update_atomically_on_conflict() {
+    let mut registry = Registry::default();
+    let a = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "项目 A".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    bind_path(
+        &mut registry,
+        BindInput {
+            project_ref: a.id,
+            path: "C:/work/shared".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = registry.revision();
+    let result = upsert_project_with_paths(
+        &mut registry,
+        ProjectInput {
+            name: "项目 B".into(),
+            create_only: true,
+            expected_revision: before.clone(),
+            add_paths: vec![BindInput {
+                path: "C:/work/shared".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(registry.revision(), before);
+    assert!(registry.find_project("项目 B").is_none());
+}
+
+#[test]
+fn replacing_project_paths_preserves_unchanged_binding_identity() {
+    let mut registry = Registry::default();
+    let a = upsert_project(
+        &mut registry,
+        ProjectInput {
+            name: "项目 A".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let keep = bind_path(
+        &mut registry,
+        BindInput {
+            project_ref: a.id.clone(),
+            path: "C:/work/keep".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    bind_path(
+        &mut registry,
+        BindInput {
+            project_ref: a.id.clone(),
+            path: "C:/work/remove".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let revision = registry.revision();
+    upsert_project_with_paths(
+        &mut registry,
+        ProjectInput {
+            id: a.id.clone(),
+            name: "项目 A".into(),
+            expected_revision: revision,
+            replace_paths: true,
+            add_paths: vec![BindInput {
+                path: "C:/work/keep".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let paths = registry.workspaces_of(&a.id);
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].id, keep.id);
 }
 
 /// 建一个临时目录 + 登记表路径。返回值里的 `PathBuf` 是目录，调用方
@@ -618,173 +781,4 @@ fn registry_file_lives_under_data_for_backup_coverage() {
         path.display()
     );
     assert!(path.ends_with("workspace-registry.json"));
-}
-
-// ---------------------------------------------------------------------------
-// 从工作日志导入
-// ---------------------------------------------------------------------------
-
-fn work_log_fixture() -> WorkLogFile {
-    WorkLogFile {
-        schema_version: "work-log-projects.v2".to_string(),
-        projects: vec![
-            WorkLogProject {
-                id: "pj-1".to_string(),
-                name: "扩展仓库".to_string(),
-                aliases: vec!["himind-extensions".to_string()],
-                kind: "平台产品".to_string(),
-                status: "active".to_string(),
-                external_id: "prj_abc".to_string(),
-                paths: vec![WorkLogPath {
-                    path: "F:/WebProjects/himind-extensions".to_string(),
-                    kind: "repo".to_string(),
-                }],
-            },
-            WorkLogProject {
-                id: "pj-2".to_string(),
-                name: "没有路径的项目".to_string(),
-                kind: "交付项目".to_string(),
-                status: "active".to_string(),
-                ..Default::default()
-            },
-            WorkLogProject {
-                id: "pj-3".to_string(),
-                name: "路径被抢的项目".to_string(),
-                kind: "未知分类".to_string(),
-                paths: vec![
-                    WorkLogPath {
-                        path: "F:/WebProjects/himind-extensions".to_string(),
-                        kind: "repo".to_string(),
-                    },
-                    WorkLogPath {
-                        path: "relative/not/absolute".to_string(),
-                        kind: "repo".to_string(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ],
-    }
-}
-
-#[test]
-fn import_plan_flags_conflicts_and_maps_kinds_without_writing() {
-    let (_dir, path) = temp_registry();
-    let registry = Registry::default();
-    let mut plan = plan_work_log_import(&registry, &work_log_fixture());
-
-    assert_eq!(plan.total_projects, 3);
-    assert_eq!(plan.create_count, 3, "登记表为空时三条都是新建");
-    assert_eq!(plan.bind_count, 1, "只有第一条路径可绑定");
-    // 被抢的路径 + 相对路径各跳过一条。
-    assert_eq!(plan.skipped_paths.len(), 2);
-    assert!(
-        plan.skipped_paths
-            .iter()
-            .any(|item| item.note.contains("本批次的项目")),
-        "冲突说明要指出撞的是谁：{:?}",
-        plan.skipped_paths
-    );
-    assert!(plan
-        .skipped_paths
-        .iter()
-        .any(|item| item.note.contains("不是绝对路径")));
-
-    // 类型映射：认不出的落 other 并留一条说明。
-    let unknown = plan
-        .entries
-        .iter()
-        .find(|item| item.work_log_id == "pj-3")
-        .unwrap();
-    assert_eq!(unknown.kind, KIND_OTHER);
-    assert!(unknown.notes.iter().any(|note| note.contains("没有对应项")));
-
-    // 没有路径的项目也要留一条说明，而不是静默变成空项目。
-    let empty = plan
-        .entries
-        .iter()
-        .find(|item| item.work_log_id == "pj-2")
-        .unwrap();
-    assert!(empty.notes.iter().any(|note| note.contains("没有路径")));
-
-    // dry-run 不写盘：计划生成过，登记表文件仍不存在。
-    assert!(!path.exists(), "dry-run 不应写盘");
-    plan.dry_run = true;
-}
-
-#[test]
-fn import_applies_identity_bindings_and_links() {
-    let (_dir, path) = temp_registry();
-    let source = work_log_fixture();
-    let mut plan = None;
-    Registry::update_at(&path, |registry| {
-        let computed = plan_work_log_import(registry, &source);
-        apply_work_log_import(registry, &source, &computed)?;
-        plan = Some(computed);
-        Ok(())
-    })
-    .unwrap();
-    assert!(plan.is_some());
-
-    let registry = Registry::load_from(&path).unwrap();
-    assert_eq!(registry.projects.len(), 3);
-
-    let imported = registry.find_project("扩展仓库").expect("项目应已导入");
-    assert_eq!(imported.kind, KIND_PRODUCT);
-    assert_eq!(imported.links.work_log_project_id, "pj-1");
-    assert_eq!(imported.links.work_log_project_name, "扩展仓库");
-    assert_eq!(imported.links.workbench_project_id, "prj_abc");
-    assert!(imported.description.contains("平台产品"));
-
-    let bindings = registry.workspaces_of(&imported.id);
-    assert_eq!(bindings.len(), 1);
-    assert_eq!(bindings[0].source, SOURCE_IMPORT);
-    assert_eq!(bindings[0].confidence, CONFIDENCE_EXACT);
-
-    // 导入后能按路径解析出项目——这是这次迁移真正的目的。
-    let hit = resolve_path(&registry, "F:/WebProjects/himind-extensions/plugins/x")
-        .unwrap()
-        .expect("导入的绑定应能解析");
-    assert_eq!(hit.project.id, imported.id);
-}
-
-#[test]
-fn import_merges_into_existing_project_without_renaming_it() {
-    let (_dir, path) = temp_registry();
-    // 先在登记表里放一个同名项目，名字与工作日志不同（用户后来改过）。
-    Registry::update_at(&path, |registry| {
-        upsert_project(
-            registry,
-            ProjectInput {
-                name: "扩展仓库".to_string(),
-                aliases: vec!["旧别名".to_string()],
-                ..Default::default()
-            },
-        )
-        .map(|_| ())
-    })
-    .unwrap();
-
-    let source = work_log_fixture();
-    Registry::update_at(&path, |registry| {
-        let plan = plan_work_log_import(registry, &source);
-        assert_eq!(plan.merge_count, 1);
-        apply_work_log_import(registry, &source, &plan)
-    })
-    .unwrap();
-
-    let registry = Registry::load_from(&path).unwrap();
-    let merged = registry.find_project("扩展仓库").unwrap();
-    // 名字不被覆盖，别名是并集，链接补上。
-    assert_eq!(merged.aliases.iter().any(|item| item == "旧别名"), true);
-    assert_eq!(
-        merged
-            .aliases
-            .iter()
-            .any(|item| item == "himind-extensions"),
-        true
-    );
-    assert_eq!(merged.links.work_log_project_id, "pj-1");
-    // 项目总数 = 原有 1 + 另外两条新建。
-    assert_eq!(registry.projects.len(), 3);
 }

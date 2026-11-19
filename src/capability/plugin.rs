@@ -1307,7 +1307,6 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
                 "workspace.registry.candidate.accept",
                 "workspace.registry.candidate.dismiss",
                 "workspace.registry.validate",
-                "workspace.registry.import",
             ],
             &[],
         ),
@@ -3382,8 +3381,8 @@ mod tests {
         assert_eq!(item.version, crate::workspace_registry::CAPABILITY_VERSION);
         assert_eq!(
             item.capabilities.len(),
-            11,
-            "11 条 workspace.registry.* 能力都应在这个条目里"
+            10,
+            "10 条通用 workspace.registry.* 能力都应在这个条目里"
         );
         for capability in &item.capabilities {
             assert!(
@@ -3630,12 +3629,16 @@ mod tests {
     }
 
     #[test]
-    fn broker_capability_dependencies_allow_read_only_workspace_session_services() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-plugin-broker-dependency-test-{}",
-            next_request_id()
-        ));
-        fs::create_dir_all(&root).unwrap();
+    fn broker_capability_dependencies_allow_explicit_workspace_services() {
+        let workspace_candidate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".himind")
+            .join("test-tmp")
+            .join(format!(
+                "agent-plugin-broker-dependency-test-{}",
+                next_request_id()
+            ));
+        fs::create_dir_all(&workspace_candidate).unwrap();
+        let root = workspace_candidate;
         let manifest = PluginManifest {
             icon: String::new(),
             id: "com.test.work-log".to_string(),
@@ -3660,6 +3663,10 @@ mod tests {
                 "workspace.session.sources".to_string(),
                 "workspace.session.list".to_string(),
                 "workspace.session.messages".to_string(),
+                "workspace.registry.project.list".to_string(),
+                "workspace.registry.context.get".to_string(),
+                "workspace.registry.project.upsert".to_string(),
+                "workspace.registry.path.bind".to_string(),
                 "media.image.generate".to_string(),
             ],
             contributes: PluginContributions::default(),
@@ -3672,7 +3679,8 @@ mod tests {
         for pattern in [
             "workspace.session.*",
             "workspace.*",
-            "workspace.registry.project.upsert",
+            "workspace.registry.resolve",
+            "workspace.registry.project.delete",
             "system.health",
             "market.install",
             "*",
@@ -4186,6 +4194,10 @@ fn validate_broker_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error
             | "workspace.session.list"
             | "workspace.session.messages"
             | "workspace.session.activity"
+            | "workspace.registry.project.list"
+            | "workspace.registry.context.get"
+            | "workspace.registry.project.upsert"
+            | "workspace.registry.path.bind"
     ) || VIEW_EXTERNAL_CAPABILITY_PREFIXES
         .iter()
         .any(|prefix| value.starts_with(prefix))
