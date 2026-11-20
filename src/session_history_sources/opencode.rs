@@ -381,7 +381,7 @@ fn opencode_transcript_page_scoped_from_paths(
         let selection =
             read_opencode_messages(&connection, native_id, end_offset, page_size, activity)?;
         return Ok(session_history::SessionTranscriptPage {
-            snapshot_cursor: None,
+            snapshot_cursor: Some(selection.snapshot_cursor),
             session_id,
             through_seq: Some(selection.through_seq),
             messages: selection.messages,
@@ -392,6 +392,7 @@ fn opencode_transcript_page_scoped_from_paths(
 }
 
 struct TranscriptSelection {
+    snapshot_cursor: String,
     messages: Vec<SessionTranscriptMessage>,
     through_seq: i64,
     next_cursor: Option<String>,
@@ -497,6 +498,7 @@ fn read_v2_page(
     }
     messages.reverse();
     Ok(TranscriptSelection {
+        snapshot_cursor: end.to_string(),
         messages,
         through_seq: end.saturating_sub(1) as i64,
         next_cursor: (start > 0).then(|| start.to_string()),
@@ -607,6 +609,7 @@ fn read_legacy_page(
     }
     messages.reverse();
     Ok(TranscriptSelection {
+        snapshot_cursor: end.to_string(),
         messages,
         through_seq: end.saturating_sub(1) as i64,
         next_cursor: (start > 0).then(|| start.to_string()),
@@ -1171,6 +1174,46 @@ mod tests {
             .unwrap_err(),
             "SESSION_NOT_FOUND"
         );
+    }
+
+    #[test]
+    fn opencode_activity_snapshot_keeps_expanded_page_stable_after_append() {
+        let temp = TempRoot::new();
+        let path = temp.0.join("activity-page.db");
+        create_v2_database(&path);
+        let connection = Connection::open(&path).unwrap();
+        let parts: Vec<_> = (0..250).map(|_| serde_json::json!({
+            "type":"reasoning", "time":{"created":1794391200000i64,"completed":1794391201000i64}
+        })).collect();
+        let data = serde_json::json!({"content":parts}).to_string();
+        connection
+            .execute(
+                "UPDATE session_message SET data=?1 WHERE id='m102'",
+                [&data],
+            )
+            .unwrap();
+        let load = |end| {
+            opencode_transcript_page_scoped_from_paths(
+                &registry(),
+                Some("project-a"),
+                "ses_synthetic",
+                std::slice::from_ref(&path),
+                end,
+                50,
+                true,
+            )
+            .unwrap()
+        };
+        let first = load(None);
+        assert!(first.messages.len() > 200);
+        assert_eq!(first.snapshot_cursor.as_deref(), Some("102"));
+        connection.execute_batch(
+            "INSERT INTO session_message VALUES ('m103','ses_synthetic','user',103,1794391203000,'{\"text\":\"new message\"}');"
+        ).unwrap();
+        let resumed = load(Some(
+            first.snapshot_cursor.as_ref().unwrap().parse().unwrap(),
+        ));
+        assert_eq!(first, resumed);
     }
 
     #[test]

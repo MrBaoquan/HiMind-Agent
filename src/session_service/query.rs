@@ -201,7 +201,9 @@ fn decode_cursor(
     if cursor.version != 1
         || cursor.operation != operation
         || cursor.session > count
-        || cursor.within_page > 50
+        // Activity adapters can expand one native message into multiple timed
+        // items. Its offset is checked against the loaded page before use.
+        || (operation != "activity" && cursor.within_page > 50)
     {
         return Err("SESSION_CURSOR_INVALID".into());
     }
@@ -824,6 +826,71 @@ mod tests {
             .unwrap_err(),
             "SESSION_SNAPSHOT_CHANGED"
         );
+    }
+
+    #[test]
+    fn activity_cursor_resumes_expanded_execution_page_past_fifty_items() {
+        let mut request = request(json!({
+            "from":"2026-11-16T00:00:00Z", "to":"2026-11-17T00:00:00Z", "limit":200
+        }));
+        let started_at_ms = DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let load = |_: &SessionSummary, boundary: Option<String>| {
+            assert!(boundary.is_none() || boundary.as_deref() == Some("50"));
+            Ok(SessionTranscriptPage {
+                session_id: "codex:a".into(),
+                snapshot_cursor: Some("50".into()),
+                through_seq: Some(49),
+                next_cursor: None,
+                // A native page of 50 messages expands into more activity items.
+                messages: (0..250)
+                    .map(|i| SessionTranscriptMessage {
+                        execution: Some(crate::session_history::SessionExecutionTiming {
+                            basis: "opencode_item_timing_v1".into(),
+                            started_at_ms,
+                            completed_at_ms: started_at_ms + 1000,
+                        }),
+                        id: format!("execution:{i}"),
+                        role: "execution".into(),
+                        content: String::new(),
+                        timestamp: None,
+                        files: vec![],
+                    })
+                    .collect(),
+            })
+        };
+        let first = project(
+            &registry(),
+            "activity",
+            &request,
+            vec![session("a", None)],
+            status(),
+            load,
+        )
+        .unwrap();
+        assert_eq!(first["activities"].as_array().unwrap().len(), 200);
+        request.cursor = first["next_cursor"].as_str().map(Into::into);
+        let second = project(
+            &registry(),
+            "activity",
+            &request,
+            vec![session("a", None)],
+            status(),
+            load,
+        )
+        .unwrap();
+        assert_eq!(second["activities"].as_array().unwrap().len(), 50);
+        assert_eq!(second["activities"][0]["message"]["id"], "execution:200");
+        assert!(second["next_cursor"].is_null());
+        let ids: HashSet<_> = first["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["activities"].as_array().unwrap())
+            .map(|row| row["message"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 250);
     }
 
     #[test]
