@@ -1181,6 +1181,16 @@ pub(crate) fn submit(
     skill_id: &str,
     version: &str,
 ) -> Result<AuthoringDraft, Box<dyn Error>> {
+    submit_with_scope(options, agent_id, skill_id, version, None)
+}
+
+pub(crate) fn submit_with_scope(
+    options: &Options,
+    agent_id: &str,
+    skill_id: &str,
+    version: &str,
+    scope: Option<&crate::api::distribution::WorkbenchSubmissionScope>,
+) -> Result<AuthoringDraft, Box<dyn Error>> {
     let draft = read(skill_id, version)?;
     ensure_ready_to_submit(&draft)?;
     // 分发目标门禁：只有把工件交给组织工作台的项目才允许提审。
@@ -1221,6 +1231,7 @@ pub(crate) fn submit(
         &report,
         draft.revision_of.as_deref(),
         &source,
+        scope,
     )?;
     let dashboard_draft_id = submitted
         .get("id")

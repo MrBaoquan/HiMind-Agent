@@ -15,6 +15,7 @@ use crate::store::{atomic_file, paths};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 
+pub(crate) const STATUS_SUBMITTED: &str = "submitted";
 pub(crate) const STATUS_PENDING: &str = "pending";
 pub(crate) const STATUS_PUBLISHED: &str = "published";
 pub(crate) const STATUS_FAILED: &str = "failed";
@@ -25,7 +26,7 @@ pub(crate) struct DistributionStateEntry {
     pub id: String,
     pub version: String,
     pub target: DistributionTarget,
-    /// `pending` / `published` / `failed`。
+    /// `pending` / `submitted` / `published` / `failed`。
     pub status: String,
     /// GitHub 落点：tag、Release id 与网页地址。
     #[serde(default)]

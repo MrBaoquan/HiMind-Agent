@@ -3335,7 +3335,7 @@ impl CapabilityGateway {
                 "提交 Skill 审核",
                 "显示本机候选包确认后，以绑定用户身份提交 Skill 审核。",
                 "network_write",
-                authoring_identity_schema(),
+                workbench_submission_schema(),
                 CapabilityHandler::SkillSubmissionSubmit,
             ),
             registration(
@@ -3436,7 +3436,7 @@ impl CapabilityGateway {
                 "提交 Workflow 审核",
                 "将已确认的 Workflow Candidate、依赖锁和本地测试报告提交到组织审核。",
                 "network_write",
-                authoring_identity_schema(),
+                workbench_submission_schema(),
                 CapabilityHandler::WorkflowSubmissionSubmit,
             ),
             registration(
@@ -3452,7 +3452,7 @@ impl CapabilityGateway {
                 "提交插件审核",
                 "显示本机候选包确认后，以绑定用户身份提交插件审核。",
                 "network_write",
-                authoring_identity_schema(),
+                workbench_submission_schema(),
                 CapabilityHandler::PluginSubmissionSubmit,
             ),
             registration(
@@ -7643,6 +7643,11 @@ impl CapabilityGateway {
 
     fn submit_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         let (id, version) = authoring_identity(&input)?;
+        let scope: Option<crate::api::distribution::WorkbenchSubmissionScope> = input
+            .get("scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let draft = crate::skill::authoring::read(&id, &version)?;
         if draft.tested_at.is_none() {
             return Err("Skill 候选包尚未完成测试".into());
@@ -7651,12 +7656,15 @@ impl CapabilityGateway {
             crate::skill::authoring::confirm(&id, &version)?;
         }
         let agent_id = self.load_paired_agent()?;
-        Ok(serde_json::to_value(crate::skill::authoring::submit(
-            &self.options,
-            &agent_id,
-            &id,
-            &version,
-        )?)?)
+        Ok(serde_json::to_value(
+            crate::skill::authoring::submit_with_scope(
+                &self.options,
+                &agent_id,
+                &id,
+                &version,
+                scope.as_ref(),
+            )?,
+        )?)
     }
 
     fn skill_submission_status(&self) -> Result<Value, Box<dyn Error>> {
@@ -7688,6 +7696,11 @@ impl CapabilityGateway {
 
     fn submit_plugin_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         let (id, version) = authoring_identity(&input)?;
+        let scope: Option<crate::api::distribution::WorkbenchSubmissionScope> = input
+            .get("scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let draft = crate::plugin_authoring::read(&id, &version)?;
         if draft.tested_at.is_none() {
             return Err("插件候选包尚未完成测试".into());
@@ -7696,19 +7709,33 @@ impl CapabilityGateway {
             crate::plugin_authoring::confirm(&id, &version)?;
         }
         let agent_id = self.load_paired_agent()?;
-        Ok(serde_json::to_value(crate::plugin_authoring::submit(
-            &self.options,
-            &agent_id,
-            &id,
-            &version,
-        )?)?)
+        Ok(serde_json::to_value(
+            crate::plugin_authoring::submit_with_scope(
+                &self.options,
+                &agent_id,
+                &id,
+                &version,
+                scope.as_ref(),
+            )?,
+        )?)
     }
 
     fn submit_workflow_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         let (id, version) = authoring_identity(&input)?;
+        let scope: Option<crate::api::distribution::WorkbenchSubmissionScope> = input
+            .get("scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let agent_id = self.load_paired_agent()?;
         Ok(serde_json::to_value(
-            crate::workflow::submit_authoring_candidate(&self.options, &agent_id, &id, &version)?,
+            crate::workflow::submit_authoring_candidate_with_scope(
+                &self.options,
+                &agent_id,
+                &id,
+                &version,
+                scope.as_ref(),
+            )?,
         )?)
     }
 
@@ -8163,6 +8190,25 @@ fn delete_target_stats(target: &Path, is_directory: bool) -> Result<(usize, u64)
         }
     }
     Ok((items, bytes))
+}
+
+fn workbench_submission_schema() -> Value {
+    let mut schema = authoring_identity_schema();
+    schema["properties"]["scope"] = json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "review_department_id": {"type": "string"},
+            "audience": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "mode": {"type": "string", "enum": ["organization", "restricted"]},
+                    "user_ids": {"type": "array", "maxItems": 500, "items": {"type": "string"}},
+                    "department_ids": {"type": "array", "maxItems": 500, "items": {"type": "string"}}
+                }, "required": ["mode"]
+            }
+        }, "required": ["audience"]
+    });
+    schema
 }
 
 fn authoring_identity_schema() -> Value {

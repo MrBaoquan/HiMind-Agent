@@ -1,4 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import type { WorkbenchSubmissionContext, WorkbenchSubmissionScope } from '../services/extensionSubmission';
+import { WorkbenchAudienceDialog } from '../components/WorkbenchAudienceDialog';
+import { createOrganizationDirectoryAdapter, type OrganizationPage } from '../services/organizationDirectory';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Blocks, CheckCircle2, ChevronDown, CircleAlert, Clock3, Copy, FileText, FolderOpen, FolderPlus, GitBranch, Hammer, Inbox, MessageCircle, MoreHorizontal, Plus, RefreshCw, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BusyIndicator } from '../components/BusyIndicator';
@@ -132,7 +135,7 @@ type DevelopmentPageProps = {
   /// 「用 AI 开发」：把某个扩展工作区交给 HiMind AI，直接开一条绑定该目录的会话。
   /// 与来源管理里的「设为当前工作区并打开扩展开发」是两件事，故不与 onDevelopWorkspace 同名。
   onDevelopWorkspaceWithAi: (root: string) => void;
-  onSubmit: (kind: ExtensionProjectKind, extensionId: string, version: string) => Promise<void>;
+  onSubmit: (kind: ExtensionProjectKind, extensionId: string, version: string, scope?: WorkbenchSubmissionScope) => Promise<void>;
   /** 项目规则的收敛动作：把已确认的规则版本发布到本机规则库。 */
   onPublishInstruction: (extensionId: string, version: string) => Promise<void>;
   onOpenFolder: (path: string) => void;
@@ -145,7 +148,8 @@ type DevelopmentPageProps = {
   /** 设置项目级分发目标；传 null 表示继承分发单元默认。 */
   onSetDistributionTargets: (kind: ExtensionProjectKind, extensionId: string, targets: DistributionTarget[] | null) => Promise<void>;
   /** 按生效目标发布（先 GitHub 后工作台）。 */
-  onPublishDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string) => Promise<void>;
+  onAudienceUpdated: () => Promise<void>;
+  onPublishDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string, scope?: WorkbenchSubmissionScope) => Promise<void>;
   onLoadCollaboration: (productKey: string) => Promise<ExtensionCollaboration>;
   onSearchCollaborators: (productKey: string, query: string) => Promise<ExtensionCollaboratorOption[]>;
   onInviteCollaborator: (productKey: string, userId: string) => Promise<unknown>;
@@ -153,7 +157,19 @@ type DevelopmentPageProps = {
   onRespondInvitation: (invitationId: string, action: 'accept' | 'decline') => Promise<void>;
 };
 
+const organizationDirectory = createOrganizationDirectoryAdapter(params => agentApi.workbenchSubmissionRequest<OrganizationPage & { protocol: string; namespace: string }>('directory', params), 'connected-organization');
+
+type AudienceRequest = { kind: ExtensionProjectKind; id: string; version: string; name: string; action: 'submit' | 'publish' | 'update' | 'change'; github?: boolean; submissionId?: string };
+
 export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
+  const [audienceRequest, setAudienceRequest] = useState<AudienceRequest>();
+  const loadSubmissionContext = useCallback(() => {
+    if (!audienceRequest) throw new Error('缺少提审信息');
+    const params: [string, string][] = [['product_key', audienceRequest.id]];
+    if (audienceRequest.submissionId && audienceRequest.action !== 'change') params.push(['review_id', audienceRequest.submissionId]);
+    return agentApi.workbenchSubmissionRequest<WorkbenchSubmissionContext>('context', params);
+  }, [audienceRequest]);
+
   const confirm = useConfirm();
   const [query, setQuery] = useState('');
   const [kindFilter, setKindFilter] = useState<'all' | ExtensionProjectKind>('all');
@@ -523,11 +539,25 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           </aside>
           <main className="development-project-detail">
             <button className="workspace-back development-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回扩展列表</button>
-            {selected ? <ProjectDetail key={selected.key} project={selected} activation={activationForProject(selected, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onPublishInstruction={props.onPublishInstruction} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onSetDistributionTargets={props.onSetDistributionTargets} onPublishDistribution={props.onPublishDistribution} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个扩展" text={props.dashboardEnabled ? '查看本地项目、构建和发布进度。' : '查看本地项目、构建和版本。'} />}
+            {selected ? <ProjectDetail key={selected.key} project={selected} activation={activationForProject(selected, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={async (kind, id, version) => {
+              if (kind === 'expert' || kind === 'instruction') return props.onSubmit(kind, id, version);
+              setAudienceRequest({ kind, id, version, name: selected.name, action: 'submit' });
+            }} onEditAudience={(submissionId, version) => setAudienceRequest({ kind: selected.kind, id: selected.extensionId, version, name: selected.name, action: selected.submissions.some(item => item.value.id === submissionId && item.value.release_status === 'published') ? 'change' : 'update', submissionId })} onPublishInstruction={props.onPublishInstruction} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onSetDistributionTargets={props.onSetDistributionTargets} onPublishDistribution={async (kind, id, version) => {
+              const targets = selected.local?.distribution_targets || [];
+              if (!targets.includes('workbench') || kind === 'expert' || kind === 'instruction') return props.onPublishDistribution(kind, id, version);
+              setAudienceRequest({ kind, id, version, name: selected.name, action: 'publish', github: targets.includes('github') });
+            }} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个扩展" text={props.dashboardEnabled ? '查看本地项目、构建和发布进度。' : '查看本地项目、构建和版本。'} />}
           </main>
         </section>}
       </div>
     </div>}
+    {audienceRequest ? <WorkbenchAudienceDialog name={audienceRequest.name} version={audienceRequest.version} github={audienceRequest.github} update={audienceRequest.action === 'update' || audienceRequest.action === 'change'} published={audienceRequest.action === 'change'} directory={organizationDirectory} load={loadSubmissionContext} onClose={() => setAudienceRequest(undefined)} onConfirm={async (scope, revision) => {
+      const { kind, id, version, action, submissionId } = audienceRequest;
+      if (action === 'publish') return props.onPublishDistribution(kind, id, version, scope);
+      if (action === 'submit') return props.onSubmit(kind, id, version, scope);
+      await agentApi.workbenchSubmissionRequest(action === 'change' ? 'change' : 'update', [], { audience: scope.audience, revision, department_id: scope.review_department_id }, action === 'change' ? id : submissionId);
+      await props.onAudienceUpdated();
+    }} /> : null}
     {createOpen ? <CreateProjectDialog busy={busy} workspaces={workspaceChoices} defaultWorkspace={workspaceChoices[0]?.root || ''} onClose={() => setCreateOpen(false)} onCreate={async (input, parentDir) => { try { const project = await props.onCreate(input, parentDir); const remembered = normalizeFsPath(parentDir); setPreferredWorkspace(remembered); try { localStorage.setItem(WORKSPACE_MEMORY_KEY, remembered); } catch { /* 记不住就每次重选，不影响创建。 */ } setSelectedWorkspace(remembered); setQuery(''); setKindFilter('all'); setSelectedKey(`${project.kind}:${project.extension_id}`); setDetailOpen(true); setCreateOpen(false); return project; } catch (error) { /* The parent keeps the dialog open and shows the error. */ throw error; } }} /> : null}
     {removeProject ? <ConfirmRemoveDialog project={removeProject} dashboardEnabled={props.dashboardEnabled} busy={busy} onClose={() => setRemoveProject(null)} onConfirm={async () => { await props.onRemove(removeProject.id); setRemoveProject(null); }} /> : null}
   </div>;
@@ -596,7 +626,7 @@ function ProjectListItem({ project, activation, dashboardEnabled, busyAction, se
   </button>;
 }
 
-function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorized, availablePlugins, busyAction, onOpenProject, onAssociateProject, onBuild, onDevelopWithAi, onSubmit, onPublishInstruction, onOpenFolder, onRequestRemove, onUpdateSource, onSetDistributionTargets, onPublishDistribution, onLoadCollaboration, onSearchCollaborators, onInviteCollaborator, onRemoveCollaborator }: {
+function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorized, availablePlugins, busyAction, onOpenProject, onAssociateProject, onBuild, onDevelopWithAi, onSubmit, onEditAudience, onPublishInstruction, onOpenFolder, onRequestRemove, onUpdateSource, onSetDistributionTargets, onPublishDistribution, onLoadCollaboration, onSearchCollaborators, onInviteCollaborator, onRemoveCollaborator }: {
   project: ProjectModel;
   activation?: ExtensionActivationReceipt;
   dashboardEnabled: boolean;
@@ -608,6 +638,7 @@ function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorize
   onBuild: DevelopmentPageProps['onBuild'];
   onDevelopWithAi: DevelopmentPageProps['onDevelopWithAi'];
   onSubmit: DevelopmentPageProps['onSubmit'];
+  onEditAudience: (submissionId: string, version: string) => void;
   onPublishInstruction: DevelopmentPageProps['onPublishInstruction'];
   onOpenFolder: (path: string) => void;
   onRequestRemove: (project: ExtensionProject) => void;
@@ -660,7 +691,7 @@ function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorize
         {project.local?.workspace_available ? <section className="development-section"><h4>最近构建</h4>{draft ? <BuildSummary project={project} activation={activation} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onPublishInstruction={onPublishInstruction} /> : <div className="development-empty-line"><span>尚未构建</span></div>}</section> : null}
         <section className="development-section"><h4>依赖</h4>{dependencies.length ? <div className="development-dependency-list">{dependencies.map(item => <div key={item.id}><strong>{item.name}</strong><small>{item.required ? '必需' : '可选'}{item.version ? ` · ${item.version}` : ''}</small></div>)}</div> : <p className="muted">无依赖</p>}</section>
       </> : null}
-      {tab === 'release' ? <ReleasePanel project={project} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onPublish={onPublishDistribution} /> : null}
+      {tab === 'release' ? <ReleasePanel project={project} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onEditAudience={onEditAudience} onPublish={onPublishDistribution} /> : null}
       {tab === 'collaboration' && dashboardEnabled ? <CollaborationPanel project={project} accountAuthorized={accountAuthorized} busyAction={busyAction} onLoad={onLoadCollaboration} onSearch={onSearchCollaborators} onInvite={onInviteCollaborator} onRemove={onRemoveCollaborator} /> : null}
       {tab === 'settings' ? <SettingsPanel project={project} dashboardEnabled={dashboardEnabled} busy={busy} onOpenFolder={onOpenFolder} onRequestRemove={onRequestRemove} onUpdateSource={onUpdateSource} onSetDistributionTargets={onSetDistributionTargets} /> : null}
     </div>
@@ -802,7 +833,7 @@ function ActivationFactStrip({ confirmed, activation, published = false, submitt
   </div>;
 }
 
-function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit, onPublish }: { project: ProjectModel; dashboardEnabled: boolean; draft?: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit']; onPublish: DevelopmentPageProps['onPublishDistribution'] }) {
+function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit, onEditAudience, onPublish }: { project: ProjectModel; dashboardEnabled: boolean; draft?: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit']; onEditAudience: (id: string, version: string) => void; onPublish: DevelopmentPageProps['onPublishDistribution'] }) {
   // 项目规则没有仓库与工作台分发端点，收敛动作在本机规则库，这里只说明去向。
   if (project.kind === 'instruction') {
     return <div className="development-notice"><FileText size={16} /><div><strong>项目规则在本机发布</strong><span>在本机规则库发布后，可在「AI 对话 → 项目规则」选择并同步到客户端。</span></div></div>;
@@ -825,6 +856,7 @@ function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit
     <DistributionTargetSummary project={project} />
     <DistributionReleasePanel project={project} draft={draft} busy={busy} onPublish={onPublish} />
     {active ? <ActiveReview submission={active} draft={activeDraft} /> : null}
+    {active?.value.id && (active.value.status === 'submitted' || active.value.status === 'changes_requested' || active.value.status === 'approved' || active.value.release_status === 'published') ? <button type="button" className="btn" disabled={busy} onClick={() => onEditAudience(active.value.id!, active.value.version)}>修改可见范围</button> : null}
     {draft && !currentPublished && !submittedBuild ? <section className="development-release-callout"><div><strong>{canSubmit && sourceReady ? (active ? '有新的测试制品' : '测试制品已就绪') : '测试制品待处理'}</strong><span>{project.kind === 'workflow' ? '工作流检查已完成，提交后进入工作台审核。' : !sourceReady ? '未能读取代码版本，请确认项目位于 Git 仓库中。' : canSubmit ? (active ? '提交后将替代当前等待审核的制品。' : '提交最近一次测试制品进入工作台审核。') : '当前账号不能提交审核。'}</span></div>{canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, project.extensionId, draftVersion(draft))}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : null}</section> : null}
     {!active && !draft ? <div className="development-notice"><CircleAlert size={16} /><div><strong>尚未构建</strong><span>{dashboardEnabled ? '完成构建后即可提交审核。' : '完成构建后即可测试，并通过来源或安装包分发。'}</span></div></div> : null}
     <section className="development-section"><h4>版本历史</h4><div className="development-version-list">{versions.map(version => <article key={version.version}><div><strong>v{version.version}</strong><Pill kind={version.state.tone}>{version.state.label}</Pill></div><small>{version.updatedAt ? formatStamp(version.updatedAt) : '测试制品'}</small>{version.notes ? <p>{version.notes}</p> : null}</article>)}</div></section>
@@ -1235,6 +1267,7 @@ function distributionStateLabel(entry: DistributionStateEntry) {
       ? `${target}已发布${when}${entry.tag ? ` · ${entry.tag}` : ''}`
       : `${target}已提交${when}${entry.submission_id ? ` · ${entry.submission_id}` : ''}`;
   }
+  if (entry.status === 'submitted') return `${target}审核中${entry.submission_id ? ` · ${entry.submission_id}` : ''}`;
   if (entry.status === 'failed') return `${target}发布失败${when} · ${entry.error || '未知错误'}`;
   return `${target}发布中${when}`;
 }

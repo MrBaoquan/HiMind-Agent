@@ -2318,7 +2318,7 @@ fn run_extension_cli(options: &Options, arguments: &[String]) -> Result<(), Box<
             let value = draft_confirm_value(kind, id, version)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
-        [group, action, kind, id, version] | [group, action, kind, id, version, _]
+        [group, action, kind, id, version, flags @ ..]
             if group == "draft" && action == "submit" =>
         {
             if !arguments.iter().any(|value| value == "--yes")
@@ -2329,28 +2329,47 @@ fn run_extension_cli(options: &Options, arguments: &[String]) -> Result<(), Box<
                         .into(),
                 );
             }
+            let mut scope = None;
+            let mut remaining = flags.iter();
+            while let Some(flag) = remaining.next() {
+                match flag.as_str() {
+                    "--yes" => {}
+                    "--scope" if scope.is_none() => {
+                        let raw = remaining.next().ok_or("--scope 需要提审范围 JSON")?;
+                        scope = Some(serde_json::from_str::<
+                            api::distribution::WorkbenchSubmissionScope,
+                        >(raw)?);
+                    }
+                    _ => return Err(format!("未知或重复的提审参数：{flag}").into()),
+                }
+            }
             let state = api::client::load_agent_state(&options.state_path)
                 .map_err(|error| format!("读取 HiMind 账号授权状态失败：{error}"))?;
             options.set_agent_credential(&state.credential);
             let value = match kind.as_str() {
-                "plugin" => serde_json::to_value(crate::plugin_authoring::submit(
+                "plugin" => serde_json::to_value(crate::plugin_authoring::submit_with_scope(
                     options,
                     &state.agent_id,
                     id,
                     version,
+                    scope.as_ref(),
                 )?)?,
-                "skill" => serde_json::to_value(crate::skill::authoring::submit(
+                "skill" => serde_json::to_value(crate::skill::authoring::submit_with_scope(
                     options,
                     &state.agent_id,
                     id,
                     version,
+                    scope.as_ref(),
                 )?)?,
-                "workflow" => serde_json::to_value(crate::workflow::submit_authoring_candidate(
-                    options,
-                    &state.agent_id,
-                    id,
-                    version,
-                )?)?,
+                "workflow" => {
+                    serde_json::to_value(crate::workflow::submit_authoring_candidate_with_scope(
+                        options,
+                        &state.agent_id,
+                        id,
+                        version,
+                        scope.as_ref(),
+                    )?)?
+                }
                 _ => return Err("扩展类型必须是 plugin、skill 或 workflow".into()),
             };
             println!("{}", serde_json::to_string_pretty(&value)?);

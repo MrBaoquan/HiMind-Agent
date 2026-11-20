@@ -705,6 +705,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_github_authorization_page,
             super::commands::preview_extension_distribution,
             super::commands::publish_extension_distribution,
+            super::commands::workbench_submission_request,
             super::commands::get_extension_distribution_state,
             super::commands::prepare_extension_authoring,
             super::commands::remove_extension_project,

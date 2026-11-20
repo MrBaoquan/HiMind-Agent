@@ -189,7 +189,7 @@ pub(crate) fn activate_expert_draft(
 }
 
 #[tauri::command]
-pub(crate) fn submit_expert_draft(
+pub(crate) async fn submit_expert_draft(
     expert_id: String,
     version: String,
     state: State<'_, AgentState>,
@@ -200,8 +200,13 @@ pub(crate) fn submit_expert_draft(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::expert_authoring::submit(&state.options, &agent_id, &expert_id, &version)
-        .map_err(|error| error.to_string())
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::expert_authoring::submit(&options, &agent_id, &expert_id, &version)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -5012,10 +5017,11 @@ pub(crate) fn preview_extension_distribution(
 
 /// 按生效目标发布。与 CLI 共用同一编排，失败也会写入分发台账。
 #[tauri::command]
-pub(crate) fn publish_extension_distribution(
+pub(crate) async fn publish_extension_distribution(
     kind: String,
     extension_id: String,
     version: String,
+    scope: Option<crate::api::distribution::WorkbenchSubmissionScope>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
     let kind = crate::extension_projects::ExtensionProjectKind::parse(&kind)
@@ -5025,14 +5031,20 @@ pub(crate) fn publish_extension_distribution(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::app::distribution_publish::publish(
-        &state.options,
-        &agent_id,
-        kind,
-        &extension_id,
-        &version,
-    )
-    .map_err(|error| error.to_string())
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::distribution_publish::publish_with_scope(
+            &options,
+            &agent_id,
+            kind,
+            &extension_id,
+            &version,
+            scope.as_ref(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -5416,9 +5428,10 @@ pub(crate) fn confirm_workflow_draft(
 }
 
 #[tauri::command]
-pub(crate) fn submit_workflow_draft(
+pub(crate) async fn submit_workflow_draft(
     workflow_id: String,
     version: String,
+    scope: Option<crate::api::distribution::WorkbenchSubmissionScope>,
     state: State<'_, AgentState>,
 ) -> Result<crate::workflow::WorkflowDraft, String> {
     require_dashboard(&state)?;
@@ -5430,8 +5443,19 @@ pub(crate) fn submit_workflow_draft(
     if agent_id.is_empty() {
         return Err("HiMind 账号尚未授权".to_string());
     }
-    crate::workflow::submit_authoring_candidate(&state.options, &agent_id, &workflow_id, &version)
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::workflow::submit_authoring_candidate_with_scope(
+            &options,
+            &agent_id,
+            &workflow_id,
+            &version,
+            scope.as_ref(),
+        )
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -5495,29 +5519,41 @@ pub(crate) fn list_plugin_submissions(
 }
 
 #[tauri::command]
-pub(crate) fn submit_plugin_draft(
+pub(crate) async fn submit_plugin_draft(
     plugin_id: String,
     version: String,
+    scope: Option<crate::api::distribution::WorkbenchSubmissionScope>,
     state: State<'_, AgentState>,
 ) -> Result<crate::plugin_authoring::PluginDraft, String> {
     require_dashboard(&state)?;
-    let draft =
-        crate::plugin_authoring::read(&plugin_id, &version).map_err(|error| error.to_string())?;
-    if !confirm_authoring_submission(
-        "插件",
-        &draft.manifest.name,
-        &version,
-        &draft.candidate_sha256,
-    ) {
-        return Err("用户取消了插件提审".to_string());
-    }
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::plugin_authoring::submit(&state.options, &agent_id, &plugin_id, &version)
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let draft = crate::plugin_authoring::read(&plugin_id, &version)
+            .map_err(|error| error.to_string())?;
+        if !confirm_authoring_submission(
+            "插件",
+            &draft.manifest.name,
+            &version,
+            &draft.candidate_sha256,
+        ) {
+            return Err("用户取消了插件提审".to_string());
+        }
+        crate::plugin_authoring::submit_with_scope(
+            &options,
+            &agent_id,
+            &plugin_id,
+            &version,
+            scope.as_ref(),
+        )
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -5610,31 +5646,45 @@ pub(crate) fn activate_skill_draft(
 }
 
 #[tauri::command]
-pub(crate) fn submit_skill_draft(
+pub(crate) async fn submit_skill_draft(
     skill_id: String,
     version: String,
+    scope: Option<crate::api::distribution::WorkbenchSubmissionScope>,
     state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
     require_dashboard(&state)?;
-    let draft =
-        crate::skill::authoring::read(&skill_id, &version).map_err(|error| error.to_string())?;
-    if !confirm_authoring_submission(
-        "Skill",
-        &draft.manifest.name,
-        &version,
-        &draft.candidate_sha256,
-    ) {
-        return Err("用户取消了 Skill 提审".to_string());
-    }
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::skill::authoring::submit(&state.options, &agent_id, &skill_id, &version)
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let draft = crate::skill::authoring::read(&skill_id, &version)
+            .map_err(|error| error.to_string())?;
+        if !confirm_authoring_submission(
+            "Skill",
+            &draft.manifest.name,
+            &version,
+            &draft.candidate_sha256,
+        ) {
+            return Err("用户取消了 Skill 提审".to_string());
+        }
+        crate::skill::authoring::submit_with_scope(
+            &options,
+            &agent_id,
+            &skill_id,
+            &version,
+            scope.as_ref(),
+        )
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
+// Call on a blocking worker. On Windows the native dialog runs a modal message
+// loop and opening it in a synchronous Tauri command stalls main-window IPC.
 fn confirm_authoring_submission(kind: &str, name: &str, version: &str, sha256: &str) -> bool {
     matches!(
         rfd::MessageDialog::new()
@@ -10221,4 +10271,34 @@ mod tests {
         missing.remove("username");
         assert!(validate_credential_fields(&request, &missing, &secret, &existing).is_err());
     }
+}
+
+#[tauri::command]
+pub(crate) async fn workbench_submission_request(
+    operation: String,
+    params: Vec<(String, String)>,
+    payload: Option<serde_json::Value>,
+    submission_id: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    require_dashboard(&state)?;
+    let options = state.options.clone();
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::api::distribution::workbench_submission_request(
+            &options,
+            &agent_id,
+            &operation,
+            &params,
+            payload.as_ref(),
+            submission_id.as_deref(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }

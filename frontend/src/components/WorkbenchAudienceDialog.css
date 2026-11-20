@@ -1,0 +1,20 @@
+.workbench-audience-dialog { width: min(30rem, calc(100vw - var(--space-6))); max-height: calc(100dvh - var(--space-6)); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: auto; }
+.workbench-audience-dialog.is-expanded { width: min(46rem, calc(100vw - var(--space-6))); }
+.workbench-audience-dialog form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; max-height: calc(100dvh - var(--space-6)); }
+.workbench-audience-dialog header, .workbench-audience-dialog footer { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-4) var(--space-5); }
+.workbench-audience-dialog header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+.workbench-audience-dialog header h2 { margin: 0; font-size: 1rem; }
+.workbench-audience-dialog header p { margin: var(--space-1) 0 0; color: var(--text-muted); overflow-wrap: anywhere; }
+.workbench-audience-content { display: grid; gap: var(--space-3); overflow: auto; padding: var(--space-4) var(--space-5); }
+.workbench-audience-dialog footer { border-top: 1px solid var(--border); }
+.workbench-audience-dialog footer span { margin-right: auto; min-width: 0; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; color: var(--text-muted); }
+.workbench-audience-dialog footer button { flex: none; }
+.workbench-audience-scope { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.workbench-audience-icon { display: grid; place-items: center; padding: var(--space-2); background: var(--surface-muted); border-radius: var(--radius-md); }
+.workbench-audience-scope small, .workbench-audience-scope strong { display: block; }
+.workbench-audience-scope small, .organization-picker small, .workbench-github-note { color: var(--text-muted); }
+.workbench-audience-modes { display: flex; flex-wrap: wrap; gap: var(--space-3); padding: var(--space-2); margin: 0; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.workbench-audience-modes label, .workbench-review-department { display: flex; align-items: center; gap: var(--space-2); }
+@media (max-width: 560px) {
+  .workbench-audience-dialog header, .workbench-audience-dialog footer, .workbench-audience-content { padding-inline: var(--space-3); }
+}

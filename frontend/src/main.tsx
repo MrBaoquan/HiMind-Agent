@@ -1618,7 +1618,7 @@ function AgentApp() {
     }
   }
 
-  async function runDevelopmentOperation(key: string, action: () => Promise<void>, success: string, fallback: string) {
+  async function runDevelopmentOperation(key: string, action: () => Promise<void>, success: string, fallback: string, propagateError = false) {
     if (developmentOperation) return;
     setDevelopmentOperation(key);
     try {
@@ -1626,6 +1626,7 @@ function AgentApp() {
       notify('success', success);
     } catch (error) {
       notify('error', formatError(error, fallback));
+      if (propagateError) throw error;
     } finally {
       setDevelopmentOperation(null);
     }
@@ -2821,7 +2822,8 @@ function AgentApp() {
       }}
       onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
       onDevelopWorkspaceWithAi={(root: string) => { void openExtensionWorkspaceAi(root); }}
-       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version); else if (kind === 'workflow') await agentApi.submitWorkflowDraft(extensionId, version); else if (kind === 'expert') await agentApi.submitExpertDraft(extensionId, version); else throw new Error('项目规则请发布到本机规则库'); await refreshDevelopment(); }, '已提交审核', '提交审核失败')}
+       onSubmit={(kind, extensionId, version, scope) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version, scope); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version, scope); else if (kind === 'workflow') await agentApi.submitWorkflowDraft(extensionId, version, scope); else if (kind === 'expert') await agentApi.submitExpertDraft(extensionId, version); else throw new Error('项目规则请发布到本机规则库'); await refreshDevelopment(); }, '已提交审核', '提交审核失败', !!scope)}
+      onAudienceUpdated={refreshDevelopment}
       onPublishInstruction={(extensionId: string, version: string) => runDevelopmentOperation(`publish-instruction:${extensionId}`, async () => { await agentApi.publishInstructionPackLocally(extensionId, version); await Promise.all([refreshDevelopment(), refreshPlugins()]); }, '已发布到本机规则库', '发布项目规则失败')}
       onOpenFolder={(path) => run(() => agentApi.openFolder(path), '项目目录已打开', '打开项目目录失败')}
       onAddWorkspace={addExtensionWorkspace}
@@ -2829,14 +2831,14 @@ function AgentApp() {
        onRemove={(projectId) => runDevelopmentOperation(`remove:${projectId}`, async () => { await agentApi.removeExtensionProject(projectId); await refreshDevelopment(); }, '项目已移除', '移除项目失败')}
       onUpdateSource={(projectId: string, input: ExtensionProjectSourceInput, syncRemote: boolean) => runDevelopmentOperation(`source:${projectId}`, async () => { await agentApi.updateExtensionProjectSource(projectId, input, syncRemote); await refreshDevelopment(); }, '代码仓库已保存', '保存代码仓库失败')}
       onSetDistributionTargets={(kind, extensionId, targets) => runDevelopmentOperation(`target:${kind}:${extensionId}`, async () => { await agentApi.setExtensionProjectDistributionTargets(kind, extensionId, targets); await refreshDevelopment(); }, targets ? '分发目标已更新' : '已恢复继承分发单元默认', '保存分发目标失败')}
-      onPublishDistribution={(kind, extensionId, version) => runDevelopmentOperation(`publish:${kind}:${extensionId}`, async () => {
-        const report = await agentApi.publishExtensionDistribution(kind, extensionId, version);
+      onPublishDistribution={(kind, extensionId, version, scope) => runDevelopmentOperation(`publish:${kind}:${extensionId}`, async () => {
+        const report = await agentApi.publishExtensionDistribution(kind, extensionId, version, scope);
         await refreshDevelopment();
         const failed = report.outcomes.filter(outcome => outcome.status === 'failed');
         if (failed.length) {
           throw new Error(failed.map(outcome => `${outcome.target}: ${outcome.error || '发布失败'}`).join('；'));
         }
-      }, '发布完成', '发布失败')}
+      }, scope ? '已提交工作台审核' : '发布完成', '发布失败', !!scope)}
       onLoadCollaboration={agentApi.extensionCollaboration}
       onSearchCollaborators={agentApi.extensionCollaboratorOptions}
       onInviteCollaborator={agentApi.inviteExtensionCollaborator}

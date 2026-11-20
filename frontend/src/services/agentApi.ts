@@ -1,3 +1,4 @@
+import type { WorkbenchSubmissionScope } from "./extensionSubmission";
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type { CatalogView } from '../pages/mcpCatalogView';
 
@@ -4247,8 +4248,10 @@ export const agentApi = {
     /** 分发预览：无副作用，用于 UI 说明这次会发到哪里。 */
     previewExtensionDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string) =>
       invoke<DistributionPreview>('preview_extension_distribution', { kind, extensionId, version }),
-    publishExtensionDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string) =>
-      invoke<DistributionPublishReport>('publish_extension_distribution', { kind, extensionId, version }),
+    publishExtensionDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string, scope?: WorkbenchSubmissionScope) =>
+      invoke<DistributionPublishReport>('publish_extension_distribution', { kind, extensionId, version, scope }),
+    workbenchSubmissionRequest: <T,>(operation: 'context' | 'directory' | 'update' | 'change', params: [string, string][] = [], payload?: unknown, submissionId?: string) =>
+      invoke<T>('workbench_submission_request', { operation, params, payload, submissionId }),
     extensionDistributionState: (kind?: ExtensionProjectKind, extensionId?: string) =>
       invoke<DistributionStateEntry[]>('get_extension_distribution_state', { kind, extensionId }),
     githubDistributionAccount: () => invoke<GithubAccountStatus>('get_github_distribution_account'),
@@ -4284,9 +4287,9 @@ export const agentApi = {
     workflowDrafts: () => invoke<AuthoringWorkflowDraft[]>('list_workflow_drafts'),
     testWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('test_workflow_draft', { workflowId, version }),
     confirmWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('confirm_workflow_draft', { workflowId, version }),
-    submitWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('submit_workflow_draft', { workflowId, version }),
+    submitWorkflowDraft: (workflowId: string, version: string, scope?: WorkbenchSubmissionScope) => invoke<AuthoringWorkflowDraft>('submit_workflow_draft', { workflowId, version, scope }),
     workflowSubmissions: () => invoke<{ items?: AuthoringWorkflowDraft[] }>('list_workflow_submissions'),
-    submitPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('submit_plugin_draft', { pluginId, version }),
+    submitPluginDraft: (pluginId: string, version: string, scope?: WorkbenchSubmissionScope) => invoke<AuthoringPluginDraft>('submit_plugin_draft', { pluginId, version, scope }),
     pluginVersions: (pluginId: string, source?: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId, source }),
     planPluginInstall: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version, source, artifactId, sha256 }),
     skillCatalog: () => invoke<SkillCatalogResponse>('get_skill_catalog'),
@@ -4308,7 +4311,7 @@ export const agentApi = {
     testSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillTestResult>('test_skill_draft', { skillId, version }),
     confirmSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('confirm_skill_draft', { skillId, version }),
     activateSkillDraft: (skillId: string, version: string) => invoke<SkillActivationResult>('activate_skill_draft', { skillId, version }),
-    submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
+    submitSkillDraft: (skillId: string, version: string, scope?: WorkbenchSubmissionScope) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version, scope }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
     readSkillDocument: (skillId: string) => invoke<SkillDocument>('read_skill_document', { skillId }),
     /** 客户端 × 作用域 × 能力矩阵：功能开关的唯一答案来源。 */

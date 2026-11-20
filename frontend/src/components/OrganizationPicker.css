@@ -1,0 +1,25 @@
+.organization-picker { display: grid; gap: var(--space-2); min-width: 0; }
+.organization-picker-search { display: flex; align-items: center; gap: var(--space-2); }
+.organization-picker-search input { flex: 1; min-width: 0; }
+.organization-picker-path, .organization-picker-path > span { display: flex; align-items: center; gap: var(--space-1); }
+.organization-picker-path { flex-wrap: wrap; min-width: 0; }
+.organization-picker-path button { padding: var(--space-1); color: var(--text); background: transparent; border: 0; cursor: pointer; overflow-wrap: anywhere; }
+.organization-picker-columns { display: flex; gap: var(--space-2); min-width: 0; }
+.organization-picker-columns section { flex: 1; min-width: 0; min-height: 7rem; max-height: 13rem; overflow: auto; padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.organization-picker-columns h3 { margin: 0 0 var(--space-1); color: var(--text-muted); font-size: 0.8rem; }
+.organization-picker ul { list-style: none; padding: 0; margin: 0; }
+.organization-picker-row { display: flex; gap: var(--space-1); align-items: center; border-radius: var(--radius-md); }
+.organization-picker-row:hover { background: var(--surface-muted); }
+.organization-picker-row label { flex: 1; min-width: 0; display: flex; gap: var(--space-2); align-items: center; padding: var(--space-1); cursor: pointer; }
+.organization-picker-row label > span { min-width: 0; }
+.organization-picker-row label > svg, .organization-picker-row label > input { flex: none; }
+.organization-picker-row strong, .organization-picker-row small { display: block; overflow-wrap: anywhere; }
+.organization-picker-row strong { font-weight: 500; }
+.organization-picker-selection ul { display: flex; flex-wrap: wrap; max-height: 6rem; overflow: auto; gap: var(--space-1); margin-top: var(--space-1); }
+.organization-picker-selection li { max-width: 100%; }
+.organization-picker-selection button { display: flex; align-items: center; gap: var(--space-1); max-width: 100%; overflow-wrap: anywhere; padding: var(--space-1) var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--text); background: var(--surface-muted); cursor: pointer; }
+.organization-picker-message { display: flex; align-items: center; gap: var(--space-2); overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .organization-picker-columns { flex-direction: column; }
+  .organization-picker-columns section { min-height: auto; max-height: 9rem; }
+}

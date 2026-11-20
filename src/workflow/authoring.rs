@@ -182,6 +182,16 @@ pub(crate) fn submit(
     package_id: &str,
     version: &str,
 ) -> Result<WorkflowDraft, Box<dyn Error>> {
+    submit_with_scope(options, agent_id, package_id, version, None)
+}
+
+pub(crate) fn submit_with_scope(
+    options: &crate::Options,
+    agent_id: &str,
+    package_id: &str,
+    version: &str,
+    scope: Option<&crate::api::distribution::WorkbenchSubmissionScope>,
+) -> Result<WorkflowDraft, Box<dyn Error>> {
     let draft = read(package_id, version)?;
     if draft.state != ExtensionCandidateState::Confirmed {
         return Err("Workflow Candidate 尚未确认".into());
@@ -222,6 +232,7 @@ pub(crate) fn submit(
         &draft.test_report,
         None,
         &source,
+        scope,
         "",
     )?;
     let dashboard_draft_id = submitted

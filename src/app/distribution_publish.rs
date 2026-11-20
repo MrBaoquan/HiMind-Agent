@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use crate::app::distribution_state::{
-    self, DistributionStateEntry, STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHED,
+    self, DistributionStateEntry, STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHED, STATUS_SUBMITTED,
 };
 use crate::app::extension_signing;
 use crate::app::github_publisher::{self, GithubArtifact, GithubPublishPlan};
@@ -454,36 +454,45 @@ pub(crate) fn publish(
     id: &str,
     version: &str,
 ) -> Result<Value, Box<dyn Error>> {
+    publish_with_scope(options, agent_id, kind, id, version, None)
+}
+
+pub(crate) fn publish_with_scope(
+    options: &crate::Options,
+    agent_id: &str,
+    kind: ExtensionProjectKind,
+    id: &str,
+    version: &str,
+    scope: Option<&crate::api::distribution::WorkbenchSubmissionScope>,
+) -> Result<Value, Box<dyn Error>> {
     let targets = extension_projects::effective_distribution_targets(kind, id);
     let asset = resolve_asset(kind, id, version)?;
-    let mut outcomes = Vec::new();
-
-    // 顺序固定：GitHub 先发布，工作台提审才能带上可追溯的 tag 与摘要。
-    let ordered = [DistributionTarget::Github, DistributionTarget::Workbench];
-    for target in ordered {
-        if !targets.contains(&target) {
-            continue;
-        }
-        outcomes.push(match target {
-            DistributionTarget::Github => publish_github(&asset)?,
-            DistributionTarget::Workbench => publish_workbench(options, agent_id, &asset, kind)?,
-        });
-    }
+    let outcomes = run_distribution_targets(
+        &targets,
+        || {
+            let payload = serde_json::json!({"product_key": id, "scope": scope});
+            crate::api::distribution::workbench_submission_request(
+                options,
+                agent_id,
+                "preflight",
+                &[],
+                Some(&payload),
+                None,
+            )?;
+            Ok(())
+        },
+        |target| match target {
+            DistributionTarget::Github => publish_github(&asset),
+            DistributionTarget::Workbench => {
+                publish_workbench(options, agent_id, &asset, kind, scope)
+            }
+        },
+    )?;
 
     if outcomes.is_empty() {
         return Err("当前项目没有可用的分发目标".into());
     }
-    let published = outcomes
-        .iter()
-        .filter(|outcome| outcome.status == STATUS_PUBLISHED)
-        .count();
-    let status = if published == outcomes.len() {
-        "released"
-    } else if published == 0 {
-        STATUS_FAILED
-    } else {
-        "partially_published"
-    };
+    let status = distribution_batch_status(&outcomes);
     Ok(json!({
         "kind": asset.kind,
         "id": asset.id,
@@ -492,6 +501,45 @@ pub(crate) fn publish(
         "status": status,
         "outcomes": outcomes,
     }))
+}
+
+// Preflight every selected workbench destination before allowing any external publication.
+// Destination callbacks also make the no-network and partial-publication contracts testable.
+fn run_distribution_targets(
+    targets: &[DistributionTarget],
+    preflight: impl FnOnce() -> Result<(), Box<dyn Error>>,
+    mut publish_target: impl FnMut(DistributionTarget) -> Result<TargetOutcome, Box<dyn Error>>,
+) -> Result<Vec<TargetOutcome>, Box<dyn Error>> {
+    if targets.contains(&DistributionTarget::Workbench) {
+        preflight()?;
+    }
+    let mut outcomes = Vec::new();
+    for target in [DistributionTarget::Github, DistributionTarget::Workbench] {
+        if targets.contains(&target) {
+            outcomes.push(publish_target(target)?);
+        }
+    }
+    Ok(outcomes)
+}
+
+fn distribution_batch_status(outcomes: &[TargetOutcome]) -> &'static str {
+    let succeeded = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome.status.as_str(), STATUS_PUBLISHED | STATUS_SUBMITTED))
+        .count();
+    if succeeded == outcomes.len()
+        && outcomes
+            .iter()
+            .any(|outcome| outcome.status == STATUS_SUBMITTED)
+    {
+        "awaiting_review"
+    } else if succeeded == outcomes.len() {
+        "released"
+    } else if succeeded == 0 {
+        STATUS_FAILED
+    } else {
+        "partially_published"
+    }
 }
 
 fn publish_github(asset: &DistributionAsset) -> Result<TargetOutcome, Box<dyn Error>> {
@@ -688,25 +736,35 @@ fn publish_workbench(
     agent_id: &str,
     asset: &DistributionAsset,
     kind: ExtensionProjectKind,
+    scope: Option<&crate::api::distribution::WorkbenchSubmissionScope>,
 ) -> Result<TargetOutcome, Box<dyn Error>> {
     let target = DistributionTarget::Workbench;
     let previous = distribution_state::load()?
         .get(&asset.kind, &asset.id, &asset.version, target)
         .cloned();
     let result = match kind {
-        ExtensionProjectKind::Plugin => {
-            crate::plugin_authoring::submit(options, agent_id, &asset.id, &asset.version)
-                .map(|draft| draft.dashboard_submission_id.unwrap_or_default())
-        }
-        ExtensionProjectKind::Skill => {
-            crate::skill::authoring::submit(options, agent_id, &asset.id, &asset.version)
-                .map(|draft| draft.dashboard_draft_id.unwrap_or_default())
-        }
-        ExtensionProjectKind::Workflow => crate::workflow::submit_authoring_candidate(
+        ExtensionProjectKind::Plugin => crate::plugin_authoring::submit_with_scope(
             options,
             agent_id,
             &asset.id,
             &asset.version,
+            scope,
+        )
+        .map(|draft| draft.dashboard_submission_id.unwrap_or_default()),
+        ExtensionProjectKind::Skill => crate::skill::authoring::submit_with_scope(
+            options,
+            agent_id,
+            &asset.id,
+            &asset.version,
+            scope,
+        )
+        .map(|draft| draft.dashboard_draft_id.unwrap_or_default()),
+        ExtensionProjectKind::Workflow => crate::workflow::submit_authoring_candidate_with_scope(
+            options,
+            agent_id,
+            &asset.id,
+            &asset.version,
+            scope,
         )
         .map(|draft| draft.dashboard_submission_id.unwrap_or_default()),
         ExtensionProjectKind::Expert => Err("专家扩展暂未接入工作台发布端点".into()),
@@ -718,14 +776,14 @@ fn publish_workbench(
         Ok(submission_id) => {
             distribution_state::record(DistributionStateEntry {
                 submission_id,
-                status: STATUS_PUBLISHED.to_string(),
-                published_at: now_stamp(),
+                status: STATUS_SUBMITTED.to_string(),
+                published_at: String::new(),
                 error: String::new(),
                 ..entry_shell(asset, target, previous.as_ref())
             })?;
             Ok(TargetOutcome {
                 target: target.as_str().to_string(),
-                status: STATUS_PUBLISHED.to_string(),
+                status: STATUS_SUBMITTED.to_string(),
                 detail: None,
                 error: String::new(),
             })
@@ -878,6 +936,96 @@ fn now_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_only_never_requires_workbench_context() {
+        let outcome = |target: DistributionTarget| {
+            Ok(TargetOutcome {
+                target: target.as_str().into(),
+                status: STATUS_PUBLISHED.into(),
+                detail: None,
+                error: String::new(),
+            })
+        };
+        let result = run_distribution_targets(
+            &[DistributionTarget::Github],
+            || panic!("GitHub publication requested organization context"),
+            outcome,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].target, "github");
+    }
+
+    #[test]
+    fn failing_workbench_preflight_prevents_github_side_effects() {
+        let result = run_distribution_targets(
+            &[DistributionTarget::Github, DistributionTarget::Workbench],
+            || Err("invalid audience".into()),
+            |_| panic!("publication ran before audience validation"),
+        );
+        assert!(result.unwrap_err().to_string().contains("invalid audience"));
+    }
+
+    #[test]
+    fn dual_destination_runs_preflight_then_github_then_submission() {
+        let visits = std::cell::RefCell::new(Vec::new());
+        let result = run_distribution_targets(
+            &[DistributionTarget::Workbench, DistributionTarget::Github],
+            || {
+                visits.borrow_mut().push("preflight");
+                Ok(())
+            },
+            |target| {
+                visits.borrow_mut().push(target.as_str());
+                Ok(TargetOutcome {
+                    target: target.as_str().into(),
+                    status: if target == DistributionTarget::Workbench {
+                        STATUS_SUBMITTED.into()
+                    } else {
+                        STATUS_PUBLISHED.into()
+                    },
+                    detail: None,
+                    error: String::new(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(*visits.borrow(), vec!["preflight", "github", "workbench"]);
+        assert_eq!(distribution_batch_status(&result), "awaiting_review");
+    }
+
+    #[test]
+    fn submitted_workbench_is_not_reported_as_published() {
+        let outcome = |target: &str, status: &str| TargetOutcome {
+            target: target.into(),
+            status: status.into(),
+            detail: None,
+            error: String::new(),
+        };
+        assert_eq!(
+            distribution_batch_status(&[outcome("github", STATUS_PUBLISHED)]),
+            "released"
+        );
+        assert_eq!(
+            distribution_batch_status(&[outcome("workbench", STATUS_SUBMITTED)]),
+            "awaiting_review"
+        );
+        assert_eq!(
+            distribution_batch_status(&[
+                outcome("github", STATUS_PUBLISHED),
+                outcome("workbench", STATUS_SUBMITTED)
+            ]),
+            "awaiting_review"
+        );
+        assert_eq!(
+            distribution_batch_status(&[
+                outcome("github", STATUS_PUBLISHED),
+                outcome("workbench", STATUS_FAILED)
+            ]),
+            "partially_published"
+        );
+    }
 
     #[test]
     fn hex_sha256_matches_known_vector() {

@@ -1127,6 +1127,28 @@ pub fn report_extension_reconcile(
     Ok(())
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct WorkbenchSubmissionScope {
+    pub audience: serde_json::Value,
+    #[serde(default)]
+    pub review_department_id: String,
+}
+
+fn attach_workbench_scope(
+    form: Form,
+    scope: Option<&WorkbenchSubmissionScope>,
+) -> Result<Form, Box<dyn Error>> {
+    match scope {
+        Some(scope) => Ok(form
+            .text(
+                "workbench_audience",
+                serde_json::to_string(&scope.audience)?,
+            )
+            .text("review_department_id", scope.review_department_id.clone())),
+        None => Ok(form.text("workbench_audience_default", "1")),
+    }
+}
+
 pub fn submit_skill(
     client: &Client,
     api_base: &str,
@@ -1136,6 +1158,7 @@ pub fn submit_skill(
     test_report: &serde_json::Value,
     revision_of_version: Option<&str>,
     source: &crate::extension_projects::ExtensionSubmissionSource,
+    scope: Option<&WorkbenchSubmissionScope>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let file_name = package_path
         .file_name()
@@ -1171,6 +1194,7 @@ pub fn submit_skill(
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
+    let form = attach_workbench_scope(form, scope)?;
     let response = client
         .post(format!("{api_base}/api/agent/skills/submissions"))
         .bearer_auth(access_token)
@@ -1191,6 +1215,7 @@ pub fn submit_workflow(
     test_report: &serde_json::Value,
     revision_of_version: Option<&str>,
     source: &crate::extension_projects::ExtensionSubmissionSource,
+    scope: Option<&WorkbenchSubmissionScope>,
     release_notes: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let file_name = package_path
@@ -1230,6 +1255,7 @@ pub fn submit_workflow(
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
+    let form = attach_workbench_scope(form, scope)?;
     let response = client
         .post(format!("{api_base}/api/agent/workflows/submissions"))
         .bearer_auth(access_token)
@@ -1282,6 +1308,7 @@ pub fn submit_plugin(
     test_report: &serde_json::Value,
     revision_of_version: Option<&str>,
     source: &crate::extension_projects::ExtensionSubmissionSource,
+    scope: Option<&WorkbenchSubmissionScope>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let file_name = package_path
         .file_name()
@@ -1317,6 +1344,7 @@ pub fn submit_plugin(
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
+    let form = attach_workbench_scope(form, scope)?;
     let response = client
         .post(format!("{api_base}/api/agent/plugins/submissions"))
         .bearer_auth(access_token)
@@ -2414,4 +2442,68 @@ mod tests {
             "Dashboard product himind-agent has type desktop_app, expected desktop_agent"
         ));
     }
+}
+
+pub(crate) fn workbench_submission_request(
+    options: &crate::Options,
+    agent_id: &str,
+    operation: &str,
+    params: &[(String, String)],
+    payload: Option<&serde_json::Value>,
+    submission_id: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let access = crate::api::oauth::platform_access_token(
+        options,
+        crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
+    )?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let api_base = options.api_base();
+    let request = match operation {
+        "context" => client.get(format!("{api_base}/api/agent/workbench-submission-context")),
+        "directory" => client.get(format!("{api_base}/api/agent/organization-directory/v1")),
+        "preflight" => client
+            .post(format!("{api_base}/api/agent/workbench-submission-context"))
+            .json(payload.ok_or("缺少提审范围")?),
+        "change" => {
+            let id = submission_id
+                .filter(|id| {
+                    !id.is_empty()
+                        && id.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                        })
+                })
+                .ok_or("扩展编号无效")?;
+            client
+                .put(format!(
+                    "{api_base}/api/agent/workbench-products/{id}/audience"
+                ))
+                .json(payload.ok_or("缺少可见范围")?)
+        }
+        "update" => {
+            let id = submission_id
+                .filter(|id| {
+                    !id.is_empty()
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+                .ok_or("提审编号无效")?;
+            client
+                .put(format!(
+                    "{api_base}/api/agent/workbench-submissions/{id}/audience"
+                ))
+                .json(payload.ok_or("缺少提审范围")?)
+        }
+        _ => return Err("不支持的提审操作".into()),
+    };
+    parse_submission_response(
+        request
+            .query(params)
+            .bearer_auth(access.token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )
 }
