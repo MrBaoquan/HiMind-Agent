@@ -132,6 +132,9 @@ pub(crate) fn risk_rank(value: &str) -> u8 {
 }
 
 pub(crate) fn target_description(capability_id: &str, input: &serde_json::Value) -> String {
+    if input.get("binding_revision").is_some() || input.get("credential_ref").is_some() {
+        return serde_json::json!({"operation":capability_id,"arguments":input}).to_string();
+    }
     if matches!(
         capability_id,
         "extension.plugin.candidate.activate"

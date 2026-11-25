@@ -150,10 +150,18 @@ fn string_field(input: &Value, key: &str) -> Option<String> {
 }
 
 fn pin_target(input: &Value) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let plan = crate::store::ai_services::capability_selection_plan(crate::store::ai_services::CAP_VISION, input)?;
+    let plan = crate::store::ai_services::capability_selection_plan(
+        crate::store::ai_services::CAP_VISION,
+        input,
+    )?;
     let selected = &plan["selected"];
-    if selected["eligible"] != true { return Err("批量任务的服务或模型当前不可执行".into()); }
-    let pinned_service = format!("custom:{}", selected["service_id"].as_str().ok_or("缺少服务")?);
+    if selected["eligible"] != true {
+        return Err("批量任务的服务或模型当前不可执行".into());
+    }
+    let pinned_service = format!(
+        "custom:{}",
+        selected["service_id"].as_str().ok_or("缺少服务")?
+    );
     let pinned_model = selected["model"].as_str().ok_or("缺少模型")?.to_string();
     Ok((pinned_service, pinned_model))
 }
@@ -601,15 +609,52 @@ mod plugin_ai_tests {
     fn batch_model_pin_survives_serialization_and_default_changes() {
         use crate::store::ai_services as ai;
         let _guard = crate::store::paths::test_env_lock();
-        let root = std::env::temp_dir().join(format!("himind-plugin-ai-batch-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("himind-plugin-ai-batch-{}", std::process::id()));
         let previous = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
-        ai::upsert(ai::CustomAIServiceInput { id:"vision".into(),display_name:"测试视觉".into(),base_url:"http://127.0.0.1:9/v1".into(),protocol:ai::AIServiceProtocol::OpenaiChat,model:"first".into(),models:vec!["first".into(),"second".into()],image_model:String::new(),image_adapter:String::new(),media:Default::default(),api_key:"test-only".into(),endpoints:vec![] }).unwrap();
-        ai::set_capability_routes(ai::CAP_VISION, vec![ai::CapabilityRouteEntry::new("vision", "second")]).unwrap();
+        ai::upsert(ai::CustomAIServiceInput {
+            id: "vision".into(),
+            display_name: "测试视觉".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            protocol: ai::AIServiceProtocol::OpenaiChat,
+            model: "first".into(),
+            models: vec!["first".into(), "second".into()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media: Default::default(),
+            api_key: "test-only".into(),
+            endpoints: vec![],
+        })
+        .unwrap();
+        ai::set_capability_routes(
+            ai::CAP_VISION,
+            vec![ai::CapabilityRouteEntry::new("vision", "second")],
+        )
+        .unwrap();
         let (service, model) = pin_target(&json!({})).unwrap();
-        let job = BatchJob { id:"test".into(),status:"interrupted".into(),total:0,done:0,failed:0,profile:"full".into(),service,pinned_model:model,budget_tokens:0,used_tokens:0,created_at:0,updated_at:0,items:vec![] };
-        let restored: BatchJob = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
-        ai::set_capability_routes(ai::CAP_VISION, vec![ai::CapabilityRouteEntry::new("vision", "first")]).unwrap();
+        let job = BatchJob {
+            id: "test".into(),
+            status: "interrupted".into(),
+            total: 0,
+            done: 0,
+            failed: 0,
+            profile: "full".into(),
+            service,
+            pinned_model: model,
+            budget_tokens: 0,
+            used_tokens: 0,
+            created_at: 0,
+            updated_at: 0,
+            items: vec![],
+        };
+        let restored: BatchJob =
+            serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        ai::set_capability_routes(
+            ai::CAP_VISION,
+            vec![ai::CapabilityRouteEntry::new("vision", "first")],
+        )
+        .unwrap();
         assert_eq!(pin_target(&json!({})).unwrap().1, "first");
         let config = resume_config(&restored, &json!({})).unwrap();
         assert_eq!(config["service"], "custom:vision");
@@ -619,7 +664,10 @@ mod plugin_ai_tests {
         legacy.as_object_mut().unwrap().remove("pinned_model");
         let legacy: BatchJob = serde_json::from_value(legacy).unwrap();
         assert!(resume_config(&legacy, &json!({})).is_err());
-        match previous { Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value), None => std::env::remove_var("HIMIND_AGENT_HOME") }
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

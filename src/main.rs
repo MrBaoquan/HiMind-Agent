@@ -2141,7 +2141,8 @@ fn run_workflow_package(
     let context = capability::types::InvocationContext::new(
         capability::types::InvocationSource::Workflow,
         "workflow-runner",
-    );
+    )
+    .with_trusted_workspace(std::env::current_dir()?.to_string_lossy().to_string());
     let capabilities = gateway.list_capabilities(&context)?;
     let probe_context = context.clone().without_agent_core_run();
     let report = workflow::preflight_with_connector_probes(
@@ -2162,7 +2163,13 @@ fn run_workflow_package(
     let runner = workflow::WorkflowRunner::open_default()?;
     let ledger = store::local_runs::LocalRunLedger::open_default()?;
     let run = if resume_run_id.is_empty() {
-        runner.start("local-agent", package, &workflow_request_id(), &input)?
+        runner.start_in_workspace(
+            "local-agent",
+            package,
+            &workflow_request_id(),
+            &input,
+            &context.trusted_workspace_ref,
+        )?
     } else {
         ledger
             .get_run(resume_run_id)?
@@ -3458,7 +3465,7 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 &capability::types::InvocationContext::new(
                     capability::types::InvocationSource::Cli,
                     "local-cli",
-                ),
+                ).with_trusted_workspace(std::env::current_dir()?.to_string_lossy().to_string()),
                 &arguments[1],
                 input,
             )?;

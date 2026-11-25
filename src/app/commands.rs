@@ -4602,10 +4602,11 @@ fn plugin_credential_request(
     if item.source == "builtin" {
         return Err("内置集成的凭据由 Agent 适配器管理".to_string());
     }
+    let descriptor_id = credential_id.trim().split('@').next().unwrap_or_default();
     let request = item
         .credentials
         .iter()
-        .find(|request| request.id == credential_id.trim())
+        .find(|request| request.id == descriptor_id)
         .cloned()
         .ok_or_else(|| format!("插件未声明凭据: {plugin_id}/{credential_id}"))?;
     let fingerprint =
@@ -4667,6 +4668,9 @@ pub(crate) fn save_plugin_credential_profile(
     public_fields: std::collections::BTreeMap<String, String>,
     secret_fields: std::collections::BTreeMap<String, String>,
 ) -> Result<(), String> {
+    if credential_id.contains('@') {
+        return Err("已导入凭证请通过安全导入通道重新验证身份及服务地址".into());
+    }
     let (_item, request, fingerprint) = plugin_credential_request(&plugin_id, &credential_id)?;
     let existing = crate::store::plugin_credentials::statuses_with_fingerprints(
         plugin_id.trim(),
@@ -8201,10 +8205,14 @@ pub(crate) async fn resume_workflow_run(
 
 #[tauri::command]
 pub(crate) async fn start_workflow_run(
+    window: WebviewWindow,
     state: State<'_, AgentState>,
     package_id: String,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if window.label() != "main" {
+        return Err("Workflow launch requires the native user surface".into());
+    }
     let gateway = state.capability_gateway.clone();
     tauri::async_runtime::spawn_blocking(move || {
         start_workflow_with_gateway(gateway, &package_id, input).map_err(|error| error.to_string())
@@ -8487,7 +8495,8 @@ pub(crate) fn resume_workflow_with_gateway(
     let context = InvocationContext::new(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
-    );
+    )
+    .with_trusted_workspace(interaction.workspace_ref.clone());
     let capabilities = gateway.list_capabilities(&context)?;
     let probe_context = context.clone().without_agent_core_run();
     let report = crate::workflow::preflight_with_connector_probes(
@@ -8607,7 +8616,16 @@ fn start_workflow_with_gateway(
     let context = InvocationContext::new(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
+    )
+    .with_trusted_workspace(
+        input
+            .get("workspace_root")
+            .or_else(|| input.get("project_root"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
     );
+    // This function is only reached from the native main-window launch form.
+    // Model/API scheduling receives its session context in a separate function.
     let (package, run) =
         prepare_workflow_run(gateway.clone(), package_id, input.clone(), &context)?;
     dispatch_run_in_background(gateway, context, package, run.run_id.clone(), input)?;
@@ -8718,7 +8736,13 @@ fn prepare_workflow_run(
     }
     let runner = crate::workflow::WorkflowRunner::open_default()?;
     let request_id = format!("{}:{}", context.request_id, crate::workflow_request_id());
-    let run = runner.start("local-agent", &package, &request_id, &input)?;
+    let run = runner.start_in_workspace(
+        "local-agent",
+        &package,
+        &request_id,
+        &input,
+        &context.trusted_workspace_ref,
+    )?;
     Ok((package, run))
 }
 
@@ -9021,7 +9045,8 @@ fn workflow_interaction_request(
             "step_id": run.current_step_id,
             "kind": "approval",
             "title": format!("{}等待审批", step_title),
-            "description": if risk_level.is_empty() { "确认后继续执行此步骤".to_string() } else { format!("风险等级 {}，确认后继续执行此步骤", risk_level) },
+            "description": if let Some(target) = event.payload.get("execution_target").filter(|v| !v.is_null()) { format!("风险等级 {}，执行目标：{}",risk_level,target) } else if risk_level.is_empty() { "确认后继续执行此步骤".to_string() } else { format!("风险等级 {}，确认后继续执行此步骤", risk_level) },
+            "execution_target": event.payload.get("execution_target"),
             "required_action": "approve_or_reject",
             "status": "pending",
             "source_event_id": event.event_id,
@@ -10248,6 +10273,9 @@ mod tests {
             description: String::new(),
             docs_url: String::new(),
             verify_capability: String::new(),
+            broker_capabilities: Vec::new(),
+            secure_import: None,
+            workspace_binding: None,
         };
         let existing = crate::store::plugin_credentials::PluginCredentialStatus {
             id: request.id.clone(),

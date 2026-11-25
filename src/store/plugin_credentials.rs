@@ -103,7 +103,6 @@ fn write_store(store: &StoreFile) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _lock = atomic_file::lock(&path)?;
     atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(store)?)?;
     Ok(())
 }
@@ -238,6 +237,7 @@ pub(crate) fn save_profile(
         }
         protected_fields.insert(name, protect_secret_for_current_user(value)?);
     }
+    let _lock = atomic_file::lock(&store_path())?;
     let mut store = read_store()?;
     let existing = store
         .plugins
@@ -276,6 +276,7 @@ pub(crate) fn save_profile(
 pub(crate) fn remove(plugin_id: &str, credential_id: &str) -> Result<bool, Box<dyn Error>> {
     let plugin_id = validate_segment("插件 ID", plugin_id)?;
     let credential_id = validate_segment("凭据 ID", credential_id)?;
+    let _lock = atomic_file::lock(&store_path())?;
     let mut store = read_store()?;
     let removed = store
         .plugins
@@ -298,6 +299,7 @@ pub(crate) fn remove(plugin_id: &str, credential_id: &str) -> Result<bool, Box<d
 /// 插件卸载/移除时清掉它名下的凭据，别留孤儿秘密。
 pub(crate) fn remove_all_for_plugin(plugin_id: &str) -> Result<bool, Box<dyn Error>> {
     let plugin_id = validate_segment("插件 ID", plugin_id)?;
+    let _lock = atomic_file::lock(&store_path())?;
     let mut store = read_store()?;
     let removed = store.plugins.remove(&plugin_id).is_some();
     if removed {
@@ -357,6 +359,63 @@ pub(crate) fn broker_fields(
         fields.insert(name.clone(), unprotect_secret_for_current_user(value)?);
     }
     Ok(fields)
+}
+
+/// Multiple saved instances of one declared credential. The descriptor remains
+/// stable; the reference selects a user-imported profile, never another plugin.
+pub(crate) fn save_instance(
+    plugin_id: &str,
+    credential_id: &str,
+    profile_ref: &str,
+    public_fields: &BTreeMap<String, String>,
+    secret_fields: &BTreeMap<String, String>,
+    fingerprint: &str,
+) -> Result<PluginCredentialStatus, Box<dyn Error>> {
+    let id = instance_id(credential_id, profile_ref)?;
+    save_profile(plugin_id, &id, public_fields, secret_fields, fingerprint)
+}
+
+pub(crate) fn instance_statuses(
+    plugin_id: &str,
+    credential_id: &str,
+    fingerprint: &str,
+) -> Result<Vec<PluginCredentialStatus>, Box<dyn Error>> {
+    let prefix = format!("{}@", validate_segment("凭据声明 ID", credential_id)?);
+    let store = read_store()?;
+    Ok(store
+        .plugins
+        .get(plugin_id)
+        .map(|plugin| {
+            plugin
+                .entries
+                .keys()
+                .filter(|id| id.starts_with(&prefix))
+                .map(|id| status_of_with_fingerprint(&store.plugins, plugin_id, id, fingerprint))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+pub(crate) fn broker_instance_fields(
+    plugin_id: &str,
+    credential_id: &str,
+    profile_ref: &str,
+    fingerprint: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    broker_fields(
+        plugin_id,
+        &instance_id(credential_id, profile_ref)?,
+        fingerprint,
+    )
+}
+
+fn instance_id(credential_id: &str, profile_ref: &str) -> Result<String, Box<dyn Error>> {
+    let descriptor = validate_segment("凭据声明 ID", credential_id)?;
+    let reference = validate_segment("凭据引用", profile_ref)?;
+    if descriptor.contains('@') || reference.contains('@') || reference.len() > 64 {
+        return Err("凭据引用格式无效".into());
+    }
+    validate_segment("凭据实例", &format!("{descriptor}@{reference}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +482,56 @@ pub(crate) fn audit_events(limit: usize) -> Result<Vec<CredentialAuditEvent>, Bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_instances_are_isolated_encrypted_and_revoked_by_plugin_removal() {
+        let _home = PinnedHome::new("instances");
+        let public = BTreeMap::from([("endpoint".to_string(), "https://one.example".to_string())]);
+        for (reference, secret) in [
+            ("first", "instance-one-secret"),
+            ("second", "instance-two-secret"),
+        ] {
+            save_instance(
+                "com.test.plugin",
+                "developer",
+                reference,
+                &public,
+                &BTreeMap::from([("key".to_string(), secret.to_string())]),
+                "fingerprint",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            broker_instance_fields("com.test.plugin", "developer", "first", "fingerprint").unwrap()
+                ["key"],
+            "instance-one-secret"
+        );
+        assert_eq!(
+            broker_instance_fields("com.test.plugin", "developer", "second", "fingerprint")
+                .unwrap()["key"],
+            "instance-two-secret"
+        );
+        assert!(
+            broker_instance_fields("com.other.plugin", "developer", "first", "fingerprint")
+                .is_err()
+        );
+        assert!(
+            broker_instance_fields("com.test.plugin", "developer", "first", "changed").is_err()
+        );
+        assert_eq!(
+            instance_statuses("com.test.plugin", "developer", "fingerprint")
+                .unwrap()
+                .len(),
+            2
+        );
+        let raw = std::fs::read_to_string(store_path()).unwrap();
+        assert!(!raw.contains("instance-one-secret") && !raw.contains("instance-two-secret"));
+        assert!(instance_id("developer", "bad@other").is_err());
+        remove_all_for_plugin("com.test.plugin").unwrap();
+        assert!(
+            broker_instance_fields("com.test.plugin", "developer", "first", "fingerprint").is_err()
+        );
+    }
 
     /// HIMIND_AGENT_HOME 是进程级环境变量：并行的用例会互相顶掉，必须与全仓
     /// 其它改动该变量的测试共用同一把锁，否则会互相看到对方的临时 home。

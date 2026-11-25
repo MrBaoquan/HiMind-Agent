@@ -105,6 +105,20 @@ fn approval_context(
     if !step.approval_required || waiting_for_feedback(ledger, run)? {
         return Ok(None);
     }
+    let frozen_target = ledger
+        .list_events(&run.run_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.step_id == step.id && event.event_type == RuntimeEventType::ApprovalRequested
+        })
+        .and_then(|event| {
+            event
+                .payload
+                .get("execution_target")
+                .filter(|value| !value.is_null())
+                .cloned()
+        });
     Ok(Some(workflow_approval_context(
         &package,
         step,
@@ -114,6 +128,7 @@ fn approval_context(
             .get("input")
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+        frozen_target,
     )))
 }
 
@@ -159,6 +174,7 @@ fn workflow_approval_context(
     step: &WorkflowStep,
     run: &LocalRun,
     input: Value,
+    frozen_target: Option<Value>,
 ) -> ApprovalContext {
     let approval_id = workflow_approval_id(&run.run_id, &step.id);
     let capability_id = if step.capability_id.trim().is_empty() {
@@ -192,6 +208,12 @@ fn workflow_approval_context(
         commit_sha,
         risk_level,
     );
+
+    let description = if let Some(target) = frozen_target {
+        format!("{description}\n实际执行目标：{target}")
+    } else {
+        description
+    };
 
     ApprovalContext {
         run_id: run.run_id.clone(),

@@ -2892,6 +2892,14 @@ export type PluginSubmissionStatus = {
     updated_at: string;
 };
 
+// Workbench submissions are remote records, distinct from local authoring drafts.
+export type WorkflowSubmissionStatus = PluginSubmissionStatus & {
+    description: string;
+    min_agent_version: string;
+    capabilities: string[];
+    created_at: string;
+};
+
 export type AuthoringSkillDraft = {
     manifest: SkillManifest;
     readme: string;
@@ -4288,7 +4296,7 @@ export const agentApi = {
     testWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('test_workflow_draft', { workflowId, version }),
     confirmWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('confirm_workflow_draft', { workflowId, version }),
     submitWorkflowDraft: (workflowId: string, version: string, scope?: WorkbenchSubmissionScope) => invoke<AuthoringWorkflowDraft>('submit_workflow_draft', { workflowId, version, scope }),
-    workflowSubmissions: () => invoke<{ items?: AuthoringWorkflowDraft[] }>('list_workflow_submissions'),
+    workflowSubmissions: () => invoke<{ items?: WorkflowSubmissionStatus[] }>('list_workflow_submissions'),
     submitPluginDraft: (pluginId: string, version: string, scope?: WorkbenchSubmissionScope) => invoke<AuthoringPluginDraft>('submit_plugin_draft', { pluginId, version, scope }),
     pluginVersions: (pluginId: string, source?: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId, source }),
     planPluginInstall: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version, source, artifactId, sha256 }),

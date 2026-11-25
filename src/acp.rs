@@ -367,6 +367,21 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                             };
+                            let prompt = match crate::app::secure_import::preprocess(&prompt) {
+                                Ok(value) => {
+                                    value["content"].as_str().unwrap_or_default().to_string()
+                                }
+                                Err(_) => {
+                                    write_error(
+                                        &writer,
+                                        Some(id),
+                                        -32602,
+                                        "安全导入未完成；消息未保存或发送",
+                                    )?;
+                                    line.clear();
+                                    continue;
+                                }
+                            };
                             let history_snapshot = match history.lock() {
                                 Ok(history) => history.clone(),
                                 Err(_) => {
@@ -431,7 +446,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 )
                                 .with_ai_client_id(ai_client_id_for_prompt)
                                 .with_device_id(device_id)
-                                .with_workspace_ref(cwd.clone());
+                                .with_trusted_workspace(cwd.clone());
                                 context.request_id = format!(
                                     "acp_{}_{}",
                                     session_id_for_prompt,

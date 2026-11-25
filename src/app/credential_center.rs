@@ -545,6 +545,42 @@ fn plugin_items(
                 .cloned()
                 .unwrap_or_default();
             item.fields = field_views(&credential.fields, status);
+            if let Ok(instances) = crate::store::plugin_credentials::instance_statuses(
+                &plugin.id,
+                &credential.id,
+                &fingerprint,
+            ) {
+                for instance in instances {
+                    let mut saved = item.clone();
+                    saved.id = format!("plugin.{}:{}", plugin.id, instance.id);
+                    saved.label = format!(
+                        "{} · {}",
+                        item.label,
+                        instance
+                            .public_fields
+                            .get("endpoint")
+                            .map(String::as_str)
+                            .unwrap_or("已导入")
+                    );
+                    saved.configured = instance.configured;
+                    saved.status = if !plugin.enabled {
+                        "disabled"
+                    } else if !instance.descriptor_current {
+                        "needs_review"
+                    } else {
+                        "unverified"
+                    }
+                    .to_string();
+                    saved.editable = true;
+                    saved.manage_action = "plugin-credential-import".to_string();
+                    saved.description = "通过对话安全导入；重新粘贴接入信息可轮换，删除可清理本机凭证。工程绑定不含密钥。".to_string();
+                    saved.fields = field_views(&credential.fields, Some(&instance));
+                    saved.configured_fields = instance.configured_fields;
+                    saved.public_fields = instance.public_fields;
+                    saved.updated_at = instance.updated_at;
+                    items.push(saved);
+                }
+            }
             items.push(item);
         }
     }

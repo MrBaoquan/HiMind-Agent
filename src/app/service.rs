@@ -1,6 +1,6 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::blocking::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
@@ -372,9 +372,7 @@ pub(crate) fn start_background_services(
         thread::sleep(Duration::from_secs(60));
         let (delivered, dropped) = crate::notification_channels::retry_due();
         if delivered > 0 || dropped > 0 {
-            eprintln!(
-                "notification retry: delivered={delivered} dropped={dropped}"
-            );
+            eprintln!("notification retry: delivered={delivered} dropped={dropped}");
         }
     });
 
@@ -593,6 +591,22 @@ fn handle_local_http(
         }
     }
     match (method, path.as_str()) {
+        ("GET", "/credentials/matchers") => {
+            let value = crate::app::secure_import::matchers().unwrap_or_else(|_| json!({"schemas":[]}));
+            write_local_response(&mut stream,200,&value.to_string(),"application/json")
+        }
+        ("POST", "/credentials/import") => {
+            let result = (|| -> Result<Value, Box<dyn Error>> {
+                let payload: Value = serde_json::from_str(body).map_err(|_| "安全导入请求格式无效")?;
+                let content = payload.get("content").and_then(Value::as_str).ok_or("缺少接入信息")?;
+                crate::app::secure_import::preprocess(content)
+            })();
+            match result {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                // Never reflect parser/network bodies containing imported secrets.
+                Err(_) => write_local_response(&mut stream, 400, &json!({"error":"安全导入未完成，请检查完整接入信息、扩展及授权；原消息未发送。"}).to_string(), "application/json"),
+            }
+        }
         ("POST", "/enroll") => {
             if !crate::app::control_plane_provider::status(&options).enabled_by_user {
                 return write_local_response(
@@ -2030,6 +2044,8 @@ fn commit_streamed_file(source: &Path, destination: &Path) -> std::io::Result<()
 
 fn local_operation(method: &str, path: &str) -> Option<&'static str> {
     match (method, path) {
+        ("GET", "/credentials/matchers") => Some("local.credentials.import"),
+        ("POST", "/credentials/import") => Some("local.credentials.import"),
         ("GET" | "POST", "/pick-folder") => Some("local.file.pick_folder"),
         ("GET" | "POST", "/pick-files") => Some("local.file.pick_files"),
         ("GET", "/pick-remote-client") => Some("local.remote.clients.pick"),

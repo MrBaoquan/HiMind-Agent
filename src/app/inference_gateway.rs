@@ -1620,6 +1620,15 @@ fn route(
     }
     let required_protocol = path_protocol(&head.path).ok_or(GatewayError::UnsupportedPath)?;
     let candidates = authorize_candidates(&bindings, &head.headers, body, required_protocol)?;
+    if crate::app::secure_import::contains_secret_body(body) {
+        let _ = write_json_error(
+            stream,
+            400,
+            "himind_secret_import_required",
+            "检测到未处理的接入凭证。请通过安全导入通道重试；本次请求未转发到模型服务。",
+        );
+        return Ok(());
+    }
     let binding = candidates
         .first()
         .cloned()

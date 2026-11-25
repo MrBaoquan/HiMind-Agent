@@ -19,6 +19,7 @@ const OBSERVED_FRAME_LIMIT: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_CONNECTIONS: usize = 64;
 const SESSION_QUERY: &str = "himind_session";
 const SESSION_COOKIE: &str = "himind_ai_session";
+const SECURE_CHAT_IMPORT: &str = include_str!("secure_chat_import.js");
 const RUNTIME_TOKEN_QUERY: &str = "token";
 // Keep the iframe on a browser-visible loopback hostname. Authentication is
 // carried by the session token bridge rather than a cross-site cookie.
@@ -515,14 +516,24 @@ impl BuiltinAiProxyControl {
     /// caller supplied URL or a DSH private storage path.
     pub(crate) fn from_history_url(value: &str) -> Result<Self, String> {
         let url = url::Url::parse(value).map_err(|_| "history_host_invalid".to_string())?;
-        if url.scheme() != "http" || url.host_str() != Some("127.0.0.1")
-            || url.port().is_none() || !url.username().is_empty() || url.password().is_some()
-            || url.path() != "/" || url.fragment().is_some()
+        if url.scheme() != "http"
+            || url.host_str() != Some("127.0.0.1")
+            || url.port().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.fragment().is_some()
             || url.query_pairs().count() != 1
-            || !url.query_pairs().any(|(key,value)| key == SESSION_QUERY && !value.is_empty()) {
+            || !url
+                .query_pairs()
+                .any(|(key, value)| key == SESSION_QUERY && !value.is_empty())
+        {
             return Err("history_host_invalid".into());
         }
-        Ok(Self { url: value.into(), rail_view_preset: Arc::new(RwLock::new(None)) })
+        Ok(Self {
+            url: value.into(),
+            rail_view_preset: Arc::new(RwLock::new(None)),
+        })
     }
 
     pub(crate) fn verify_browser_entry(&self) -> Result<(), String> {
@@ -821,6 +832,11 @@ impl BuiltinAiProxyControl {
     /// `args` field whose keys match that method's descriptor. Callers therefore
     /// pass the endpoint verbatim together with that method's named arguments.
     fn call_api(&self, client: &Client, endpoint: &str, args: Value) -> Result<Value, String> {
+        if crate::app::secure_import::contains_secret_body(
+            &serde_json::to_vec(&args).map_err(|_| "invalid runtime arguments")?,
+        ) {
+            return Err("安全导入尚未完成，运行时消息未保存".into());
+        }
         let mut url =
             url::Url::parse(&self.url).map_err(|_| "HiMind AI 本机地址无效".to_string())?;
         let session = url
@@ -1096,7 +1112,47 @@ fn handle_connection(
     if !request_token_matches(&request, token) {
         return write_forbidden(&mut client);
     }
+    if request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|target| url::Url::parse(&format!("http://localhost{target}")).ok())
+        .is_some_and(|url| url.path() == "/himind/credentials/import")
+    {
+        // A proxy can serve several runtime workspaces. Import credentials only;
+        // bind later using the invocation's trusted workspace, never a global one.
+        return handle_secure_chat_import(&mut client, &request, remainder, None);
+    }
 
+    if request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .is_some_and(|p| p.split('?').next() == Some("/himind/credentials/matchers"))
+    {
+        let value = crate::app::secure_import::matchers().unwrap_or_else(|_| json!({"schemas":[]}));
+        let body = value.to_string();
+        return write!(client,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+    }
+    // Last server boundary before the runtime can persist a typed/programmatic
+    // message. Buffer complete mutation bodies rather than forwarding prefixes.
+    let mut guarded_body = remainder.to_vec();
+    if request.starts_with("POST ") || request.starts_with("PUT ") || request.starts_with("PATCH ")
+    {
+        if header_has_token(&request, "transfer-encoding", "chunked") {
+            return write_forbidden(&mut client);
+        }
+        let length = response_content_length(&request)?.unwrap_or(0);
+        if length > OBSERVED_FRAME_LIMIT as usize || remainder.len() > length {
+            return write_forbidden(&mut client);
+        }
+        guarded_body.resize(length, 0);
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        client.read_exact(&mut guarded_body[remainder.len()..])?;
+        if crate::app::secure_import::contains_secret_body(&guarded_body) {
+            return write_forbidden(&mut client);
+        }
+    }
     let websocket = is_websocket_upgrade(&request);
     let runtime_entry_request = !websocket && is_runtime_entry_request(&request);
     let rewritten =
@@ -1104,7 +1160,9 @@ fn handle_connection(
     let mut server = TcpStream::connect_timeout(&upstream, Duration::from_secs(5))?;
     configure_stream(&server)?;
     server.write_all(rewritten.as_bytes())?;
-    server.write_all(remainder)?;
+    if !websocket {
+        server.write_all(&guarded_body)?;
+    }
 
     if runtime_entry_request {
         let view_preset = rail_view_preset
@@ -1122,15 +1180,28 @@ fn handle_connection(
     let mut client_reader = client.try_clone()?;
     let mut server_writer = server.try_clone()?;
     let upload_shutdown = Arc::clone(&shutdown);
+    let client_for_shutdown = client.try_clone()?;
     let upload = thread::Builder::new()
         .name("himind-ai-proxy-upload".to_string())
         .spawn(move || {
-            copy_until_shutdown(
-                &mut client_reader,
-                &mut server_writer,
-                &upload_shutdown,
-                None,
-            )
+            if websocket {
+                let result = guarded_websocket_upload(
+                    &mut client_reader,
+                    &mut server_writer,
+                    &upload_shutdown,
+                    guarded_body,
+                );
+                let _ = server_writer.shutdown(std::net::Shutdown::Both);
+                let _ = client_for_shutdown.shutdown(std::net::Shutdown::Both);
+                result
+            } else {
+                copy_until_shutdown(
+                    &mut client_reader,
+                    &mut server_writer,
+                    &upload_shutdown,
+                    None,
+                )
+            }
         })
         .map_err(|error| {
             io::Error::other(format!("proxy upload thread creation failed: {error}"))
@@ -1145,6 +1216,65 @@ fn handle_connection(
     );
     let _ = upload.join();
     download
+}
+
+fn secure_import_markers_json() -> String {
+    let entries = crate::app::secure_import::matchers().unwrap_or_else(|_| json!({"schemas":[]}));
+    let mut markers = vec!["himind.credential-import.v1".to_string()];
+    for entry in entries["schemas"].as_array().into_iter().flatten() {
+        if let Some(schema) = entry["schema"].as_str() {
+            markers.push(schema.to_string());
+        }
+        for prefix in entry["secret_prefixes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            markers.push(prefix.to_string());
+        }
+    }
+    serde_json::to_string(&markers)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('<', "\\u003c")
+}
+
+fn handle_secure_chat_import(
+    client: &mut TcpStream,
+    header: &str,
+    remainder: &[u8],
+    _workspace: Option<&str>,
+) -> io::Result<()> {
+    let result = (|| -> Result<Value, Box<dyn std::error::Error>> {
+        if !header.starts_with("POST ") || header_has_token(header, "transfer-encoding", "chunked")
+        {
+            return Err("invalid request".into());
+        }
+        let length = response_content_length(header)?
+            .filter(|length| *length <= 96 * 1024)
+            .ok_or("invalid size")?;
+        if remainder.len() > length {
+            return Err("unexpected body".into());
+        }
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut body = remainder.to_vec();
+        body.resize(length, 0);
+        client.read_exact(&mut body[remainder.len()..])?;
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| "invalid body")?;
+        let content = payload
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("missing content")?;
+        crate::app::secure_import::preprocess(content)
+    })();
+    let (status, body) = match result {
+        Ok(value) => ("200 OK", value.to_string()),
+        Err(_) => (
+            "400 Bad Request",
+            json!({"error":"安全导入未完成，凭证未发送到对话。"}).to_string(),
+        ),
+    };
+    write!(client,"HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
 }
 
 fn configure_stream(stream: &TcpStream) -> io::Result<()> {
@@ -1521,6 +1651,12 @@ fn customize_runtime_html(html: &str, rail_view_preset: Option<&str>) -> String 
         "<title>DeepSeek Harness</title>",
         "<title>HiMind AI</title>",
     );
+    if !html.contains("data-himind-secure-import") {
+        inject_head_snippet(
+            &mut html,
+            &format!("<script data-himind-secure-import>window.__himindCredentialMatchers={};{SECURE_CHAT_IMPORT}</script>", secure_import_markers_json()),
+        );
+    }
     if let Some(preset) = rail_view_preset.filter(|preset| !preset.is_empty()) {
         if !html.contains("data-himind-rail-view") {
             inject_head_snippet(&mut html, preset);
@@ -1667,6 +1803,115 @@ fn copy_until_shutdown(
     Ok(())
 }
 
+/// Hold entire client messages until checked. This runs before the runtime's
+/// message/draft store and handles masking, fragmentation and TCP splits.
+fn guarded_websocket_upload(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    shutdown: &AtomicBool,
+    initial: Vec<u8>,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    let mut initial = Some(initial);
+    let mut wire_message = Vec::new();
+    let mut message = Vec::new();
+    let mut fragmented = false;
+    let mut chunk = [0u8; 8192];
+    while !shutdown.load(Ordering::Acquire) {
+        let size = if let Some(bytes) = initial.take().filter(|b| !b.is_empty()) {
+            pending.extend_from_slice(&bytes);
+            0
+        } else {
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        pending.extend_from_slice(&chunk[..size]);
+        loop {
+            if pending.len() < 2 {
+                break;
+            }
+            let first = pending[0];
+            let opcode = first & 15;
+            if first & 0x70 != 0 {
+                return Err(io::Error::other("compressed client frame denied"));
+            }
+            let mut header = 2;
+            let mut length = u64::from(pending[1] & 127);
+            if length == 126 {
+                if pending.len() < 4 {
+                    break;
+                }
+                length = u64::from(u16::from_be_bytes([pending[2], pending[3]]));
+                header = 4;
+            } else if length == 127 {
+                if pending.len() < 10 {
+                    break;
+                }
+                length = u64::from_be_bytes(pending[2..10].try_into().unwrap());
+                header = 10;
+            }
+            if length > OBSERVED_FRAME_LIMIT || pending[1] & 128 == 0 {
+                return Err(io::Error::other("invalid client message"));
+            }
+            if pending.len() < header + 4 {
+                break;
+            }
+            let mask: [u8; 4] = pending[header..header + 4].try_into().unwrap();
+            header += 4;
+            let total = header + length as usize;
+            if pending.len() < total {
+                break;
+            }
+            let frame: Vec<_> = pending.drain(..total).collect();
+            if opcode >= 8 {
+                writer.write_all(&frame)?;
+                continue;
+            }
+            if opcode == 1 || opcode == 2 {
+                if fragmented {
+                    return Err(io::Error::other("overlapping client messages"));
+                }
+                fragmented = true;
+            } else if opcode != 0 || !fragmented {
+                return Err(io::Error::other("invalid client continuation"));
+            }
+            message.extend(
+                frame[header..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ mask[i % 4]),
+            );
+            wire_message.extend_from_slice(&frame);
+            if message.len() > OBSERVED_FRAME_LIMIT as usize {
+                return Err(io::Error::other("client message too large"));
+            }
+            if first & 128 != 0 {
+                if crate::app::secure_import::contains_secret_body(&message) {
+                    return Err(io::Error::other(
+                        "secure import required before message persistence",
+                    ));
+                }
+                writer.write_all(&wire_message)?;
+                message.clear();
+                wire_message.clear();
+                fragmented = false;
+            }
+        }
+    }
+    Ok(())
+}
+
 struct WebSocketObserver {
     handshake_complete: bool,
     buffer: Vec<u8>,
@@ -1807,6 +2052,52 @@ impl WebSocketObserver {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn upload_guard_blocks_fragmented_escaped_credentials_before_runtime_storage() {
+        fn frame(opcode: u8, fin: bool, bytes: &[u8]) -> Vec<u8> {
+            assert!(bytes.len() < 126);
+            let mask = [2u8, 7, 11, 17];
+            let mut wire = vec![opcode | if fin { 128 } else { 0 }, 128 | bytes.len() as u8];
+            wire.extend_from_slice(&mask);
+            wire.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            wire
+        }
+        for denied in [false, true] {
+            let input = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(input.local_addr().unwrap()).unwrap();
+            let (mut incoming, _) = input.accept().unwrap();
+            let output = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut forward = TcpStream::connect(output.local_addr().unwrap()).unwrap();
+            let (mut received, _) = output.accept().unwrap();
+            let message = if denied {
+                br#"{"content":"himind.credential\u002dimport.v1"}"#.as_slice()
+            } else {
+                br#"{"content":"ordinary"}"#.as_slice()
+            };
+            let middle = message.len() / 2;
+            let mut wire = frame(1, false, &message[..middle]);
+            wire.extend(frame(0, true, &message[middle..]));
+            let expected = wire.clone();
+            let worker = std::thread::spawn(move || {
+                guarded_websocket_upload(
+                    &mut incoming,
+                    &mut forward,
+                    &AtomicBool::new(false),
+                    Vec::new(),
+                )
+            });
+            for chunk in wire.chunks(3) {
+                client.write_all(chunk).unwrap();
+            }
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let result = worker.join().unwrap();
+            assert_eq!(result.is_err(), denied);
+            let mut bytes = Vec::new();
+            received.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, if denied { Vec::new() } else { expected });
+        }
+    }
 
     #[test]
     fn upstream_must_be_a_numbered_loopback_http_url() {
@@ -2195,6 +2486,39 @@ mod tests {
         assert!(customized.contains("data-himind-runtime-brand"));
         assert!(customized.contains("svg[viewBox=\"0 0 182 24\"]"));
         assert!(customized.contains("MutationObserver"));
+        assert!(customized.contains("data-himind-secure-import"));
+        assert!(
+            customized.find("data-himind-secure-import").unwrap()
+                < customized.find("</head>").unwrap()
+        );
+    }
+
+    #[test]
+    fn secure_import_endpoint_is_local_and_never_reflects_raw_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let initial = read_http_header(&mut stream).unwrap();
+            let end = find_header_end(&initial).unwrap();
+            handle_secure_chat_import(
+                &mut stream,
+                &String::from_utf8_lossy(&initial[..end]),
+                &initial[end..],
+                None,
+            )
+            .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let raw = "himind.credential-import.v1";
+        let body = json!({"content":raw}).to_string();
+        write!(stream,"POST /himind/credentials/import HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(!response.contains(raw));
+        assert!(response.contains("Cache-Control: no-store"));
     }
 
     #[test]

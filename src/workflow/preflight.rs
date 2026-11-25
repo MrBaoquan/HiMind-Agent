@@ -301,14 +301,29 @@ pub(crate) fn preflight(
                 );
             }
             if !available {
-                push_blocker(
-                    &mut diagnostics,
-                    "capability.unavailable",
-                    "dependencies",
-                    format!("required capability is unavailable: {capability_id}"),
-                    "启用对应 Capability，或安装提供该 Capability 的 Plugin/Connector。",
-                    true,
-                );
+                if capability_is_conditionally_disabled(
+                    &package.steps,
+                    capability_id,
+                    &serde_json::json!({"input":input}),
+                ) {
+                    push_warning(
+                        &mut diagnostics,
+                        "capability.condition_disabled",
+                        "dependencies",
+                        format!("capability {capability_id} is unavailable but all declaring steps are disabled by launch input"),
+                        "Changing the launch branch requires another preflight; enable the provider before selecting that branch.",
+                        true,
+                    );
+                } else {
+                    push_blocker(
+                        &mut diagnostics,
+                        "capability.unavailable",
+                        "dependencies",
+                        format!("required capability is unavailable: {capability_id}"),
+                        "启用对应 Capability，或安装提供该 Capability 的 Plugin/Connector。",
+                        true,
+                    );
+                }
             }
             WorkflowCapabilityPreflight {
                 id: capability_id.clone(),
@@ -662,6 +677,67 @@ struct LaunchContract {
     segmented: bool,
 }
 
+/// Only a provably disabled launch branch can waive a declared capability.
+/// Conditions depending on runtime output remain required; a declaration with
+/// no corresponding step also remains required. Parent conditions cover nested
+/// loop steps without trusting caller-supplied workflow output.
+fn capability_is_conditionally_disabled(
+    steps: &[super::WorkflowStep],
+    capability: &str,
+    context: &Value,
+) -> bool {
+    fn launch_condition_known(condition: &super::WorkflowCondition, context: &Value) -> bool {
+        match condition.operator.as_str() {
+            "all" | "any" | "not" => {
+                !condition.conditions.is_empty()
+                    && condition
+                        .conditions
+                        .iter()
+                        .all(|child| launch_condition_known(child, context))
+            }
+            _ => {
+                if !condition.path.starts_with("input.") {
+                    return false;
+                }
+                let mut current = context;
+                for segment in condition.path.split('.') {
+                    let Some(next) = current.get(segment) else {
+                        return false;
+                    };
+                    current = next;
+                }
+                true
+            }
+        }
+    }
+    fn visit(
+        steps: &[super::WorkflowStep],
+        capability: &str,
+        context: &Value,
+        disabled: bool,
+        found: &mut bool,
+        active: &mut bool,
+    ) {
+        for step in steps {
+            let disabled = disabled
+                || step.when.as_ref().is_some_and(|condition| {
+                    launch_condition_known(condition, context)
+                        && matches!(super::evaluate_condition(condition, context), Ok(false))
+                });
+            if step.capability_id == capability {
+                *found = true;
+                *active |= !disabled;
+            }
+            if let Some(config) = &step.loop_config {
+                visit(&config.steps, capability, context, disabled, found, active);
+            }
+        }
+    }
+    let (mut found, mut active) = (false, false);
+    visit(steps, capability, context, false, &mut found, &mut active);
+    found && !active
+}
+
 enum InputCoverage {
     /// 启动时一定会带上值。
     Guaranteed,
@@ -827,14 +903,40 @@ fn validate_capability_step_input(
         return;
     };
     let mut merged = run_input.as_object().cloned().unwrap_or_default();
+    let mut deferred = std::collections::BTreeSet::new();
     if let Some(step_input) = step.input.as_object() {
         for (name, value) in step_input {
+            let sources = super::executor::step_template_sources(value);
+            if !sources.is_empty() {
+                if sources
+                    .iter()
+                    .all(|source| receipt_dependency_exists(package, step, source))
+                {
+                    deferred.insert(name.clone());
+                    merged.remove(name);
+                    continue;
+                }
+                push_blocker(
+                    diagnostics,
+                    "capability.input.receipt",
+                    "input",
+                    format!(
+                        "{}（步骤 {}）：{name} 引用了未声明依赖的步骤回执",
+                        capability_id, step.id
+                    ),
+                    "将回执来源声明为该步骤的前置依赖，不得引用自身、未来或不存在的步骤。",
+                    true,
+                );
+                continue;
+            }
             let resolved = super::executor::resolve_workflow_input_templates(value, run_input);
             // 启动输入尚未提供时，`input.*` 模板会解析成 null。这里不能把 null
             // 塞进能力入参：它会被 schema 当成“提供了错误类型”，从而掩盖真正的
             // 启动契约判断。缺失值交由 required_properties_without_value 统一处理。
             if !resolved.is_null() {
                 merged.insert(name.clone(), resolved);
+            } else {
+                merged.remove(name);
             }
         }
     }
@@ -863,8 +965,19 @@ fn validate_capability_step_input(
     let merged = Value::Object(merged);
     // 先用运行期的过滤规则对齐输入，再校验：预检查的对象与真正下发给能力的对象一致。
     let filtered = super::executor::capability_input(&capability.input_schema, &merged);
+    let mut preflight_schema = capability.input_schema.clone();
+    if let Some(object) = preflight_schema.as_object_mut() {
+        if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|name| !name.as_str().is_some_and(|name| deferred.contains(name)));
+        }
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            for name in &deferred {
+                properties.remove(name);
+            }
+        }
+    }
     for (name, coverage) in
-        required_properties_without_value(&capability.input_schema, &filtered, launch, step)
+        required_properties_without_value(&preflight_schema, &filtered, launch, step)
     {
         match coverage {
             // 分段执行时用户按入口逐次启动，表单声明的可选项就是调用方契约；
@@ -895,7 +1008,7 @@ fn validate_capability_step_input(
     }
     // 第二道校验负责取值合法性（类型、枚举、列表写法）。它内部的 required 判定
     // 不认启动契约，会把表单/入口提供的属性重复判成缺失，所以先按启动契约重算 required。
-    let runtime_schema = schema_for_runtime_validation(&capability.input_schema, launch, step);
+    let runtime_schema = schema_for_runtime_validation(&preflight_schema, launch, step);
     if let Err(error) =
         crate::capability::service::validate_capability_input_schema(&runtime_schema, &filtered)
     {
@@ -908,6 +1021,31 @@ fn validate_capability_step_input(
             true,
         );
     }
+}
+
+fn receipt_dependency_exists(
+    package: &WorkflowPackage,
+    step: &super::WorkflowStep,
+    source: &str,
+) -> bool {
+    if source.is_empty() || source == step.id {
+        return false;
+    }
+    let mut pending = step.depends_on.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(dependency) = package.steps.iter().find(|candidate| candidate.id == id) else {
+            continue;
+        };
+        if id == source {
+            return true;
+        }
+        pending.extend(dependency.depends_on.iter().cloned());
+    }
+    false
 }
 
 /// 返回「没有值时能力会失败」的必填属性，以及它的启动覆盖程度。
@@ -1145,10 +1283,7 @@ fn tool_none_steps(steps: &[super::WorkflowStep]) -> Vec<(String, String)> {
         for step in steps {
             if let Some(runtime) = step.runtime.as_ref() {
                 if runtime.tool_policy.trim() == "none" {
-                    out.push((
-                        step.id.clone(),
-                        runtime.provider.trim().to_string(),
-                    ));
+                    out.push((step.id.clone(), runtime.provider.trim().to_string()));
                 }
             }
             if let Some(loop_config) = step.loop_config.as_ref() {
@@ -1259,16 +1394,39 @@ fn validate_files_only_support(
 ) {
     let mut check = |id: &str, role_id: &str, runtime: &super::WorkflowRuntimeStep| {
         let role = package.roles.get(role_id.trim());
-        let policy = role.map(|role| role.tool_policy.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.tool_policy.trim());
-        if policy != "files_only" && runtime.permission_mode != "full_access" { return; }
-        let provider = role.map(|role| role.runtime_provider.trim()).filter(|value| !value.is_empty()).unwrap_or(runtime.provider.trim());
-        if policy != "files_only" && runtime.permission_mode == "full_access" && (provider == "personal.codex" || crate::runtime::acp::is_provider(provider)) {
-            if !runtime_reports.iter().any(|report| report.provider == provider && report.status == "ready") {
-                push_blocker(diagnostics, "runtime.full_access_unsupported", "runtime", format!("executor {provider} is unavailable for step {id}"), "请检查所选执行器的安装和配置。", true);
+        let policy = role
+            .map(|role| role.tool_policy.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(runtime.tool_policy.trim());
+        if policy != "files_only" && runtime.permission_mode != "full_access" {
+            return;
+        }
+        let provider = role
+            .map(|role| role.runtime_provider.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(runtime.provider.trim());
+        if policy != "files_only"
+            && runtime.permission_mode == "full_access"
+            && (provider == "personal.codex" || crate::runtime::acp::is_provider(provider))
+        {
+            if !runtime_reports
+                .iter()
+                .any(|report| report.provider == provider && report.status == "ready")
+            {
+                push_blocker(
+                    diagnostics,
+                    "runtime.full_access_unsupported",
+                    "runtime",
+                    format!("executor {provider} is unavailable for step {id}"),
+                    "请检查所选执行器的安装和配置。",
+                    true,
+                );
             }
             return;
         }
-        let builtin_ready = runtime_reports.iter().any(|report| report.provider == "himind.builtin" && report.status == "ready");
+        let builtin_ready = runtime_reports
+            .iter()
+            .any(|report| report.provider == "himind.builtin" && report.status == "ready");
         if !matches!(provider, "auto" | "himind.builtin") || !builtin_ready {
             push_blocker(diagnostics, if runtime.permission_mode == "full_access" { "runtime.full_access_unsupported" } else { "runtime.files_only_unsupported" }, "runtime",
                 format!("workflow step {id} requires built-in permission/tool enforcement but provider {provider} cannot enforce it or HiMind AI is unavailable"),
@@ -1276,15 +1434,25 @@ fn validate_files_only_support(
         }
     };
     for step in steps {
-        if let Some(runtime) = &step.runtime { check(&step.id, &step.role_id, runtime); }
+        if let Some(runtime) = &step.runtime {
+            check(&step.id, &step.role_id, runtime);
+        }
         if let Some(delegate) = &step.delegate {
             for branch in &delegate.branches {
-                if let Some(runtime) = &branch.runtime { check(&format!("{}:{}", step.id, branch.id), &branch.role_id, runtime); }
+                if let Some(runtime) = &branch.runtime {
+                    check(
+                        &format!("{}:{}", step.id, branch.id),
+                        &branch.role_id,
+                        runtime,
+                    );
+                }
             }
         }
     }
     for step in steps {
-        if let Some(config) = &step.loop_config { validate_files_only_support(package, &config.steps, runtime_reports, diagnostics); }
+        if let Some(config) = &step.loop_config {
+            validate_files_only_support(package, &config.steps, runtime_reports, diagnostics);
+        }
     }
 }
 
@@ -1753,7 +1921,8 @@ mod tests {
         // 1) 显式声明 builtin + none：合法，不产生诊断。
         let mut ok = package(Vec::new());
         ok.steps.clear();
-        ok.steps.push(step_with_policy("STEP", "himind.builtin", "none"));
+        ok.steps
+            .push(step_with_policy("STEP", "himind.builtin", "none"));
         let mut diagnostics = Vec::new();
         validate_tool_policy_support(&ok, &[], &mut diagnostics);
         assert!(
@@ -1764,7 +1933,8 @@ mod tests {
         // 2) 显式声明 codex + none 且 codex 可用：blocker。
         let mut bad = package(Vec::new());
         bad.steps.clear();
-        bad.steps.push(step_with_policy("STEP", "personal.codex", "none"));
+        bad.steps
+            .push(step_with_policy("STEP", "personal.codex", "none"));
         let available = vec![runtime_report("personal.codex", "ready")];
         let mut diagnostics = Vec::new();
         validate_tool_policy_support(&bad, &available, &mut diagnostics);
@@ -1779,7 +1949,12 @@ mod tests {
         // 3) 委派分支声明 none：必须被扫到（审查角色正是在分支里）。
         let mut delegated = package(Vec::new());
         delegated.steps.clear();
-        delegated.steps.push(delegate_with_branch_policy("GATE", "BRANCH", "personal.codex", "none"));
+        delegated.steps.push(delegate_with_branch_policy(
+            "GATE",
+            "BRANCH",
+            "personal.codex",
+            "none",
+        ));
         let mut diagnostics = Vec::new();
         validate_tool_policy_support(&delegated, &available, &mut diagnostics);
         assert_eq!(
@@ -1790,17 +1965,24 @@ mod tests {
         assert!(diagnostics[0].message.contains("GATE:BRANCH"));
     }
 
-    fn step_with_policy(id: &str, provider: &str, tool_policy: &str) -> crate::workflow::WorkflowStep {
+    fn step_with_policy(
+        id: &str,
+        provider: &str,
+        tool_policy: &str,
+    ) -> crate::workflow::WorkflowStep {
         crate::workflow::WorkflowStep {
             id: id.to_string(),
             title: id.to_string(),
             kind: "runtime".to_string(),
             capability_id: String::new(),
-            runtime: Some(serde_json::from_value(serde_json::json!({
-                "provider": provider,
-                "prompt": "do it",
-                "tool_policy": tool_policy
-            })).unwrap()),
+            runtime: Some(
+                serde_json::from_value(serde_json::json!({
+                    "provider": provider,
+                    "prompt": "do it",
+                    "tool_policy": tool_policy
+                }))
+                .unwrap(),
+            ),
             delegate: None,
             loop_config: None,
             when: None,
@@ -1833,10 +2015,13 @@ mod tests {
             kind: "delegate".to_string(),
             capability_id: String::new(),
             runtime: None,
-            delegate: Some(Box::new(serde_json::from_value(serde_json::json!({
-                "min_succeeded": 1,
-                "branches": [branch]
-            })).unwrap())),
+            delegate: Some(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "min_succeeded": 1,
+                    "branches": [branch]
+                }))
+                .unwrap(),
+            )),
             loop_config: None,
             when: None,
             fail_when: None,
@@ -1910,20 +2095,30 @@ mod tests {
     fn files_only_preflight_checks_inherited_role_provider_and_builtin_availability() {
         let mut package = package(Vec::new());
         package.steps[0].role_id = "editor".into();
-        package.steps[0].runtime = Some(serde_json::from_value(json!({
-            "provider":"personal.codex", "prompt":"Edit the file"
-        })).unwrap());
-        package.roles.insert("editor".into(), serde_json::from_value(json!({"tool_policy":"files_only"})).unwrap());
+        package.steps[0].runtime = Some(
+            serde_json::from_value(json!({
+                "provider":"personal.codex", "prompt":"Edit the file"
+            }))
+            .unwrap(),
+        );
+        package.roles.insert(
+            "editor".into(),
+            serde_json::from_value(json!({"tool_policy":"files_only"})).unwrap(),
+        );
         let ready = vec![runtime_report("himind.builtin", "ready")];
         let mut diagnostics = Vec::new();
         validate_tool_policy_support(&package, &ready, &mut diagnostics);
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
         package.roles.get_mut("editor").unwrap().runtime_provider = "auto".into();
         diagnostics.clear();
         validate_tool_policy_support(&package, &ready, &mut diagnostics);
         assert!(diagnostics.is_empty());
         validate_tool_policy_support(&package, &[], &mut diagnostics);
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "runtime.files_only_unsupported"));
     }
 
     fn capability(id: &str) -> CapabilityDescriptor {
@@ -2034,7 +2229,8 @@ mod tests {
         package.steps[0].capability_id.clear();
         package.steps[0].kind = "runtime".to_string();
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "auto".to_string(),
+            permission_mode: String::new(),
+            provider: "auto".to_string(),
             prompt: "Do work.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2059,21 +2255,49 @@ mod tests {
     fn codex_full_access_preflight_requires_ready_provider_and_still_rejects_files_only() {
         let mut package = package(Vec::new());
         package.steps[0].role_id = "implementer".into();
-        package.roles.insert("implementer".into(), crate::workflow::WorkflowRole {
-            runtime_provider: "personal.codex".into(), tool_policy: "default".into(), ..Default::default()
-        });
-        package.steps[0].runtime = Some(serde_json::from_value(json!({
-            "provider":"auto", "permission_mode":"full_access", "prompt":"Implement"
-        })).unwrap());
+        package.roles.insert(
+            "implementer".into(),
+            crate::workflow::WorkflowRole {
+                runtime_provider: "personal.codex".into(),
+                tool_policy: "default".into(),
+                ..Default::default()
+            },
+        );
+        package.steps[0].runtime = Some(
+            serde_json::from_value(json!({
+                "provider":"auto", "permission_mode":"full_access", "prompt":"Implement"
+            }))
+            .unwrap(),
+        );
         let mut diagnostics = Vec::new();
-        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
+        validate_files_only_support(
+            &package,
+            &package.steps,
+            &[runtime_report("personal.codex", "ready")],
+            &mut diagnostics,
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "unavailable")], &mut diagnostics);
-        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported"));
+        validate_files_only_support(
+            &package,
+            &package.steps,
+            &[runtime_report("personal.codex", "unavailable")],
+            &mut diagnostics,
+        );
+        assert!(diagnostics
+            .iter()
+            .any(|item| item.code == "runtime.full_access_unsupported"));
         package.roles.get_mut("implementer").unwrap().tool_policy = "files_only".into();
         diagnostics.clear();
-        validate_files_only_support(&package, &package.steps, &[runtime_report("personal.codex", "ready")], &mut diagnostics);
-        assert!(diagnostics.iter().any(|item| item.code == "runtime.full_access_unsupported" || item.code == "runtime.files_only_unsupported"));
+        validate_files_only_support(
+            &package,
+            &package.steps,
+            &[runtime_report("personal.codex", "ready")],
+            &mut diagnostics,
+        );
+        assert!(diagnostics
+            .iter()
+            .any(|item| item.code == "runtime.full_access_unsupported"
+                || item.code == "runtime.files_only_unsupported"));
     }
 
     #[test]
@@ -2081,7 +2305,8 @@ mod tests {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2122,7 +2347,8 @@ mod tests {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2166,7 +2392,8 @@ mod tests {
         package.supported_runtimes = vec!["himind.builtin".to_string()];
         package.optional_providers = vec!["acp.claude".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "himind.builtin".to_string(),
+            permission_mode: String::new(),
+            provider: "himind.builtin".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2216,7 +2443,8 @@ mod tests {
             "personal.github-copilot".to_string(),
         ];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "auto".to_string(),
+            permission_mode: String::new(),
+            provider: "auto".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2248,7 +2476,8 @@ mod tests {
         let mut package = package(Vec::new());
         package.supported_runtimes = vec!["personal.codex".to_string()];
         package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
-            permission_mode: String::new(), provider: "personal.codex".to_string(),
+            permission_mode: String::new(),
+            provider: "personal.codex".to_string(),
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
@@ -2594,6 +2823,40 @@ mod tests {
     }
 
     #[test]
+    fn receipt_inputs_are_deferred_only_for_declared_dependencies() {
+        let mut workflow = package(Vec::new());
+        let mut preview = workflow.steps[0].clone();
+        preview.id = "PREVIEW".into();
+        preview.capability_id = "system.health".into();
+        let mut activate = preview.clone();
+        activate.id = "ACTIVATE".into();
+        activate.capability_id = "test.activate".into();
+        activate.depends_on = vec!["PREVIEW".into()];
+        activate.input = json!({"receipt":"steps.PREVIEW"});
+        workflow.steps = vec![preview, activate];
+        let health = capability("system.health");
+        let mut publish = capability("test.activate");
+        publish.input_schema = json!({"type":"object","properties":{"receipt":{"type":"object"}},"required":["receipt"],"additionalProperties":false});
+        let map = std::collections::BTreeMap::from([
+            ("system.health", &health),
+            ("test.activate", &publish),
+        ]);
+        let mut diagnostics = Vec::new();
+        validate_capability_step_inputs(
+            &workflow,
+            &map,
+            &json!({"receipt":"forged"}),
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        workflow.steps[1].depends_on.clear();
+        validate_capability_step_inputs(&workflow, &map, &json!({}), &mut diagnostics);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "capability.input.receipt"));
+    }
+
+    #[test]
     fn launch_form_field_mapping_covers_renamed_capability_property() {
         let view = json!({
             "schema_version": "workflow_view.v1",
@@ -2684,6 +2947,75 @@ mod tests {
         let report = preflight(&package, "0.3.47", &[capability], &json!({}));
         assert!(report.ready, "{:?}", report.blockers);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unavailable_capability_is_optional_only_when_all_declaring_steps_are_disabled_by_launch_input(
+    ) {
+        let mut package = package(Vec::new());
+        package.steps[0].when = Some(crate::workflow::WorkflowCondition {
+            operator: "equals".into(),
+            path: "input.build_provider".into(),
+            value: json!("optional-provider"),
+            conditions: Vec::new(),
+        });
+        let skipped = preflight(
+            &package,
+            "0.3.94",
+            &[],
+            &json!({"build_provider":"external"}),
+        );
+        assert!(
+            !skipped
+                .blockers
+                .iter()
+                .any(|b| b.contains("required capability is unavailable: system.health")),
+            "{:?}",
+            skipped.blockers
+        );
+        assert!(skipped
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "capability.condition_disabled"));
+        for input in [json!({"build_provider":"optional-provider"}), json!({})] {
+            let enabled = preflight(&package, "0.3.94", &[], &input);
+            assert!(enabled
+                .blockers
+                .iter()
+                .any(|b| b.contains("required capability is unavailable: system.health")));
+        }
+        let mut unconditional = package.steps[0].clone();
+        unconditional.id = "UNCONDITIONAL".into();
+        unconditional.when = None;
+        package.steps.push(unconditional);
+        let shared = preflight(
+            &package,
+            "0.3.94",
+            &[],
+            &json!({"build_provider":"external"}),
+        );
+        assert!(shared
+            .blockers
+            .iter()
+            .any(|b| b.contains("required capability is unavailable: system.health")));
+        package.steps.truncate(1);
+        package.steps[0].when.as_mut().unwrap().path = "steps.NOT_COMPLETED.ok".into();
+        let runtime_dependent = preflight(
+            &package,
+            "0.3.94",
+            &[],
+            &json!({"steps":{"NOT_COMPLETED":{"ok":false}}}),
+        );
+        assert!(runtime_dependent
+            .blockers
+            .iter()
+            .any(|b| b.contains("required capability is unavailable: system.health")));
+        package.steps[0].when.as_mut().unwrap().operator = "exists".into();
+        let runtime_exists = preflight(&package, "0.3.94", &[], &json!({}));
+        assert!(runtime_exists
+            .blockers
+            .iter()
+            .any(|b| b.contains("required capability is unavailable: system.health")));
     }
 
     #[test]

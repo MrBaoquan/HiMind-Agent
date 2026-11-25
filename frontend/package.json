@@ -2,6 +2,7 @@
   "scripts": {
     "build": "node scripts/remediation/service-ui-build.mjs",
     "dev": "vite --host 127.0.0.1",
+    "check:secure-chat-import-browser": "node scripts/check-secure-chat-import.browser.mjs",
     "check:start-form": "node --experimental-strip-types scripts/check-start-form.mts",
     "check:workflow-option-sources": "node --experimental-strip-types scripts/check-workflow-option-sources.mts",
     "check:run-view": "node --experimental-strip-types scripts/check-run-view.mts",
@@ -18,6 +19,7 @@
     "check:status-copy": "node --experimental-strip-types scripts/check-status-copy.mts",
     "check:extension-activation-status": "node --experimental-strip-types scripts/check-extension-activation-status.mts",
     "check:development-local-only": "node --experimental-strip-types scripts/check-development-local-only.mts",
+    "check:workflow-submission-browser": "node scripts/check-workflow-submission.browser.mjs",
     "check:ai-service-onboarding": "node --experimental-strip-types scripts/check-ai-service-onboarding.mts",
     "check:ai-client-source-browser": "node scripts/check-ai-client-source.browser.mjs",
     "check:ai-service-onboarding-browser": "node scripts/check-ai-service-onboarding.browser.mjs",

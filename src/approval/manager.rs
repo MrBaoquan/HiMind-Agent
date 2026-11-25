@@ -24,7 +24,6 @@ pub struct LogEntry {
 pub struct ApprovalManager {
     pending: Mutex<Vec<PendingApproval>>,
     facts: Mutex<Vec<ApprovalFact>>,
-    settings: Mutex<ApprovalSettings>,
     log_entries: Mutex<Vec<LogEntry>>,
     log_path: PathBuf,
     settings_path: PathBuf,
@@ -54,13 +53,11 @@ impl ApprovalManager {
         let instance_id = generate_instance_id();
         let instance_lock = acquire_instance_lock(&agent_home, &instance_id);
         let log_entries = load_persisted_logs(&log_path);
-        let settings = load_persisted_settings(&settings_path);
         let (facts, interrupted) = recover_abandoned_facts(&agent_home, &facts_path)
             .unwrap_or_else(|_| (load_persisted_facts(&facts_path), 0));
         let manager = Self {
             pending: Mutex::new(Vec::new()),
             facts: Mutex::new(facts),
-            settings: Mutex::new(settings),
             log_entries: Mutex::new(log_entries),
             log_path,
             settings_path,
@@ -338,11 +335,7 @@ impl ApprovalManager {
             ApprovalMode::Manual => {}
         }
 
-        let timeout = self
-            .settings
-            .lock()
-            .map(|s| s.timeout_seconds)
-            .unwrap_or(30);
+        let timeout = self.get_settings().timeout_seconds;
         let timeout = timeout_override.unwrap_or(timeout);
 
         let id = request_id.map(str::to_string).unwrap_or_else(generate_id);
@@ -543,8 +536,30 @@ impl ApprovalManager {
             .collect()
     }
 
+    /// The file is the authority shared by desktop, MCP and workers. Never
+    /// reuse a cached grant: revocation must take effect on the next request.
+    /// Mutations hold this same lock until the atomic write completes, so an
+    /// unrelated update cannot restore another process's stale permissions.
+    fn lock_settings(
+        &self,
+    ) -> Result<(crate::store::atomic_file::AtomicFileLock, ApprovalSettings), String> {
+        let lock = crate::store::atomic_file::lock(&self.settings_path)
+            .map_err(|error| format!("锁定审批设置失败: {error}"))?;
+        let settings = match fs::read(&self.settings_path) {
+            Ok(content) => serde_json::from_slice::<ApprovalSettings>(&content)
+                .map_err(|error| format!("读取审批设置失败: {error}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ApprovalSettings::default()
+            }
+            Err(error) => return Err(format!("读取审批设置失败: {error}")),
+        };
+        Ok((lock, settings))
+    }
+
     pub fn get_settings(&self) -> ApprovalSettings {
-        self.settings.lock().map(|s| s.clone()).unwrap_or_default()
+        self.lock_settings()
+            .map(|(_, settings)| settings)
+            .unwrap_or_default()
     }
 
     pub fn effective_mode_for_risk(&self, risk_level: &str) -> ApprovalMode {
@@ -567,11 +582,10 @@ impl ApprovalManager {
         if user_id.is_empty() || agent_id.is_empty() {
             return Err("审批身份绑定需要 Dashboard 用户和 Agent 标识".to_string());
         }
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
+        let (_file_lock, mut settings) = self.lock_settings()?;
         if settings.owner_user_id == user_id && settings.agent_id == agent_id {
             return Ok(false);
         }
-        let previous = settings.clone();
         let previous_profile = settings.profile.clone();
         // An empty binding is the normal state after logout, independent-mode
         // startup, or a transient authorization recovery. It does not prove
@@ -610,10 +624,7 @@ impl ApprovalManager {
                 }
             }
         }
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         drop(settings);
         let message = if identity_changed {
             format!(
@@ -636,11 +647,10 @@ impl ApprovalManager {
     /// an explicit 完全放行 / 完全信任 choice back into approval popups. Only
     /// identity-scoped grant rules are tied to the account.
     pub fn clear_identity(&self) -> Result<bool, String> {
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
+        let (_file_lock, mut settings) = self.lock_settings()?;
         if settings.owner_user_id.is_empty() && settings.agent_id.is_empty() {
             return Ok(false);
         }
-        let previous = settings.clone();
         if !settings.owner_user_id.trim().is_empty() && !settings.agent_id.trim().is_empty() {
             settings.last_bound_user_id = settings.owner_user_id.clone();
             settings.last_bound_agent_id = settings.agent_id.clone();
@@ -650,10 +660,7 @@ impl ApprovalManager {
         settings.binding_updated_at = unix_now();
         // Local posture (profile + risk acknowledgement) is intentionally kept.
         reset_identity_sensitive_rules(&mut settings);
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         drop(settings);
         self.add_log(
             "info",
@@ -663,10 +670,7 @@ impl ApprovalManager {
     }
 
     pub fn should_show_popup(&self) -> bool {
-        self.settings
-            .lock()
-            .map(|settings| settings.notification_mode == "popup")
-            .unwrap_or(true)
+        self.get_settings().notification_mode == "popup"
     }
 
     pub fn update_profile(&self, profile: &str, confirmed: bool) -> Result<(), String> {
@@ -695,8 +699,7 @@ impl ApprovalManager {
         {
             return Err("风险授权有效期仅支持 1 小时、3 小时、1 天或永久".to_string());
         }
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
-        let previous = settings.clone();
+        let (_file_lock, mut settings) = self.lock_settings()?;
         settings.profile = profile.to_string();
         settings.risk_acknowledged_at = if matches!(profile, "trusted" | "full_access") && confirmed
         {
@@ -715,10 +718,7 @@ impl ApprovalManager {
         if profile == "focus" {
             settings.notification_mode = "inbox".to_string();
         }
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         Ok(())
     }
 
@@ -727,16 +727,12 @@ impl ApprovalManager {
         if !matches!(mode, "popup" | "tray" | "inbox") {
             return Err(format!("不支持的审批提醒方式: {mode}"));
         }
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
-        let previous = settings.clone();
+        let (_file_lock, mut settings) = self.lock_settings()?;
         if settings.profile == "focus" {
             settings.profile = "balanced".to_string();
         }
         settings.notification_mode = mode.to_string();
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         Ok(())
     }
 
@@ -748,7 +744,7 @@ impl ApprovalManager {
         if !matches!(mode, "inherit" | "manual" | "auto_approve" | "auto_deny") {
             return Err(format!("不支持的审批模式: {mode}"));
         }
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
+        let (_file_lock, mut settings) = self.lock_settings()?;
         let is_r4 = request_type == "risk:R4";
         let is_r3 = request_type == "risk:R3"
             || super::policy::is_destructive_capability(request_type)
@@ -766,7 +762,6 @@ impl ApprovalManager {
                 "R3 仅可在完全信任或完全放行档位下自动批准；请先明确启用对应档位".to_string()
             });
         }
-        let previous = settings.clone();
         if mode == "inherit" {
             settings.rules.remove(request_type);
         } else {
@@ -774,10 +769,7 @@ impl ApprovalManager {
                 .rules
                 .insert(request_type.to_string(), mode.to_string());
         }
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         Ok(())
     }
 
@@ -785,13 +777,9 @@ impl ApprovalManager {
         if !(1..=86_400).contains(&seconds) {
             return Err("审批超时必须在 1 秒到 24 小时之间".to_string());
         }
-        let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
-        let previous = settings.clone();
+        let (_file_lock, mut settings) = self.lock_settings()?;
         settings.timeout_seconds = seconds;
-        if let Err(error) = persist_settings(&self.settings_path, &settings) {
-            *settings = previous;
-            return Err(error);
-        }
+        persist_settings_locked(&self.settings_path, &settings)?;
         Ok(())
     }
 
@@ -839,7 +827,7 @@ impl ApprovalManager {
         manual_only: bool,
         risk_level: Option<&str>,
     ) -> (ApprovalMode, bool) {
-        if let Ok(settings) = self.settings.lock() {
+        if let Ok((_file_lock, settings)) = self.lock_settings() {
             // A different workbench account must never inherit the previous
             // account's posture, so the persisted OAuth identity is re-read on
             // every invocation and background workers fail closed even before
@@ -919,7 +907,7 @@ impl ApprovalManager {
             }
             (default_mode, false)
         } else {
-            (default_mode, false)
+            (ApprovalMode::Manual, false)
         }
     }
 
@@ -1219,13 +1207,6 @@ fn load_persisted_logs(path: &std::path::Path) -> Vec<LogEntry> {
     entries
 }
 
-fn load_persisted_settings(path: &std::path::Path) -> ApprovalSettings {
-    let Ok(content) = fs::read(path) else {
-        return ApprovalSettings::default();
-    };
-    serde_json::from_slice::<ApprovalSettings>(&content).unwrap_or_default()
-}
-
 fn load_persisted_facts(path: &std::path::Path) -> Vec<ApprovalFact> {
     let read = |candidate: &std::path::Path| {
         fs::read(candidate)
@@ -1308,11 +1289,20 @@ fn approval_owner_is_alive(agent_home: &std::path::Path, instance_id: &str) -> b
     }
 }
 
+#[cfg(test)]
 fn persist_settings(path: &std::path::Path, settings: &ApprovalSettings) -> Result<(), String> {
-    let content = serde_json::to_vec_pretty(settings)
-        .map_err(|error| format!("序列化审批设置失败: {error}"))?;
     let _lock = crate::store::atomic_file::lock(path)
         .map_err(|error| format!("锁定审批设置失败: {error}"))?;
+    persist_settings_locked(path, settings)
+}
+
+// Caller holds the settings file lock across the entire read/modify/write.
+fn persist_settings_locked(
+    path: &std::path::Path,
+    settings: &ApprovalSettings,
+) -> Result<(), String> {
+    let content = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("序列化审批设置失败: {error}"))?;
     crate::store::atomic_file::atomic_write(path, &content)
         .map_err(|error| format!("保存审批设置失败: {error}"))
 }
@@ -1336,12 +1326,7 @@ fn reset_identity_sensitive_rules(settings: &mut ApprovalSettings) {
 ///
 /// 单独起线程有三个理由：投递是网络操作、失败不能影响审批、
 /// 用户没配通道时开销为零（子线程里读配置为空就直接返回）。
-fn spawn_notification(
-    approval_id: String,
-    title: String,
-    description: String,
-    risk_level: String,
-) {
+fn spawn_notification(approval_id: String, title: String, description: String, risk_level: String) {
     let risk = risk_level.clone();
     let _ = std::thread::Builder::new()
         .name("himind-notify".to_string())
@@ -1591,6 +1576,219 @@ mod destructive_tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn cross_instance_settings_enable_and_revoke_full_access() {
+        let home = test_home("cross-instance-profile");
+        let requester = ApprovalManager::new_in(home.clone());
+        let desktop = ApprovalManager::new_in(home.clone());
+        desktop
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        assert!(matches!(
+            requester.effective_mode_for_risk("R4"),
+            ApprovalMode::AutoApprove
+        ));
+        assert_eq!(requester.get_settings().profile, "full_access");
+        assert!(requester
+            .request_capability_approval(
+                "exhibit.web.build",
+                "R2",
+                "build".into(),
+                "isolated test".into()
+            )
+            .unwrap());
+        assert_eq!(
+            requester.list_recent_facts()[0].resolution_reason,
+            "full_access_profile_auto_approved"
+        );
+        desktop.update_profile("strict", false).unwrap();
+        assert!(matches!(
+            requester.effective_mode_for_risk("R2"),
+            ApprovalMode::Manual
+        ));
+        assert!(matches!(
+            requester.effective_mode_for_risk("R4"),
+            ApprovalMode::Manual
+        ));
+        drop((requester, desktop));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_instance_settings_updates_preserve_other_fields_and_identity() {
+        let home = test_home("cross-instance-updates");
+        let stale = ApprovalManager::new_in(home.clone());
+        let desktop = ApprovalManager::new_in(home.clone());
+        desktop.bind_identity("user-a", "agent-a").unwrap();
+        desktop
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        desktop.update_rule("risk:R3", "manual").unwrap();
+        stale.update_timeout(37).unwrap();
+        stale.update_notification_mode("inbox").unwrap();
+        stale.update_rule("exhibit.web.build", "auto_deny").unwrap();
+        let settings = desktop.get_settings();
+        assert_eq!(settings.profile, "full_access");
+        assert_eq!(settings.owner_user_id, "user-a");
+        assert_eq!(settings.timeout_seconds, 37);
+        assert!(!desktop.should_show_popup());
+        assert_eq!(settings.rules["risk:R3"], "manual");
+        assert_eq!(settings.rules["exhibit.web.build"], "auto_deny");
+        stale.bind_identity("user-b", "agent-b").unwrap();
+        assert_eq!(desktop.get_settings().profile, "balanced");
+        assert!(matches!(
+            desktop.effective_mode_for_risk("R4"),
+            ApprovalMode::Manual
+        ));
+        drop((stale, desktop));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_instance_settings_explicit_rules_remain_authoritative() {
+        let home = test_home("cross-instance-rules");
+        let requester = ApprovalManager::new_in(home.clone());
+        let desktop = ApprovalManager::new_in(home.clone());
+        desktop
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        desktop.update_rule("risk:R2", "auto_deny").unwrap();
+        assert!(matches!(
+            requester.effective_mode_for_risk("R2"),
+            ApprovalMode::AutoDeny
+        ));
+        desktop.update_rule("risk:R2", "manual").unwrap();
+        assert!(matches!(
+            requester.effective_mode_for_risk("R2"),
+            ApprovalMode::Manual
+        ));
+        desktop.update_rule("risk:R2", "inherit").unwrap();
+        assert!(matches!(
+            requester.effective_mode_for_risk("R2"),
+            ApprovalMode::AutoApprove
+        ));
+        drop((requester, desktop));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_instance_settings_corruption_cannot_keep_cached_full_access() {
+        let home = test_home("cross-instance-corrupt");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        fs::write(home.join("approval-settings.json"), b"invalid json").unwrap();
+        assert!(matches!(
+            manager.effective_mode_for_risk("R4"),
+            ApprovalMode::Manual
+        ));
+        assert!(manager.update_timeout(42).is_err());
+        assert_eq!(
+            fs::read(home.join("approval-settings.json")).unwrap(),
+            b"invalid json"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_process_settings_reload_after_other_process_writes() {
+        const TEST_NAME: &str = "approval::manager::destructive_tests::cross_process_settings_reload_after_other_process_writes";
+        const CHILD_HOME: &str = "HIMIND_APPROVAL_SYNC_TEST_HOME";
+        const CHILD_PROFILE: &str = "HIMIND_APPROVAL_SYNC_TEST_PROFILE";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let manager = ApprovalManager::new_in(PathBuf::from(home));
+            let profile = std::env::var(CHILD_PROFILE).unwrap();
+            manager
+                .update_profile_with_duration(&profile, profile == "full_access", Some(0))
+                .unwrap();
+            return;
+        }
+        let home = test_home("real-cross-process-settings");
+        let requester = ApprovalManager::new_in(home.clone());
+        for (profile, automatic) in [("full_access", true), ("strict", false)] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--test-threads=1"])
+                .env(CHILD_HOME, &home)
+                .env(CHILD_PROFILE, profile)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(requester.get_settings().profile, profile);
+            assert_eq!(
+                matches!(
+                    requester.effective_mode_for_risk("R4"),
+                    ApprovalMode::AutoApprove
+                ),
+                automatic
+            );
+        }
+        drop(requester);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_instance_settings_concurrent_writers_do_not_lose_rules() {
+        let home = test_home("concurrent-settings");
+        let desktop = ApprovalManager::new_in(home.clone());
+        desktop
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let manager = ApprovalManager::new_in(home.clone());
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    manager
+                        .update_rule(&format!("test.rule.{index}"), "manual")
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let settings = desktop.get_settings();
+        for index in 0..8 {
+            assert_eq!(settings.rules[&format!("test.rule.{index}")], "manual");
+        }
+        assert_eq!(settings.profile, "full_access");
+        drop(desktop);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cross_instance_settings_expiry_and_missing_file_revoke_grants() {
+        let home = test_home("settings-expiry");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager
+            .update_profile_with_duration("full_access", true, Some(0))
+            .unwrap();
+        let mut settings = manager.get_settings();
+        settings.risk_acknowledged_at = super::unix_now() - 7200;
+        settings.risk_acknowledged_duration_seconds = 3600;
+        super::persist_settings(&home.join("approval-settings.json"), &settings).unwrap();
+        assert!(matches!(
+            manager.effective_mode_for_risk("R4"),
+            ApprovalMode::Manual
+        ));
+        fs::remove_file(home.join("approval-settings.json")).unwrap();
+        assert!(matches!(
+            manager.effective_mode_for_risk("R4"),
+            ApprovalMode::Manual
+        ));
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

@@ -175,8 +175,10 @@ pub(crate) fn protected_workspace_reason(executable: &Path, workspace: &Path) ->
     let candidate = path_key(workspace);
     protected_roots(executable).into_iter().find_map(|root| {
         let root = path_key(&root);
-        if candidate == root || candidate.starts_with(&(root.clone() + "\\"))
-            || root.starts_with(&(candidate.clone() + "\\")) {
+        if candidate == root
+            || candidate.starts_with(&(root.clone() + "\\"))
+            || root.starts_with(&(candidate.clone() + "\\"))
+        {
             Some(format!("Agent 管理目录（{}）禁止 ACL 预热", root))
         } else {
             None
@@ -323,13 +325,31 @@ const { pathToFileURL } = require("node:url");
             Ok(child) => child,
             Err(error) => return WarmupOutcome::Failed(format!("无法执行 node：{error}")),
         };
-        let stdout = child.stdout.take().map(crate::runtime::process::capture_output);
-        let stderr = child.stderr.take().map(crate::runtime::process::capture_output);
-        let status = crate::runtime::process::wait_for_child_with_timeout_and_cancel(&mut child,
-            "HIMIND_SANDBOX_WARMUP_TIMEOUT_SECONDS", 300, "工作区沙箱准备", || Ok(false));
-        let stdout = crate::runtime::process::join_output(stdout).trim().to_string();
-        let stderr = crate::runtime::process::join_output(stderr).trim().to_string();
-        let status = match status { Ok(status) => status, Err(error) => return WarmupOutcome::Failed(error.to_string()) };
+        let stdout = child
+            .stdout
+            .take()
+            .map(crate::runtime::process::capture_output);
+        let stderr = child
+            .stderr
+            .take()
+            .map(crate::runtime::process::capture_output);
+        let status = crate::runtime::process::wait_for_child_with_timeout_and_cancel(
+            &mut child,
+            "HIMIND_SANDBOX_WARMUP_TIMEOUT_SECONDS",
+            300,
+            "工作区沙箱准备",
+            || Ok(false),
+        );
+        let stdout = crate::runtime::process::join_output(stdout)
+            .trim()
+            .to_string();
+        let stderr = crate::runtime::process::join_output(stderr)
+            .trim()
+            .to_string();
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => return WarmupOutcome::Failed(error.to_string()),
+        };
         if status.success() {
             WarmupOutcome::Ready(if stdout.is_empty() {
                 "ready".to_string()

@@ -1,3 +1,4 @@
+import type { WorkflowSubmissionStatus } from './services/agentApi';
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RefreshCw, ShieldAlert } from 'lucide-react';
@@ -285,7 +286,7 @@ function AgentApp() {
   const [workflowDrafts, setWorkflowDrafts] = useState<AuthoringWorkflowDraft[]>([]);
   const [expertDrafts, setExpertDrafts] = useState<import('./services/agentApi').ExpertAuthoringDraft[]>([]);
   const [instructionDrafts, setInstructionDrafts] = useState<InstructionPackDraft[]>([]);
-  const [workflowSubmissions, setWorkflowSubmissions] = useState<AuthoringWorkflowDraft[]>([]);
+  const [workflowSubmissions, setWorkflowSubmissions] = useState<WorkflowSubmissionStatus[]>([]);
   const [pluginSubmissions, setPluginSubmissions] = useState<PluginSubmissionStatus[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
   const [skillStatus, setSkillStatus] = useState<CodexSkillStatusResponse | null>(null);

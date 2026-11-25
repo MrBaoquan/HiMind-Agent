@@ -214,6 +214,8 @@ pub(crate) struct InvocationContext {
     pub ai_client_id: String,
     pub device_id: String,
     pub workspace_ref: String,
+    /// Set only by a session/runtime/native user adapter, never from model input.
+    pub trusted_workspace_ref: String,
     pub business_context: Value,
     pub session_id_hash: String,
     pub request_id: String,
@@ -261,6 +263,7 @@ impl InvocationContext {
             ai_client_id,
             device_id: String::new(),
             workspace_ref: String::new(),
+            trusted_workspace_ref: String::new(),
             business_context: Value::Object(serde_json::Map::new()),
             session_id_hash: String::new(),
             request_id: next_request_id(),
@@ -281,6 +284,13 @@ impl InvocationContext {
 
     pub(crate) fn with_workspace_ref(mut self, value: impl Into<String>) -> Self {
         self.workspace_ref = value.into();
+        self
+    }
+
+    pub(crate) fn with_trusted_workspace(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        self.workspace_ref = value.clone();
+        self.trusted_workspace_ref = value;
         self
     }
 

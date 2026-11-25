@@ -4218,7 +4218,7 @@ impl CapabilityGateway {
         &self,
         context: &InvocationContext,
         capability_id: &str,
-        input: Value,
+        mut input: Value,
         mut execution: Option<&mut CapabilityExecutionContext<'_>>,
     ) -> Result<Value, Box<dyn Error>> {
         // 工作台媒体能力已从 `media.*` 迁移到 `workbench.media.*`；旧 ID 只在调用
@@ -4240,6 +4240,25 @@ impl CapabilityGateway {
                 None => original_capability_id,
             }
         };
+        // Re-enter through the concrete contract so generic plugin.invoke cannot
+        // bypass binding, risk classification, approval or execution freezing.
+        if capability_id == "plugin.invoke" {
+            let id = input
+                .get("capability_id")
+                .and_then(Value::as_str)
+                .ok_or("capability_id required")?;
+            if id == "plugin.invoke" {
+                return Err("recursive plugin invocation".into());
+            }
+            return self.invoke_internal(
+                context,
+                id,
+                input.get("input").cloned().unwrap_or_else(|| json!({})),
+                execution,
+            );
+        }
+        let prepared_binding =
+            crate::app::extension_binding::prepare(context, capability_id, &mut input)?;
         if is_svn_admin_capability(capability_id) {
             return Err("集中 SVN 管理能力仅由 Edge Worker 执行".into());
         }
@@ -6142,14 +6161,27 @@ impl CapabilityGateway {
             CapabilityHandler::MediaJobCancelLocal => crate::app::local_video::job_cancel(&input),
             CapabilityHandler::PluginCapability(id) => {
                 validate_mcp_capability_workspace(context, &id, &input)?;
-                let (_capability_broker, capability_env) =
+                let (_capability_broker, mut capability_env) =
                     self.capability_broker_env(context, &id)?;
-                let output = invoke_plugin_capability(
+                if prepared_binding.is_some() {
+                    capability_env.push((
+                        "HIMIND_VERIFIED_BINDING".into(),
+                        policy::args_digest(&input)?,
+                    ));
+                }
+                let _binding_lock = prepared_binding
+                    .as_ref()
+                    .map(|b| b.execution_lock())
+                    .transpose()?;
+                let mut output = invoke_plugin_capability(
                     &id,
                     input.clone(),
                     self.trusted_dashboard_url().as_deref(),
                     &capability_env,
                 )?;
+                if let Some(binding) = &prepared_binding {
+                    binding.complete(&input, &mut output)?;
+                }
                 finalize_plugin_capability(context, &id, &input, output)
             }
             CapabilityHandler::DownstreamMcp(id) => self.downstream_mcp.invoke(&id, input),

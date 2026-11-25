@@ -256,7 +256,7 @@ impl<'de> Deserialize<'de> for PluginCredentialField {
     }
 }
 
-/// 插件声明的一条凭据需求。字段尽量少：凭据的语义由 Agent 侧统一解释。
+/// 插件声明凭据的字段及受控导入合同；业务语义由扩展解释。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct PluginCredentialRequest {
     /// 插件内唯一的凭据标识（如 `wechat.app`）。
@@ -279,6 +279,12 @@ pub(crate) struct PluginCredentialRequest {
     /// Optional plugin capability that checks whether the saved profile is usable.
     #[serde(default)]
     pub verify_capability: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broker_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_import: Option<crate::app::secure_import::ImportDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding: Option<crate::app::extension_binding::BindingDeclaration>,
 }
 
 fn default_credential_field_type() -> String {
@@ -1352,6 +1358,9 @@ fn builtin_credential_requests(id: &str) -> Vec<PluginCredentialRequest> {
             description: "用于访问当前账号有权限的 SVN 项目仓库。".to_string(),
             docs_url: String::new(),
             verify_capability: "svn.connection.test".to_string(),
+            broker_capabilities: Vec::new(),
+            secure_import: None,
+            workspace_binding: None,
         }],
         "com.himind.builtin.inner-admin" => vec![PluginCredentialRequest {
             id: "inner-admin.account".to_string(),
@@ -1381,6 +1390,9 @@ fn builtin_credential_requests(id: &str) -> Vec<PluginCredentialRequest> {
             description: "用于内网工程同步、代码上传和展项信息读取。".to_string(),
             docs_url: String::new(),
             verify_capability: "network.inner-admin.login.status".to_string(),
+            broker_capabilities: Vec::new(),
+            secure_import: None,
+            workspace_binding: None,
         }],
         _ => Vec::new(),
     }
@@ -2026,6 +2038,29 @@ fn invoke_plugin_capability_for_item(
     result
 }
 
+pub(crate) fn invoke_credential_import_handler(
+    plugin: &PluginRegistryItem,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let capability = PluginCapabilityManifest {
+        id: "credential.import.verify".into(),
+        description: String::new(),
+        input_schema: Value::Null,
+        risk_level: "read_only".into(),
+        availability: "local".into(),
+        timeout_seconds: 15,
+    };
+    invoke_plugin_process(
+        plugin,
+        &capability,
+        &capability.id,
+        input,
+        None,
+        &[],
+        Duration::from_secs(15),
+    )
+}
+
 fn start_credential_broker_for_plugin(
     plugin: &PluginRegistryItem,
     capability_id: &str,
@@ -2050,7 +2085,7 @@ fn invoke_plugin_process(
     plugin: &PluginRegistryItem,
     capability: &PluginCapabilityManifest,
     capability_id: &str,
-    input: Value,
+    mut input: Value,
     trusted_dashboard_url: Option<&str>,
     extra_env: &[(String, String)],
     timeout: Duration,
@@ -2062,6 +2097,25 @@ fn invoke_plugin_process(
         return Err(format!("unsupported plugin runtime: {}", plugin.runtime).into());
     }
 
+    if plugin.credentials.iter().any(|c| {
+        c.workspace_binding.as_ref().is_some_and(|b| {
+            b.bind_capability == capability_id
+                || b.bound_capabilities.iter().any(|id| id == capability_id)
+        })
+    }) {
+        let digest = crate::approval::policy::args_digest(&input)?;
+        if !extra_env
+            .iter()
+            .any(|(k, v)| k == "HIMIND_VERIFIED_BINDING" && v == &digest)
+        {
+            return Err("bound extension operations require the trusted capability gateway".into());
+        }
+    }
+    let profile_ref = input
+        .get("credential_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let entry = plugin_manifest_entry(&plugin)?;
     let request = json!({
         "jsonrpc": "2.0",
@@ -2070,7 +2124,24 @@ fn invoke_plugin_process(
         "params": input,
     });
 
-    let broker_session = start_credential_broker_for_plugin(plugin, capability_id, timeout)?;
+    let broker_session = if capability_id == "credential.import.verify" {
+        None
+    } else if profile_ref.is_some()
+        && plugin
+            .permissions
+            .iter()
+            .any(|permission| permission == crate::capability::credential_broker::BROKER_PERMISSION)
+    {
+        crate::capability::credential_broker::BrokerSession::start_with_profile(
+            &plugin.id,
+            capability_id,
+            &plugin.credentials,
+            timeout,
+            profile_ref.as_deref(),
+        )?
+    } else {
+        start_credential_broker_for_plugin(plugin, capability_id, timeout)?
+    };
 
     let mut command = crate::runtime::process::hidden_command(entry);
     command
@@ -2078,6 +2149,7 @@ fn invoke_plugin_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_remove("HIMIND_VERIFIED_BINDING")
         .env_remove("HIMIND_CONTROL_PLANE_URL")
         .env_remove("HIMIND_DASHBOARD_URL")
         .env_remove("HIMIND_API_BASE")
@@ -2224,7 +2296,13 @@ fn invoke_plugin_process(
         return Err(format!("plugin returned empty response: {}", plugin.id).into());
     }
 
-    let response: Value = serde_json::from_str(response_line.trim())?;
+    let response: Value =
+        serde_json::from_str(response_line.trim()).map_err(|_| "invalid plugin JSON response")?;
+    let response = if let Some(broker) = broker_session.as_ref() {
+        broker.redact_output(response)
+    } else {
+        response
+    };
     if let Some(error) = response.get("error") {
         // 插件正常应答、只是这次能力调用报了错（例如参数不合法或业务前置不满足）：
         // 这是能力层结果，不属于插件健康问题，不能据此把插件和它的依赖者一起判死。
@@ -2690,6 +2768,64 @@ fn next_request_id() -> String {
 
 pub(crate) fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, serde_json::Error> {
     let manifest: PluginManifest = serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+    for credential in &manifest.credentials {
+        let namespace = plugin_capability_namespace(&manifest);
+        if credential.secure_import.is_some()
+            && (!credential.id.starts_with(&format!(
+                "{}.",
+                namespace.split('.').next().unwrap_or_default()
+            )) || credential
+                .broker_capabilities
+                .iter()
+                .any(|id| !manifest.capabilities.iter().any(|c| &c.id == id)))
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "secure credential declaration must stay in the extension namespace",
+            )));
+        }
+
+        crate::app::secure_import::validate_declaration(credential).map_err(|_| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid secure credential declaration",
+            ))
+        })?;
+        if let Some(binding) = &credential.workspace_binding {
+            let namespace = plugin_capability_namespace(&manifest);
+            if !binding
+                .bind_capability
+                .starts_with(&format!("{namespace}."))
+                || binding.root_field.is_empty()
+                || !manifest
+                    .capabilities
+                    .iter()
+                    .any(|c| c.id == binding.bind_capability)
+                || binding
+                    .bound_capabilities
+                    .iter()
+                    .any(|id| !manifest.capabilities.iter().any(|c| &c.id == id))
+                || binding.target_fields.len() > 16
+                || binding.bound_capabilities.len() > 64
+                || binding.target_fields.is_empty()
+                || binding.target_fields.iter().any(|f| {
+                    matches!(
+                        f.as_str(),
+                        "credential_ref" | "binding_revision" | "project_root" | "workspace_root"
+                    )
+                })
+                || binding
+                    .bound_capabilities
+                    .iter()
+                    .any(|id| !id.starts_with(&format!("{namespace}.")))
+            {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid workspace binding declaration",
+                )));
+            }
+        }
+    }
     if !matches!(manifest.package_role.as_str(), "application" | "extension") {
         return Err(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2858,6 +2994,9 @@ mod tests {
             description: String::new(),
             docs_url: String::new(),
             verify_capability: String::new(),
+            broker_capabilities: Vec::new(),
+            secure_import: None,
+            workspace_binding: None,
         }];
         let session =
             start_credential_broker_for_plugin(&plugin, "broker-gate.run", Duration::from_secs(5))

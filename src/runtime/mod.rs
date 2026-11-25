@@ -19,13 +19,13 @@ pub(crate) mod codex_usage_delivery;
 pub(crate) mod copilot;
 pub(crate) mod deepseek_harness;
 pub(crate) mod distribution;
-pub(crate) mod native;
-pub(crate) mod process;
-pub(crate) mod owned_tree;
-#[cfg(all(test,windows))]
+#[cfg(all(test, windows))]
 mod executor_live;
-#[cfg(all(test,windows))]
+#[cfg(all(test, windows))]
 mod executor_live_handoff;
+pub(crate) mod native;
+pub(crate) mod owned_tree;
+pub(crate) mod process;
 
 pub(crate) const PROVIDER_NATIVE: &str = "himind.native";
 pub(crate) const PROVIDER_BUILTIN: &str = "himind.builtin";
@@ -148,44 +148,56 @@ where
     }
     let local_context =
         agent_run_invocation_context(options, agent_id, task, envelope, &claim, expected_provider);
-    let mut local_recording = if expected_provider==PROVIDER_CODEX {
+    let mut local_recording = if expected_provider == PROVIDER_CODEX {
         // Codex receipts require a durable caller, not best-effort telemetry.
         // Reuse the original local identity on redelivery, retaining failures.
-        let ledger=crate::store::local_runs::LocalRunLedger::open_default()?;
-        let identity=codex_usage_delivery::bound_caller(&codex_usage::default_root(),&claim.run.id,&ledger)?
-            .unwrap_or_else(||format!("run_{}",local_context.request_id));
-        let existing=ledger.get_run(&identity)?;
-        let recorder=AgentCoreRunRecorder::with_ledger(ledger);
-        let mut run=match existing {Some(run)=>run,None=>recorder.begin(agent_id,&local_context,expected_provider)?};
-        run.runtime_provider=expected_provider.into();
-        if let Some(step)=run.steps.first_mut() {step.runtime_provider=expected_provider.into();step.model=claim.ai_model.clone();}
-        Some((recorder,run))
-    } else {match AgentCoreRunRecorder::open_default() {
-        Ok(recorder) => match recorder.begin(agent_id, &local_context, expected_provider) {
-            Ok(mut run) => {
-                run.runtime_provider=expected_provider.into();
-                if let Some(step)=run.steps.first_mut() {
-                    step.runtime_provider=expected_provider.into();
-                    step.model=claim.ai_model.clone();
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+        let identity = codex_usage_delivery::bound_caller(
+            &codex_usage::default_root(),
+            &claim.run.id,
+            &ledger,
+        )?
+        .unwrap_or_else(|| format!("run_{}", local_context.request_id));
+        let existing = ledger.get_run(&identity)?;
+        let recorder = AgentCoreRunRecorder::with_ledger(ledger);
+        let mut run = match existing {
+            Some(run) => run,
+            None => recorder.begin(agent_id, &local_context, expected_provider)?,
+        };
+        run.runtime_provider = expected_provider.into();
+        if let Some(step) = run.steps.first_mut() {
+            step.runtime_provider = expected_provider.into();
+            step.model = claim.ai_model.clone();
+        }
+        Some((recorder, run))
+    } else {
+        match AgentCoreRunRecorder::open_default() {
+            Ok(recorder) => match recorder.begin(agent_id, &local_context, expected_provider) {
+                Ok(mut run) => {
+                    run.runtime_provider = expected_provider.into();
+                    if let Some(step) = run.steps.first_mut() {
+                        step.runtime_provider = expected_provider.into();
+                        step.model = claim.ai_model.clone();
+                    }
+                    Some((recorder, run))
                 }
-                Some((recorder, run))
+                Err(error) => {
+                    eprintln!(
+                        "Agent Run local run begin failed for {}: {error}",
+                        claim.run.id
+                    );
+                    None
+                }
             },
             Err(error) => {
                 eprintln!(
-                    "Agent Run local run begin failed for {}: {error}",
+                    "Agent Run local run ledger unavailable for {}: {error}",
                     claim.run.id
                 );
                 None
             }
-        },
-        Err(error) => {
-            eprintln!(
-                "Agent Run local run ledger unavailable for {}: {error}",
-                claim.run.id
-            );
-            None
         }
-    }};
+    };
 
     let settings = crate::app::remote_execution::load(&options.state_path)?;
     if !settings.enabled {
@@ -212,11 +224,15 @@ where
         _ => return Err("Dashboard returned an unsupported Agent Run access mode".into()),
     }
 
-    let execution = if expected_provider==PROVIDER_CODEX {
-        let ledger=crate::store::local_runs::LocalRunLedger::open_default()?;
-        let (_,run)=local_recording.as_mut().ok_or("Codex caller ledger required")?;
-        execute_agent_codex_with_receipt(&ledger,&claim.run.id,run,||executor(&claim))
-    } else {executor(&claim)};
+    let execution = if expected_provider == PROVIDER_CODEX {
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+        let (_, run) = local_recording
+            .as_mut()
+            .ok_or("Codex caller ledger required")?;
+        execute_agent_codex_with_receipt(&ledger, &claim.run.id, run, || executor(&claim))
+    } else {
+        executor(&claim)
+    };
     let execution = execution.and_then(|value| {
         let _artifact_lease = process::start_run_lease_renewal(client, options, agent_id, &claim);
         let value = artifacts::prepare_execution_result(client, options, agent_id, &claim, value)?;
@@ -237,12 +253,14 @@ where
     match execution {
         Ok(value) => {
             if let Some((recorder, mut run)) = local_recording {
-                run.usage = value.get("usage").filter(|value|!value.is_null())
-                    .and_then(|usage|serde_json::from_value(usage.clone()).ok());
+                run.usage = value
+                    .get("usage")
+                    .filter(|value| !value.is_null())
+                    .and_then(|usage| serde_json::from_value(usage.clone()).ok());
                 let facts = json!({"provider":expected_provider,"upstream_run_id":claim.run.id,
                     "session_id":value.get("provider_session_id"),"version":value.get("provider_version"),
                     "model_source":value.get("model_source"),"usage":run.usage,"cost_status":value.get("cost_status")});
-                let local_run_id=run.run_id.clone();
+                let local_run_id = run.run_id.clone();
                 if let Err(error) = recorder.complete(run, &value) {
                     eprintln!(
                         "Agent Run local run completion failed for {}: {error}",
@@ -282,10 +300,13 @@ where
                     // caller DB; do not replace the original failed history.
                     return Err(message.into());
                 }
-                let failure = error.downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>();
-                if let Some(failure)=failure {run.usage=failure.usage.clone();}
-                let local_run_id=run.run_id.clone();
-                let facts=json!({"provider":expected_provider,"upstream_run_id":claim.run.id,
+                let failure = error
+                    .downcast_ref::<crate::runtime::deepseek_harness::WorkflowRuntimeFailure>();
+                if let Some(failure) = failure {
+                    run.usage = failure.usage.clone();
+                }
+                let local_run_id = run.run_id.clone();
+                let facts = json!({"provider":expected_provider,"upstream_run_id":claim.run.id,
                     "usage":run.usage,"provenance":failure.and_then(|failure|failure.provenance.as_ref())});
                 let recording_result = if status == "canceled" {
                     recorder.cancel(run, &message)
@@ -298,7 +319,7 @@ where
                         claim.run.id
                     );
                 }
-                record_agent_runtime_facts(&local_run_id,&facts);
+                record_agent_runtime_facts(&local_run_id, &facts);
             }
             Err(message.into())
         }
@@ -307,60 +328,95 @@ where
 
 /// The actual AgentRun boundary. Replayed receipts deliver usage only and must
 /// never call the provider or report succeeded to the Dashboard.
-fn execute_agent_codex_with_receipt<F>(ledger:&crate::store::local_runs::LocalRunLedger,
-    provider_run:&str,run:&mut crate::agent_core_contracts::LocalRun,execute:F) -> Result<Value,Box<dyn Error>>
-where F:FnOnce()->Result<Value,Box<dyn Error>> {
-    let root=codex_usage::default_root();
-    codex_usage_delivery::bind(ledger,&root,provider_run,&run.run_id,"capability",1)?;
-    if let Some(recovered)=codex_usage_delivery::recover(ledger,&root,provider_run,&run.run_id,"capability",1)? {
-        run.usage=recovered.usage;
-        let receipt=codex_usage::read_receipt(&root,provider_run)?.ok_or("committed receipt missing")?;
+fn execute_agent_codex_with_receipt<F>(
+    ledger: &crate::store::local_runs::LocalRunLedger,
+    provider_run: &str,
+    run: &mut crate::agent_core_contracts::LocalRun,
+    execute: F,
+) -> Result<Value, Box<dyn Error>>
+where
+    F: FnOnce() -> Result<Value, Box<dyn Error>>,
+{
+    let root = codex_usage::default_root();
+    codex_usage_delivery::bind(ledger, &root, provider_run, &run.run_id, "capability", 1)?;
+    if let Some(recovered) =
+        codex_usage_delivery::recover(ledger, &root, provider_run, &run.run_id, "capability", 1)?
+    {
+        run.usage = recovered.usage;
+        let receipt =
+            codex_usage::read_receipt(&root, provider_run)?.ok_or("committed receipt missing")?;
         return Err(Box::new(deepseek_harness::WorkflowRuntimeFailure {
             message:"AgentRun recovered usage; prior business outcome is unknown; provider replay refused".into(),
             report:None,usage:run.usage.clone(),provenance:Some(json!({"usage_receipt":receipt,"receipt_recovery_only":true})),
         }));
     }
-    let result=execute();
+    let result = execute();
     #[cfg(test)]
-    if codex_usage::read_receipt(&root,provider_run)?.is_some() {codex_usage_delivery::fail_after_receipt_commit()?;}
-    if let Some(recovered)=codex_usage_delivery::recover(ledger,&root,provider_run,&run.run_id,"capability",1)? {run.usage=recovered.usage;}
+    if codex_usage::read_receipt(&root, provider_run)?.is_some() {
+        codex_usage_delivery::fail_after_receipt_commit()?;
+    }
+    if let Some(recovered) =
+        codex_usage_delivery::recover(ledger, &root, provider_run, &run.run_id, "capability", 1)?
+    {
+        run.usage = recovered.usage;
+    }
     result
 }
 
 fn record_agent_runtime_facts(run_id: &str, facts: &Value) {
-    let result=(|| -> Result<(),Box<dyn Error>> {
-        let ledger=crate::store::local_runs::LocalRunLedger::open_default()?;
-        append_agent_runtime_facts(&ledger,run_id,facts)
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+        append_agent_runtime_facts(&ledger, run_id, facts)
     })();
-    if result.is_err() {eprintln!("AgentRun runtime facts persistence failed for {run_id}");}
+    if result.is_err() {
+        eprintln!("AgentRun runtime facts persistence failed for {run_id}");
+    }
 }
 
-fn append_agent_runtime_facts(ledger:&crate::store::local_runs::LocalRunLedger,run_id:&str,facts:&Value)
-    -> Result<(),Box<dyn Error>> {
-        let event_id=format!("{run_id}:runtime-facts");
-        let events=ledger.list_events(run_id)?;
-        if let Some(existing)=events.iter().find(|event|event.event_id==event_id) {
-            return if existing.payload==json!({"runtime_provenance":facts}) {Ok(())}
-                else {Err("AgentRun facts conflict with the persisted run snapshot".into())};
-        }
-        // The legacy recorder reserves fixed start/terminal slots 0 and 1,
-        // independently of the ledger's allocator. Never overwrite those slots.
-        let max=events.iter().map(|event|event.sequence).max().unwrap_or(0);
-        let mut sequence=ledger.next_runtime_sequence(run_id)?;
-        for _ in 0..64 {
-            if sequence>max {break;}
-            sequence=ledger.next_runtime_sequence(run_id)?;
-        }
-        if sequence<=max {return Err("AgentRun runtime sequence reservation failed".into());}
-        let event=crate::agent_core_contracts::RuntimeEvent {
-            schema_version:crate::agent_core_contracts::RUNTIME_EVENT_SCHEMA_VERSION.into(),
-            event_id,run_id:run_id.into(),step_id:"capability".into(),
-            capability_id:String::new(),sequence,
-            occurred_at:std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string(),
-            provider:"himind.agent".into(),event_type:crate::agent_core_contracts::RuntimeEventType::UsageRecorded,
-            payload:json!({"runtime_provenance":facts}),
+fn append_agent_runtime_facts(
+    ledger: &crate::store::local_runs::LocalRunLedger,
+    run_id: &str,
+    facts: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let event_id = format!("{run_id}:runtime-facts");
+    let events = ledger.list_events(run_id)?;
+    if let Some(existing) = events.iter().find(|event| event.event_id == event_id) {
+        return if existing.payload == json!({"runtime_provenance":facts}) {
+            Ok(())
+        } else {
+            Err("AgentRun facts conflict with the persisted run snapshot".into())
         };
-        ledger.append_event(&event)?; Ok(())
+    }
+    // The legacy recorder reserves fixed start/terminal slots 0 and 1,
+    // independently of the ledger's allocator. Never overwrite those slots.
+    let max = events.iter().map(|event| event.sequence).max().unwrap_or(0);
+    let mut sequence = ledger.next_runtime_sequence(run_id)?;
+    for _ in 0..64 {
+        if sequence > max {
+            break;
+        }
+        sequence = ledger.next_runtime_sequence(run_id)?;
+    }
+    if sequence <= max {
+        return Err("AgentRun runtime sequence reservation failed".into());
+    }
+    let event = crate::agent_core_contracts::RuntimeEvent {
+        schema_version: crate::agent_core_contracts::RUNTIME_EVENT_SCHEMA_VERSION.into(),
+        event_id,
+        run_id: run_id.into(),
+        step_id: "capability".into(),
+        capability_id: String::new(),
+        sequence,
+        occurred_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .to_string(),
+        provider: "himind.agent".into(),
+        event_type: crate::agent_core_contracts::RuntimeEventType::UsageRecorded,
+        payload: json!({"runtime_provenance":facts}),
+    };
+    ledger.append_event(&event)?;
+    Ok(())
 }
 
 fn agent_run_invocation_context(
@@ -385,7 +441,7 @@ fn agent_run_invocation_context(
         InvocationSource::DashboardWorker,
         format!("dashboard-user:{}", claim.run.created_by_user_id.trim()),
     )
-    .with_workspace_ref(claim.workspace_path.clone())
+    .with_trusted_workspace(claim.workspace_path.clone())
     .with_device_id(crate::agent_core_service::current_device_id(
         &options.state_path,
     ))
@@ -689,32 +745,59 @@ mod tests {
 
     #[test]
     fn executor_agent_result_and_runtime_facts_survive_ledger_restart() {
-        use crate::{agent_core_service::AgentCoreRunRecorder,store::local_runs::LocalRunLedger};
-        let path=std::env::temp_dir().join(format!("agent-facts-{}",rand::random::<u64>())).join("ledger.sqlite");
-        let ledger=LocalRunLedger::new(&path);
-        let recorder=AgentCoreRunRecorder::with_ledger(ledger.clone());
-        let context=crate::capability::types::InvocationContext::local_http();
-        let mut run=recorder.begin("fixture",&context,PROVIDER_CODEX).unwrap();
-        let text=json!({"passed":true,"summary":"complete","details":"x".repeat(40000)}).to_string();
-        let value=normalize_execution_result(json!({"completed":true,"final_message":text,
-            "session_id":"thread-retained","model_source":"personal_cli_config",
-            "usage":{"input_tokens":10,"output_tokens":2,"estimated_cost":0.0,"currency":"","billing_owner":"user"}
-        }),PROVIDER_CODEX);
-        assert_eq!(value["final_message"],text,"normalization must retain the full bounded provider final");
-        assert_eq!(value["provider_session_id"],"thread-retained");
-        assert_eq!(value["cost_status"],"unknown");
-        run.usage=serde_json::from_value(value["usage"].clone()).ok();
-        let run=recorder.complete(run,&value).unwrap();
-        let facts=json!({"provider":PROVIDER_CODEX,"session_id":value["provider_session_id"],"usage":run.usage});
-        super::append_agent_runtime_facts(&ledger,&run.run_id,&facts).unwrap();
-        super::append_agent_runtime_facts(&ledger,&run.run_id,&facts).unwrap();
-        let restarted=LocalRunLedger::new(path);
-        assert_eq!(restarted.get_run(&run.run_id).unwrap().unwrap().usage.unwrap().input_tokens,10);
-        let events=restarted.list_events(&run.run_id).unwrap();
-        let facts:Vec<_>=events.iter().filter(|event|event.payload.get("runtime_provenance").is_some()).collect();
-        assert_eq!(facts.len(),1);
-        assert_eq!(facts[0].event_type,crate::agent_core_contracts::RuntimeEventType::UsageRecorded);
-        assert_eq!(facts[0].payload["runtime_provenance"]["session_id"],"thread-retained");
+        use crate::{agent_core_service::AgentCoreRunRecorder, store::local_runs::LocalRunLedger};
+        let path = std::env::temp_dir()
+            .join(format!("agent-facts-{}", rand::random::<u64>()))
+            .join("ledger.sqlite");
+        let ledger = LocalRunLedger::new(&path);
+        let recorder = AgentCoreRunRecorder::with_ledger(ledger.clone());
+        let context = crate::capability::types::InvocationContext::local_http();
+        let mut run = recorder.begin("fixture", &context, PROVIDER_CODEX).unwrap();
+        let text =
+            json!({"passed":true,"summary":"complete","details":"x".repeat(40000)}).to_string();
+        let value = normalize_execution_result(
+            json!({"completed":true,"final_message":text,
+                "session_id":"thread-retained","model_source":"personal_cli_config",
+                "usage":{"input_tokens":10,"output_tokens":2,"estimated_cost":0.0,"currency":"","billing_owner":"user"}
+            }),
+            PROVIDER_CODEX,
+        );
+        assert_eq!(
+            value["final_message"], text,
+            "normalization must retain the full bounded provider final"
+        );
+        assert_eq!(value["provider_session_id"], "thread-retained");
+        assert_eq!(value["cost_status"], "unknown");
+        run.usage = serde_json::from_value(value["usage"].clone()).ok();
+        let run = recorder.complete(run, &value).unwrap();
+        let facts = json!({"provider":PROVIDER_CODEX,"session_id":value["provider_session_id"],"usage":run.usage});
+        super::append_agent_runtime_facts(&ledger, &run.run_id, &facts).unwrap();
+        super::append_agent_runtime_facts(&ledger, &run.run_id, &facts).unwrap();
+        let restarted = LocalRunLedger::new(path);
+        assert_eq!(
+            restarted
+                .get_run(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .usage
+                .unwrap()
+                .input_tokens,
+            10
+        );
+        let events = restarted.list_events(&run.run_id).unwrap();
+        let facts: Vec<_> = events
+            .iter()
+            .filter(|event| event.payload.get("runtime_provenance").is_some())
+            .collect();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].event_type,
+            crate::agent_core_contracts::RuntimeEventType::UsageRecorded
+        );
+        assert_eq!(
+            facts[0].payload["runtime_provenance"]["session_id"],
+            "thread-retained"
+        );
     }
 
     #[test]

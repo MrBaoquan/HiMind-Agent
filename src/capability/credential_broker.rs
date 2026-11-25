@@ -12,7 +12,7 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,9 @@ struct SessionState {
     token: String,
     deadline: Instant,
     credentials: BTreeMap<String, (String, BTreeSet<String>)>,
+    profile_ref: Option<String>,
+    secret_keys: BTreeMap<String, BTreeSet<String>>,
+    acquired_secrets: Arc<Mutex<Vec<String>>>,
 }
 
 pub(crate) struct BrokerSession {
@@ -38,6 +41,7 @@ pub(crate) struct BrokerSession {
     stop: Arc<AtomicBool>,
     address: std::net::SocketAddr,
     handle: Option<thread::JoinHandle<()>>,
+    acquired_secrets: Arc<Mutex<Vec<String>>>,
 }
 
 impl Drop for BrokerSession {
@@ -65,11 +69,56 @@ fn random_token() -> String {
 }
 
 impl BrokerSession {
+    /// Exact values acquired by this invocation may never escape via plugin
+    /// output, business errors, model results or plugin health diagnostics.
+    pub(crate) fn redact_output(&self, value: Value) -> Value {
+        fn redact(value: Value, secrets: &[String]) -> Value {
+            match value {
+                Value::String(mut s) => {
+                    for secret in secrets {
+                        if !secret.is_empty() {
+                            s = s.replace(secret, "[redacted]");
+                        }
+                    }
+                    Value::String(s)
+                }
+                Value::Array(a) => {
+                    Value::Array(a.into_iter().map(|v| redact(v, secrets)).collect())
+                }
+                Value::Object(o) => Value::Object(
+                    o.into_iter()
+                        .map(|(k, v)| {
+                            let key = match redact(Value::String(k), secrets) {
+                                Value::String(key) => key,
+                                _ => unreachable!(),
+                            };
+                            (key, redact(v, secrets))
+                        })
+                        .collect(),
+                ),
+                v => v,
+            }
+        }
+        match self.acquired_secrets.lock() {
+            Ok(secrets) => redact(value, &secrets),
+            Err(_) => json!({"error":"credential output protection unavailable"}),
+        }
+    }
     pub(crate) fn start(
         plugin_id: &str,
         capability: &str,
         credentials: &[PluginCredentialRequest],
         timeout: Duration,
+    ) -> Result<Option<Self>, Box<dyn Error>> {
+        Self::start_with_profile(plugin_id, capability, credentials, timeout, None)
+    }
+
+    pub(crate) fn start_with_profile(
+        plugin_id: &str,
+        capability: &str,
+        credentials: &[PluginCredentialRequest],
+        timeout: Duration,
+        profile_ref: Option<&str>,
     ) -> Result<Option<Self>, Box<dyn Error>> {
         if credentials.is_empty() {
             return Ok(None);
@@ -77,6 +126,13 @@ impl BrokerSession {
         let fingerprint = credential_declaration_fingerprint(credentials);
         let declared = credentials
             .iter()
+            .filter(|credential| {
+                credential.broker_capabilities.is_empty()
+                    || credential
+                        .broker_capabilities
+                        .iter()
+                        .any(|id| id == capability)
+            })
             .map(|credential| {
                 (
                     credential.id.clone(),
@@ -95,12 +151,28 @@ impl BrokerSession {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let token = random_token();
+        let acquired_secrets = Arc::new(Mutex::new(Vec::new()));
         let session = Arc::new(SessionState {
             plugin_id: plugin_id.to_string(),
             capability: capability.to_string(),
             token: token.clone(),
             deadline: Instant::now() + timeout.min(Duration::from_secs(120)),
             credentials: declared,
+            profile_ref: profile_ref.map(str::to_string),
+            secret_keys: credentials
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        c.fields
+                            .iter()
+                            .filter(|f| f.secret)
+                            .map(|f| f.key.clone())
+                            .collect(),
+                    )
+                })
+                .collect(),
+            acquired_secrets: Arc::clone(&acquired_secrets),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
@@ -139,6 +211,7 @@ impl BrokerSession {
             stop,
             address,
             handle: Some(handle),
+            acquired_secrets,
         }))
     }
 }
@@ -216,13 +289,39 @@ fn handle_connection(mut stream: TcpStream, session: &SessionState) -> Result<()
         let _ = write_json(stream, 403, json!({"error":"undeclared_credential"}));
         return Ok(());
     };
-    match crate::store::plugin_credentials::broker_fields(
-        &session.plugin_id,
-        credential_id,
-        fingerprint,
-    ) {
+    let requested_profile = parsed.get("profile_ref").and_then(Value::as_str);
+    if requested_profile != session.profile_ref.as_deref() {
+        let _ = write_json(stream, 403, json!({"error":"credential_profile_mismatch"}));
+        return Ok(());
+    }
+    let resolved = match session.profile_ref.as_deref() {
+        Some(reference) => crate::store::plugin_credentials::broker_instance_fields(
+            &session.plugin_id,
+            credential_id,
+            reference,
+            fingerprint,
+        ),
+        None => crate::store::plugin_credentials::broker_fields(
+            &session.plugin_id,
+            credential_id,
+            fingerprint,
+        ),
+    };
+    match resolved {
         Ok(mut fields) => {
             fields.retain(|key, _| allowed_fields.contains(key));
+            if let Some(keys) = session.secret_keys.get(credential_id) {
+                let mut secrets = session
+                    .acquired_secrets
+                    .lock()
+                    .map_err(|_| "credential output protection unavailable")?;
+                secrets.extend(
+                    fields
+                        .iter()
+                        .filter(|(k, _)| keys.contains(*k))
+                        .map(|(_, v)| v.clone()),
+                );
+            }
             let _ = crate::store::plugin_credentials::record_audit(
                 "plugin",
                 &session.plugin_id,
@@ -375,6 +474,9 @@ mod tests {
             description: String::new(),
             docs_url: String::new(),
             verify_capability: String::new(),
+            broker_capabilities: Vec::new(),
+            secure_import: None,
+            workspace_binding: None,
         }
     }
 
@@ -457,6 +559,67 @@ mod tests {
             &json!({"credential_id":"other.secret","purpose":"demo.run"}).to_string(),
         );
         assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+
+        crate::store::plugin_credentials::save_instance(
+            "com.test.plugin",
+            "demo.api",
+            "project-a",
+            &public_fields,
+            &secret_fields,
+            &fingerprint,
+        )
+        .unwrap();
+        let scoped = BrokerSession::start_with_profile(
+            "com.test.plugin",
+            "demo.run",
+            &declared,
+            Duration::from_secs(5),
+            Some("project-a"),
+        )
+        .unwrap()
+        .unwrap();
+        let mismatch = raw_broker_request(
+            &scoped,
+            &json!({"credential_id":"demo.api","purpose":"demo.run","profile_ref":"project-b"})
+                .to_string(),
+        );
+        assert!(mismatch.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!mismatch.contains("sk-broker-secret"));
+        let missing = raw_broker_request(
+            &scoped,
+            &json!({"credential_id":"demo.api","purpose":"demo.run"}).to_string(),
+        );
+        assert!(missing.starts_with("HTTP/1.1 403 Forbidden"));
+        let allowed = raw_broker_request(
+            &scoped,
+            &json!({"credential_id":"demo.api","purpose":"demo.run","profile_ref":"project-a"})
+                .to_string(),
+        );
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            scoped.redact_output(json!({"error":{"nested":["echo sk-broker-secret"]}}))["error"]
+                ["nested"][0],
+            "echo [redacted]"
+        );
+        let keyed = scoped.redact_output(json!({"sk-broker-secret": "nested"}));
+        assert_eq!(keyed["[redacted]"], "nested");
+        assert!(!keyed.to_string().contains("sk-broker-secret"));
+        drop(scoped);
+        let mut restricted_declared = declared.clone();
+        restricted_declared[0].broker_capabilities = vec!["demo.approved".into()];
+        let denied_scope = BrokerSession::start_with_profile(
+            "com.test.plugin",
+            "demo.unrelated",
+            &restricted_declared,
+            Duration::from_secs(5),
+            Some("project-a"),
+        )
+        .unwrap()
+        .unwrap();
+        let denied=raw_broker_request(&denied_scope,&json!({"credential_id":"demo.api","purpose":"demo.unrelated","profile_ref":"project-a"}).to_string());
+        assert!(denied.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!denied.contains("sk-broker-secret"));
+        drop(denied_scope);
 
         drop(session);
         let audit = std::fs::read_to_string(root.join("credential-audit.jsonl")).unwrap();

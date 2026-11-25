@@ -174,6 +174,7 @@ export function CredentialCenterPanel({
   };
 
   const actionLabel = (item: CredentialCatalogItem) => {
+    if (item.manage_action === 'plugin-credential-import') return '管理已导入凭据';
     if (item.manage_action === 'ai-services') return '打开 AI 服务';
     if (item.status === 'needs_review') return '核对并更新';
     if (item.status === 'missing' || !item.configured) return item.editable ? '添加凭据' : '去配置';
@@ -326,7 +327,7 @@ function CredentialEditDialog({ item, onClose, onSaved }: { item: CredentialCata
       <div className="modal-body">
         {item.description ? <p className="field-hint">{item.description}</p> : null}
         {!item.descriptor_current ? <div className="inline-feedback visible" role="alert">插件更新了凭据声明，请核对字段后重新保存。</div> : null}
-        <CredentialFieldsEditor fields={item.fields} drafts={drafts} disabled={busy} firstInputRef={initialFocusRef} onChange={(key, value) => setDrafts(current => ({ ...current, [key]: value }))} />
+        <CredentialFieldsEditor fields={item.fields} drafts={drafts} disabled={busy || item.manage_action === 'plugin-credential-import'} firstInputRef={initialFocusRef} onChange={(key, value) => setDrafts(current => ({ ...current, [key]: value }))} />
         {error ? <div className="inline-feedback visible credential-center-error" role="alert">
           <span>{credentialErrorSummary(error, '未能保存这次更改，请检查内容后重试。')}</span>
           <DiagnosticDetails detail={error} summary="查看错误详情" format="pre" />
@@ -335,7 +336,7 @@ function CredentialEditDialog({ item, onClose, onSaved }: { item: CredentialCata
           <div>{item.configured ? <button type="button" className="btn btn-danger-quiet" disabled={busy} onClick={() => void remove()}><Trash2 size={14} />移除凭据</button> : null}</div>
           <div className="actions-row">
             <button type="button" className="btn" disabled={busy} onClick={onClose}>取消</button>
-            <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void save()}>{busy ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{item.kind === 'file_path' ? '选择文件' : '保存'}</button>
+            {item.manage_action !== 'plugin-credential-import' ? <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void save()}>{busy ? <BusyIndicator size={14} /> : <CheckCircle2 size={14} />}{item.kind === 'file_path' ? '选择文件' : '保存'}</button> : null}
           </div>
         </div>
       </div>

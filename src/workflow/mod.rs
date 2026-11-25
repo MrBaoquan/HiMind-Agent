@@ -9,6 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::extension_contracts::DistributionTarget;
 
 mod activation;
+#[cfg(test)]
+mod andx_delivery_tests;
 mod authoring;
 mod candidate;
 mod condition;

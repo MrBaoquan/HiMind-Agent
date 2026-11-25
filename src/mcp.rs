@@ -1290,6 +1290,16 @@ fn mcp_invocation_context_for_client(client_id: String, device_id: &str) -> Invo
         format!("mcp:{client_id}")
     })
     .with_device_id(device_id.to_string())
+    .with_trusted_workspace(
+        std::env::var("HIMIND_AI_WORKSPACE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            }),
+    )
 }
 
 fn mcp_configured_client_id() -> String {

@@ -280,10 +280,12 @@ pub(crate) fn execute_runtime_step_with_resources(
             .insert("codex".to_string(), facts);
     }
     if let Some(structured) = structured {
+        result["report"] = structured.clone();
         if let (Some(result), Some(structured)) = (result.as_object_mut(), structured.as_object()) {
             for (key, value) in structured {
                 if [
                     "schema_version",
+                    "report",
                     "provider",
                     "workspace",
                     "model",
@@ -378,8 +380,15 @@ fn validate_runtime_output(
     }
     let schema_value: Value = serde_json::from_slice(&std::fs::read(schema_path)?)?;
     let validator = jsonschema::validator_for(&schema_value)?;
+    // Preserve historical envelope schemas while allowing strict business
+    // reports to keep their own schema_version and additionalProperties.
+    let candidate = if validator.is_valid(output) {
+        output
+    } else {
+        output.get("report").unwrap_or(output)
+    };
     let errors = validator
-        .iter_errors(output)
+        .iter_errors(candidate)
         .map(|error| error.to_string())
         .collect::<Vec<_>>();
     if errors.is_empty() {
@@ -2136,6 +2145,29 @@ fn main() {
         assert!(enforce_runtime_network_policy("personal.codex", Some(true)).is_ok());
         // 未声明网络约束时不得把「无法证明隔离」当成拒绝服务的理由。
         assert!(enforce_runtime_network_policy("personal.codex", None).is_ok());
+    }
+
+    #[test]
+    fn strict_business_report_schema_preserves_host_provenance() {
+        let mut package = role_package(&[]);
+        let root = std::env::temp_dir().join(format!("andx-report-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("report.json"),
+            serde_json::to_vec(&json!({
+                "type":"object","additionalProperties":false,"required":["schema_version","ok"],
+                "properties":{"schema_version":{"const":"andx-report.v1"},"ok":{"const":true}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        package.source_root = root.clone();
+        let mut output = json!({"schema_version":"workflow_runtime_result.v1","provider":"host",
+            "report":{"schema_version":"andx-report.v1","ok":true}});
+        assert!(validate_runtime_output(&package, "report.json", &output).is_ok());
+        output["report"]["ok"] = json!(false);
+        assert!(validate_runtime_output(&package, "report.json", &output).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn role_package(roles: &[(&str, super::super::WorkflowRole)]) -> WorkflowPackage {

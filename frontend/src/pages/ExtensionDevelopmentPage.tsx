@@ -1,3 +1,4 @@
+import type { WorkflowSubmissionStatus } from '../services/agentApi';
 import type { WorkbenchSubmissionContext, WorkbenchSubmissionScope } from '../services/extensionSubmission';
 import { WorkbenchAudienceDialog } from '../components/WorkbenchAudienceDialog';
 import { createOrganizationDirectoryAdapter, type OrganizationPage } from '../services/organizationDirectory';
@@ -28,7 +29,7 @@ type DraftRef =
 type SubmissionRef =
   | { kind: 'plugin'; value: PluginSubmissionStatus }
   | { kind: 'skill'; value: SkillSubmissionStatus }
-  | { kind: 'workflow'; value: AuthoringWorkflowDraft };
+  | { kind: 'workflow'; value: WorkflowSubmissionStatus };
 
 type ProjectModel = {
   key: string;
@@ -114,7 +115,7 @@ type DevelopmentPageProps = {
   extensionActivations: ExtensionActivationReceipt[];
   pluginSubmissions: PluginSubmissionStatus[];
   skillSubmissions: SkillSubmissionStatus[];
-  workflowSubmissions: AuthoringWorkflowDraft[];
+  workflowSubmissions: WorkflowSubmissionStatus[];
   availablePlugins: PluginCatalogItem[];
   invitations: ExtensionCollaborationInvitation[];
   accountAuthorized: boolean;
@@ -1065,7 +1066,7 @@ function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remo
   props.instructionDrafts.forEach(value => ensure('instruction', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'instruction', value }));
   props.pluginSubmissions.forEach(value => ensure('plugin', value.product_key, value.name).submissions.push({ kind: 'plugin', value }));
   props.skillSubmissions.forEach(value => ensure('skill', value.product_key, value.name || value.product_key).submissions.push({ kind: 'skill', value }));
-  props.workflowSubmissions.forEach(value => ensure('workflow', value.manifest.id, value.manifest.name).submissions.push({ kind: 'workflow', value }));
+  props.workflowSubmissions.forEach(value => ensure('workflow', value.product_key, value.name).submissions.push({ kind: 'workflow', value }));
   for (const project of map.values()) {
     project.drafts.sort((left, right) => compareVersions(draftVersion(right), draftVersion(left)) || right.value.updated_at.localeCompare(left.value.updated_at));
     project.submissions.sort((left, right) => right.value.updated_at.localeCompare(left.value.updated_at));

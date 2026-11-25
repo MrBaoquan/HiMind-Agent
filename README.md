@@ -135,3 +135,16 @@ cargo run -- --api http://127.0.0.1:18083 --once
 
 1. F:\U3DProjects
 2. F:\Project Released Files
+
+
+## 通用扩展安全接入（0.3.94）
+
+管理员从业务后台复制接入信息，开发者粘贴到 HiMind 对话。Agent 核心只理解通用导入协议、已安装扩展声明、秘密字段及凭证引用；不解释具体业务密钥、身份、目录、目标或发布 API。工作台仅本地识别通用信封 importProtocol，识别后才在草稿/标题/历史/runtime 注入前调用 `/credentials/import`；普通云端聊天不新增本机 Agent 依赖。原生运行时代理在 HTTP/WebSocket 转交存储前拒绝残留凭证，ACP 在历史前处理，模型网关最后拒绝残留原文。外部客户端及直连第三方 Runtime 的历史不受此边界保护。
+
+扩展凭据声明 `secure_import`：精确 schema、字段映射、秘密前缀、只读身份探测路径及 `credential.import.verify` 处理器。安装授权需要 `secret.import.structured`、`network.credential-import.endpoint` 和 Broker 权限。宿主执行有界 HTTPS 源站请求（环回 HTTP 开发例外），禁止跳转；秘密不交给验证处理器，扩展解释已脱敏文档和身份响应，宿主校验输出白名单后加密保存。通用 `importProtocol=himind.credential-import.v1` 可让缺少扩展的入口拒绝完整原文。非标准自由文本秘密不能被任意识别，必须使用完整结构化接入信息。
+
+`workspace_binding` 声明根目录字段、绑定能力、需绑定能力和目标字段。宿主按可信会话工作区下的精确子工程/页面根目录 + 扩展身份保存凭证引用、扩展定义目标和随机修订；模型自填路径不能扩大范围，不使用全局当前目标。审批固定真实参数和修订，执行持锁复核，换绑要求重新审批。MCP 使用宿主启动的 `HIMIND_AI_WORKSPACE` 或进程 cwd；ACP/托管执行使用真实会话/claim；未携带可信会话的 API 拒绝目标操作。原生 Workflow 表单是独立用户入口，模型调度不走该入口。
+
+业务接入流程由对应扩展提供，日常使用无需填写 Profile、环境变量或凭证中心。新增业务扩展只增加声明及处理器，不修改聊天代理、推理网关和通用审批。凭证中心可展示公开字段及删除实例，不能读取秘密。
+
+验证：`frontend/scripts/check-secure-chat-import.browser.mjs`，Rust `app::secure_import` / `app::extension_binding` / `app::builtin_ai_proxy` 和凭证 Broker 回归。跨仓业务 Workflow 图测试仍为显式 ignored 集成，模拟远端与模型结果，不作为真实线上业务验收。
